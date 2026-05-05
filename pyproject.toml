@@ -10,6 +10,7 @@ dependencies = [
     "ipykernel>=7.2.0",
     "numpy>=2.4.4",
     "pyqt6>=6.11.0",
+    "pyqtgraph>=0.14.0",
     "qtpy>=2.4.3",
     "scikit-image>=0.26.0",
     "scipy>=1.17.1",
