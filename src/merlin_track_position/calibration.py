@@ -1,4 +1,4 @@
-"""2D motor-axis calibration represented directly as xarray datasets."""
+"""2D motor-axis calibration from observed image shifts and stage positions."""
 
 from __future__ import annotations
 
@@ -55,7 +55,9 @@ def fit_calibration_from_images(
     for image in image_arrays:
         shift = estimate_shift(reference_image, image, **shift_kwargs)
         shifts.append(np.asarray(shift["shift_px"].values, dtype=np.float64))
-        measurement_warnings.append(tuple(str(shift.attrs.get("warnings", "")).splitlines()))
+        measurement_warnings.append(
+            tuple(str(shift.attrs.get("warnings", "")).splitlines())
+        )
 
     return _fit_calibration_from_measurement_arrays(
         relative_stage,
@@ -96,7 +98,9 @@ def fit_calibration_from_measurements(
     )
 
 
-def estimate_stage_offset(calibration: xr.Dataset, shift: xr.Dataset | Sequence[float]) -> np.ndarray:
+def estimate_stage_offset(
+    calibration: xr.Dataset, shift: xr.Dataset | Sequence[float]
+) -> np.ndarray:
     """Convert an observed image shift to estimated stage-plane offset."""
 
     shift_px = (
@@ -202,7 +206,9 @@ def _fit_calibration_from_measurement_arrays(
 
     measurement_warnings_tuple = _pad_warnings(measurement_warnings, stage.shape[0])
     if any(measurement_warnings_tuple):
-        warnings.append("one or more shift measurements reported image-matching warnings")
+        warnings.append(
+            "one or more shift measurements reported image-matching warnings"
+        )
 
     sample_count = stage.shape[0]
     coords: dict[str, Any] = {
@@ -211,7 +217,11 @@ def _fit_calibration_from_measurement_arrays(
         "pixel_axis": list(PIXEL_AXES),
     }
     data_vars: dict[str, Any] = {
-        "stage_to_pixel": (("pixel_axis", "stage_axis"), stage_to_pixel, {"units": "px/um"}),
+        "stage_to_pixel": (
+            ("pixel_axis", "stage_axis"),
+            stage_to_pixel,
+            {"units": "px/um"},
+        ),
         "pixel_to_stage": (
             ("stage_axis", "pixel_axis"),
             np.linalg.inv(stage_to_pixel),
@@ -231,20 +241,32 @@ def _fit_calibration_from_measurement_arrays(
         "residual_stage_um": (("sample", "stage_axis"), residual_um, {"units": "um"}),
         "measurement_warnings": (
             ("sample",),
-            np.asarray(["\n".join(items) for items in measurement_warnings_tuple], dtype=str),
+            np.asarray(
+                ["\n".join(items) for items in measurement_warnings_tuple], dtype=str
+            ),
         ),
     }
 
     repeatability = _repeatability(stage, pixels)
     if repeatability is not None:
-        repeatability_stage_um, repeatability_count, repeatability_mean, repeatability_std = repeatability
-        coords["repeatability_position"] = np.arange(repeatability_stage_um.shape[0], dtype=np.int64)
+        (
+            repeatability_stage_um,
+            repeatability_count,
+            repeatability_mean,
+            repeatability_std,
+        ) = repeatability
+        coords["repeatability_position"] = np.arange(
+            repeatability_stage_um.shape[0], dtype=np.int64
+        )
         data_vars["repeatability_stage_um"] = (
             ("repeatability_position", "stage_axis"),
             repeatability_stage_um,
             {"units": "um"},
         )
-        data_vars["repeatability_count"] = (("repeatability_position",), repeatability_count)
+        data_vars["repeatability_count"] = (
+            ("repeatability_position",),
+            repeatability_count,
+        )
         data_vars["repeatability_mean_shift_px"] = (
             ("repeatability_position", "pixel_axis"),
             repeatability_mean,

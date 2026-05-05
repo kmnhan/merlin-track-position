@@ -42,25 +42,39 @@ def estimate_shift(
 
     diagnostic_warnings: list[str] = []
     if dynamic_range <= 1e-12 or standard_deviation <= 1e-12:
-        diagnostic_warnings.append("reference image has little or no intensity contrast")
+        diagnostic_warnings.append(
+            "reference image has little or no intensity contrast"
+        )
     if gradient_rms <= max(1e-12, 1e-4 * max(dynamic_range, 1.0)):
-        diagnostic_warnings.append("reference image has low texture; shift may be unreliable")
+        diagnostic_warnings.append(
+            "reference image has low texture; shift may be unreliable"
+        )
 
     if dynamic_range <= 1e-12 or standard_deviation <= 1e-12:
-        reference_norm = normalize_intensity(reference_gray, clip_percentiles=clip_percentiles)
-        current_norm = normalize_intensity(current_gray, clip_percentiles=clip_percentiles)
+        reference_norm = normalize_intensity(
+            reference_gray, clip_percentiles=clip_percentiles
+        )
+        current_norm = normalize_intensity(
+            current_gray, clip_percentiles=clip_percentiles
+        )
         shift_px = np.array([np.nan, np.nan], dtype=np.float64)
         registration_error = np.inf
         phase_difference = np.nan
     else:
-        reference_norm = normalize_intensity(reference_gray, clip_percentiles=clip_percentiles)
-        current_norm = normalize_intensity(current_gray, clip_percentiles=clip_percentiles)
-        shift_px, registration_error, phase_difference, skimage_warnings = _estimate_translation(
-            reference_norm,
-            current_norm,
-            use_window=use_window,
-            upsample_factor=upsample_factor,
-            normalization=normalization,
+        reference_norm = normalize_intensity(
+            reference_gray, clip_percentiles=clip_percentiles
+        )
+        current_norm = normalize_intensity(
+            current_gray, clip_percentiles=clip_percentiles
+        )
+        shift_px, registration_error, phase_difference, skimage_warnings = (
+            _estimate_translation(
+                reference_norm,
+                current_norm,
+                use_window=use_window,
+                upsample_factor=upsample_factor,
+                normalization=normalization,
+            )
         )
         diagnostic_warnings.extend(
             f"skimage registration warning: {message}" for message in skimage_warnings
@@ -68,7 +82,9 @@ def estimate_shift(
 
     if not np.isfinite(registration_error):
         shift_px = np.array([np.nan, np.nan], dtype=np.float64)
-        diagnostic_warnings.append("registration error is not finite; shift estimate is unreliable")
+        diagnostic_warnings.append(
+            "registration error is not finite; shift estimate is unreliable"
+        )
     elif registration_error > high_error_threshold:
         diagnostic_warnings.append(
             f"high registration error: {registration_error:.3g} > {high_error_threshold:.3g}"
@@ -96,7 +112,11 @@ def estimate_shift(
             "phase_difference": ((), float(phase_difference)),
             "texture_dynamic_range": ((), dynamic_range),
             "texture_gradient_rms": ((), gradient_rms),
-            "tile_median_shift_px": (("pixel_axis",), tile_median_shift, {"units": "px"}),
+            "tile_median_shift_px": (
+                ("pixel_axis",),
+                tile_median_shift,
+                {"units": "px"},
+            ),
             "tile_shift_std_px": ((), float(tile_shift_std), {"units": "px"}),
         },
         coords={"pixel_axis": list(PIXEL_AXES)},

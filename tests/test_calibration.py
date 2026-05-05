@@ -42,8 +42,12 @@ class CalibrationTests(unittest.TestCase):
 
         calibration = fit_calibration_from_measurements(stage, pixels)
 
-        np.testing.assert_allclose(calibration["stage_to_pixel"].values, stage_to_pixel, atol=1e-12)
-        np.testing.assert_allclose(estimate_stage_offset(calibration, [22.5, 4.0]), [50.0, 0.0], atol=1e-10)
+        np.testing.assert_allclose(
+            calibration["stage_to_pixel"].values, stage_to_pixel, atol=1e-12
+        )
+        np.testing.assert_allclose(
+            estimate_stage_offset(calibration, [22.5, 4.0]), [50.0, 0.0], atol=1e-10
+        )
         self.assertLess(float(calibration["condition_number"].values), 2.0)
 
     def test_poor_condition_warning(self):
@@ -76,7 +80,9 @@ class CalibrationTests(unittest.TestCase):
         images = []
         for stage_row in stage:
             du, dv = stage_to_pixel @ stage_row
-            images.append(ndimage.shift(reference, shift=(dv, du), order=3, mode="wrap"))
+            images.append(
+                ndimage.shift(reference, shift=(dv, du), order=3, mode="wrap")
+            )
 
         calibration = fit_calibration_from_images(
             images,
@@ -85,8 +91,12 @@ class CalibrationTests(unittest.TestCase):
             clip_percentiles=None,
         )
 
-        np.testing.assert_allclose(calibration["stage_to_pixel"].values, stage_to_pixel, atol=0.03)
-        np.testing.assert_allclose(calibration["image"].values, np.stack(images), atol=0.0)
+        np.testing.assert_allclose(
+            calibration["stage_to_pixel"].values, stage_to_pixel, atol=0.03
+        )
+        np.testing.assert_allclose(
+            calibration["image"].values, np.stack(images), atol=0.0
+        )
         np.testing.assert_allclose(calibration["stage_um"].values, stage)
         self.assertEqual(calibration.attrs["reference_index"], 0)
 
@@ -95,7 +105,12 @@ class CalibrationTests(unittest.TestCase):
         stage_to_pixel = np.array([[0.3, -0.1], [0.08, 0.22]])
         stage = np.array([[0.0, 0.0], [20.0, 0.0], [0.0, 20.0], [20.0, 20.0]])
         images = [
-            ndimage.shift(reference, shift=tuple((stage_to_pixel @ row)[::-1]), order=3, mode="wrap")
+            ndimage.shift(
+                reference,
+                shift=tuple((stage_to_pixel @ row)[::-1]),
+                order=3,
+                mode="wrap",
+            )
             for row in stage
         ]
 
@@ -114,9 +129,16 @@ class CalibrationTests(unittest.TestCase):
     def test_h5_roundtrip_preserves_images_and_calibration(self):
         reference = textured_image(seed=50, shape=(96, 104))
         stage_to_pixel = np.array([[0.29, -0.12], [0.07, 0.25]])
-        stage = np.array([[0.0, 0.0], [25.0, 0.0], [-25.0, 0.0], [0.0, 25.0], [25.0, 25.0]])
+        stage = np.array(
+            [[0.0, 0.0], [25.0, 0.0], [-25.0, 0.0], [0.0, 25.0], [25.0, 25.0]]
+        )
         images = [
-            ndimage.shift(reference, shift=tuple((stage_to_pixel @ row)[::-1]), order=3, mode="wrap")
+            ndimage.shift(
+                reference,
+                shift=tuple((stage_to_pixel @ row)[::-1]),
+                order=3,
+                mode="wrap",
+            )
             for row in stage
         ]
         dataset = fit_calibration_from_images(
@@ -134,8 +156,12 @@ class CalibrationTests(unittest.TestCase):
                 loaded = dataset_on_disk.load()
 
         np.testing.assert_allclose(loaded["image"].values, np.stack(images))
-        np.testing.assert_allclose(loaded["stage_um"].values, dataset["stage_um"].values)
-        np.testing.assert_allclose(loaded["stage_to_pixel"].values, dataset["stage_to_pixel"].values)
+        np.testing.assert_allclose(
+            loaded["stage_um"].values, dataset["stage_um"].values
+        )
+        np.testing.assert_allclose(
+            loaded["stage_to_pixel"].values, dataset["stage_to_pixel"].values
+        )
         np.testing.assert_allclose(loaded["bias_px"].values, dataset["bias_px"].values)
 
     def test_correct_uses_xarray_dataset(self):
@@ -143,16 +169,34 @@ class CalibrationTests(unittest.TestCase):
         stage_to_pixel = np.array([[0.25, -0.1], [0.05, 0.2]])
         stage = np.array([[0.0, 0.0], [20.0, 0.0], [0.0, 20.0], [20.0, 20.0]])
         images = [
-            ndimage.shift(reference, shift=tuple((stage_to_pixel @ row)[::-1]), order=3, mode="wrap")
+            ndimage.shift(
+                reference,
+                shift=tuple((stage_to_pixel @ row)[::-1]),
+                order=3,
+                mode="wrap",
+            )
             for row in stage
         ]
-        calibration = fit_calibration_from_images(images, stage, check_tiles=False, clip_percentiles=None)
-        current = ndimage.shift(reference, shift=tuple((stage_to_pixel @ np.array([8.0, -4.0]))[::-1]), order=3, mode="wrap")
+        calibration = fit_calibration_from_images(
+            images, stage, check_tiles=False, clip_percentiles=None
+        )
+        current = ndimage.shift(
+            reference,
+            shift=tuple((stage_to_pixel @ np.array([8.0, -4.0]))[::-1]),
+            order=3,
+            mode="wrap",
+        )
 
-        result = correct(calibration, reference, current, check_tiles=False, clip_percentiles=None)
+        result = correct(
+            calibration, reference, current, check_tiles=False, clip_percentiles=None
+        )
 
-        np.testing.assert_allclose(result["estimated_stage_offset_um"].values, [8.0, -4.0], atol=1.0)
-        np.testing.assert_allclose(result["correction_um"].values, [-8.0, 4.0], atol=1.0)
+        np.testing.assert_allclose(
+            result["estimated_stage_offset_um"].values, [8.0, -4.0], atol=1.0
+        )
+        np.testing.assert_allclose(
+            result["correction_um"].values, [-8.0, 4.0], atol=1.0
+        )
 
     def test_fit_calibration_requires_independent_stage_axes(self):
         stage = np.array([[0.0, 0.0], [10.0, 0.0], [20.0, 0.0]])

@@ -72,6 +72,7 @@ def get_base_file_dir() -> pathlib.Path:
     """Get the base file directory for the current scan."""
     _get_value(INSTR_SCAN_SETUP_PATH, "Data file base directory")
 
+
 def get_x_start() -> float:
     """Get the X Start position for the current scan."""
     return _get_value(INSTR_SCAN_SETUP_PATH, "X Start")
