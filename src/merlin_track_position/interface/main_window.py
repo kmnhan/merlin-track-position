@@ -10,6 +10,7 @@ import pyqtgraph as pg
 import xarray as xr
 from qtpy import QtCore, QtGui, QtWidgets
 
+from merlin_track_position.interface.calibration_thread import CalibrationThread
 from merlin_track_position.interface.calibration_panel import (
     CalibrationPanel,
     _calibration_summary,
@@ -126,6 +127,7 @@ class MainWindow(_MainWindowGUI):
         self._settings = QtCore.QSettings("merlin-track-position", "Track Positions")
         self._calibration: xr.Dataset | None = None
         self._calibration_path: Path | None = None
+        self._calibration_thread = CalibrationThread(self)
 
         default_roi_geometry = _default_roi_geometry()
         roi_values: list[float] = []
@@ -149,11 +151,27 @@ class MainWindow(_MainWindowGUI):
         self.calibration_panel.calibration_details_button.clicked.connect(
             self._on_calibration_details_clicked
         )
+        self.calibration_panel.new_calibration_button.clicked.connect(
+            self._on_new_calibration_clicked
+        )
+        self._calibration_thread.sigCalibrationReady.connect(
+            self._on_new_calibration_ready
+        )
+        self._calibration_thread.sigCalibrationFailed.connect(
+            self._on_new_calibration_failed
+        )
         self.calibration_panel.reset()
 
         self._server = MotorServer(self)
         self._server.sigMoveDetected.connect(self._on_move_detected)
         self._server.start()
+
+    @staticmethod
+    def _load_calibration_from_path(path: Path) -> xr.Dataset:
+        with xr.open_dataset(path, engine="h5netcdf") as dataset_on_disk:
+            calibration = dataset_on_disk.load()
+        _validate_calibration_dataset(calibration)
+        return calibration
 
     @QtCore.Slot(int)
     def _on_move_detected(self, target: int) -> None:
@@ -190,9 +208,7 @@ class MainWindow(_MainWindowGUI):
 
         path = Path(file_name)
         try:
-            with xr.open_dataset(path, engine="h5netcdf") as dataset_on_disk:
-                calibration = dataset_on_disk.load()
-            _validate_calibration_dataset(calibration)
+            calibration = self._load_calibration_from_path(path)
         except Exception as exc:
             QtWidgets.QMessageBox.critical(
                 self,
@@ -235,11 +251,59 @@ class MainWindow(_MainWindowGUI):
         self.calibration_panel.show_saved_calibration(path.name)
 
     @QtCore.Slot()
+    def _on_new_calibration_clicked(self) -> None:
+        if self._calibration_thread.isRunning():
+            return
+
+        self.calibration_panel.show_calibration_in_progress()
+        self._calibration_thread.start()
+
+    @QtCore.Slot(object)
+    def _on_new_calibration_ready(self, calibration: object) -> None:
+        try:
+            if not isinstance(calibration, xr.Dataset):
+                raise TypeError("calibration thread did not return an xarray Dataset")
+            _validate_calibration_dataset(calibration)
+        except Exception as exc:
+            self._restore_calibration_idle_state()
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Could not use calibration",
+                str(exc),
+            )
+            return
+
+        self._calibration = calibration
+        self._calibration_path = None
+        self.calibration_panel.show_loaded_calibration(calibration, "new calibration")
+
+    @QtCore.Slot(str)
+    def _on_new_calibration_failed(self, error_message: str) -> None:
+        self._restore_calibration_idle_state()
+        QtWidgets.QMessageBox.critical(
+            self,
+            "Could not create calibration",
+            error_message,
+        )
+
+    @QtCore.Slot()
     def _on_calibration_details_clicked(self) -> None:
         if self._calibration is None:
             return
 
         self.calibration_panel.build_details_dialog(self._calibration).exec()
+
+    def _restore_calibration_idle_state(self) -> None:
+        if self._calibration is None:
+            self.calibration_panel.reset()
+            return
+
+        display_name = (
+            self._calibration_path.name
+            if self._calibration_path is not None
+            else "current calibration"
+        )
+        self.calibration_panel.show_loaded_calibration(self._calibration, display_name)
 
     def _set_roi_geometry(self, geometry: tuple[float, float, float, float]) -> None:
         x, y, width, height = _clamp_roi_geometry(geometry)
@@ -247,6 +311,9 @@ class MainWindow(_MainWindowGUI):
         self.image_roi.setSize((width, height), update=True, finish=False)
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        self._calibration_thread.stop()
+        self._calibration_thread.wait()
+
         self._server.stop()
         self._server.wait()
 

@@ -232,9 +232,10 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.reset()
 
     def reset(self) -> None:
+        self.load_calibration_button.setEnabled(True)
         self.save_calibration_button.setEnabled(False)
         self.calibration_details_button.setEnabled(False)
-        self.new_calibration_button.setEnabled(False)
+        self.new_calibration_button.setEnabled(True)
         self.calibration_status_label.setText("No calibration loaded.")
         self.calibration_warnings_text.setPlainText("No calibration loaded.")
         for label in self.metric_labels.values():
@@ -244,14 +245,23 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.repeatability_group.setVisible(False)
         self.residual_plot.clear()
 
+    def show_calibration_in_progress(self) -> None:
+        self.load_calibration_button.setEnabled(False)
+        self.save_calibration_button.setEnabled(False)
+        self.calibration_details_button.setEnabled(False)
+        self.new_calibration_button.setEnabled(False)
+        self.calibration_status_label.setText("New calibration in progress...")
+
     def show_loaded_calibration(
         self,
         calibration: xr.Dataset,
         display_name: str,
     ) -> None:
         summary = _calibration_summary(calibration)
+        self.load_calibration_button.setEnabled(True)
         self.save_calibration_button.setEnabled(True)
         self.calibration_details_button.setEnabled(True)
+        self.new_calibration_button.setEnabled(True)
         self.calibration_status_label.setText(
             f"Loaded calibration: {display_name} ({summary['sample_count']} samples)"
         )

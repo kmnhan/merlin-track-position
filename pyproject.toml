@@ -30,3 +30,8 @@ include = [
     "tests",
     "README.md",
 ]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+]

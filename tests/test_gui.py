@@ -88,7 +88,7 @@ class MainWindowGUISmokeTests(unittest.TestCase):
             self.assertFalse(
                 window.calibration_panel.calibration_details_button.isEnabled()
             )
-            self.assertFalse(
+            self.assertTrue(
                 window.calibration_panel.new_calibration_button.isEnabled()
             )
         finally:
@@ -97,6 +97,35 @@ class MainWindowGUISmokeTests(unittest.TestCase):
 
 
 class CalibrationPanelSmokeTests(unittest.TestCase):
+    def test_reset_enables_new_calibration_without_loaded_calibration(self):
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        panel = CalibrationPanel()
+        try:
+            panel.reset()
+
+            self.assertTrue(panel.load_calibration_button.isEnabled())
+            self.assertFalse(panel.save_calibration_button.isEnabled())
+            self.assertFalse(panel.calibration_details_button.isEnabled())
+            self.assertTrue(panel.new_calibration_button.isEnabled())
+        finally:
+            panel.close()
+            app.processEvents()
+
+    def test_show_calibration_in_progress_disables_calibration_controls(self):
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        panel = CalibrationPanel()
+        try:
+            panel.show_calibration_in_progress()
+
+            self.assertFalse(panel.load_calibration_button.isEnabled())
+            self.assertFalse(panel.save_calibration_button.isEnabled())
+            self.assertFalse(panel.calibration_details_button.isEnabled())
+            self.assertFalse(panel.new_calibration_button.isEnabled())
+            self.assertIn("in progress", panel.calibration_status_label.text())
+        finally:
+            panel.close()
+            app.processEvents()
+
     def test_show_loaded_calibration_updates_display_state(self):
         app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
         panel = CalibrationPanel()
@@ -120,6 +149,7 @@ class CalibrationPanelSmokeTests(unittest.TestCase):
 
             self.assertTrue(panel.save_calibration_button.isEnabled())
             self.assertTrue(panel.calibration_details_button.isEnabled())
+            self.assertTrue(panel.new_calibration_button.isEnabled())
             self.assertIn("calibration.h5", panel.calibration_status_label.text())
             self.assertEqual(panel.metric_labels["sample_count"].text(), "6")
             self.assertEqual(
