@@ -54,7 +54,7 @@ print(result.attrs["warnings"])
 The calibration model is:
 
 ```text
-pixel_shift = J @ [stage_a_um, stage_b_um] + bias
+pixel_shift = J @ [stage_a_um, stage_b_um]
 motor_correction_um = -inv(J) @ measured_pixel_shift
 ```
 
@@ -85,7 +85,6 @@ The main dataset variables are:
 - `residual_stage_um(sample, stage_axis)`
 - `stage_to_pixel(pixel_axis, stage_axis)`
 - `pixel_to_stage(stage_axis, pixel_axis)`
-- `bias_px(pixel_axis)`
 
 ## Recommended Data Collection
 

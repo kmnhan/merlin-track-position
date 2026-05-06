@@ -78,11 +78,10 @@ def fit_calibration_from_measurements(
     measurement_warnings: Sequence[Sequence[str]] | None = None,
     reference_stage_um: Sequence[float] = (0.0, 0.0),
     reference_index: int | None = None,
-    fit_bias: bool = True,
     residual_warning_px: float = 1.0,
     condition_warning_threshold: float = 50.0,
 ) -> xr.Dataset:
-    """Fit ``pixel_shift = J @ stage_um + bias`` from measured shifts."""
+    """Fit ``pixel_shift = J @ stage_um`` from measured shifts."""
 
     stage = np.asarray(stage_um, dtype=np.float64)
     pixels = np.asarray(pixel_shift_px, dtype=np.float64)
@@ -92,7 +91,6 @@ def fit_calibration_from_measurements(
         measurement_warnings=measurement_warnings,
         reference_stage_um=reference_stage_um,
         reference_index=reference_index,
-        fit_bias=fit_bias,
         residual_warning_px=residual_warning_px,
         condition_warning_threshold=condition_warning_threshold,
     )
@@ -109,8 +107,7 @@ def estimate_stage_offset(
         else np.asarray(shift, dtype=float)
     )
     pixel_to_stage = np.asarray(calibration["pixel_to_stage"].values, dtype=np.float64)
-    bias_px = np.asarray(calibration["bias_px"].values, dtype=np.float64)
-    return pixel_to_stage @ (shift_px - bias_px)
+    return pixel_to_stage @ shift_px
 
 
 def correct(
@@ -160,7 +157,6 @@ def _fit_calibration_from_measurement_arrays(
     measurement_warnings: Sequence[Sequence[str]] | None = None,
     reference_stage_um: Sequence[float] = (0.0, 0.0),
     reference_index: int | None = None,
-    fit_bias: bool = True,
     residual_warning_px: float = 1.0,
     condition_warning_threshold: float = 50.0,
     images: np.ndarray | None = None,
@@ -172,21 +168,15 @@ def _fit_calibration_from_measurement_arrays(
     if stage.shape[0] < 3:
         raise ValueError("at least three measured points are required")
 
-    x = np.column_stack([stage, np.ones(stage.shape[0])]) if fit_bias else stage
     rank = int(np.linalg.matrix_rank(stage))
     if rank < 2:
         raise ValueError("stage positions must span two independent motor directions")
 
-    coef, _, _, _ = np.linalg.lstsq(x, pixels, rcond=None)
-    if fit_bias:
-        stage_to_pixel = coef[:2, :].T
-        bias_px = coef[2, :]
-    else:
-        stage_to_pixel = coef.T
-        bias_px = np.zeros(2, dtype=np.float64)
+    coef, _, _, _ = np.linalg.lstsq(stage, pixels, rcond=None)
+    stage_to_pixel = coef.T
 
     condition_number = float(np.linalg.cond(stage_to_pixel))
-    predicted = stage @ stage_to_pixel.T + bias_px
+    predicted = stage @ stage_to_pixel.T
     residual_px = pixels - predicted
     pixel_to_stage = np.linalg.inv(stage_to_pixel)
     residual_um = residual_px @ pixel_to_stage.T
@@ -227,7 +217,6 @@ def _fit_calibration_from_measurement_arrays(
             np.linalg.inv(stage_to_pixel),
             {"units": "um/px"},
         ),
-        "bias_px": (("pixel_axis",), bias_px, {"units": "px"}),
         "reference_stage_um": (
             ("stage_axis",),
             np.asarray(reference_stage_um, dtype=np.float64),
@@ -297,7 +286,8 @@ def _fit_calibration_from_measurement_arrays(
         coords=coords,
         attrs={
             "format": "merlin-track-position calibration",
-            "format_version": "2",
+            "format_version": "1",
+            "model": "through_origin_linear",
             "reference_index": -1 if reference_index is None else int(reference_index),
             "warnings": "\n".join(tuple(warnings)),
         },

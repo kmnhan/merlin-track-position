@@ -162,7 +162,6 @@ class CalibrationTests(unittest.TestCase):
         np.testing.assert_allclose(
             loaded["stage_to_pixel"].values, dataset["stage_to_pixel"].values
         )
-        np.testing.assert_allclose(loaded["bias_px"].values, dataset["bias_px"].values)
 
     def test_correct_uses_xarray_dataset(self):
         reference = textured_image(seed=60, shape=(128, 136))
