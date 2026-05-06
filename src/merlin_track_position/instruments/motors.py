@@ -2,9 +2,7 @@ import contextlib
 import time
 from collections.abc import Iterable
 
-
-from merlin_track_position import BCSz
-
+import merlin_track_position.instruments.BCSz as BCSz
 from merlin_track_position.constants import BCS_SERVER_HOST, BCS_SERVER_PORT
 
 MOTOR_NAMES = {

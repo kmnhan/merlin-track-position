@@ -7,8 +7,7 @@ from typing import Any, Sequence
 import numpy as np
 import xarray as xr
 
-from merlin_track_position.image_io import as_grayscale_array
-from merlin_track_position.shift import estimate_shift
+from merlin_track_position.tracking.shift import as_grayscale_array, estimate_shift
 
 STAGE_AXES = ("stage_a_um", "stage_b_um")
 PIXEL_AXES = ("du_px", "dv_px")

@@ -12,7 +12,7 @@ Depth-of-field information is intentionally ignored in this first version.
 
 ```python
 import numpy as np
-from merlin_track_position import estimate_shift
+from merlin_track_position.tracking.shift import estimate_shift
 
 # reference and current are 2D grayscale NumPy arrays.
 reference = np.load("reference.npy")
@@ -29,7 +29,10 @@ Fit calibration directly from image arrays and known motor positions:
 
 ```python
 import numpy as np
-from merlin_track_position import correct, fit_calibration_from_images
+from merlin_track_position.tracking.calibration import (
+    correct,
+    fit_calibration_from_images,
+)
 
 # images is a list of 2D grayscale NumPy arrays.
 # stage_um has one [stage_a_um, stage_b_um] row per image.

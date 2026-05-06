@@ -6,7 +6,7 @@ import numpy as np
 import xarray as xr
 from scipy import ndimage
 
-from merlin_track_position import (
+from merlin_track_position.tracking.calibration import (
     correct,
     estimate_stage_offset,
     fit_calibration_from_images,

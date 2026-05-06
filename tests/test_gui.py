@@ -6,7 +6,6 @@ import numpy as np
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from merlin_track_position import fit_calibration_from_measurements
 from merlin_track_position.gui import (
     _MainWindowGUI,
     _calibration_summary,
@@ -14,6 +13,7 @@ from merlin_track_position.gui import (
     _default_roi_geometry,
     _validate_calibration_dataset,
 )
+from merlin_track_position.tracking.calibration import fit_calibration_from_measurements
 from qtpy import QtWidgets
 
 

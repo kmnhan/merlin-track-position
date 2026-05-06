@@ -3,7 +3,7 @@ import unittest
 import numpy as np
 from scipy import ndimage
 
-from merlin_track_position import estimate_shift
+from merlin_track_position.tracking.shift import estimate_shift
 
 
 def textured_image(seed=1, shape=(192, 224)):
