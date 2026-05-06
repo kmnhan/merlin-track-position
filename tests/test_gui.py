@@ -6,13 +6,14 @@ import numpy as np
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from merlin_track_position.gui import (
+from merlin_track_position.interface.main_window import (
     _MainWindowGUI,
     _calibration_summary,
     _clamp_roi_geometry,
     _default_roi_geometry,
     _validate_calibration_dataset,
 )
+from merlin_track_position.interface.calibration_panel import CalibrationPanel
 from merlin_track_position.tracking.calibration import fit_calibration_from_measurements
 from qtpy import QtWidgets
 
@@ -80,16 +81,58 @@ class MainWindowGUISmokeTests(unittest.TestCase):
         window = _MainWindowGUI()
         try:
             self.assertEqual(window.image_item.image.shape, (480, 704))
-            self.assertFalse(window.save_calibration_button.isEnabled())
-            self.assertFalse(window.calibration_details_button.isEnabled())
-            self.assertFalse(window.new_calibration_button.isEnabled())
+            self.assertIsInstance(window.calibration_panel, CalibrationPanel)
+            self.assertFalse(
+                window.calibration_panel.save_calibration_button.isEnabled()
+            )
+            self.assertFalse(
+                window.calibration_panel.calibration_details_button.isEnabled()
+            )
+            self.assertFalse(
+                window.calibration_panel.new_calibration_button.isEnabled()
+            )
         finally:
             window.close()
             app.processEvents()
 
+
+class CalibrationPanelSmokeTests(unittest.TestCase):
+    def test_show_loaded_calibration_updates_display_state(self):
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        panel = CalibrationPanel()
+        try:
+            stage_to_pixel = np.array([[0.5, -0.1], [0.2, 0.4]])
+            stage = np.array(
+                [
+                    [0.0, 0.0],
+                    [20.0, 0.0],
+                    [0.0, 20.0],
+                    [20.0, 0.0],
+                    [0.0, 20.0],
+                    [20.0, 20.0],
+                ]
+            )
+            calibration = fit_calibration_from_measurements(
+                stage, stage @ stage_to_pixel.T
+            )
+
+            panel.show_loaded_calibration(calibration, "calibration.h5")
+
+            self.assertTrue(panel.save_calibration_button.isEnabled())
+            self.assertTrue(panel.calibration_details_button.isEnabled())
+            self.assertIn("calibration.h5", panel.calibration_status_label.text())
+            self.assertEqual(panel.metric_labels["sample_count"].text(), "6")
+            self.assertEqual(
+                panel.calibration_warnings_text.toPlainText(),
+                "No calibration warnings.",
+            )
+        finally:
+            panel.close()
+            app.processEvents()
+
     def test_calibration_details_dialog_includes_tabs_samples_and_images(self):
         app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-        window = _MainWindowGUI()
+        panel = CalibrationPanel()
         try:
             stage_to_pixel = np.array([[0.5, -0.1], [0.2, 0.4]])
             stage = np.array(
@@ -110,7 +153,7 @@ class MainWindowGUISmokeTests(unittest.TestCase):
                 y=np.arange(images.shape[1]), x=np.arange(images.shape[2])
             ).assign(image=(("sample", "y", "x"), images))
 
-            dialog = window._build_calibration_details_dialog(calibration)
+            dialog = panel.build_details_dialog(calibration)
             try:
                 tabs = dialog.findChild(QtWidgets.QTabWidget, "calibration_details_tabs")
                 self.assertIsNotNone(tabs)
@@ -135,7 +178,7 @@ class MainWindowGUISmokeTests(unittest.TestCase):
             finally:
                 dialog.close()
         finally:
-            window.close()
+            panel.close()
             app.processEvents()
 
 

@@ -1,25 +1,12 @@
 from __future__ import annotations
 
 import math
-import multiprocessing
-import sys
-from pathlib import Path
 
 import numpy as np
 import pyqtgraph as pg
 import xarray as xr
-from qtpy import QtCore, QtGui, QtWidgets
+from qtpy import QtCore, QtWidgets
 
-from merlin_track_position.server import MotorServer
-
-IMAGE_WIDTH: int = 704
-IMAGE_HEIGHT: int = 480
-ROI_SETTINGS_KEYS: tuple[str, str, str, str] = (
-    "roi/x",
-    "roi/y",
-    "roi/width",
-    "roi/height",
-)
 REQUIRED_CALIBRATION_VARIABLES: tuple[str, ...] = (
     "stage_um",
     "residual_stage_um",
@@ -62,36 +49,6 @@ REPEATABILITY_ROWS: tuple[tuple[str, str], ...] = (
     ("mean_rms_std_px", "Mean RMS std px"),
     ("max_rms_std_px", "Max RMS std px"),
 )
-
-
-def _default_roi_geometry(
-    image_width: float = IMAGE_WIDTH,
-    image_height: float = IMAGE_HEIGHT,
-) -> tuple[float, float, float, float]:
-    width = 0.25 * image_width
-    height = 0.25 * image_height
-    return (
-        0.5 * (image_width - width),
-        0.5 * (image_height - height),
-        width,
-        height,
-    )
-
-
-def _clamp_roi_geometry(
-    geometry: tuple[float, float, float, float],
-    image_width: float = IMAGE_WIDTH,
-    image_height: float = IMAGE_HEIGHT,
-) -> tuple[float, float, float, float]:
-    x, y, width, height = geometry
-    if not all(math.isfinite(value) for value in geometry):
-        return _default_roi_geometry(image_width, image_height)
-
-    width = min(max(width, 1.0), image_width)
-    height = min(max(height, 1.0), image_height)
-    x = min(max(x, 0.0), image_width - width)
-    y = min(max(y, 0.0), image_height - height)
-    return (x, y, width, height)
 
 
 def _format_number(value: object) -> str:
@@ -200,58 +157,17 @@ def _calibration_summary(dataset: xr.Dataset) -> dict[str, object]:
     }
 
 
-class _MainWindowGUI(QtWidgets.QMainWindow):
-    def __init__(self, parent: QtCore.QObject | None = None):
+class CalibrationPanel(QtWidgets.QWidget):
+    def __init__(self, parent: QtWidgets.QWidget | None = None):
         super().__init__(parent)
 
-        self.setWindowTitle("Track Positions")
-
-        central_widget = QtWidgets.QWidget()
-        self.setCentralWidget(central_widget)
-
-        main_layout = QtWidgets.QVBoxLayout(central_widget)
-        splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
-        main_layout.addWidget(splitter)
-
-        self.image_plot = pg.PlotWidget()
-        self.image_plot.setAspectLocked(True)
-        self.image_plot.setLabel("bottom", "x", units="px")
-        self.image_plot.setLabel("left", "y", units="px")
-        self.image_plot.showGrid(x=True, y=True, alpha=0.2)
-        self.image_plot.invertY(True)
-
-        self.image_item = pg.ImageItem(axisOrder="row-major")
-        self.image_item.setImage(
-            np.zeros((int(IMAGE_HEIGHT), int(IMAGE_WIDTH)), dtype=np.int64),
-        )
-        self.image_item.setRect(QtCore.QRectF(0.0, 0.0, IMAGE_WIDTH, IMAGE_HEIGHT))
-        self.image_plot.addItem(self.image_item)
-        self.image_plot.setXRange(0.0, IMAGE_WIDTH, padding=0.0)
-        self.image_plot.setYRange(0.0, IMAGE_HEIGHT, padding=0.0)
-
-        roi_geometry = _default_roi_geometry()
-        self.image_roi = pg.RectROI(
-            roi_geometry[:2],
-            roi_geometry[2:],
-            sideScalers=True,
-            maxBounds=QtCore.QRectF(0.0, 0.0, IMAGE_WIDTH, IMAGE_HEIGHT),
-            pen=pg.mkPen("#008c99", width=2),
-            hoverPen=pg.mkPen("#00c2d1", width=2),
-        )
-        self.image_roi.setZValue(10)
-        self.image_plot.addItem(self.image_roi)
-        splitter.addWidget(self.image_plot)
-
-        calibration_panel = QtWidgets.QWidget()
-        calibration_layout = QtWidgets.QVBoxLayout(calibration_panel)
+        calibration_layout = QtWidgets.QVBoxLayout(self)
 
         calibration_button_layout = QtWidgets.QHBoxLayout()
         self.load_calibration_button = QtWidgets.QPushButton("Load calibration")
         self.save_calibration_button = QtWidgets.QPushButton("Save calibration")
         self.calibration_details_button = QtWidgets.QPushButton("Details...")
         self.new_calibration_button = QtWidgets.QPushButton("New calibration")
-        self.save_calibration_button.setEnabled(False)
-        self.calibration_details_button.setEnabled(False)
         self.new_calibration_button.setEnabled(False)
         calibration_button_layout.addWidget(self.load_calibration_button)
         calibration_button_layout.addWidget(self.save_calibration_button)
@@ -259,7 +175,7 @@ class _MainWindowGUI(QtWidgets.QMainWindow):
         calibration_button_layout.addWidget(self.new_calibration_button)
         calibration_layout.addLayout(calibration_button_layout)
 
-        self.calibration_status_label = QtWidgets.QLabel("No calibration loaded.")
+        self.calibration_status_label = QtWidgets.QLabel()
         self.calibration_status_label.setWordWrap(True)
         calibration_layout.addWidget(self.calibration_status_label)
 
@@ -275,7 +191,6 @@ class _MainWindowGUI(QtWidgets.QMainWindow):
         self.calibration_warnings_text = QtWidgets.QPlainTextEdit()
         self.calibration_warnings_text.setReadOnly(True)
         self.calibration_warnings_text.setMaximumHeight(90)
-        self.calibration_warnings_text.setPlainText("No calibration loaded.")
         warnings_layout.addWidget(self.calibration_warnings_text)
 
         metrics_group = QtWidgets.QGroupBox("Calibration Metrics")
@@ -284,7 +199,7 @@ class _MainWindowGUI(QtWidgets.QMainWindow):
         for key, label, tooltip in METRIC_ROWS:
             name_label = QtWidgets.QLabel(label)
             name_label.setToolTip(tooltip)
-            value_label = QtWidgets.QLabel("n/a")
+            value_label = QtWidgets.QLabel()
             value_label.setToolTip(tooltip)
             value_label.setTextInteractionFlags(
                 QtCore.Qt.TextInteractionFlag.TextSelectableByMouse
@@ -297,13 +212,12 @@ class _MainWindowGUI(QtWidgets.QMainWindow):
         repeatability_layout = QtWidgets.QFormLayout(self.repeatability_group)
         self.repeatability_labels: dict[str, QtWidgets.QLabel] = {}
         for key, label in REPEATABILITY_ROWS:
-            value_label = QtWidgets.QLabel("n/a")
+            value_label = QtWidgets.QLabel()
             value_label.setTextInteractionFlags(
                 QtCore.Qt.TextInteractionFlag.TextSelectableByMouse
             )
             self.repeatability_labels[key] = value_label
             repeatability_layout.addRow(label, value_label)
-        self.repeatability_group.setVisible(False)
         left_column.addWidget(self.repeatability_group)
         right_column.addWidget(warnings_group)
 
@@ -315,10 +229,54 @@ class _MainWindowGUI(QtWidgets.QMainWindow):
         self.residual_plot.setAspectLocked(True)
         calibration_layout.addWidget(self.residual_plot, stretch=1)
 
-        splitter.addWidget(calibration_panel)
-        splitter.setSizes([760, 440])
+        self.reset()
 
-    def _build_calibration_details_dialog(
+    def reset(self) -> None:
+        self.save_calibration_button.setEnabled(False)
+        self.calibration_details_button.setEnabled(False)
+        self.new_calibration_button.setEnabled(False)
+        self.calibration_status_label.setText("No calibration loaded.")
+        self.calibration_warnings_text.setPlainText("No calibration loaded.")
+        for label in self.metric_labels.values():
+            label.setText("n/a")
+        for label in self.repeatability_labels.values():
+            label.setText("n/a")
+        self.repeatability_group.setVisible(False)
+        self.residual_plot.clear()
+
+    def show_loaded_calibration(
+        self,
+        calibration: xr.Dataset,
+        display_name: str,
+    ) -> None:
+        summary = _calibration_summary(calibration)
+        self.save_calibration_button.setEnabled(True)
+        self.calibration_details_button.setEnabled(True)
+        self.calibration_status_label.setText(
+            f"Loaded calibration: {display_name} ({summary['sample_count']} samples)"
+        )
+
+        warnings = summary["warnings"]
+        warnings_text = "\n".join(warnings) if warnings else "No calibration warnings."
+        self.calibration_warnings_text.setPlainText(warnings_text)
+
+        for key, _, _ in METRIC_ROWS:
+            self.metric_labels[key].setText(_format_number(summary[key]))
+
+        repeatability = summary["repeatability"]
+        self.repeatability_group.setVisible(repeatability is not None)
+        for key, label in self.repeatability_labels.items():
+            if repeatability is None:
+                label.setText("n/a")
+            else:
+                label.setText(_format_number(repeatability[key]))
+
+        self._plot_residuals(calibration)
+
+    def show_saved_calibration(self, display_name: str) -> None:
+        self.calibration_status_label.setText(f"Saved calibration: {display_name}")
+
+    def build_details_dialog(
         self,
         calibration: xr.Dataset,
     ) -> QtWidgets.QDialog:
@@ -506,115 +464,7 @@ class _MainWindowGUI(QtWidgets.QMainWindow):
 
         return dialog
 
-
-class MainWindow(_MainWindowGUI):
-    def __init__(self, parent: QtCore.QObject | None = None):
-        super().__init__(parent)
-
-        self._settings = QtCore.QSettings("merlin-track-position", "Track Positions")
-        self._calibration: xr.Dataset | None = None
-        self._calibration_path: Path | None = None
-
-        default_roi_geometry = _default_roi_geometry()
-        roi_values: list[float] = []
-        for key, fallback in zip(ROI_SETTINGS_KEYS, default_roi_geometry, strict=True):
-            value = self._settings.value(key, fallback)
-            try:
-                roi_values.append(float(value))
-            except (TypeError, ValueError):
-                roi_values.append(fallback)
-        self._set_roi_geometry(_clamp_roi_geometry(tuple(roi_values)))
-
-        self.image_roi.sigRegionChangeFinished.connect(
-            self._on_roi_region_change_finished
-        )
-        self.load_calibration_button.clicked.connect(self._on_load_calibration_clicked)
-        self.save_calibration_button.clicked.connect(self._on_save_calibration_clicked)
-        self.calibration_details_button.clicked.connect(
-            self._on_calibration_details_clicked
-        )
-
-        self.save_calibration_button.setEnabled(False)
-        self.calibration_details_button.setEnabled(False)
-        self.calibration_status_label.setText("No calibration loaded.")
-        self.calibration_warnings_text.setPlainText("No calibration loaded.")
-        for label in self.metric_labels.values():
-            label.setText("n/a")
-        self.repeatability_group.setVisible(False)
-        self.residual_plot.clear()
-
-        self._server = MotorServer(self)
-        self._server.sigMoveDetected.connect(self._on_move_detected)
-        self._server.start()
-
-    @QtCore.Slot(int)
-    def _on_move_detected(self, target: int) -> None:
-        self._server.set_result(True, "")
-
-    @QtCore.Slot(object)
-    def _on_roi_region_change_finished(self, roi: object | None = None) -> None:
-        del roi
-        position = self.image_roi.pos()
-        size = self.image_roi.size()
-        geometry = _clamp_roi_geometry(
-            (
-                float(position.x()),
-                float(position.y()),
-                float(size.x()),
-                float(size.y()),
-            )
-        )
-        self._set_roi_geometry(geometry)
-        for key, value in zip(ROI_SETTINGS_KEYS, geometry, strict=True):
-            self._settings.setValue(key, float(value))
-        self._settings.sync()
-
-    @QtCore.Slot()
-    def _on_load_calibration_clicked(self) -> None:
-        file_name, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self,
-            "Load calibration",
-            "",
-            "Calibration files (*.h5 *.hdf5 *.nc);;All files (*)",
-        )
-        if not file_name:
-            return
-
-        path = Path(file_name)
-        try:
-            with xr.open_dataset(path, engine="h5netcdf") as dataset_on_disk:
-                calibration = dataset_on_disk.load()
-            _validate_calibration_dataset(calibration)
-        except Exception as exc:
-            QtWidgets.QMessageBox.critical(
-                self,
-                "Could not load calibration",
-                str(exc),
-            )
-            return
-
-        self._calibration = calibration
-        self._calibration_path = path
-        summary = _calibration_summary(calibration)
-        self.save_calibration_button.setEnabled(True)
-        self.calibration_details_button.setEnabled(True)
-        self.calibration_status_label.setText(
-            f"Loaded calibration: {path.name} ({summary['sample_count']} samples)"
-        )
-
-        warnings = summary["warnings"]
-        warnings_text = "\n".join(warnings) if warnings else "No calibration warnings."
-        self.calibration_warnings_text.setPlainText(warnings_text)
-
-        for key, _, _ in METRIC_ROWS:
-            self.metric_labels[key].setText(_format_number(summary[key]))
-
-        repeatability = summary["repeatability"]
-        self.repeatability_group.setVisible(repeatability is not None)
-        if repeatability is not None:
-            for key, label in self.repeatability_labels.items():
-                label.setText(_format_number(repeatability[key]))
-
+    def _plot_residuals(self, calibration: xr.Dataset) -> None:
         self.residual_plot.clear()
         stage = np.asarray(calibration["stage_um"].values, dtype=float)
         residual = np.asarray(calibration["residual_stage_um"].values, dtype=float)
@@ -657,61 +507,3 @@ class MainWindow(_MainWindowGUI):
                 symbolBrush=pg.mkBrush("#d62728"),
                 symbolPen=pg.mkPen("#d62728"),
             )
-
-    @QtCore.Slot()
-    def _on_save_calibration_clicked(self) -> None:
-        if self._calibration is None:
-            return
-
-        default_path = self._calibration_path or Path.home() / "calibration.h5"
-        file_name, _ = QtWidgets.QFileDialog.getSaveFileName(
-            self,
-            "Save calibration",
-            str(default_path),
-            "Calibration files (*.h5 *.hdf5 *.nc);;All files (*)",
-        )
-        if not file_name:
-            return
-
-        path = Path(file_name)
-        try:
-            self._calibration.to_netcdf(path, engine="h5netcdf")
-        except Exception as exc:
-            QtWidgets.QMessageBox.critical(
-                self,
-                "Could not save calibration",
-                str(exc),
-            )
-            return
-
-        self._calibration_path = path
-        self.calibration_status_label.setText(f"Saved calibration: {path.name}")
-
-    @QtCore.Slot()
-    def _on_calibration_details_clicked(self) -> None:
-        if self._calibration is None:
-            return
-
-        self._build_calibration_details_dialog(self._calibration).exec()
-
-    def _set_roi_geometry(self, geometry: tuple[float, float, float, float]) -> None:
-        x, y, width, height = _clamp_roi_geometry(geometry)
-        self.image_roi.setPos((x, y), update=False, finish=False)
-        self.image_roi.setSize((width, height), update=True, finish=False)
-
-    def closeEvent(self, event: QtGui.QCloseEvent) -> None:
-        self._server.stop()
-        self._server.wait()
-
-        super().closeEvent(event)
-
-
-if __name__ == "__main__":
-    multiprocessing.freeze_support()
-
-    qapp = QtWidgets.QApplication(sys.argv)
-    qapp.setStyle("Fusion")
-    win = MainWindow()
-    win.show()
-    win.activateWindow()
-    qapp.exec()
