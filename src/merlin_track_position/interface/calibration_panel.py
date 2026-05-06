@@ -162,6 +162,7 @@ class CalibrationPanel(QtWidgets.QWidget):
         super().__init__(parent)
 
         calibration_layout = QtWidgets.QVBoxLayout(self)
+        calibration_layout.setContentsMargins(0, 0, 0, 0)
 
         calibration_button_layout = QtWidgets.QHBoxLayout()
         self.load_calibration_button = QtWidgets.QPushButton("Load calibration")

@@ -8,12 +8,14 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from merlin_track_position.interface.main_window import (
     _MainWindowGUI,
-    _calibration_summary,
     _clamp_roi_geometry,
     _default_roi_geometry,
     _validate_calibration_dataset,
 )
-from merlin_track_position.interface.calibration_panel import CalibrationPanel
+from merlin_track_position.interface.calibration_panel import (
+    CalibrationPanel,
+    _calibration_summary,
+)
 from merlin_track_position.tracking.calibration import fit_calibration_from_measurements
 from qtpy import QtWidgets
 
@@ -88,9 +90,7 @@ class MainWindowGUISmokeTests(unittest.TestCase):
             self.assertFalse(
                 window.calibration_panel.calibration_details_button.isEnabled()
             )
-            self.assertTrue(
-                window.calibration_panel.new_calibration_button.isEnabled()
-            )
+            self.assertTrue(window.calibration_panel.new_calibration_button.isEnabled())
         finally:
             window.close()
             app.processEvents()
@@ -185,7 +185,9 @@ class CalibrationPanelSmokeTests(unittest.TestCase):
 
             dialog = panel.build_details_dialog(calibration)
             try:
-                tabs = dialog.findChild(QtWidgets.QTabWidget, "calibration_details_tabs")
+                tabs = dialog.findChild(
+                    QtWidgets.QTabWidget, "calibration_details_tabs"
+                )
                 self.assertIsNotNone(tabs)
                 self.assertEqual(tabs.count(), 3)
                 self.assertEqual(

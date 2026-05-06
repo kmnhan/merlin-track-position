@@ -13,19 +13,11 @@ from qtpy import QtCore, QtGui, QtWidgets
 from merlin_track_position.interface.calibration_thread import CalibrationThread
 from merlin_track_position.interface.calibration_panel import (
     CalibrationPanel,
-    _calibration_summary,
     _validate_calibration_dataset,
 )
 from merlin_track_position.server import MotorServer
 
-__all__ = (
-    "MainWindow",
-    "_MainWindowGUI",
-    "_calibration_summary",
-    "_clamp_roi_geometry",
-    "_default_roi_geometry",
-    "_validate_calibration_dataset",
-)
+__all__ = ("MainWindow",)
 
 IMAGE_WIDTH: int = 704
 IMAGE_HEIGHT: int = 480
@@ -111,7 +103,6 @@ class _MainWindowGUI(QtWidgets.QMainWindow):
 
         self.calibration_panel = CalibrationPanel()
         splitter.addWidget(self.calibration_panel)
-        splitter.setSizes([760, 440])
 
     def _build_calibration_details_dialog(
         self,
