@@ -67,6 +67,14 @@ def _move_motors_and_wait(
     tolerance: float | Iterable[float] | None = None,
     max_retries: int = 4,
 ) -> tuple[float, ...]:
+    logger.debug(
+        "Requesting move: motor_aliases=%s, goals=%s, tolerance=%s, max_retries=%d",
+        motor_aliases,
+        goals,
+        tolerance,
+        max_retries,
+    )
+
     motor_aliases = tuple(motor_aliases)
     goals = tuple(float(goal) for goal in goals)
 
@@ -169,13 +177,6 @@ def move_motors_and_wait(
 
     """
     with _bcs_server_context() as server:
-        logger.debug(
-            "Requesting move: motor_aliases=%s, goals=%s, tolerance=%s, max_retries=%d",
-            motor_aliases,
-            goals,
-            tolerance,
-            max_retries,
-        )
         return _move_motors_and_wait(
             server,
             motor_aliases,

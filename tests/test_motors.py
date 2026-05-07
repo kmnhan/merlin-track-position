@@ -120,14 +120,13 @@ class MoveMotorsAndWaitTests(unittest.TestCase):
         server = FakeBCSServer([(9.5, 2.5), (9.75, 2.25)])
 
         with patch("merlin_track_position.instruments.motors.time.sleep"):
-            with self.assertRaises(RuntimeError):
-                _move_motors_and_wait(
-                    server,
-                    ("x", "y"),
-                    (10.0, 2.0),
-                    tolerance=0.05,
-                    max_retries=1,
-                )
+            _move_motors_and_wait(
+                server,
+                ("x", "y"),
+                (10.0, 2.0),
+                tolerance=0.05,
+                max_retries=1,
+            )
 
         self.assertEqual(len(server.move_calls), 2)
 

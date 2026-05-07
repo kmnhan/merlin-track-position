@@ -12,33 +12,6 @@ from skimage.registration import phase_cross_correlation
 PIXEL_AXES = ("du_px", "dv_px")
 
 
-def as_grayscale_array(image: Any) -> np.ndarray:
-    """Return *image* as a finite 2D float64 grayscale array.
-
-    The project expects grayscale camera images. This helper accepts 2D arrays
-    directly and also tolerates single-channel or RGB/RGBA files loaded by
-    image libraries so notebook experiments are less brittle.
-    """
-
-    array = np.asarray(image)
-    if array.ndim == 2:
-        gray = array
-    elif array.ndim == 3 and array.shape[2] == 1:
-        gray = array[..., 0]
-    elif array.ndim == 3 and array.shape[2] in (3, 4):
-        rgb = array[..., :3].astype(np.float64, copy=False)
-        gray = 0.2126 * rgb[..., 0] + 0.7152 * rgb[..., 1] + 0.0722 * rgb[..., 2]
-    else:
-        raise ValueError(f"expected a grayscale 2D image, got shape {array.shape!r}")
-
-    gray = gray.astype(np.float64, copy=False)
-    if gray.size == 0:
-        raise ValueError("image is empty")
-    if not np.isfinite(gray).all():
-        raise ValueError("image contains non-finite values")
-    return gray
-
-
 def normalize_intensity(
     image: Any,
     *,
@@ -47,8 +20,14 @@ def normalize_intensity(
 ) -> np.ndarray:
     """Robustly normalize a grayscale image to zero mean and unit variance."""
 
-    gray = as_grayscale_array(image)
-    working = gray.astype(np.float64, copy=True)
+    working = np.asarray(image, dtype=np.float64)
+    if working.ndim != 2:
+        raise ValueError(f"image must be 2D, got shape {working.shape!r}")
+    if working.size == 0:
+        raise ValueError("image must not be empty")
+    if not np.isfinite(working).all():
+        raise ValueError("image must contain only finite values")
+    working = working.copy()
 
     if clip_percentiles is not None:
         low, high = np.percentile(working, clip_percentiles)
@@ -75,17 +54,29 @@ def estimate_shift(
 ) -> xr.Dataset:
     """Estimate subpixel translation between two grayscale images."""
 
-    reference_gray = as_grayscale_array(reference)
-    current_gray = as_grayscale_array(current)
-    if reference_gray.shape != current_gray.shape:
+    reference_image = np.asarray(reference, dtype=np.float64)
+    current_image = np.asarray(current, dtype=np.float64)
+    if reference_image.ndim != 2:
+        raise ValueError(
+            f"reference image must be 2D, got shape {reference_image.shape!r}"
+        )
+    if current_image.ndim != 2:
+        raise ValueError(
+            f"current image must be 2D, got shape {current_image.shape!r}"
+        )
+    if reference_image.size == 0 or current_image.size == 0:
+        raise ValueError("images must not be empty")
+    if not np.isfinite(reference_image).all() or not np.isfinite(current_image).all():
+        raise ValueError("images must contain only finite values")
+    if reference_image.shape != current_image.shape:
         raise ValueError(
             "reference and current images must have identical shapes; "
-            f"got {reference_gray.shape!r} and {current_gray.shape!r}"
+            f"got {reference_image.shape!r} and {current_image.shape!r}"
         )
 
-    dynamic_range = float(np.max(reference_gray) - np.min(reference_gray))
-    standard_deviation = float(np.std(reference_gray))
-    gy, gx = np.gradient(reference_gray)
+    dynamic_range = float(np.max(reference_image) - np.min(reference_image))
+    standard_deviation = float(np.std(reference_image))
+    gy, gx = np.gradient(reference_image)
     gradient_rms = float(np.sqrt(np.mean(gx * gx + gy * gy)))
 
     diagnostic_warnings: list[str] = []
@@ -100,20 +91,20 @@ def estimate_shift(
 
     if dynamic_range <= 1e-12 or standard_deviation <= 1e-12:
         reference_norm = normalize_intensity(
-            reference_gray, clip_percentiles=clip_percentiles
+            reference_image, clip_percentiles=clip_percentiles
         )
         current_norm = normalize_intensity(
-            current_gray, clip_percentiles=clip_percentiles
+            current_image, clip_percentiles=clip_percentiles
         )
         shift_px = np.array([np.nan, np.nan], dtype=np.float64)
         registration_error = np.inf
         phase_difference = np.nan
     else:
         reference_norm = normalize_intensity(
-            reference_gray, clip_percentiles=clip_percentiles
+            reference_image, clip_percentiles=clip_percentiles
         )
         current_norm = normalize_intensity(
-            current_gray, clip_percentiles=clip_percentiles
+            current_image, clip_percentiles=clip_percentiles
         )
         shift_px, registration_error, phase_difference, skimage_warnings = (
             _estimate_translation(
@@ -170,8 +161,8 @@ def estimate_shift(
         coords={"pixel_axis": list(PIXEL_AXES)},
         attrs={
             "method": "skimage.registration.phase_cross_correlation",
-            "image_height": int(reference_gray.shape[0]),
-            "image_width": int(reference_gray.shape[1]),
+            "image_height": int(reference_image.shape[0]),
+            "image_width": int(reference_image.shape[1]),
             "upsample_factor": int(upsample_factor),
             "skimage_normalization": "none" if normalization is None else normalization,
             "warnings": "\n".join(diagnostic_warnings),
@@ -269,6 +260,6 @@ def _tile_consistency(
     if tile_std > tolerance or full_distance > tolerance:
         warning = (
             "tile shift estimates are inconsistent with the whole-frame shift; "
-            "static background, non-rigid motion, or low local texture may be influencing the match"
+            "static background or low contrast within ROI may be influencing the match"
         )
     return median, tile_std, warning

@@ -7,7 +7,7 @@ from typing import Any, Sequence
 import numpy as np
 import xarray as xr
 
-from merlin_track_position.tracking.shift import as_grayscale_array, estimate_shift
+from merlin_track_position.tracking.shift import estimate_shift
 
 STAGE_AXES = ("stage_a_um", "stage_b_um")
 PIXEL_AXES = ("du_px", "dv_px")
@@ -24,7 +24,7 @@ def fit_calibration_from_images(
 ) -> xr.Dataset:
     """Fit calibration directly from grayscale image arrays and stage offsets."""
 
-    image_arrays = [as_grayscale_array(image) for image in images]
+    image_arrays = [np.asarray(image, dtype=np.float64) for image in images]
     stage = np.asarray(stage_um, dtype=np.float64)
     if len(image_arrays) < 3:
         raise ValueError("at least three calibration images are required")
@@ -67,31 +67,6 @@ def fit_calibration_from_images(
         residual_warning_px=residual_warning_px,
         condition_warning_threshold=condition_warning_threshold,
         images=np.stack(image_arrays, axis=0),
-    )
-
-
-def fit_calibration_from_measurements(
-    stage_um: Sequence[Sequence[float]],
-    pixel_shift_px: Sequence[Sequence[float]],
-    *,
-    measurement_warnings: Sequence[Sequence[str]] | None = None,
-    reference_stage_um: Sequence[float] = (0.0, 0.0),
-    reference_index: int | None = None,
-    residual_warning_px: float = 1.0,
-    condition_warning_threshold: float = 50.0,
-) -> xr.Dataset:
-    """Fit ``pixel_shift = J @ stage_um`` from measured shifts."""
-
-    stage = np.asarray(stage_um, dtype=np.float64)
-    pixels = np.asarray(pixel_shift_px, dtype=np.float64)
-    return _fit_calibration_from_measurement_arrays(
-        stage,
-        pixels,
-        measurement_warnings=measurement_warnings,
-        reference_stage_um=reference_stage_um,
-        reference_index=reference_index,
-        residual_warning_px=residual_warning_px,
-        condition_warning_threshold=condition_warning_threshold,
     )
 
 

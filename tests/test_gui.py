@@ -3,6 +3,7 @@ import os
 import unittest
 
 import numpy as np
+import xarray as xr
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -16,8 +17,135 @@ from merlin_track_position.interface.calibration_panel import (
     CalibrationPanel,
     _calibration_summary,
 )
-from merlin_track_position.tracking.calibration import fit_calibration_from_measurements
 from qtpy import QtWidgets
+
+
+def _synthetic_calibration(
+    stage: np.ndarray,
+    stage_to_pixel: np.ndarray,
+    images: np.ndarray | None = None,
+) -> xr.Dataset:
+    stage = np.asarray(stage, dtype=float)
+    stage_to_pixel = np.asarray(stage_to_pixel, dtype=float)
+    measured = stage @ stage_to_pixel.T
+    predicted = measured.copy()
+    residual_px = measured - predicted
+    pixel_to_stage = np.linalg.inv(stage_to_pixel)
+    residual_um = residual_px @ pixel_to_stage.T
+
+    coords = {
+        "sample": np.arange(stage.shape[0], dtype=np.int64),
+        "stage_axis": ["stage_a_um", "stage_b_um"],
+        "pixel_axis": ["du_px", "dv_px"],
+    }
+    data_vars = {
+        "stage_to_pixel": (
+            ("pixel_axis", "stage_axis"),
+            stage_to_pixel,
+            {"units": "px/um"},
+        ),
+        "pixel_to_stage": (
+            ("stage_axis", "pixel_axis"),
+            pixel_to_stage,
+            {"units": "um/px"},
+        ),
+        "reference_stage_um": (
+            ("stage_axis",),
+            np.zeros(2, dtype=float),
+            {"units": "um"},
+        ),
+        "condition_number": ((), float(np.linalg.cond(stage_to_pixel))),
+        "stage_um": (("sample", "stage_axis"), stage, {"units": "um"}),
+        "measured_shift_px": (("sample", "pixel_axis"), measured, {"units": "px"}),
+        "predicted_shift_px": (
+            ("sample", "pixel_axis"),
+            predicted,
+            {"units": "px"},
+        ),
+        "residual_shift_px": (
+            ("sample", "pixel_axis"),
+            residual_px,
+            {"units": "px"},
+        ),
+        "residual_stage_um": (("sample", "stage_axis"), residual_um, {"units": "um"}),
+        "measurement_warnings": ("sample", np.full(stage.shape[0], "", dtype=str)),
+    }
+
+    repeatability = _synthetic_repeatability(stage, measured)
+    if repeatability is not None:
+        repeatability_stage, repeatability_count, _, repeatability_std = repeatability
+        coords["repeatability_position"] = np.arange(
+            repeatability_stage.shape[0], dtype=np.int64
+        )
+        data_vars["repeatability_stage_um"] = (
+            ("repeatability_position", "stage_axis"),
+            repeatability_stage,
+            {"units": "um"},
+        )
+        data_vars["repeatability_count"] = (
+            ("repeatability_position",),
+            repeatability_count,
+        )
+        data_vars["repeatability_rms_std_px"] = (
+            ("repeatability_position",),
+            np.sqrt(np.mean(repeatability_std * repeatability_std, axis=1)),
+            {"units": "px"},
+        )
+
+    if images is not None:
+        images = np.asarray(images, dtype=float)
+        coords["y"] = np.arange(images.shape[1], dtype=np.int64)
+        coords["x"] = np.arange(images.shape[2], dtype=np.int64)
+        data_vars["image"] = (
+            ("sample", "y", "x"),
+            images,
+            {"description": "calibration grayscale image stack"},
+        )
+
+    return xr.Dataset(
+        data_vars=data_vars,
+        coords=coords,
+        attrs={
+            "format": "merlin-track-position calibration",
+            "format_version": "1",
+            "model": "through_origin_linear",
+            "reference_index": -1,
+            "warnings": "",
+        },
+    )
+
+
+def _synthetic_repeatability(
+    stage: np.ndarray,
+    pixels: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
+    groups: dict[tuple[float, float], list[np.ndarray]] = {}
+    for stage_row, pixel_row in zip(stage, pixels, strict=True):
+        groups.setdefault((float(stage_row[0]), float(stage_row[1])), []).append(
+            pixel_row
+        )
+
+    stage_rows: list[np.ndarray] = []
+    counts: list[int] = []
+    means: list[np.ndarray] = []
+    stds: list[np.ndarray] = []
+    for key, rows in groups.items():
+        if len(rows) < 2:
+            continue
+        values = np.vstack(rows)
+        stage_rows.append(np.asarray(key, dtype=float))
+        counts.append(len(rows))
+        means.append(np.mean(values, axis=0))
+        stds.append(np.std(values, axis=0, ddof=1))
+
+    if not stage_rows:
+        return None
+    return (
+        np.vstack(stage_rows),
+        np.asarray(counts, dtype=np.int64),
+        np.vstack(means),
+        np.vstack(stds),
+    )
 
 
 class GUIHelperTests(unittest.TestCase):
@@ -52,8 +180,7 @@ class GUIHelperTests(unittest.TestCase):
                 [20.0, 20.0],
             ]
         )
-        pixels = stage @ stage_to_pixel.T
-        calibration = fit_calibration_from_measurements(stage, pixels)
+        calibration = _synthetic_calibration(stage, stage_to_pixel)
 
         summary = _calibration_summary(calibration)
 
@@ -70,7 +197,7 @@ class GUIHelperTests(unittest.TestCase):
     def test_validate_calibration_dataset_rejects_missing_required_field(self):
         stage_to_pixel = np.array([[0.5, 0.0], [0.0, 0.4]])
         stage = np.array([[0.0, 0.0], [20.0, 0.0], [0.0, 20.0]])
-        calibration = fit_calibration_from_measurements(stage, stage @ stage_to_pixel.T)
+        calibration = _synthetic_calibration(stage, stage_to_pixel)
         broken = calibration.drop_vars("residual_stage_um")
 
         with self.assertRaisesRegex(ValueError, "residual_stage_um"):
@@ -141,9 +268,7 @@ class CalibrationPanelSmokeTests(unittest.TestCase):
                     [20.0, 20.0],
                 ]
             )
-            calibration = fit_calibration_from_measurements(
-                stage, stage @ stage_to_pixel.T
-            )
+            calibration = _synthetic_calibration(stage, stage_to_pixel)
 
             panel.show_loaded_calibration(calibration, "calibration.h5")
 
@@ -173,15 +298,10 @@ class CalibrationPanelSmokeTests(unittest.TestCase):
                     [20.0, 20.0],
                 ]
             )
-            calibration = fit_calibration_from_measurements(
-                stage, stage @ stage_to_pixel.T
-            )
             images = np.arange(stage.shape[0] * 4 * 5, dtype=float).reshape(
                 stage.shape[0], 4, 5
             )
-            calibration = calibration.assign_coords(
-                y=np.arange(images.shape[1]), x=np.arange(images.shape[2])
-            ).assign(image=(("sample", "y", "x"), images))
+            calibration = _synthetic_calibration(stage, stage_to_pixel, images)
 
             dialog = panel.build_details_dialog(calibration)
             try:

@@ -10,7 +10,6 @@ from merlin_track_position.tracking.calibration import (
     correct,
     estimate_stage_offset,
     fit_calibration_from_images,
-    fit_calibration_from_measurements,
 )
 
 
@@ -25,44 +24,6 @@ def textured_image(seed=10, shape=(160, 176)):
 
 
 class CalibrationTests(unittest.TestCase):
-    def test_fit_calibration_from_measurements(self):
-        stage_to_pixel = np.array([[0.45, -0.12], [0.08, 0.37]])
-        stage = np.array(
-            [
-                [0.0, 0.0],
-                [50.0, 0.0],
-                [-50.0, 0.0],
-                [0.0, 50.0],
-                [0.0, -50.0],
-                [50.0, 50.0],
-                [-50.0, 50.0],
-            ]
-        )
-        pixels = stage @ stage_to_pixel.T
-
-        calibration = fit_calibration_from_measurements(stage, pixels)
-
-        np.testing.assert_allclose(
-            calibration["stage_to_pixel"].values, stage_to_pixel, atol=1e-12
-        )
-        np.testing.assert_allclose(
-            estimate_stage_offset(calibration, [22.5, 4.0]), [50.0, 0.0], atol=1e-10
-        )
-        self.assertLess(float(calibration["condition_number"].values), 2.0)
-
-    def test_poor_condition_warning(self):
-        stage_to_pixel = np.array([[1.0, 0.999], [0.0, 0.001]])
-        stage = np.array([[0.0, 0.0], [10.0, 0.0], [0.0, 10.0], [10.0, 10.0]])
-        pixels = stage @ stage_to_pixel.T
-
-        calibration = fit_calibration_from_measurements(
-            stage,
-            pixels,
-            condition_warning_threshold=10.0,
-        )
-
-        self.assertIn("poorly conditioned", calibration.attrs["warnings"])
-
     def test_fit_calibration_from_numpy_arrays(self):
         reference = textured_image(seed=20)
         stage_to_pixel = np.array([[0.27, -0.14], [0.09, 0.31]])
@@ -98,7 +59,43 @@ class CalibrationTests(unittest.TestCase):
             calibration["image"].values, np.stack(images), atol=0.0
         )
         np.testing.assert_allclose(calibration["stage_um"].values, stage)
+        np.testing.assert_allclose(
+            estimate_stage_offset(calibration, stage_to_pixel @ [30.0, 0.0]),
+            [30.0, 0.0],
+            atol=1.0,
+        )
         self.assertEqual(calibration.attrs["reference_index"], 0)
+
+    def test_fit_calibration_warns_for_poor_condition(self):
+        reference = textured_image(seed=25)
+        stage_to_pixel = np.array([[0.27, -0.14], [0.09, 0.31]])
+        stage = np.array(
+            [
+                [0.0, 0.0],
+                [30.0, 0.0],
+                [0.0, 30.0],
+                [30.0, 30.0],
+            ]
+        )
+        images = [
+            ndimage.shift(
+                reference,
+                shift=tuple((stage_to_pixel @ row)[::-1]),
+                order=3,
+                mode="wrap",
+            )
+            for row in stage
+        ]
+
+        calibration = fit_calibration_from_images(
+            images,
+            stage,
+            check_tiles=False,
+            clip_percentiles=None,
+            condition_warning_threshold=1.0,
+        )
+
+        self.assertIn("poorly conditioned", calibration.attrs["warnings"])
 
     def test_xarray_dataset_includes_image_stack(self):
         reference = textured_image(seed=40, shape=(96, 104))
@@ -199,10 +196,15 @@ class CalibrationTests(unittest.TestCase):
 
     def test_fit_calibration_requires_independent_stage_axes(self):
         stage = np.array([[0.0, 0.0], [10.0, 0.0], [20.0, 0.0]])
-        pixels = np.array([[0.0, 0.0], [5.0, 1.0], [10.0, 2.0]])
+        reference = textured_image(seed=70, shape=(96, 104))
 
         with self.assertRaises(ValueError):
-            fit_calibration_from_measurements(stage, pixels)
+            fit_calibration_from_images(
+                [reference, reference, reference],
+                stage,
+                check_tiles=False,
+                clip_percentiles=None,
+            )
 
 
 if __name__ == "__main__":
