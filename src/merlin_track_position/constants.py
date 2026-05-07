@@ -3,6 +3,20 @@
 import sys
 import pathlib
 
+# Mapping from shorthand motor names to actual motor names at the beamline.
+MOTOR_NAMES = {
+    "x": "Sample X",
+    "y": "Sample Y (Vert)",
+    "z": "Sample Z",
+    "p": "Polar",
+    "t": "Tilt",
+    "cam": "Video Switch",
+    "TA": "Cryostat Temp A",
+    "TB": "Cryostat Temp B",
+    "TC": "Cryostat Temp C",
+    "TD": "Cryostat Temp D",
+}
+
 # Image size for initial crop from the array returned by the framegrabber.
 IMAGE_WIDTH: int = 704
 IMAGE_HEIGHT: int = 480

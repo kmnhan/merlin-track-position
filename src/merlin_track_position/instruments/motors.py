@@ -3,20 +3,8 @@ import time
 from collections.abc import Iterable
 
 import merlin_track_position.instruments.BCSz as BCSz
-from merlin_track_position.constants import BCS_SERVER_HOST, BCS_SERVER_PORT
+from merlin_track_position.constants import BCS_SERVER_HOST, BCS_SERVER_PORT, MOTOR_NAMES
 
-MOTOR_NAMES = {
-    "x": "Sample X",
-    "y": "Sample Y (Vert)",
-    "z": "Sample Z",
-    "p": "Polar",
-    "t": "Tilt",
-    "cam": "Video Switch",
-    "TA": "Cryostat Temp A",
-    "TB": "Cryostat Temp B",
-    "TC": "Cryostat Temp C",
-    "TD": "Cryostat Temp D",
-}  #: Mapping from shorthand motor names to actual motor names at the beamline.
 
 
 @contextlib.contextmanager
