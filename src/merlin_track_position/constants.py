@@ -31,7 +31,6 @@ MOTOR_SERVER_PORT = 6554
 BCS_SERVER_HOST = "localhost"
 BCS_SERVER_PORT = 5577
 
-
 if sys.platform == "win32":
     # Assume we're on the acquisition PC, support files are on local.
     SUPPORT_FILE_BASE = pathlib.Path(
