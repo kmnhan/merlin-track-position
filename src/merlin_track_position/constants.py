@@ -3,6 +3,10 @@
 import sys
 import pathlib
 
+# Image size for initial crop from the array returned by the framegrabber.
+IMAGE_WIDTH: int = 704
+IMAGE_HEIGHT: int = 480
+
 # If you change this, make sure to also update FrameGrabbber FSM UI2.vi
 FRAMEGRAB_SERVER_PORT = 6553
 

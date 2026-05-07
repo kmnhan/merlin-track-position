@@ -10,17 +10,17 @@ import pyqtgraph as pg
 import xarray as xr
 from qtpy import QtCore, QtGui, QtWidgets
 
-from merlin_track_position.interface.calibration_thread import CalibrationThread
+from merlin_track_position.constants import IMAGE_HEIGHT, IMAGE_WIDTH
 from merlin_track_position.interface.calibration_panel import (
     CalibrationPanel,
     _validate_calibration_dataset,
 )
+from merlin_track_position.interface.calibration_thread import CalibrationThread
 from merlin_track_position.server import MotorServer
 
 __all__ = ("MainWindow",)
 
-IMAGE_WIDTH: int = 704
-IMAGE_HEIGHT: int = 480
+
 ROI_SETTINGS_KEYS: tuple[str, str, str, str] = (
     "roi/x",
     "roi/y",
@@ -80,13 +80,13 @@ class _MainWindowGUI(QtWidgets.QMainWindow):
         self.image_plot.invertY(True)
 
         self.image_item = pg.ImageItem(axisOrder="row-major")
-        self.image_item.setImage(
-            np.zeros((int(IMAGE_HEIGHT), int(IMAGE_WIDTH)), dtype=np.int64),
-        )
-        self.image_item.setRect(QtCore.QRectF(0.0, 0.0, IMAGE_WIDTH, IMAGE_HEIGHT))
+        sample_img = np.ones((int(IMAGE_HEIGHT), int(IMAGE_WIDTH)), dtype=np.int64)
+        sample_img[0, 0] = 0
+        self.image_item.setImage(sample_img)
         self.image_plot.addItem(self.image_item)
-        self.image_plot.setXRange(0.0, IMAGE_WIDTH, padding=0.0)
-        self.image_plot.setYRange(0.0, IMAGE_HEIGHT, padding=0.0)
+        self.image_plot.plotItem.vb.setRange(
+            rect=QtCore.QRectF(0, 0, IMAGE_WIDTH, IMAGE_HEIGHT), padding=0
+        )
 
         roi_geometry = _default_roi_geometry()
         self.image_roi = pg.RectROI(
@@ -97,6 +97,11 @@ class _MainWindowGUI(QtWidgets.QMainWindow):
             pen=pg.mkPen("#008c99", width=2),
             hoverPen=pg.mkPen("#00c2d1", width=2),
         )
+        self.image_roi.addScaleHandle((0.0, 0.0), (1.0, 1.0))
+        self.image_roi.addScaleHandle((1.0, 0.0), (0.0, 1.0))
+        self.image_roi.addScaleHandle((0.0, 1.0), (1.0, 0.0))
+        self.image_roi.addScaleHandle((0.5, 0.0), (0.5, 1.0))
+        self.image_roi.addScaleHandle((0.0, 0.5), (1.0, 0.5))
         self.image_roi.setZValue(10)
         self.image_plot.addItem(self.image_roi)
         splitter.addWidget(self.image_plot)

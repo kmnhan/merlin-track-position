@@ -5,7 +5,11 @@ import json
 import numpy as np
 import zmq
 
-from merlin_track_position.constants import FRAMEGRAB_SERVER_PORT
+from merlin_track_position.constants import (
+    FRAMEGRAB_SERVER_PORT,
+    IMAGE_WIDTH,
+    IMAGE_HEIGHT,
+)
 import numpy.typing as npt
 
 
@@ -40,6 +44,6 @@ def get_framegrabber_image(timeout_ms: int = 5000) -> npt.NDArray[np.float64]:
 
     return (
         np.frombuffer(data, dtype=np.dtype(meta["dtype"]))
-        .reshape(tuple(meta["shape"]))[:-1, :-17]  # crop empty border
+        .reshape(tuple(meta["shape"]))[:IMAGE_HEIGHT, :IMAGE_WIDTH]
         .copy()
     )
