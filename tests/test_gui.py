@@ -108,7 +108,6 @@ def _synthetic_calibration(
         attrs={
             "format": "merlin-track-position calibration",
             "format_version": "1",
-            "model": "through_origin_linear",
             "reference_index": -1,
             "warnings": "",
         },

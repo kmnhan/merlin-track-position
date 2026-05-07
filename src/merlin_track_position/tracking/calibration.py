@@ -20,9 +20,20 @@ def fit_calibration_from_images(
     reference_index: int | None = None,
     residual_warning_px: float = 1.0,
     condition_warning_threshold: float = 50.0,
+    additional_context: dict[str, Any] | None = None,
     **shift_kwargs: Any,
 ) -> xr.Dataset:
-    """Fit calibration directly from grayscale image arrays and stage offsets."""
+    """Fit calibration directly from grayscale image arrays and stage offsets.
+
+    Parameters
+    ----------
+    images
+        Sequence of 2D grayscale images.
+    stage_um
+        Sequence of stage positions in microns corresponding to each image, as
+        (stage_a_um, stage_b_um).
+
+    """
 
     image_arrays = [np.asarray(image, dtype=np.float64) for image in images]
     stage = np.asarray(stage_um, dtype=np.float64)
@@ -58,16 +69,136 @@ def fit_calibration_from_images(
             tuple(str(shift.attrs.get("warnings", "")).splitlines())
         )
 
-    return _fit_calibration_from_measurement_arrays(
-        relative_stage,
-        np.vstack(shifts),
-        measurement_warnings=measurement_warnings,
-        reference_stage_um=stage[reference_index],
-        reference_index=reference_index,
-        residual_warning_px=residual_warning_px,
-        condition_warning_threshold=condition_warning_threshold,
-        images=np.stack(image_arrays, axis=0),
+    pixels = np.vstack(shifts)
+    images = np.stack(image_arrays, axis=0)
+    reference_stage_um = stage[reference_index]
+
+    rank = int(np.linalg.matrix_rank(relative_stage))
+    if rank < 2:
+        raise ValueError("stage positions must span two independent motor directions")
+
+    coef, _, _, _ = np.linalg.lstsq(relative_stage, pixels, rcond=None)
+    stage_to_pixel = coef.T
+
+    condition_number = float(np.linalg.cond(stage_to_pixel))
+    predicted = relative_stage @ stage_to_pixel.T
+    residual_px = pixels - predicted
+    pixel_to_stage = np.linalg.inv(stage_to_pixel)
+    residual_um = residual_px @ pixel_to_stage.T
+
+    warnings: list[str] = []
+    residual_rms_px = float(np.sqrt(np.mean(np.sum(residual_px * residual_px, axis=1))))
+    if residual_rms_px > residual_warning_px:
+        warnings.append(
+            f"calibration residual RMS {residual_rms_px:.3g} px exceeds "
+            f"{residual_warning_px:.3g} px"
+        )
+    if condition_number > condition_warning_threshold:
+        warnings.append(
+            f"calibration matrix is poorly conditioned: condition number "
+            f"{condition_number:.3g} > {condition_warning_threshold:.3g}"
+        )
+
+    measurement_warnings_tuple = _pad_warnings(
+        measurement_warnings, relative_stage.shape[0]
     )
+    if any(measurement_warnings_tuple):
+        warnings.append(
+            "one or more shift measurements reported image-matching warnings"
+        )
+
+    sample_count = relative_stage.shape[0]
+    coords: dict[str, Any] = {
+        "sample": np.arange(sample_count, dtype=np.int64),
+        "stage_axis": list(STAGE_AXES),
+        "pixel_axis": list(PIXEL_AXES),
+    }
+    data_vars: dict[str, Any] = {
+        "stage_to_pixel": (
+            ("pixel_axis", "stage_axis"),
+            stage_to_pixel,
+            {"units": "px/um"},
+        ),
+        "pixel_to_stage": (
+            ("stage_axis", "pixel_axis"),
+            np.linalg.inv(stage_to_pixel),
+            {"units": "um/px"},
+        ),
+        "reference_stage_um": (
+            ("stage_axis",),
+            np.asarray(reference_stage_um, dtype=np.float64),
+            {"units": "um"},
+        ),
+        "condition_number": ((), float(condition_number)),
+        "stage_um": (("sample", "stage_axis"), relative_stage, {"units": "um"}),
+        "measured_shift_px": (("sample", "pixel_axis"), pixels, {"units": "px"}),
+        "predicted_shift_px": (("sample", "pixel_axis"), predicted, {"units": "px"}),
+        "residual_shift_px": (("sample", "pixel_axis"), residual_px, {"units": "px"}),
+        "residual_stage_um": (("sample", "stage_axis"), residual_um, {"units": "um"}),
+        "measurement_warnings": (
+            ("sample",),
+            np.asarray(
+                ["\n".join(items) for items in measurement_warnings_tuple], dtype=str
+            ),
+        ),
+    }
+
+    repeatability = _repeatability(relative_stage, pixels)
+    if repeatability is not None:
+        (
+            repeatability_stage_um,
+            repeatability_count,
+            repeatability_mean,
+            repeatability_std,
+        ) = repeatability
+        coords["repeatability_position"] = np.arange(
+            repeatability_stage_um.shape[0], dtype=np.int64
+        )
+        data_vars["repeatability_stage_um"] = (
+            ("repeatability_position", "stage_axis"),
+            repeatability_stage_um,
+            {"units": "um"},
+        )
+        data_vars["repeatability_count"] = (
+            ("repeatability_position",),
+            repeatability_count,
+        )
+        data_vars["repeatability_mean_shift_px"] = (
+            ("repeatability_position", "pixel_axis"),
+            repeatability_mean,
+            {"units": "px"},
+        )
+        data_vars["repeatability_std_shift_px"] = (
+            ("repeatability_position", "pixel_axis"),
+            repeatability_std,
+            {"units": "px"},
+        )
+        data_vars["repeatability_rms_std_px"] = (
+            ("repeatability_position",),
+            np.sqrt(np.mean(repeatability_std * repeatability_std, axis=1)),
+            {"units": "px"},
+        )
+
+    if images is not None:
+        coords["y"] = np.arange(images.shape[1], dtype=np.int64)
+        coords["x"] = np.arange(images.shape[2], dtype=np.int64)
+        data_vars["image"] = (
+            ("sample", "y", "x"),
+            images,
+            {"description": "calibration grayscale image stack"},
+        )
+
+    calibration_attrs = {
+        "format": "merlin-track-position calibration",
+        "format_version": "1",
+        "reference_index": -1 if reference_index is None else int(reference_index),
+        "warnings": "\n".join(tuple(warnings)),
+    }
+
+    if additional_context is not None:
+        calibration_attrs = calibration_attrs | additional_context
+
+    return xr.Dataset(data_vars=data_vars, coords=coords, attrs=calibration_attrs)
 
 
 def estimate_stage_offset(
@@ -120,150 +251,6 @@ def correct(
         attrs={
             "method": "calibrated_shift_correction",
             "warnings": "\n".join([*calibration_warnings, *shift_warnings]),
-        },
-    )
-
-
-def _fit_calibration_from_measurement_arrays(
-    stage: np.ndarray,
-    pixels: np.ndarray,
-    *,
-    measurement_warnings: Sequence[Sequence[str]] | None = None,
-    reference_stage_um: Sequence[float] = (0.0, 0.0),
-    reference_index: int | None = None,
-    residual_warning_px: float = 1.0,
-    condition_warning_threshold: float = 50.0,
-    images: np.ndarray | None = None,
-) -> xr.Dataset:
-    if stage.ndim != 2 or stage.shape[1] != 2:
-        raise ValueError("stage_um must have shape (n, 2)")
-    if pixels.ndim != 2 or pixels.shape != stage.shape:
-        raise ValueError("pixel_shift_px must have shape (n, 2)")
-    if stage.shape[0] < 3:
-        raise ValueError("at least three measured points are required")
-
-    rank = int(np.linalg.matrix_rank(stage))
-    if rank < 2:
-        raise ValueError("stage positions must span two independent motor directions")
-
-    coef, _, _, _ = np.linalg.lstsq(stage, pixels, rcond=None)
-    stage_to_pixel = coef.T
-
-    condition_number = float(np.linalg.cond(stage_to_pixel))
-    predicted = stage @ stage_to_pixel.T
-    residual_px = pixels - predicted
-    pixel_to_stage = np.linalg.inv(stage_to_pixel)
-    residual_um = residual_px @ pixel_to_stage.T
-
-    warnings: list[str] = []
-    residual_rms_px = float(np.sqrt(np.mean(np.sum(residual_px * residual_px, axis=1))))
-    if residual_rms_px > residual_warning_px:
-        warnings.append(
-            f"calibration residual RMS {residual_rms_px:.3g} px exceeds "
-            f"{residual_warning_px:.3g} px"
-        )
-    if condition_number > condition_warning_threshold:
-        warnings.append(
-            f"calibration matrix is poorly conditioned: condition number "
-            f"{condition_number:.3g} > {condition_warning_threshold:.3g}"
-        )
-
-    measurement_warnings_tuple = _pad_warnings(measurement_warnings, stage.shape[0])
-    if any(measurement_warnings_tuple):
-        warnings.append(
-            "one or more shift measurements reported image-matching warnings"
-        )
-
-    sample_count = stage.shape[0]
-    coords: dict[str, Any] = {
-        "sample": np.arange(sample_count, dtype=np.int64),
-        "stage_axis": list(STAGE_AXES),
-        "pixel_axis": list(PIXEL_AXES),
-    }
-    data_vars: dict[str, Any] = {
-        "stage_to_pixel": (
-            ("pixel_axis", "stage_axis"),
-            stage_to_pixel,
-            {"units": "px/um"},
-        ),
-        "pixel_to_stage": (
-            ("stage_axis", "pixel_axis"),
-            np.linalg.inv(stage_to_pixel),
-            {"units": "um/px"},
-        ),
-        "reference_stage_um": (
-            ("stage_axis",),
-            np.asarray(reference_stage_um, dtype=np.float64),
-            {"units": "um"},
-        ),
-        "condition_number": ((), float(condition_number)),
-        "stage_um": (("sample", "stage_axis"), stage, {"units": "um"}),
-        "measured_shift_px": (("sample", "pixel_axis"), pixels, {"units": "px"}),
-        "predicted_shift_px": (("sample", "pixel_axis"), predicted, {"units": "px"}),
-        "residual_shift_px": (("sample", "pixel_axis"), residual_px, {"units": "px"}),
-        "residual_stage_um": (("sample", "stage_axis"), residual_um, {"units": "um"}),
-        "measurement_warnings": (
-            ("sample",),
-            np.asarray(
-                ["\n".join(items) for items in measurement_warnings_tuple], dtype=str
-            ),
-        ),
-    }
-
-    repeatability = _repeatability(stage, pixels)
-    if repeatability is not None:
-        (
-            repeatability_stage_um,
-            repeatability_count,
-            repeatability_mean,
-            repeatability_std,
-        ) = repeatability
-        coords["repeatability_position"] = np.arange(
-            repeatability_stage_um.shape[0], dtype=np.int64
-        )
-        data_vars["repeatability_stage_um"] = (
-            ("repeatability_position", "stage_axis"),
-            repeatability_stage_um,
-            {"units": "um"},
-        )
-        data_vars["repeatability_count"] = (
-            ("repeatability_position",),
-            repeatability_count,
-        )
-        data_vars["repeatability_mean_shift_px"] = (
-            ("repeatability_position", "pixel_axis"),
-            repeatability_mean,
-            {"units": "px"},
-        )
-        data_vars["repeatability_std_shift_px"] = (
-            ("repeatability_position", "pixel_axis"),
-            repeatability_std,
-            {"units": "px"},
-        )
-        data_vars["repeatability_rms_std_px"] = (
-            ("repeatability_position",),
-            np.sqrt(np.mean(repeatability_std * repeatability_std, axis=1)),
-            {"units": "px"},
-        )
-
-    if images is not None:
-        coords["y"] = np.arange(images.shape[1], dtype=np.int64)
-        coords["x"] = np.arange(images.shape[2], dtype=np.int64)
-        data_vars["image"] = (
-            ("sample", "y", "x"),
-            images,
-            {"description": "calibration grayscale image stack"},
-        )
-
-    return xr.Dataset(
-        data_vars=data_vars,
-        coords=coords,
-        attrs={
-            "format": "merlin-track-position calibration",
-            "format_version": "1",
-            "model": "through_origin_linear",
-            "reference_index": -1 if reference_index is None else int(reference_index),
-            "warnings": "\n".join(tuple(warnings)),
         },
     )
 

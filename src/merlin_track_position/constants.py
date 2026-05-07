@@ -31,7 +31,12 @@ MOTOR_SERVER_PORT = 6554
 BCS_SERVER_HOST = "localhost"
 BCS_SERVER_PORT = 5577
 
-if sys.platform == "win32":
+# Flag to indicate whether we're running on the acquisition PC (True) or a development
+# machine (False). This can be used to determine file paths and other
+# environment-specific settings.
+IS_DAQ_PC: bool = sys.platform == "win32"
+
+if IS_DAQ_PC:
     # Assume we're on the acquisition PC, support files are on local.
     SUPPORT_FILE_BASE = pathlib.Path(
         r"C:\Beamline Controls\4.0.3 Arpes Endstation\4.0.3 Arpes Endstation Specific\Support Files"

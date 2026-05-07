@@ -1,9 +1,10 @@
-import time
 import logging
+import time
+from collections.abc import Callable
+
 import numpy as np
 import xarray as xr
 
-from merlin_track_position.instruments.framegrab import get_framegrabber_image
 from merlin_track_position.instruments.motors import get_positions, move_motors_and_wait
 from merlin_track_position.tracking.calibration import fit_calibration_from_images
 
@@ -40,7 +41,11 @@ def _make_grid(
 
 
 def run_calibration(
-    n: int, step_um: float, *, home_tolerance_um: float = 5.0
+    n: int,
+    step_um: float,
+    image_generator: Callable[[], np.ndarray],
+    *,
+    home_tolerance_um: float = 5.0,
 ) -> xr.Dataset:
     """Run the calibration routine.
 
@@ -50,11 +55,15 @@ def run_calibration(
         Number of points along each axis of the grid (total points will be n^2).
     step_um : float
         Step size in microns between adjacent grid points.
+    image_generator : Callable[[], np.ndarray]
+        Function that returns the current image as a 2D numpy array when called. This is
+        typically a wrapper around get_framegrabber_image() that may include additional
+        processing if needed.
     home_tolerance_um : float, optional
         Tolerance in microns for returning to the home position at the end of the
         routine. Default is 10 microns.
     """
-    x0, y0, cam = get_positions(("x", "y", "cam"))
+    x0, y0, polar, cam = get_positions(("x", "y", "p", "cam"))
 
     if not np.isclose(cam, 5.0):
         # Wait for camera to change to #5, which is the position for the sample view.
@@ -65,7 +74,7 @@ def run_calibration(
 
     actual_grid_um = np.empty((goal_grid_um.shape[0] + 2, 2), dtype=float)
     actual_grid_um[0, :] = [0.0, 0.0]
-    images = [get_framegrabber_image()]
+    images = [image_generator()]
 
     logger.info("Starting calibration routine with n=%d, step_um=%.2f", n, step_um)
 
@@ -80,15 +89,18 @@ def run_calibration(
         time.sleep(0.5)  # wait for image to update
 
         actual_grid_um[i + 1, :] = [(x_real - x0) * 1000, (y_real - y0) * 1000]
-        images.append(get_framegrabber_image())
+        images.append(image_generator())
 
     logger.info("Finished moving through grid points, returning to home position")
     move_motors_and_wait(("x", "y"), (x0, y0), tolerance=home_tolerance_um * 1e-3)
     time.sleep(0.5)  # wait for image to update
 
     actual_grid_um[-1, :] = [0.0, 0.0]
-    images.append(get_framegrabber_image())
+    images.append(image_generator())
 
     return fit_calibration_from_images(
-        images=images, stage_um=actual_grid_um, check_tiles=True
+        images=images,
+        stage_um=actual_grid_um,
+        check_tiles=True,
+        additional_context={"polar": polar},
     )

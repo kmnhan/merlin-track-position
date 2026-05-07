@@ -22,7 +22,6 @@ def get_framegrabber_image(timeout_ms: int = 5000) -> npt.NDArray[np.float64]:
         Maximum time set to the zmq RCVTIMEO option, to wait for a response before
         raising TimeoutError.
     """
-
     # This topic prefix is used by the LabVIEW panel (FrameGrabbber FSM UI2.vi) to
     # filter messages, so it must match the one used there.
     topic = "framegrabber/main "
