@@ -9,7 +9,13 @@ MOTOR_NAMES = {
     "x": "Sample X",
     "y": "Sample Y (Vert)",
     "z": "Sample Z",
+    "p": "Polar",
+    "t": "Tilt",
     "cam": "Video Switch",
+    "TA": "Cryostat Temp A",
+    "TB": "Cryostat Temp B",
+    "TC": "Cryostat Temp C",
+    "TD": "Cryostat Temp D",
 }  #: Mapping from shorthand motor names to actual motor names at the beamline.
 
 
@@ -46,9 +52,15 @@ def _wait_until_move_complete(
         if all(
             BCSz.MotorStatus(s).is_set(BCSz.MotorStatus.MOVE_COMPLETE) for s in status
         ):
+            time.sleep(0.2)
+
+            # Get the final positions one more time just to be extra careful
+            positions, _ = _get_motor_info(
+                bcs_server, motor_aliases, ("position", "status")
+            )
             return positions
         else:
-            time.sleep(0.25)  # don't hit the api server constantly
+            time.sleep(0.2)  # don't hit the api server constantly
 
 
 def _move_motors_and_wait(
@@ -58,7 +70,7 @@ def _move_motors_and_wait(
         motors=[MOTOR_NAMES[m] for m in motor_aliases], goals=list(goals)
     )
     # wait just a bit to let the move begin.
-    time.sleep(0.25)
+    time.sleep(0.2)
     return _wait_until_move_complete(bcs_server, motor_aliases)
 
 
@@ -66,6 +78,11 @@ def get_positions(motor_aliases: Iterable[str]) -> tuple[float, ...]:
     """Get current positions of the specified motor aliases."""
     with _bcs_server_context() as server:
         return _get_positions(server, motor_aliases)
+
+
+def get_temperatures() -> tuple[float, float, float, float]:
+    """Get current temperatures of the cryostat temp sensors."""
+    return get_positions(("TA", "TB", "TC", "TD"))
 
 
 def move_motors_and_wait(
