@@ -46,6 +46,7 @@ def run_calibration(
     image_generator: Callable[[], np.ndarray],
     *,
     home_tolerance_um: float = 5.0,
+    step_callback: Callable[[int, float, float, np.ndarray], None] | None = None,
 ) -> xr.Dataset:
     """Run the calibration routine.
 
@@ -62,6 +63,14 @@ def run_calibration(
     home_tolerance_um : float, optional
         Tolerance in microns for returning to the home position at the end of the
         routine. Default is 10 microns.
+    step_callback : Callable[[int, float, float, np.ndarray], None] | None, optional
+        Optional callback function that will be called after each move to a grid point,
+        with the following arguments:
+
+        - The index of the current step (0-based)
+        - The x offset in microns for this step
+        - The y offset in microns for this step
+        - The image captured at this step as a 2D numpy array
     """
     x0, y0, polar, cam = get_positions(("x", "y", "p", "cam"))
 
@@ -71,10 +80,20 @@ def run_calibration(
         time.sleep(4.0)  # check if we can reduce this?
 
     goal_grid_um = _make_grid(n, step_um)
+    goal_grid_um = np.vstack([goal_grid_um, [0.0, 0.0]])
 
-    actual_grid_um = np.empty((goal_grid_um.shape[0] + 2, 2), dtype=float)
+    actual_grid_um = np.empty((goal_grid_um.shape[0] + 1, 2), dtype=float)
+    images = []
+
+    def _update_step(idx, dx, dy):
+        actual_grid_um[idx, :] = [dx, dy]
+        image = image_generator()
+        images.append(image)
+        if step_callback is not None:
+            step_callback(idx, dx, dy, image)
+
+    _update_step(0, 0.0, 0.0)
     actual_grid_um[0, :] = [0.0, 0.0]
-    images = [image_generator()]
 
     logger.info("Starting calibration routine with n=%d, step_um=%.2f", n, step_um)
 
@@ -83,20 +102,23 @@ def run_calibration(
             "Moving to grid point %d: dx=%.4f mm, dy=%.4f mm", i + 1, dx * 1e3, dy * 1e3
         )
         x_goal, y_goal = x0 + dx, y0 + dy
-        logger.info("Commanding move to (%.4f, %.4f) mm", x_goal, y_goal)
-        x_real, y_real = move_motors_and_wait(("x", "y"), (x_goal, y_goal))
+
+        if i == goal_grid_um.shape[0] - 1:
+            # This is the last point, which is the home position. Use tolerance.
+            logger.info(
+                "Finished moving through grid points, returning to home position"
+            )
+            x_real, y_real = move_motors_and_wait(
+                ("x", "y"), (x0, y0), tolerance=home_tolerance_um * 1e-3
+            )
+        else:
+            logger.info("Commanding move to (%.4f, %.4f) mm", x_goal, y_goal)
+            x_real, y_real = move_motors_and_wait(("x", "y"), (x_goal, y_goal))
+
         logger.info("Actual position is (%.4f, %.4f) mm", x_real, y_real)
         time.sleep(0.5)  # wait for image to update
 
-        actual_grid_um[i + 1, :] = [(x_real - x0) * 1000, (y_real - y0) * 1000]
-        images.append(image_generator())
-
-    logger.info("Finished moving through grid points, returning to home position")
-    move_motors_and_wait(("x", "y"), (x0, y0), tolerance=home_tolerance_um * 1e-3)
-    time.sleep(0.5)  # wait for image to update
-
-    actual_grid_um[-1, :] = [0.0, 0.0]
-    images.append(image_generator())
+        _update_step(i + 1, (x_real - x0) * 1000, (y_real - y0) * 1000)
 
     return fit_calibration_from_images(
         images=images,
