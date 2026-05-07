@@ -34,18 +34,34 @@ from merlin_track_position.tracking.calibration import (
     fit_calibration_from_images,
 )
 
-# images is a list of 2D grayscale NumPy arrays.
-# stage_um has one [stage_a_um, stage_b_um] row per image.
-images = [img_center, img_a_plus, img_a_minus, img_b_plus, img_b_minus]
+# images is a list of 2D grayscale NumPy arrays. The first image is the
+# reference image, and the final image is another image taken after returning
+# to the origin.
+# stage_um has one raw encoder displacement row per image, after subtracting
+# the encoder reading for the first image.
+images = [
+    img_center,
+    img_a_plus,
+    img_a_minus,
+    img_b_plus,
+    img_b_minus,
+    img_center_return,
+]
 stage_um = np.array([
     [0.0, 0.0],
     [50.0, 0.0],
     [-50.0, 0.0],
     [0.0, 50.0],
     [0.0, -50.0],
+    [0.2, -0.1],
 ])
 
-calibration = fit_calibration_from_images(images, stage_um)
+calibration = fit_calibration_from_images(
+    images,
+    stage_um,
+    origin_stability_um=5.0,
+)
+reference = calibration["image"].isel(sample=0).values
 result = correct(calibration, reference, current)
 
 print(result["shift_px"].values)
@@ -66,8 +82,9 @@ No assumption is made that the motor axes are aligned with camera pixel axes.
 ## Xarray And HDF5
 
 Calibration results are xarray datasets. The dataset keeps the calibration image
-stack, motor coordinates, measured shifts, fitted matrix, residuals, and
-warnings together.
+stack, motor coordinates, measured shifts, fitted matrix, residuals,
+return-to-origin diagnostics, and warnings together. Sample 0 in the image stack
+is the reference image.
 
 ```python
 import xarray as xr
@@ -88,6 +105,12 @@ The main dataset variables are:
 - `residual_stage_um(sample, stage_axis)`
 - `stage_to_pixel(pixel_axis, stage_axis)`
 - `pixel_to_stage(stage_axis, pixel_axis)`
+- `origin_stability_um`
+- `return_to_origin_motor_error_um(stage_axis)`
+- `return_to_origin_motor_error_norm_um`
+- `return_to_origin_image_error_px(pixel_axis)`
+- `return_to_origin_image_error_um(stage_axis)`
+- `return_to_origin_image_error_norm_um`
 
 ## Recommended Data Collection
 
@@ -96,8 +119,9 @@ Run a scout sweep from center on each motor axis with `5, 10, 25, 50, 100,
 while keeping the same features visible.
 
 For the first calibration, capture images at center, `+/-S` and `+/-2S` on each
-motor axis, and the four `(+/-S_A, +/-S_B)` corners. Three repeats per position
-are recommended for repeatability diagnostics.
+motor axis, and the four `(+/-S_A, +/-S_B)` corners. Capture one final image
+after returning to center. Three repeats per position are recommended for
+repeatability diagnostics.
 
 Motor movement and backlash-safe approach are handled outside this code. The
 stage positions you pass beside the arrays should record the final settled
@@ -113,8 +137,9 @@ Shift and calibration results include:
 - calibration residuals in pixels and microns
 - repeatability by calibration position
 - calibration matrix condition number
+- final return-to-origin motor and image error
 - warnings for low texture, ambiguous peaks, low confidence, inconsistent local
-  shifts, and poorly conditioned calibration
+  shifts, poorly conditioned calibration, and excess return-to-origin error
 
 ## Accuracy And Morphology Limits
 

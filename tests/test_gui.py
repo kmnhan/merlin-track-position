@@ -32,6 +32,9 @@ def _synthetic_calibration(
     residual_px = measured - predicted
     pixel_to_stage = np.linalg.inv(stage_to_pixel)
     residual_um = residual_px @ pixel_to_stage.T
+    return_to_origin_motor_error_um = stage[-1]
+    return_to_origin_image_error_px = measured[-1]
+    return_to_origin_image_error_um = return_to_origin_image_error_px @ pixel_to_stage.T
 
     coords = {
         "sample": np.arange(stage.shape[0], dtype=np.int64),
@@ -55,6 +58,32 @@ def _synthetic_calibration(
             {"units": "um"},
         ),
         "condition_number": ((), float(np.linalg.cond(stage_to_pixel))),
+        "origin_stability_um": ((), 5.0, {"units": "um"}),
+        "return_to_origin_motor_error_um": (
+            ("stage_axis",),
+            return_to_origin_motor_error_um,
+            {"units": "um"},
+        ),
+        "return_to_origin_motor_error_norm_um": (
+            (),
+            float(np.linalg.norm(return_to_origin_motor_error_um)),
+            {"units": "um"},
+        ),
+        "return_to_origin_image_error_px": (
+            ("pixel_axis",),
+            return_to_origin_image_error_px,
+            {"units": "px"},
+        ),
+        "return_to_origin_image_error_um": (
+            ("stage_axis",),
+            return_to_origin_image_error_um,
+            {"units": "um"},
+        ),
+        "return_to_origin_image_error_norm_um": (
+            (),
+            float(np.linalg.norm(return_to_origin_image_error_um)),
+            {"units": "um"},
+        ),
         "stage_um": (("sample", "stage_axis"), stage, {"units": "um"}),
         "measured_shift_px": (("sample", "pixel_axis"), measured, {"units": "px"}),
         "predicted_shift_px": (
@@ -92,15 +121,16 @@ def _synthetic_calibration(
             {"units": "px"},
         )
 
-    if images is not None:
-        images = np.asarray(images, dtype=float)
-        coords["y"] = np.arange(images.shape[1], dtype=np.int64)
-        coords["x"] = np.arange(images.shape[2], dtype=np.int64)
-        data_vars["image"] = (
-            ("sample", "y", "x"),
-            images,
-            {"description": "calibration grayscale image stack"},
-        )
+    if images is None:
+        images = np.zeros((stage.shape[0], 4, 5), dtype=float)
+    images = np.asarray(images, dtype=float)
+    coords["y"] = np.arange(images.shape[1], dtype=np.int64)
+    coords["x"] = np.arange(images.shape[2], dtype=np.int64)
+    data_vars["image"] = (
+        ("sample", "y", "x"),
+        images,
+        {"description": "calibration grayscale image stack"},
+    )
 
     return xr.Dataset(
         data_vars=data_vars,
@@ -108,7 +138,6 @@ def _synthetic_calibration(
         attrs={
             "format": "merlin-track-position calibration",
             "format_version": "1",
-            "reference_index": -1,
             "warnings": "",
         },
     )

@@ -12,6 +12,8 @@ from merlin_track_position.tracking.calibration import (
     fit_calibration_from_images,
 )
 
+ORIGIN_STABILITY_UM = 5.0
+
 
 def textured_image(seed=10, shape=(160, 176)):
     rng = np.random.default_rng(seed)
@@ -36,6 +38,7 @@ class CalibrationTests(unittest.TestCase):
                 [0.0, -30.0],
                 [30.0, 30.0],
                 [-30.0, 30.0],
+                [0.0, 0.0],
             ]
         )
         images = []
@@ -48,6 +51,7 @@ class CalibrationTests(unittest.TestCase):
         calibration = fit_calibration_from_images(
             images,
             stage,
+            origin_stability_um=ORIGIN_STABILITY_UM,
             check_tiles=False,
             clip_percentiles=None,
         )
@@ -60,11 +64,17 @@ class CalibrationTests(unittest.TestCase):
         )
         np.testing.assert_allclose(calibration["stage_um"].values, stage)
         np.testing.assert_allclose(
+            calibration["return_to_origin_motor_error_um"].values, [0.0, 0.0]
+        )
+        np.testing.assert_allclose(
+            calibration["return_to_origin_image_error_px"].values, [0.0, 0.0]
+        )
+        self.assertNotIn("reference_index", calibration.attrs)
+        np.testing.assert_allclose(
             estimate_stage_offset(calibration, stage_to_pixel @ [30.0, 0.0]),
             [30.0, 0.0],
             atol=1.0,
         )
-        self.assertEqual(calibration.attrs["reference_index"], 0)
 
     def test_fit_calibration_warns_for_poor_condition(self):
         reference = textured_image(seed=25)
@@ -75,6 +85,7 @@ class CalibrationTests(unittest.TestCase):
                 [30.0, 0.0],
                 [0.0, 30.0],
                 [30.0, 30.0],
+                [0.0, 0.0],
             ]
         )
         images = [
@@ -90,6 +101,7 @@ class CalibrationTests(unittest.TestCase):
         calibration = fit_calibration_from_images(
             images,
             stage,
+            origin_stability_um=ORIGIN_STABILITY_UM,
             check_tiles=False,
             clip_percentiles=None,
             condition_warning_threshold=1.0,
@@ -100,7 +112,9 @@ class CalibrationTests(unittest.TestCase):
     def test_xarray_dataset_includes_image_stack(self):
         reference = textured_image(seed=40, shape=(96, 104))
         stage_to_pixel = np.array([[0.3, -0.1], [0.08, 0.22]])
-        stage = np.array([[0.0, 0.0], [20.0, 0.0], [0.0, 20.0], [20.0, 20.0]])
+        stage = np.array(
+            [[0.0, 0.0], [20.0, 0.0], [0.0, 20.0], [20.0, 20.0], [0.0, 0.0]]
+        )
         images = [
             ndimage.shift(
                 reference,
@@ -114,6 +128,7 @@ class CalibrationTests(unittest.TestCase):
         dataset = fit_calibration_from_images(
             images,
             stage,
+            origin_stability_um=ORIGIN_STABILITY_UM,
             check_tiles=False,
             clip_percentiles=None,
         )
@@ -127,7 +142,14 @@ class CalibrationTests(unittest.TestCase):
         reference = textured_image(seed=50, shape=(96, 104))
         stage_to_pixel = np.array([[0.29, -0.12], [0.07, 0.25]])
         stage = np.array(
-            [[0.0, 0.0], [25.0, 0.0], [-25.0, 0.0], [0.0, 25.0], [25.0, 25.0]]
+            [
+                [0.0, 0.0],
+                [25.0, 0.0],
+                [-25.0, 0.0],
+                [0.0, 25.0],
+                [25.0, 25.0],
+                [0.0, 0.0],
+            ]
         )
         images = [
             ndimage.shift(
@@ -141,6 +163,7 @@ class CalibrationTests(unittest.TestCase):
         dataset = fit_calibration_from_images(
             images,
             stage,
+            origin_stability_um=ORIGIN_STABILITY_UM,
             check_tiles=False,
             clip_percentiles=None,
         )
@@ -159,11 +182,15 @@ class CalibrationTests(unittest.TestCase):
         np.testing.assert_allclose(
             loaded["stage_to_pixel"].values, dataset["stage_to_pixel"].values
         )
+        reference_from_calibration = loaded["image"].isel(sample=0).values
+        np.testing.assert_allclose(reference_from_calibration, images[0])
 
     def test_correct_uses_xarray_dataset(self):
         reference = textured_image(seed=60, shape=(128, 136))
         stage_to_pixel = np.array([[0.25, -0.1], [0.05, 0.2]])
-        stage = np.array([[0.0, 0.0], [20.0, 0.0], [0.0, 20.0], [20.0, 20.0]])
+        stage = np.array(
+            [[0.0, 0.0], [20.0, 0.0], [0.0, 20.0], [20.0, 20.0], [0.0, 0.0]]
+        )
         images = [
             ndimage.shift(
                 reference,
@@ -174,7 +201,11 @@ class CalibrationTests(unittest.TestCase):
             for row in stage
         ]
         calibration = fit_calibration_from_images(
-            images, stage, check_tiles=False, clip_percentiles=None
+            images,
+            stage,
+            origin_stability_um=ORIGIN_STABILITY_UM,
+            check_tiles=False,
+            clip_percentiles=None,
         )
         current = ndimage.shift(
             reference,
@@ -184,7 +215,11 @@ class CalibrationTests(unittest.TestCase):
         )
 
         result = correct(
-            calibration, reference, current, check_tiles=False, clip_percentiles=None
+            calibration,
+            calibration["image"].isel(sample=0).values,
+            current,
+            check_tiles=False,
+            clip_percentiles=None,
         )
 
         np.testing.assert_allclose(
@@ -200,11 +235,171 @@ class CalibrationTests(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             fit_calibration_from_images(
-                [reference, reference, reference],
+                [reference, reference, reference, reference],
+                np.vstack([stage, [0.0, 0.0]]),
+                origin_stability_um=ORIGIN_STABILITY_UM,
+                check_tiles=False,
+                clip_percentiles=None,
+            )
+
+    def test_fit_calibration_requires_origin_stability(self):
+        reference = textured_image(seed=80, shape=(96, 104))
+        stage = np.array(
+            [[0.0, 0.0], [20.0, 0.0], [0.0, 20.0], [20.0, 20.0], [0.0, 0.0]]
+        )
+
+        with self.assertRaises(TypeError):
+            fit_calibration_from_images(
+                [reference] * len(stage),
                 stage,
                 check_tiles=False,
                 clip_percentiles=None,
             )
+
+    def test_fit_calibration_rejects_reference_index(self):
+        reference = textured_image(seed=85, shape=(96, 104))
+        stage_to_pixel = np.array([[0.3, -0.1], [0.08, 0.22]])
+        stage = np.array(
+            [[0.0, 0.0], [20.0, 0.0], [0.0, 20.0], [20.0, 20.0], [0.0, 0.0]]
+        )
+        images = [
+            ndimage.shift(
+                reference,
+                shift=tuple((stage_to_pixel @ row)[::-1]),
+                order=3,
+                mode="wrap",
+            )
+            for row in stage
+        ]
+
+        with self.assertRaisesRegex(TypeError, "reference_index"):
+            fit_calibration_from_images(
+                images,
+                stage,
+                origin_stability_um=ORIGIN_STABILITY_UM,
+                reference_index=0,
+                check_tiles=False,
+                clip_percentiles=None,
+            )
+
+    def test_fit_calibration_uses_sample_zero_as_reference(self):
+        base = textured_image(seed=90, shape=(96, 104))
+        stage_to_pixel = np.array([[0.3, -0.1], [0.08, 0.22]])
+        stage = np.array(
+            [
+                [0.0, 0.0],
+                [20.0, 0.0],
+                [0.0, 20.0],
+                [20.0, 20.0],
+                [0.3, -0.4],
+            ]
+        )
+        images = [
+            ndimage.shift(
+                base,
+                shift=tuple((stage_to_pixel @ row)[::-1]),
+                order=3,
+                mode="wrap",
+            )
+            for row in stage
+        ]
+
+        calibration = fit_calibration_from_images(
+            images,
+            stage,
+            origin_stability_um=ORIGIN_STABILITY_UM,
+            check_tiles=False,
+            clip_percentiles=None,
+        )
+
+        np.testing.assert_allclose(calibration["stage_um"].values, stage)
+        np.testing.assert_allclose(
+            calibration["return_to_origin_motor_error_um"].values, stage[-1]
+        )
+        np.testing.assert_allclose(
+            calibration["return_to_origin_motor_error_norm_um"].values,
+            np.linalg.norm(stage[-1]),
+        )
+
+    def test_fit_calibration_requires_first_stage_row_at_origin(self):
+        reference = textured_image(seed=95, shape=(96, 104))
+        stage = np.array(
+            [[1.0, 0.0], [20.0, 0.0], [0.0, 20.0], [20.0, 20.0], [0.0, 0.0]]
+        )
+
+        with self.assertRaisesRegex(ValueError, "stage_um\\[0\\]"):
+            fit_calibration_from_images(
+                [reference] * len(stage),
+                stage,
+                origin_stability_um=ORIGIN_STABILITY_UM,
+                check_tiles=False,
+                clip_percentiles=None,
+            )
+
+    def test_fit_calibration_warns_for_return_to_origin_motor_error(self):
+        reference = textured_image(seed=100, shape=(96, 104))
+        stage_to_pixel = np.array([[0.3, -0.1], [0.08, 0.22]])
+        stage = np.array(
+            [[0.0, 0.0], [20.0, 0.0], [0.0, 20.0], [20.0, 20.0], [10.0, 0.0]]
+        )
+        images = [
+            ndimage.shift(
+                reference,
+                shift=tuple((stage_to_pixel @ row)[::-1]),
+                order=3,
+                mode="wrap",
+            )
+            for row in stage
+        ]
+
+        calibration = fit_calibration_from_images(
+            images,
+            stage,
+            origin_stability_um=ORIGIN_STABILITY_UM,
+            check_tiles=False,
+            clip_percentiles=None,
+        )
+
+        self.assertIn("return-to-origin motor error", calibration.attrs["warnings"])
+        np.testing.assert_allclose(
+            calibration["return_to_origin_motor_error_um"].values, [10.0, 0.0]
+        )
+
+    def test_fit_calibration_warns_for_return_to_origin_image_error(self):
+        reference = textured_image(seed=105, shape=(96, 104))
+        stage_to_pixel = np.array([[0.3, -0.1], [0.08, 0.22]])
+        stage = np.array(
+            [[0.0, 0.0], [20.0, 0.0], [0.0, 20.0], [20.0, 20.0], [0.0, 0.0]]
+        )
+        images = [
+            ndimage.shift(
+                reference,
+                shift=tuple((stage_to_pixel @ row)[::-1]),
+                order=3,
+                mode="wrap",
+            )
+            for row in stage
+        ]
+        images[-1] = ndimage.shift(
+            reference,
+            shift=tuple((stage_to_pixel @ np.array([10.0, 0.0]))[::-1]),
+            order=3,
+            mode="wrap",
+        )
+
+        calibration = fit_calibration_from_images(
+            images,
+            stage,
+            origin_stability_um=ORIGIN_STABILITY_UM,
+            check_tiles=False,
+            clip_percentiles=None,
+        )
+
+        self.assertIn("return-to-origin image error", calibration.attrs["warnings"])
+        self.assertGreater(
+            float(calibration["return_to_origin_image_error_norm_um"].values),
+            ORIGIN_STABILITY_UM,
+        )
 
 
 if __name__ == "__main__":

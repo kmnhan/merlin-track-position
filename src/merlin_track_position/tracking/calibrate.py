@@ -45,7 +45,8 @@ def run_calibration(
     step_um: float,
     image_generator: Callable[[], np.ndarray],
     *,
-    home_tolerance_um: float = 5.0,
+    origin_stability_um: float = 1.0,
+    home_tolerance_um: float = 1.0,
     step_callback: Callable[[int, float, float, np.ndarray], None] | None = None,
 ) -> xr.Dataset:
     """Run the calibration routine.
@@ -60,9 +61,12 @@ def run_calibration(
         Function that returns the current image as a 2D numpy array when called. This is
         typically a wrapper around get_framegrabber_image() that may include additional
         processing if needed.
+    origin_stability_um : float
+        Warning threshold in microns for the final origin-return motor and image
+        closure checks.
     home_tolerance_um : float, optional
         Tolerance in microns for returning to the home position at the end of the
-        routine. Default is 10 microns.
+        routine. Default is 5 microns.
     step_callback : Callable[[int, float, float, np.ndarray], None] | None, optional
         Optional callback function that will be called after each move to a grid point,
         with the following arguments:
@@ -123,6 +127,7 @@ def run_calibration(
     return fit_calibration_from_images(
         images=images,
         stage_um=actual_grid_um,
+        origin_stability_um=origin_stability_um,
         check_tiles=True,
         additional_context={"polar": polar},
     )

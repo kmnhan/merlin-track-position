@@ -8,12 +8,19 @@ import xarray as xr
 from qtpy import QtCore, QtWidgets
 
 REQUIRED_CALIBRATION_VARIABLES: tuple[str, ...] = (
+    "image",
     "stage_um",
     "residual_stage_um",
     "residual_shift_px",
     "stage_to_pixel",
     "pixel_to_stage",
     "condition_number",
+    "origin_stability_um",
+    "return_to_origin_motor_error_um",
+    "return_to_origin_motor_error_norm_um",
+    "return_to_origin_image_error_px",
+    "return_to_origin_image_error_um",
+    "return_to_origin_image_error_norm_um",
 )
 METRIC_ROWS: tuple[tuple[str, str, str], ...] = (
     ("sample_count", "Samples", "Number of calibration positions used in the fit."),
@@ -41,6 +48,21 @@ METRIC_ROWS: tuple[tuple[str, str, str], ...] = (
         "residual_max_um",
         "Residual max um",
         "Largest converted stage-space residual across all calibration samples.",
+    ),
+    (
+        "origin_stability_um",
+        "Origin stability um",
+        "Configured threshold for final return-to-origin motor and image error warnings.",
+    ),
+    (
+        "return_to_origin_motor_error_norm_um",
+        "Return motor error um",
+        "Length of the final encoder displacement relative to the first calibration image.",
+    ),
+    (
+        "return_to_origin_image_error_norm_um",
+        "Return image error um",
+        "Length of the first-to-last image shift after converting it to stage units.",
     ),
 )
 REPEATABILITY_ROWS: tuple[tuple[str, str], ...] = (
@@ -74,19 +96,54 @@ def _validate_calibration_dataset(dataset: xr.Dataset) -> None:
     stage_to_pixel = np.asarray(dataset["stage_to_pixel"].values, dtype=float)
     pixel_to_stage = np.asarray(dataset["pixel_to_stage"].values, dtype=float)
     condition_number = np.asarray(dataset["condition_number"].values, dtype=float)
+    image = np.asarray(dataset["image"].values)
+    origin_stability = np.asarray(dataset["origin_stability_um"].values, dtype=float)
+    origin_motor = np.asarray(
+        dataset["return_to_origin_motor_error_um"].values, dtype=float
+    )
+    origin_motor_norm = np.asarray(
+        dataset["return_to_origin_motor_error_norm_um"].values, dtype=float
+    )
+    origin_image_px = np.asarray(
+        dataset["return_to_origin_image_error_px"].values, dtype=float
+    )
+    origin_image_um = np.asarray(
+        dataset["return_to_origin_image_error_um"].values, dtype=float
+    )
+    origin_image_norm = np.asarray(
+        dataset["return_to_origin_image_error_norm_um"].values, dtype=float
+    )
 
     if stage.ndim != 2 or stage.shape[1] != 2 or stage.shape[0] == 0:
         raise ValueError("stage_um must have shape (sample, 2)")
+    if not np.allclose(stage[0], 0.0, rtol=0.0, atol=1e-9):
+        raise ValueError("stage_um[0] must be the origin")
     if residual_stage.shape != stage.shape:
         raise ValueError("residual_stage_um must have the same shape as stage_um")
     if residual_shift.shape != stage.shape:
         raise ValueError("residual_shift_px must have the same shape as stage_um")
+    if image.ndim != 3 or image.shape[0] != stage.shape[0]:
+        raise ValueError("image must have shape (sample, y, x)")
     if stage_to_pixel.shape != (2, 2):
         raise ValueError("stage_to_pixel must have shape (2, 2)")
     if pixel_to_stage.shape != (2, 2):
         raise ValueError("pixel_to_stage must have shape (2, 2)")
     if condition_number.size != 1:
         raise ValueError("condition_number must be scalar")
+    if origin_stability.size != 1:
+        raise ValueError("origin_stability_um must be scalar")
+    if not np.isfinite(origin_stability).all() or float(origin_stability) <= 0.0:
+        raise ValueError("origin_stability_um must be finite and positive")
+    if origin_motor.shape != (2,):
+        raise ValueError("return_to_origin_motor_error_um must have shape (2,)")
+    if origin_motor_norm.size != 1:
+        raise ValueError("return_to_origin_motor_error_norm_um must be scalar")
+    if origin_image_px.shape != (2,):
+        raise ValueError("return_to_origin_image_error_px must have shape (2,)")
+    if origin_image_um.shape != (2,):
+        raise ValueError("return_to_origin_image_error_um must have shape (2,)")
+    if origin_image_norm.size != 1:
+        raise ValueError("return_to_origin_image_error_norm_um must be scalar")
 
 
 def _calibration_summary(dataset: xr.Dataset) -> dict[str, object]:
@@ -150,6 +207,19 @@ def _calibration_summary(dataset: xr.Dataset) -> dict[str, object]:
         "residual_max_px": residual_max_px,
         "residual_rms_um": residual_rms_um,
         "residual_max_um": residual_max_um,
+        "origin_stability_um": float(
+            np.asarray(dataset["origin_stability_um"].values, dtype=float).reshape(-1)[0]
+        ),
+        "return_to_origin_motor_error_norm_um": float(
+            np.asarray(
+                dataset["return_to_origin_motor_error_norm_um"].values, dtype=float
+            ).reshape(-1)[0]
+        ),
+        "return_to_origin_image_error_norm_um": float(
+            np.asarray(
+                dataset["return_to_origin_image_error_norm_um"].values, dtype=float
+            ).reshape(-1)[0]
+        ),
         "stage_to_pixel": np.asarray(dataset["stage_to_pixel"].values, dtype=float),
         "pixel_to_stage": np.asarray(dataset["pixel_to_stage"].values, dtype=float),
         "warnings": warnings,
