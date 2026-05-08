@@ -328,6 +328,7 @@ dependencies = [
     { name = "h5py" },
     { name = "ipykernel" },
     { name = "numpy" },
+    { name = "pypylon" },
     { name = "pyqt6" },
     { name = "pyqtgraph" },
     { name = "qtpy" },
@@ -347,6 +348,7 @@ requires-dist = [
     { name = "h5py", specifier = ">=3.15.1" },
     { name = "ipykernel", specifier = ">=7.2.0" },
     { name = "numpy", specifier = ">=2.4.4" },
+    { name = "pypylon", specifier = ">=26.4.1" },
     { name = "pyqt6", specifier = ">=6.11.0" },
     { name = "pyqtgraph", specifier = ">=0.14.0" },
     { name = "qtpy", specifier = ">=2.4.3" },
@@ -650,6 +652,18 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/c3/b2/bc9c9196916376152d655522fdcebac55e66de6603a76a02bca1b6414f6c/pygments-2.20.0.tar.gz", hash = "sha256:6757cd03768053ff99f3039c1a36d6c0aa0b263438fcab17520b30a303a82b5f", size = 4955991, upload-time = "2026-03-29T13:29:33.898Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/f4/7e/a72dd26f3b0f4f2bf1dd8923c85f7ceb43172af56d63c7383eb62b332364/pygments-2.20.0-py3-none-any.whl", hash = "sha256:81a9e26dd42fd28a23a2d169d86d7ac03b46e2f8b59ed4698fb4785f946d0176", size = 1231151, upload-time = "2026-03-29T13:29:30.038Z" },
+]
+
+[[package]]
+name = "pypylon"
+version = "26.4.1"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/0a/87/e9b38417b5f32106d228307deb5fbd8cd82a0baa103909adca3da61140d5/pypylon-26.4.1-cp39-abi3-macosx_14_0_arm64.whl", hash = "sha256:ec075daf70c6121222c03a160078e71ebd4acc6c31082b74a2b175da89d884be", size = 30377612, upload-time = "2026-05-04T13:05:53.607Z" },
+    { url = "https://files.pythonhosted.org/packages/13/b4/e47c76136f498fb3c9b72f7775918bba8a34ff144dc796ae7ea3533631cf/pypylon-26.4.1-cp39-abi3-macosx_14_0_x86_64.whl", hash = "sha256:2cb20789f4f7f5aa3ee671c2c70c3103b8619a969b6cb3284162726dde0e93c7", size = 30430790, upload-time = "2026-05-04T13:05:56.697Z" },
+    { url = "https://files.pythonhosted.org/packages/61/88/dc2f3951e6e1e731c7c0e9109c7fa3456ae5f73b9e1363567266d0e04030/pypylon-26.4.1-cp39-abi3-manylinux_2_31_aarch64.whl", hash = "sha256:777f8978ac2856995a7a9a6ec27a1ec8c5514479084fca32b6fc3ca04b73f2ca", size = 71322442, upload-time = "2026-05-04T13:07:14.622Z" },
+    { url = "https://files.pythonhosted.org/packages/1b/a5/120b7640027f8e6d7062e2e8e3ffd5ed54cf407853812ce90012bad93c0c/pypylon-26.4.1-cp39-abi3-manylinux_2_31_x86_64.whl", hash = "sha256:cf9267efad31bc036fb193ac94e55ad7c3291170d4bcaa1e4476c500f206dba0", size = 88720030, upload-time = "2026-05-04T13:06:58.945Z" },
+    { url = "https://files.pythonhosted.org/packages/de/b4/406b8162bd46bdd05df0bad3b849ec632fa617384586df8176b089d18cf0/pypylon-26.4.1-cp39-abi3-win_amd64.whl", hash = "sha256:0b4868c0ce6d62c3bee9c62fcf58773dad40f8e598cb5bd09e15eb2e9ffd5b2e", size = 111762212, upload-time = "2026-05-04T13:08:23.066Z" },
 ]
 
 [[package]]
