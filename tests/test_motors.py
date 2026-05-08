@@ -1,13 +1,18 @@
 import contextlib
+import threading
 import unittest
 from unittest.mock import patch
 
 import merlin_track_position.instruments.BCSz as BCSz
+from merlin_track_position import constants
 from merlin_track_position.constants import MOTOR_NAMES
 from merlin_track_position.instruments.motors import (
     _move_motors_and_wait,
+    get_positions,
+    get_temperatures,
     move_motors_and_wait,
 )
+from merlin_track_position.instruments.simulated_hardware import simulator
 
 
 class FakeBCSServer:
@@ -46,6 +51,7 @@ class MoveMotorsAndWaitTests(unittest.TestCase):
             yield server
 
         with (
+            patch.object(constants, "IS_DAQ_PC", True),
             patch(
                 "merlin_track_position.instruments.motors._bcs_server_context",
                 fake_bcs_server_context,
@@ -140,6 +146,100 @@ class MoveMotorsAndWaitTests(unittest.TestCase):
                 (10.0, 2.0),
                 tolerance=(0.05,),
             )
+
+
+class DevelopmentModeMotorTests(unittest.TestCase):
+    def setUp(self):
+        simulator.reset()
+
+    def test_get_positions_uses_simulator_without_bcs_context(self):
+        with (
+            patch.object(constants, "IS_DAQ_PC", False),
+            patch(
+                "merlin_track_position.instruments.motors._bcs_server_context",
+                side_effect=AssertionError("BCS context should not be opened"),
+            ),
+        ):
+            positions = get_positions(("x", "y", "cam"))
+
+        self.assertEqual(positions, (0.0, 0.0, 5.0))
+
+    def test_move_motors_and_wait_updates_simulated_positions(self):
+        with (
+            patch.object(constants, "IS_DAQ_PC", False),
+            patch(
+                "merlin_track_position.instruments.motors._bcs_server_context",
+                side_effect=AssertionError("BCS context should not be opened"),
+            ),
+            patch("merlin_track_position.instruments.simulated_hardware.time.sleep")
+            as sleep,
+        ):
+            positions = move_motors_and_wait(("x", "y"), (0.03, -0.015))
+            saved_positions = get_positions(("x", "y"))
+
+        self.assertEqual(positions, (0.03, -0.015))
+        self.assertEqual(saved_positions, (0.03, -0.015))
+        sleep.assert_called_once()
+        self.assertLessEqual(sleep.call_args.args[0], 0.5)
+
+    def test_get_temperatures_uses_static_development_values(self):
+        with patch.object(constants, "IS_DAQ_PC", False):
+            self.assertEqual(get_temperatures(), (30.0, 30.0, 30.0, 30.0))
+
+    def test_overlapping_simulated_moves_are_serialized(self):
+        first_move_settling = threading.Event()
+        second_move_started = threading.Event()
+        second_move_finished = threading.Event()
+        release_first_move = threading.Event()
+        sleep_call_count = 0
+        sleep_call_lock = threading.Lock()
+        first_result = []
+        second_result = []
+
+        def fake_sleep(delay_s):
+            nonlocal sleep_call_count
+            with sleep_call_lock:
+                sleep_call_count += 1
+                call_index = sleep_call_count
+            if call_index == 1:
+                first_move_settling.set()
+                if not release_first_move.wait(timeout=2.0):
+                    raise TimeoutError("timed out waiting to release first move")
+
+        def first_move():
+            first_result.append(move_motors_and_wait(("x",), (0.1,))[0])
+
+        def second_move():
+            second_move_started.set()
+            second_result.append(move_motors_and_wait(("x",), (0.2,))[0])
+            second_move_finished.set()
+
+        with (
+            patch.object(constants, "IS_DAQ_PC", False),
+            patch(
+                "merlin_track_position.instruments.simulated_hardware.time.sleep",
+                side_effect=fake_sleep,
+            ),
+        ):
+            first_thread = threading.Thread(target=first_move)
+            second_thread = threading.Thread(target=second_move)
+
+            first_thread.start()
+            self.assertTrue(first_move_settling.wait(timeout=2.0))
+            second_thread.start()
+            self.assertTrue(second_move_started.wait(timeout=2.0))
+            self.assertFalse(second_move_finished.wait(timeout=0.05))
+
+            release_first_move.set()
+            first_thread.join(timeout=2.0)
+            second_thread.join(timeout=2.0)
+
+            self.assertFalse(first_thread.is_alive())
+            self.assertFalse(second_thread.is_alive())
+            self.assertEqual(get_positions(("x",)), (0.2,))
+
+        self.assertEqual(first_result, [0.1])
+        self.assertEqual(second_result, [0.2])
 
 
 if __name__ == "__main__":

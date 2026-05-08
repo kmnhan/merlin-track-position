@@ -11,6 +11,7 @@ import xarray as xr
 from qtpy import QtCore, QtGui, QtWidgets
 
 from merlin_track_position.constants import IMAGE_HEIGHT, IMAGE_WIDTH
+from merlin_track_position.instruments.framegrab import get_framegrabber_image
 from merlin_track_position.interface.calibration_panel import (
     CalibrationPanel,
     _validate_calibration_dataset,
@@ -162,6 +163,8 @@ class MainWindow(_MainWindowGUI):
         self._server.sigMoveDetected.connect(self._on_move_detected)
         self._server.start()
 
+        QtCore.QTimer.singleShot(0, self._refresh_image)
+
     @staticmethod
     def _load_calibration_from_path(path: Path) -> xr.Dataset:
         with xr.open_dataset(path, engine="h5netcdf") as dataset_on_disk:
@@ -190,6 +193,10 @@ class MainWindow(_MainWindowGUI):
         for key, value in zip(ROI_SETTINGS_KEYS, geometry, strict=True):
             self._settings.setValue(key, float(value))
         self._settings.sync()
+
+    @QtCore.Slot()
+    def _refresh_image(self) -> None:
+        self.image_item.setImage(get_framegrabber_image())
 
     @QtCore.Slot()
     def _on_load_calibration_clicked(self) -> None:

@@ -6,11 +6,8 @@ from collections.abc import Iterable
 import numpy as np
 
 import merlin_track_position.instruments.BCSz as BCSz
-from merlin_track_position.constants import (
-    BCS_SERVER_HOST,
-    BCS_SERVER_PORT,
-    MOTOR_NAMES,
-)
+from merlin_track_position import constants
+from merlin_track_position.instruments.simulated_hardware import simulator
 
 logger = logging.getLogger("merlin_track_position.instruments.motors")
 
@@ -18,7 +15,7 @@ logger = logging.getLogger("merlin_track_position.instruments.motors")
 @contextlib.contextmanager
 def _bcs_server_context():
     server = BCSz.BCSServer()
-    server.connect(addr=BCS_SERVER_HOST, port=BCS_SERVER_PORT)
+    server.connect(addr=constants.BCS_SERVER_HOST, port=constants.BCS_SERVER_PORT)
     try:
         yield server
     finally:
@@ -28,7 +25,9 @@ def _bcs_server_context():
 def _get_motor_info(
     bcs_server: BCSz.BCSServer, motor_aliases: Iterable[str], keys: Iterable[str]
 ) -> tuple[tuple[float, ...], ...]:
-    info_dict = bcs_server.get_motor(motors=[MOTOR_NAMES[m] for m in motor_aliases])
+    info_dict = bcs_server.get_motor(
+        motors=[constants.MOTOR_NAMES[m] for m in motor_aliases]
+    )
     return tuple(tuple(m[k] for m in info_dict["data"]) for k in keys)
 
 
@@ -94,7 +93,7 @@ def _move_motors_and_wait(
     else:
         tolerances = tuple(float(t) for t in tolerance)
 
-    motor_names = [MOTOR_NAMES[m] for m in motor_aliases]
+    motor_names = [constants.MOTOR_NAMES[m] for m in motor_aliases]
 
     for _ in range(max_retries + 1):
         bcs_server.move_motor(motors=motor_names, goals=list(goals))
@@ -136,12 +135,18 @@ def _move_motors_and_wait(
 
 def get_positions(motor_aliases: Iterable[str]) -> tuple[float, ...]:
     """Get current positions of the specified motor aliases."""
+    if not constants.IS_DAQ_PC:
+        return simulator.get_positions(motor_aliases)
+
     with _bcs_server_context() as server:
         return _get_positions(server, motor_aliases)
 
 
 def get_temperatures() -> tuple[float, float, float, float]:
     """Get current temperatures of the cryostat temp sensors."""
+    if not constants.IS_DAQ_PC:
+        return simulator.get_temperatures()
+
     return get_positions(("TA", "TB", "TC", "TD"))
 
 
@@ -176,6 +181,14 @@ def move_motors_and_wait(
         max_retries.
 
     """
+    if not constants.IS_DAQ_PC:
+        return simulator.move_motors_and_wait(
+            motor_aliases,
+            goals,
+            tolerance=tolerance,
+            max_retries=max_retries,
+        )
+
     with _bcs_server_context() as server:
         return _move_motors_and_wait(
             server,
