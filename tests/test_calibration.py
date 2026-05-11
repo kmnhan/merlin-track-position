@@ -7,6 +7,10 @@ import numpy as np
 import xarray as xr
 from scipy import ndimage
 
+from merlin_track_position.instruments.cameras import (
+    CallableCameraPlugin,
+    CameraPairPlugin,
+)
 from merlin_track_position.interface.calibration_panel import _validate_calibration_dataset
 from merlin_track_position.tracking.calibration_core import (
     CAMERAS,
@@ -80,6 +84,32 @@ def make_stereo_images(stage, stage_to_pixel, *, seed0=20, seed1=21):
     return images_cam0, images_cam1
 
 
+def as_capture_stacks(images):
+    return [np.asarray(image)[None, ...] for image in images]
+
+
+def camera_pair_from_pair_source(pair_source):
+    pending_pair = []
+
+    def capture_cam0():
+        if pending_pair:
+            raise AssertionError("cam0 was captured before cam1 consumed the pair")
+        pending_pair.append(pair_source())
+        return pending_pair[0][0]
+
+    def capture_cam1():
+        if not pending_pair:
+            pending_pair.append(pair_source())
+        image_cam0, image_cam1 = pending_pair.pop(0)
+        del image_cam0
+        return image_cam1
+
+    return CameraPairPlugin(
+        CallableCameraPlugin("cam0", capture_cam0),
+        CallableCameraPlugin("cam1", capture_cam1),
+    )
+
+
 class CalibrationTests(unittest.TestCase):
     def test_calibration_sample_count_matches_path_shape(self):
         self.assertEqual(calibration_sample_count(3), 16)
@@ -90,11 +120,14 @@ class CalibrationTests(unittest.TestCase):
             calibration_sample_count(1)
 
     def test_run_calibration_records_initial_stage_and_tilt_attrs(self):
-        image = np.zeros((8, 8), dtype=float)
         captured_kwargs = {}
+        generator_calls = 0
 
-        def fake_image_generator():
-            return image, image
+        def fake_pair_source():
+            nonlocal generator_calls
+            generator_calls += 1
+            image = np.full((8, 8), generator_calls, dtype=float)
+            return image, image + 100.0
 
         def fake_move_motors_and_wait(motor_aliases, goals, **kwargs):
             del motor_aliases, kwargs
@@ -122,8 +155,9 @@ class CalibrationTests(unittest.TestCase):
             calibration = run_calibration(
                 2,
                 10.0,
-                fake_image_generator,
+                camera_pair_from_pair_source(fake_pair_source),
                 origin_stability_um=ORIGIN_STABILITY_UM,
+                capture_count=1,
             )
 
         self.assertEqual(calibration.attrs["initial_x_mm"], 1.2)
@@ -133,14 +167,77 @@ class CalibrationTests(unittest.TestCase):
         self.assertEqual(calibration.attrs["tilt"], 6.7)
         np.testing.assert_allclose(captured_kwargs["stage_um"][0], [0.0, 0.0, 0.0])
 
+    def test_run_calibration_captures_five_images_per_step_and_reports_once(self):
+        captured_kwargs = {}
+        callback_steps = []
+        generator_calls = 0
+
+        def fake_pair_source():
+            nonlocal generator_calls
+            generator_calls += 1
+            value = float(generator_calls)
+            return (
+                np.full((2, 2), value, dtype=np.float32),
+                np.full((2, 3), value + 100.0, dtype=np.float32),
+            )
+
+        def fake_move_motors_and_wait(motor_aliases, goals, **kwargs):
+            del motor_aliases, kwargs
+            return tuple(float(goal) for goal in goals)
+
+        def fake_fit_calibration_from_images(**kwargs):
+            captured_kwargs.update(kwargs)
+            return xr.Dataset()
+
+        def step_callback(idx, dx, dy, dz, image_cam0, image_cam1):
+            callback_steps.append((idx, dx, dy, dz, image_cam0, image_cam1))
+
+        with (
+            patch(
+                "merlin_track_position.tracking.calibrate.get_positions",
+                return_value=(1.2, 2.3, 3.4, 4.5, 6.7, 5.0),
+            ),
+            patch(
+                "merlin_track_position.tracking.calibrate.move_motors_and_wait",
+                side_effect=fake_move_motors_and_wait,
+            ),
+            patch(
+                "merlin_track_position.tracking.calibrate.fit_calibration_from_images",
+                side_effect=fake_fit_calibration_from_images,
+            ),
+            patch("merlin_track_position.tracking.calibrate.time.sleep"),
+        ):
+            run_calibration(
+                2,
+                10.0,
+                camera_pair_from_pair_source(fake_pair_source),
+                origin_stability_um=ORIGIN_STABILITY_UM,
+                step_callback=step_callback,
+            )
+
+        expected_steps = calibration_sample_count(2)
+        self.assertEqual(generator_calls, expected_steps * 5)
+        self.assertEqual(len(callback_steps), expected_steps)
+        self.assertEqual(len(captured_kwargs["images_cam0"]), expected_steps)
+        self.assertEqual(captured_kwargs["images_cam0"][0].shape, (5, 2, 2))
+        self.assertEqual(captured_kwargs["images_cam0"][0].dtype, np.float32)
+        np.testing.assert_array_equal(
+            callback_steps[0][4],
+            np.full((2, 2), 3.0, dtype=np.float32),
+        )
+        np.testing.assert_array_equal(
+            callback_steps[0][5],
+            np.full((2, 3), 103.0, dtype=np.float32),
+        )
+
     def test_fit_calibration_from_stereo_numpy_arrays(self):
         stage_to_pixel = stereo_stage_to_pixel()
         stage = calibration_stage()
         images_cam0, images_cam1 = make_stereo_images(stage, stage_to_pixel)
 
         calibration = fit_calibration_from_images(
-            images_cam0,
-            images_cam1,
+            as_capture_stacks(images_cam0),
+            as_capture_stacks(images_cam1),
             stage,
             origin_stability_um=ORIGIN_STABILITY_UM,
             check_tiles=False,
@@ -178,11 +275,85 @@ class CalibrationTests(unittest.TestCase):
             atol=1.0,
         )
 
+    def test_fit_calibration_uses_median_shift_from_capture_stack(self):
+        stage_to_pixel = stereo_stage_to_pixel()
+        stage = calibration_stage()
+        capture_deltas = np.array([-0.2, -0.1, 0.0, 0.1, 200.0], dtype=float)
+        images_cam0 = []
+        images_cam1 = []
+        for sample_index in range(stage.shape[0]):
+            images_cam0.append(
+                np.stack(
+                    [
+                        np.full((4, 4), sample_index * 10 + capture_index, dtype=np.float32)
+                        for capture_index in range(5)
+                    ],
+                    axis=0,
+                )
+            )
+            images_cam1.append(
+                np.stack(
+                    [
+                        np.full(
+                            (5, 6),
+                            10000 + sample_index * 10 + capture_index,
+                            dtype=np.float32,
+                        )
+                        for capture_index in range(5)
+                    ],
+                    axis=0,
+                )
+            )
+
+        def fake_estimate_shift(reference, current, **kwargs):
+            del reference, kwargs
+            marker = int(round(float(np.asarray(current)[0, 0])))
+            camera_index = 1 if marker >= 10000 else 0
+            if camera_index == 1:
+                marker -= 10000
+            sample_index, capture_index = divmod(marker, 10)
+            base_shift = stage_to_pixel[camera_index] @ stage[sample_index]
+            return xr.Dataset(
+                data_vars={
+                    "shift_px": (
+                        ("pixel_axis",),
+                        base_shift + capture_deltas[capture_index],
+                    ),
+                },
+                coords={"pixel_axis": list(PIXEL_AXES)},
+                attrs={"warnings": ""},
+            )
+
+        with patch(
+            "merlin_track_position.tracking.calibration_core.estimate_shift",
+            side_effect=fake_estimate_shift,
+        ) as estimate_shift:
+            calibration = fit_calibration_from_images(
+                images_cam0,
+                images_cam1,
+                stage,
+                origin_stability_um=ORIGIN_STABILITY_UM,
+                check_tiles=False,
+                clip_percentiles=None,
+            )
+
+        expected_shifts = np.einsum("cpk,sk->scp", stage_to_pixel, stage)
+        self.assertEqual(estimate_shift.call_count, stage.shape[0] * len(CAMERAS) * 5)
+        self.assertEqual(calibration.attrs["capture_count"], 5)
+        np.testing.assert_allclose(calibration["measured_shift_px"].values, expected_shifts)
+        np.testing.assert_allclose(calibration["capture_shift_mad_px"].values, 0.1)
+        self.assertEqual(calibration["image_cam0"].dtype, np.float32)
+        self.assertEqual(calibration["image_cam1"].dtype, np.float32)
+        np.testing.assert_array_equal(
+            calibration["image_cam0"].values[0],
+            np.full((4, 4), 2.0, dtype=np.float32),
+        )
+
     def test_fit_calibration_reports_measurement_warning_step_and_camera(self):
         stage_to_pixel = stereo_stage_to_pixel()
         stage = calibration_stage()
         image = np.zeros((16, 16), dtype=float)
-        images = [image for _ in range(stage.shape[0])]
+        images = as_capture_stacks([image for _ in range(stage.shape[0])])
         call_count = 0
 
         def fake_estimate_shift(reference, current, **kwargs):
@@ -238,8 +409,8 @@ class CalibrationTests(unittest.TestCase):
         stage = calibration_stage()
         images_cam0, images_cam1 = make_stereo_images(stage, stage_to_pixel)
         dataset = fit_calibration_from_images(
-            images_cam0,
-            images_cam1,
+            as_capture_stacks(images_cam0),
+            as_capture_stacks(images_cam1),
             stage,
             origin_stability_um=ORIGIN_STABILITY_UM,
             check_tiles=False,
@@ -266,8 +437,8 @@ class CalibrationTests(unittest.TestCase):
         stage = calibration_stage()
         images_cam0, images_cam1 = make_stereo_images(stage, stage_to_pixel)
         calibration = fit_calibration_from_images(
-            images_cam0,
-            images_cam1,
+            as_capture_stacks(images_cam0),
+            as_capture_stacks(images_cam1),
             stage,
             origin_stability_um=ORIGIN_STABILITY_UM,
             check_tiles=False,
@@ -291,9 +462,9 @@ class CalibrationTests(unittest.TestCase):
         result = get_correction(
             calibration,
             calibration["image_cam0"].isel(sample=0).values,
-            current_cam0,
+            current_cam0[None, ...],
             calibration["image_cam1"].isel(sample=0).values,
-            current_cam1,
+            current_cam1[None, ...],
             check_tiles=False,
             clip_percentiles=None,
         )
@@ -312,6 +483,122 @@ class CalibrationTests(unittest.TestCase):
         np.testing.assert_allclose(result["current_cam0"].values, current_cam0)
         np.testing.assert_allclose(result["current_cam1"].values, current_cam1)
         self.assertNotIn("method", result.attrs)
+
+    def test_fit_calibration_rejects_legacy_2d_inputs(self):
+        stage = calibration_stage()
+        image = np.zeros((16, 16), dtype=float)
+
+        with self.assertRaisesRegex(ValueError, "must be 3D"):
+            fit_calibration_from_images(
+                [image for _ in range(stage.shape[0])],
+                as_capture_stacks([image for _ in range(stage.shape[0])]),
+                stage,
+                origin_stability_um=ORIGIN_STABILITY_UM,
+                check_tiles=False,
+                clip_percentiles=None,
+            )
+
+    def test_get_correction_rejects_legacy_2d_current_images(self):
+        image = np.zeros((16, 16), dtype=float)
+        calibration = xr.Dataset(
+            data_vars={
+                "stage_to_pixel": (
+                    ("camera", "pixel_axis", "stage_axis"),
+                    stereo_stage_to_pixel(),
+                ),
+            },
+            coords={
+                "camera": list(CAMERAS),
+                "pixel_axis": list(PIXEL_AXES),
+                "stage_axis": list(STAGE_AXES),
+            },
+        )
+
+        with self.assertRaisesRegex(ValueError, "current_cam0\\[0\\] must be 3D"):
+            get_correction(
+                calibration,
+                image,
+                image,
+                image,
+                image[None, ...],
+                check_tiles=False,
+                clip_percentiles=None,
+            )
+
+    def test_get_correction_uses_median_shift_from_capture_stack(self):
+        stage_to_pixel = stereo_stage_to_pixel()
+        calibration = xr.Dataset(
+            data_vars={
+                "stage_to_pixel": (
+                    ("camera", "pixel_axis", "stage_axis"),
+                    stage_to_pixel,
+                ),
+            },
+            coords={
+                "camera": list(CAMERAS),
+                "pixel_axis": list(PIXEL_AXES),
+                "stage_axis": list(STAGE_AXES),
+            },
+        )
+        offset_um = np.array([8.0, -4.0, 6.0])
+        base_shifts = np.einsum("cpk,k->cp", stage_to_pixel, offset_um)
+        capture_deltas = np.array([-0.2, -0.1, 0.0, 0.1, 200.0], dtype=float)
+        reference_cam0 = np.zeros((4, 4), dtype=np.float32)
+        reference_cam1 = np.zeros((5, 6), dtype=np.float32)
+        current_cam0 = np.stack(
+            [
+                np.full(reference_cam0.shape, capture_index, dtype=np.float32)
+                for capture_index in range(5)
+            ],
+            axis=0,
+        )
+        current_cam1 = np.stack(
+            [
+                np.full(reference_cam1.shape, 100 + capture_index, dtype=np.float32)
+                for capture_index in range(5)
+            ],
+            axis=0,
+        )
+
+        def fake_estimate_shift(reference, current, **kwargs):
+            del reference, kwargs
+            marker = int(round(float(np.asarray(current)[0, 0])))
+            camera_index = 1 if marker >= 100 else 0
+            capture_index = marker - 100 if camera_index == 1 else marker
+            return xr.Dataset(
+                data_vars={
+                    "shift_px": (
+                        ("pixel_axis",),
+                        base_shifts[camera_index] + capture_deltas[capture_index],
+                    ),
+                },
+                coords={"pixel_axis": list(PIXEL_AXES)},
+                attrs={"warnings": ""},
+            )
+
+        with patch(
+            "merlin_track_position.tracking.calibration_core.estimate_shift",
+            side_effect=fake_estimate_shift,
+        ):
+            result = get_correction(
+                calibration,
+                reference_cam0,
+                current_cam0,
+                reference_cam1,
+                current_cam1,
+                check_tiles=False,
+                clip_percentiles=None,
+            )
+
+        self.assertEqual(result.attrs["capture_count"], 5)
+        np.testing.assert_allclose(result["shift_px"].values, base_shifts)
+        np.testing.assert_allclose(result["capture_shift_mad_px"].values, 0.1)
+        np.testing.assert_allclose(result["estimated_stage_offset_um"].values, offset_um)
+        np.testing.assert_allclose(result["correction_um"].values, -offset_um)
+        np.testing.assert_array_equal(
+            result["current_cam0"].values,
+            np.full(reference_cam0.shape, 2.0, dtype=np.float32),
+        )
 
     def test_do_correction_uses_reference_images_and_applies_motor_move(self):
         reference_cam0 = np.array([[1.0, 2.0], [3.0, 4.0]])
@@ -353,7 +640,7 @@ class CalibrationTests(unittest.TestCase):
         )
         captured = {}
 
-        def image_generator():
+        def pair_source():
             return current_cam0, current_cam1
 
         def fake_get_correction(
@@ -388,9 +675,10 @@ class CalibrationTests(unittest.TestCase):
         ):
             result = do_correction(
                 calibration,
-                image_generator,
+                camera_pair_from_pair_source(pair_source),
                 move_tolerance_um=(1.0, 2.0, 3.0),
                 max_retries=7,
+                capture_count=1,
                 check_tiles=False,
                 clip_percentiles=None,
             )
@@ -398,8 +686,8 @@ class CalibrationTests(unittest.TestCase):
         self.assertIs(captured["calibration"], calibration)
         np.testing.assert_allclose(captured["reference_cam0"], reference_cam0)
         np.testing.assert_allclose(captured["reference_cam1"], reference_cam1)
-        self.assertIs(captured["current_cam0"], current_cam0)
-        self.assertIs(captured["current_cam1"], current_cam1)
+        np.testing.assert_array_equal(captured["current_cam0"], current_cam0[None, ...])
+        np.testing.assert_array_equal(captured["current_cam1"], current_cam1[None, ...])
         self.assertEqual(
             captured["shift_kwargs"],
             {"check_tiles": False, "clip_percentiles": None},
@@ -459,7 +747,7 @@ class CalibrationTests(unittest.TestCase):
         )
         captured = {}
 
-        def image_generator():
+        def pair_source():
             return raw_cam0, raw_cam1
 
         def fake_get_correction(
@@ -489,10 +777,20 @@ class CalibrationTests(unittest.TestCase):
                 return_value=(1.0, 2.0, 3.0),
             ),
         ):
-            do_correction(calibration, image_generator)
+            do_correction(
+                calibration,
+                camera_pair_from_pair_source(pair_source),
+                capture_count=1,
+            )
 
-        np.testing.assert_array_equal(captured["current_cam0"], reference_cam0)
-        np.testing.assert_array_equal(captured["current_cam1"], reference_cam1)
+        np.testing.assert_array_equal(
+            captured["current_cam0"],
+            reference_cam0[None, ...],
+        )
+        np.testing.assert_array_equal(
+            captured["current_cam1"],
+            reference_cam1[None, ...],
+        )
         self.assertFalse(np.shares_memory(captured["current_cam0"], raw_cam0))
         self.assertFalse(np.shares_memory(captured["current_cam1"], raw_cam1))
 
@@ -501,8 +799,8 @@ class CalibrationTests(unittest.TestCase):
         stage = calibration_stage()
         images_cam0, images_cam1 = make_stereo_images(stage, stage_to_pixel)
         calibration = fit_calibration_from_images(
-            images_cam0,
-            images_cam1,
+            as_capture_stacks(images_cam0),
+            as_capture_stacks(images_cam1),
             stage,
             origin_stability_um=ORIGIN_STABILITY_UM,
             check_tiles=False,
@@ -523,7 +821,7 @@ class CalibrationTests(unittest.TestCase):
             mode="wrap",
         )
 
-        def image_generator():
+        def pair_source():
             return current_cam0, current_cam1
 
         with (
@@ -538,8 +836,9 @@ class CalibrationTests(unittest.TestCase):
         ):
             result = do_correction(
                 calibration,
-                image_generator,
+                camera_pair_from_pair_source(pair_source),
                 move_tolerance_um=2.5,
+                capture_count=1,
                 check_tiles=False,
                 clip_percentiles=None,
             )
@@ -581,7 +880,7 @@ class CalibrationTests(unittest.TestCase):
             coords={"stage_axis": list(STAGE_AXES)},
         )
 
-        def image_generator():
+        def pair_source():
             return image, image
 
         with (
@@ -597,7 +896,11 @@ class CalibrationTests(unittest.TestCase):
             ) as move_motors_and_wait,
         ):
             with self.assertRaisesRegex(ValueError, "finite values"):
-                do_correction(calibration, image_generator)
+                do_correction(
+                    calibration,
+                    camera_pair_from_pair_source(pair_source),
+                    capture_count=1,
+                )
 
         get_positions.assert_not_called()
         move_motors_and_wait.assert_not_called()
@@ -617,8 +920,8 @@ class CalibrationTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "three independent motor axes"):
             fit_calibration_from_images(
-                [reference_cam0] * len(stage),
-                [reference_cam1] * len(stage),
+                as_capture_stacks([reference_cam0] * len(stage)),
+                as_capture_stacks([reference_cam1] * len(stage)),
                 stage,
                 origin_stability_um=ORIGIN_STABILITY_UM,
                 check_tiles=False,
@@ -633,8 +936,8 @@ class CalibrationTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "matrix must have rank 3"):
             fit_calibration_from_images(
-                images_cam0,
-                images_cam1,
+                as_capture_stacks(images_cam0),
+                as_capture_stacks(images_cam1),
                 stage,
                 origin_stability_um=ORIGIN_STABILITY_UM,
                 check_tiles=False,
@@ -649,8 +952,8 @@ class CalibrationTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "stage_um\\[0\\]"):
             fit_calibration_from_images(
-                [reference_cam0] * len(stage),
-                [reference_cam1] * len(stage),
+                as_capture_stacks([reference_cam0] * len(stage)),
+                as_capture_stacks([reference_cam1] * len(stage)),
                 stage,
                 origin_stability_um=ORIGIN_STABILITY_UM,
                 check_tiles=False,
@@ -677,8 +980,8 @@ class CalibrationTests(unittest.TestCase):
         )
 
         calibration = fit_calibration_from_images(
-            images_cam0,
-            images_cam1,
+            as_capture_stacks(images_cam0),
+            as_capture_stacks(images_cam1),
             stage,
             origin_stability_um=ORIGIN_STABILITY_UM,
             check_tiles=False,

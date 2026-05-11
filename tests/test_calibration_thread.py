@@ -5,6 +5,10 @@ from unittest.mock import patch
 import numpy as np
 from qtpy import QtWidgets
 
+from merlin_track_position.instruments.cameras import (
+    CallableCameraPlugin,
+    CameraPairPlugin,
+)
 from merlin_track_position.interface.calibration_thread import CalibrationThread
 from merlin_track_position.tracking.sample_calibration import build_sample_calibration_dataset
 
@@ -19,12 +23,14 @@ class CalibrationThreadTests(unittest.TestCase):
         image_cam1 = np.arange(6 * 7, dtype=float).reshape(6, 7)
         calls = []
 
-        def image_generator():
-            return image_cam0, image_cam1
+        camera_pair = CameraPairPlugin(
+            CallableCameraPlugin("cam0", lambda: image_cam0),
+            CallableCameraPlugin("cam1", lambda: image_cam1),
+        )
 
-        def fake_run_calibration(n, step_um, generator, *, step_callback):
-            calls.append((n, step_um, generator))
-            captured_cam0, captured_cam1 = generator()
+        def fake_run_calibration(n, step_um, pair, *, step_callback):
+            calls.append((n, step_um, pair))
+            captured_cam0, captured_cam1 = pair.capture_pair()
             step_callback(0, 1.0, 2.0, 3.0, captured_cam0, captured_cam1)
             return build_sample_calibration_dataset(
                 image_shape_cam0=(4, 5),
@@ -46,7 +52,7 @@ class CalibrationThreadTests(unittest.TestCase):
         thread.configure(
             5,
             15.0,
-            image_generator,
+            camera_pair,
             {
                 "roi_cam0_x": 1.0,
                 "roi_cam0_y": 2.0,
@@ -60,7 +66,7 @@ class CalibrationThreadTests(unittest.TestCase):
         ):
             thread.run()
 
-        self.assertEqual(calls, [(5, 15.0, image_generator)])
+        self.assertEqual(calls, [(5, 15.0, camera_pair)])
         self.assertEqual(len(steps), 1)
         self.assertEqual(steps[0][:4], (0, 1.0, 2.0, 3.0))
         np.testing.assert_array_equal(steps[0][4], image_cam0)
@@ -73,8 +79,8 @@ class CalibrationThreadTests(unittest.TestCase):
         app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
         del app
 
-        def fake_run_calibration(n, step_um, generator, *, step_callback):
-            del n, step_um, generator, step_callback
+        def fake_run_calibration(n, step_um, camera_pair, *, step_callback):
+            del n, step_um, camera_pair, step_callback
             raise RuntimeError("boom")
 
         thread = CalibrationThread()
@@ -85,7 +91,10 @@ class CalibrationThreadTests(unittest.TestCase):
         thread.configure(
             5,
             15.0,
-            lambda: (np.zeros((2, 2)), np.zeros((2, 2))),
+            CameraPairPlugin(
+                CallableCameraPlugin("cam0", lambda: np.zeros((2, 2))),
+                CallableCameraPlugin("cam1", lambda: np.zeros((2, 2))),
+            ),
             {},
         )
 

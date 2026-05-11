@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import threading
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 
 import numpy as np
 from qtpy import QtCore
 
+from merlin_track_position.instruments.cameras import CameraPairPlugin
 from merlin_track_position.interface.calibration_panel import (
     _validate_calibration_dataset,
 )
@@ -27,14 +28,14 @@ class CalibrationThread(QtCore.QThread):
         self._running = threading.Event()
         self._n: int | None = None
         self._step_um: float | None = None
-        self._image_generator: Callable[[], tuple[np.ndarray, np.ndarray]] | None = None
+        self._camera_pair: CameraPairPlugin | None = None
         self._roi_metadata: dict[str, float] = {}
 
     def configure(
         self,
         n: int,
         step_um: float,
-        image_generator: Callable[[], tuple[np.ndarray, np.ndarray]],
+        camera_pair: CameraPairPlugin,
         roi_metadata: Mapping[str, float],
     ) -> None:
         """Set the parameters for the next calibration run."""
@@ -42,7 +43,7 @@ class CalibrationThread(QtCore.QThread):
             raise RuntimeError("cannot configure calibration while it is running")
         self._n = int(n)
         self._step_um = float(step_um)
-        self._image_generator = image_generator
+        self._camera_pair = camera_pair
         self._roi_metadata = {
             str(key): float(value) for key, value in roi_metadata.items()
         }
@@ -57,13 +58,13 @@ class CalibrationThread(QtCore.QThread):
                 if (
                     self._n is None
                     or self._step_um is None
-                    or self._image_generator is None
+                    or self._camera_pair is None
                 ):
                     raise RuntimeError("calibration thread has not been configured")
                 calibration = run_calibration(
                     self._n,
                     self._step_um,
-                    self._image_generator,
+                    self._camera_pair,
                     step_callback=self._emit_step,
                 )
                 calibration = calibration.assign_attrs(self._roi_metadata)

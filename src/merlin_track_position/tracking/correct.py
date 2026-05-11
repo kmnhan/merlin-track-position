@@ -1,15 +1,18 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
+from collections.abc import Iterable
 from typing import Any
 
 import numpy as np
 import xarray as xr
 
 from merlin_track_position.instruments.cameras import (
+    CameraPairPlugin,
     RoiGeometry,
-    capture_camera_pair,
+    capture_image_stack,
     crop_image_to_roi,
+    default_camera_pair,
+    normalize_capture_count,
 )
 from merlin_track_position.instruments.motors import get_positions, move_motors_and_wait
 from merlin_track_position.tracking.calibration_core import get_correction
@@ -28,16 +31,17 @@ ROI_ATTR_KEYS: dict[str, tuple[str, str, str, str]] = {
 
 def do_correction(
     calibration: xr.Dataset,
-    image_generator: Callable[[], tuple[np.ndarray, np.ndarray]] = capture_camera_pair,
+    camera_pair: CameraPairPlugin | None = None,
     *,
     move_tolerance_um: float | Iterable[float] | None = None,
     max_retries: int = 4,
+    capture_count: int = 5,
     **shift_kwargs: Any,
 ) -> xr.Dataset:
     """Estimate and apply the x/y/z motor correction for current camera images.
 
     The first saved calibration sample is used as the reference image pair. The current
-    image pair is captured with ``image_generator``. If the calibration carries ROI
+    image pair is captured with ``camera_pair``. If the calibration carries ROI
     metadata and the captured images are still full-frame, the current images are
     cropped to match the calibration references before comparison. The resulting
     ``correction_um`` vector is applied to the ``x``, ``y``, and ``z`` motors.
@@ -46,16 +50,19 @@ def do_correction(
     ----------
     calibration
         Calibration dataset produced by `fit_calibration_from_images`.
-    image_generator
-        Callable that captures the current camera pair as ``(cam0, cam1)``. Raw
-        full-frame capture is supported when the calibration dataset contains ROI
-        metadata. Already-cropped images are left unchanged when their shape matches the
-        saved calibration references.
+    camera_pair
+        Camera plugin pair used to capture cam0 and cam1 images. Raw full-frame capture
+        is supported when the calibration dataset contains ROI metadata. Already-cropped
+        images are left unchanged when their shape matches the saved calibration
+        references.
     move_tolerance_um
         Optional motor move tolerance in microns. A scalar is applied to all three stage
         axes; an iterable supplies per-axis tolerances.
     max_retries
         Maximum number of motor move retries to pass to :func:`move_motors_and_wait`.
+    capture_count
+        Number of current image pairs captured before estimating the correction.
+        Default is 5.
     **shift_kwargs
         Additional keyword arguments forwarded to :func:`get_correction` and ultimately
         to the image-shift estimator.
@@ -75,16 +82,19 @@ def do_correction(
         vector.
     """
 
+    capture_count = normalize_capture_count(capture_count)
+    if camera_pair is None:
+        camera_pair = default_camera_pair()
     reference_cam0 = calibration["image_cam0"].isel(sample=0).values
     reference_cam1 = calibration["image_cam1"].isel(sample=0).values
-    current_cam0, current_cam1 = image_generator()
-    current_cam0 = _crop_current_image_if_needed(
+    current_cam0, current_cam1 = capture_image_stack(camera_pair, capture_count)
+    current_cam0 = _crop_current_stack_if_needed(
         calibration,
         "cam0",
         reference_cam0,
         current_cam0,
     )
-    current_cam1 = _crop_current_image_if_needed(
+    current_cam1 = _crop_current_stack_if_needed(
         calibration,
         "cam1",
         reference_cam1,
@@ -151,26 +161,29 @@ def _um_to_mm(
     return tuple(float(item) * 1e-3 for item in value)
 
 
-def _crop_current_image_if_needed(
+def _crop_current_stack_if_needed(
     calibration: xr.Dataset,
     camera: str,
     reference: np.ndarray,
-    current: Any,
-) -> Any:
-    if np.shape(current) == np.shape(reference):
-        return current
+    current_stack: np.ndarray,
+) -> np.ndarray:
+    if current_stack.shape[1:] == np.shape(reference):
+        return current_stack
 
     roi_geometry = _roi_geometry_from_attrs(calibration, camera)
     if roi_geometry is None:
-        return current
+        return current_stack
 
-    cropped = crop_image_to_roi(current, roi_geometry)
-    if cropped.shape != reference.shape:
+    cropped_stack = np.stack(
+        [crop_image_to_roi(image, roi_geometry) for image in current_stack],
+        axis=0,
+    )
+    if cropped_stack.shape[1:] != np.shape(reference):
         raise ValueError(
-            f"cropped {camera} image shape {cropped.shape!r} does not match "
-            f"calibration reference shape {reference.shape!r}"
+            f"cropped {camera} image shape {cropped_stack.shape[1:]!r} "
+            f"does not match calibration reference shape {np.shape(reference)!r}"
         )
-    return cropped
+    return cropped_stack
 
 
 def _roi_geometry_from_attrs(

@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Callable
+import time
+from abc import ABC, abstractmethod
+from collections.abc import Callable, Sequence
+from numbers import Integral
 
 import numpy as np
 import numpy.typing as npt
@@ -14,9 +17,212 @@ from merlin_track_position.instruments.framegrab import get_framegrabber_image
 RoiGeometry = tuple[float, float, float, float]
 
 
-def capture_camera_pair() -> tuple[npt.NDArray, npt.NDArray]:
-    """Capture the current cam0 and cam1 images."""
-    return get_framegrabber_image(), get_basler_image()
+class CameraPlugin(ABC):
+    """Object interface for one image source used by calibration workflows."""
+
+    def __init__(
+        self,
+        name: str,
+        *,
+        fresh_frame_timeout_s: float = 5.0,
+        fresh_frame_poll_interval_s: float = 0.05,
+    ):
+        self.name = str(name)
+        self.fresh_frame_timeout_s = _validate_nonnegative_float(
+            "fresh_frame_timeout_s",
+            fresh_frame_timeout_s,
+        )
+        self.fresh_frame_poll_interval_s = _validate_nonnegative_float(
+            "fresh_frame_poll_interval_s",
+            fresh_frame_poll_interval_s,
+        )
+        self._last_frame: npt.NDArray | None = None
+
+    def capture(self) -> npt.NDArray:
+        """Return the next image that differs from this camera's last frame."""
+        deadline = time.monotonic() + self.fresh_frame_timeout_s
+        while True:
+            image = np.asarray(self._capture_once())
+            if self._last_frame is None or not _same_image(image, self._last_frame):
+                self._last_frame = image.copy()
+                return image
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"Timed out waiting for a fresh image from {self.name}; "
+                    "received repeated frames"
+                )
+            time.sleep(self.fresh_frame_poll_interval_s)
+
+    @abstractmethod
+    def _capture_once(self) -> npt.NDArray:
+        """Return one image from the underlying camera source."""
+
+    def cropped(self, roi_geometry: RoiGeometry) -> "CameraPlugin":
+        """Return a camera plugin that crops this camera's captured images."""
+        return CroppedCameraPlugin(self, roi_geometry)
+
+
+class FramegrabberCameraPlugin(CameraPlugin):
+    """Camera plugin backed by the framegrabber ZMQ image source."""
+
+    def __init__(
+        self,
+        name: str = "cam0",
+        *,
+        fresh_frame_timeout_s: float = 5.0,
+        fresh_frame_poll_interval_s: float = 0.05,
+    ):
+        super().__init__(
+            name,
+            fresh_frame_timeout_s=fresh_frame_timeout_s,
+            fresh_frame_poll_interval_s=fresh_frame_poll_interval_s,
+        )
+
+    def _capture_once(self) -> npt.NDArray:
+        return get_framegrabber_image()
+
+
+class BaslerCameraPlugin(CameraPlugin):
+    """Camera plugin backed by the Basler SDK image source."""
+
+    def __init__(
+        self,
+        name: str = "cam1",
+        *,
+        fresh_frame_timeout_s: float = 5.0,
+        fresh_frame_poll_interval_s: float = 0.05,
+    ):
+        super().__init__(
+            name,
+            fresh_frame_timeout_s=fresh_frame_timeout_s,
+            fresh_frame_poll_interval_s=fresh_frame_poll_interval_s,
+        )
+
+    def _capture_once(self) -> npt.NDArray:
+        return get_basler_image()
+
+
+class CallableCameraPlugin(CameraPlugin):
+    """Adapter for camera implementations supplied by application code or tests."""
+
+    def __init__(
+        self,
+        name: str,
+        capture_image: Callable[[], npt.NDArray],
+        *,
+        fresh_frame_timeout_s: float = 5.0,
+        fresh_frame_poll_interval_s: float = 0.05,
+    ):
+        super().__init__(
+            name,
+            fresh_frame_timeout_s=fresh_frame_timeout_s,
+            fresh_frame_poll_interval_s=fresh_frame_poll_interval_s,
+        )
+        self._capture_image = capture_image
+
+    def _capture_once(self) -> npt.NDArray:
+        return self._capture_image()
+
+
+class CroppedCameraPlugin(CameraPlugin):
+    """Camera plugin wrapper that crops images from another camera plugin."""
+
+    def __init__(
+        self,
+        camera: CameraPlugin,
+        roi_geometry: RoiGeometry,
+    ):
+        super().__init__(
+            camera.name,
+            fresh_frame_timeout_s=camera.fresh_frame_timeout_s,
+            fresh_frame_poll_interval_s=camera.fresh_frame_poll_interval_s,
+        )
+        self._camera = camera
+        self._roi_geometry = roi_geometry
+
+    def _capture_once(self) -> npt.NDArray:
+        return crop_image_to_roi(self._camera.capture(), self._roi_geometry)
+
+
+class CameraPairPlugin:
+    """The two camera plugins used together by calibration and correction."""
+
+    def __init__(
+        self,
+        cam0: CameraPlugin,
+        cam1: CameraPlugin,
+    ):
+        self.cam0 = cam0
+        self.cam1 = cam1
+
+    def as_tuple(self) -> tuple[CameraPlugin, CameraPlugin]:
+        return self.cam0, self.cam1
+
+    def capture_pair(self) -> tuple[npt.NDArray, npt.NDArray]:
+        return self.cam0.capture(), self.cam1.capture()
+
+    def cropped(
+        self,
+        roi_cam0: RoiGeometry,
+        roi_cam1: RoiGeometry,
+    ) -> "CameraPairPlugin":
+        return CameraPairPlugin(
+            self.cam0.cropped(roi_cam0),
+            self.cam1.cropped(roi_cam1),
+        )
+
+
+def default_camera_pair() -> CameraPairPlugin:
+    """Return the default two-camera hardware plugin pair."""
+    return CameraPairPlugin(FramegrabberCameraPlugin(), BaslerCameraPlugin())
+
+
+def normalize_capture_count(capture_count: int) -> int:
+    """Return a validated integer number of captures for one motor position."""
+    if isinstance(capture_count, bool) or not isinstance(capture_count, Integral):
+        raise ValueError("capture_count must be an integer >= 1")
+    value = int(capture_count)
+    if value < 1:
+        raise ValueError("capture_count must be an integer >= 1")
+    return value
+
+
+def capture_image_stack(
+    cameras: CameraPairPlugin | Sequence[CameraPlugin],
+    capture_count: int,
+) -> tuple[npt.NDArray, ...]:
+    """Capture image stacks from camera plugins."""
+
+    capture_count = normalize_capture_count(capture_count)
+    camera_plugins = _camera_plugins_tuple(cameras)
+    if not camera_plugins:
+        raise ValueError("at least one camera plugin is required")
+
+    image_stacks: list[list[npt.NDArray]] = [[] for _ in camera_plugins]
+    for _ in range(capture_count):
+        for camera_index, camera in enumerate(camera_plugins):
+            image_stacks[camera_index].append(np.asarray(camera.capture()))
+
+    return tuple(np.stack(images, axis=0) for images in image_stacks)
+
+
+def _camera_plugins_tuple(
+    cameras: CameraPairPlugin | Sequence[CameraPlugin],
+) -> tuple[CameraPlugin, ...]:
+    if isinstance(cameras, CameraPairPlugin):
+        return cameras.as_tuple()
+    return tuple(cameras)
+
+
+def _same_image(left: npt.NDArray, right: npt.NDArray) -> bool:
+    return left.shape == right.shape and np.array_equal(left, right)
+
+
+def _validate_nonnegative_float(name: str, value: float) -> float:
+    numeric = float(value)
+    if not math.isfinite(numeric) or numeric < 0.0:
+        raise ValueError(f"{name} must be finite and non-negative")
+    return numeric
 
 
 def crop_image_to_roi(
@@ -51,20 +257,3 @@ def crop_image_to_roi(
     y1 = min(max(int(math.ceil(y + height)), y0 + 1), image_height)
 
     return array[y0:y1, x0:x1, ...].copy()
-
-
-def make_cropped_camera_pair_capture(
-    roi_cam0: RoiGeometry,
-    roi_cam1: RoiGeometry,
-    base_capture: Callable[[], tuple[npt.NDArray, npt.NDArray]] = capture_camera_pair,
-) -> Callable[[], tuple[npt.NDArray, npt.NDArray]]:
-    """Build a camera-pair acquisition function that crops both images after capture."""
-
-    def _capture() -> tuple[npt.NDArray, npt.NDArray]:
-        image_cam0, image_cam1 = base_capture()
-        return (
-            crop_image_to_roi(image_cam0, roi_cam0),
-            crop_image_to_roi(image_cam1, roi_cam1),
-        )
-
-    return _capture

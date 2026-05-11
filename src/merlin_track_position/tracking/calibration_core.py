@@ -44,54 +44,72 @@ def fit_calibration_from_images(
             "'reference_index'"
         )
 
-    image_arrays_cam0 = _as_image_arrays("images_cam0", images_cam0)
-    image_arrays_cam1 = _as_image_arrays("images_cam1", images_cam1)
+    capture_arrays_cam0, image_dtypes_cam0 = _as_capture_arrays(
+        "images_cam0",
+        images_cam0,
+    )
+    capture_arrays_cam1, image_dtypes_cam1 = _as_capture_arrays(
+        "images_cam1",
+        images_cam1,
+    )
+    capture_count = _common_capture_count(capture_arrays_cam0, capture_arrays_cam1)
     stage = np.asarray(stage_um, dtype=np.float64)
     origin_stability_um = float(origin_stability_um)
 
     if not np.isfinite(origin_stability_um) or origin_stability_um <= 0.0:
         raise ValueError("origin_stability_um must be finite and positive")
-    if len(image_arrays_cam0) < 5:
+    if len(capture_arrays_cam0) < 5:
         raise ValueError("at least five calibration image pairs are required")
-    if len(image_arrays_cam0) != len(image_arrays_cam1):
+    if len(capture_arrays_cam0) != len(capture_arrays_cam1):
         raise ValueError(
             "images_cam0 and images_cam1 must have the same length; "
-            f"got {len(image_arrays_cam0)} and {len(image_arrays_cam1)}"
+            f"got {len(capture_arrays_cam0)} and {len(capture_arrays_cam1)}"
         )
     if stage.ndim != 2 or stage.shape[1] != 3:
         raise ValueError("stage_um must have shape (n, 3)")
     if not np.isfinite(stage).all():
         raise ValueError("stage_um must contain only finite values")
-    if len(image_arrays_cam0) != stage.shape[0]:
+    if len(capture_arrays_cam0) != stage.shape[0]:
         raise ValueError(
             f"image pairs and stage_um must have the same length; "
-            f"got {len(image_arrays_cam0)} and {stage.shape[0]}"
+            f"got {len(capture_arrays_cam0)} and {stage.shape[0]}"
         )
     if not np.allclose(stage[0], 0.0, rtol=0.0, atol=1e-9):
         raise ValueError("stage_um[0] must be the origin")
 
-    reference_cam0 = image_arrays_cam0[0]
-    reference_cam1 = image_arrays_cam1[0]
+    reference_cam0 = _median_capture_image(capture_arrays_cam0[0])
+    reference_cam1 = _median_capture_image(capture_arrays_cam1[0])
     shifts_cam0: list[np.ndarray] = []
     shifts_cam1: list[np.ndarray] = []
+    shift_mad_cam0: list[np.ndarray] = []
+    shift_mad_cam1: list[np.ndarray] = []
     measurement_warnings: list[tuple[tuple[str, ...], tuple[str, ...]]] = []
-    for image_cam0, image_cam1 in zip(
-        image_arrays_cam0,
-        image_arrays_cam1,
+    for captures_cam0, captures_cam1 in zip(
+        capture_arrays_cam0,
+        capture_arrays_cam1,
         strict=True,
     ):
-        shift_cam0 = estimate_shift(reference_cam0, image_cam0, **shift_kwargs)
-        shift_cam1 = estimate_shift(reference_cam1, image_cam1, **shift_kwargs)
-        shifts_cam0.append(np.asarray(shift_cam0["shift_px"].values, dtype=np.float64))
-        shifts_cam1.append(np.asarray(shift_cam1["shift_px"].values, dtype=np.float64))
-        measurement_warnings.append(
-            (
-                tuple(str(shift_cam0.attrs.get("warnings", "")).splitlines()),
-                tuple(str(shift_cam1.attrs.get("warnings", "")).splitlines()),
-            )
+        shift_cam0, mad_cam0, warnings_cam0 = _estimate_median_capture_shift(
+            reference_cam0,
+            captures_cam0,
+            **shift_kwargs,
         )
+        shift_cam1, mad_cam1, warnings_cam1 = _estimate_median_capture_shift(
+            reference_cam1,
+            captures_cam1,
+            **shift_kwargs,
+        )
+        shifts_cam0.append(shift_cam0)
+        shifts_cam1.append(shift_cam1)
+        shift_mad_cam0.append(mad_cam0)
+        shift_mad_cam1.append(mad_cam1)
+        measurement_warnings.append((tuple(warnings_cam0), tuple(warnings_cam1)))
 
     pixels = np.stack([np.vstack(shifts_cam0), np.vstack(shifts_cam1)], axis=1)
+    capture_shift_mad_px = np.stack(
+        [np.vstack(shift_mad_cam0), np.vstack(shift_mad_cam1)],
+        axis=1,
+    )
     observations = _pixels_to_observations(pixels)
 
     rank = int(np.linalg.matrix_rank(stage))
@@ -184,6 +202,16 @@ def fit_calibration_from_images(
             pixels,
             {"units": "px"},
         ),
+        "capture_shift_mad_px": (
+            ("sample", "camera", "pixel_axis"),
+            capture_shift_mad_px,
+            {
+                "units": "px",
+                "description": (
+                    "median absolute deviation of per-capture shift estimates"
+                ),
+            },
+        ),
     }
     if any(
         warning
@@ -202,8 +230,28 @@ def fit_calibration_from_images(
             ),
         )
 
-    images_cam0_stack = np.stack(image_arrays_cam0, axis=0)
-    images_cam1_stack = np.stack(image_arrays_cam1, axis=0)
+    images_cam0_stack = np.stack(
+        [
+            _representative_capture_image(captures, dtype)
+            for captures, dtype in zip(
+                capture_arrays_cam0,
+                image_dtypes_cam0,
+                strict=True,
+            )
+        ],
+        axis=0,
+    )
+    images_cam1_stack = np.stack(
+        [
+            _representative_capture_image(captures, dtype)
+            for captures, dtype in zip(
+                capture_arrays_cam1,
+                image_dtypes_cam1,
+                strict=True,
+            )
+        ],
+        axis=0,
+    )
     coords["y_cam0"] = np.arange(images_cam0_stack.shape[1], dtype=np.int64)
     coords["x_cam0"] = np.arange(images_cam0_stack.shape[2], dtype=np.int64)
     coords["y_cam1"] = np.arange(images_cam1_stack.shape[1], dtype=np.int64)
@@ -221,6 +269,7 @@ def fit_calibration_from_images(
 
     calibration_attrs = {
         "format_version": "1",
+        "capture_count": capture_count,
         "warnings": "\n".join(tuple(warnings)),
     }
 
@@ -262,30 +311,65 @@ def get_correction(
 ) -> xr.Dataset:
     """Estimate two-camera image shift and return calibrated motor correction."""
 
-    shift_cam0 = estimate_shift(reference_cam0, current_cam0, **shift_kwargs)
-    shift_cam1 = estimate_shift(reference_cam1, current_cam1, **shift_kwargs)
-    current_image_cam0 = np.asarray(current_cam0, dtype=np.float64)
-    current_image_cam1 = np.asarray(current_cam1, dtype=np.float64)
-    shift_px = np.stack(
-        [
-            np.asarray(shift_cam0["shift_px"].values, dtype=np.float64),
-            np.asarray(shift_cam1["shift_px"].values, dtype=np.float64),
-        ],
-        axis=0,
+    reference_image_cam0 = _as_reference_image("reference_cam0", reference_cam0)
+    reference_image_cam1 = _as_reference_image("reference_cam1", reference_cam1)
+    current_captures_cam0, current_dtypes_cam0 = _as_capture_arrays(
+        "current_cam0",
+        [current_cam0],
     )
+    current_captures_cam1, current_dtypes_cam1 = _as_capture_arrays(
+        "current_cam1",
+        [current_cam1],
+    )
+    capture_count = _common_capture_count(current_captures_cam0, current_captures_cam1)
+    current_stack_cam0 = current_captures_cam0[0]
+    current_stack_cam1 = current_captures_cam1[0]
+
+    shift_cam0, mad_cam0, warnings_cam0 = _estimate_median_capture_shift(
+        reference_image_cam0,
+        current_stack_cam0,
+        **shift_kwargs,
+    )
+    shift_cam1, mad_cam1, warnings_cam1 = _estimate_median_capture_shift(
+        reference_image_cam1,
+        current_stack_cam1,
+        **shift_kwargs,
+    )
+    current_image_cam0 = _representative_capture_image(
+        current_stack_cam0,
+        current_dtypes_cam0[0],
+    )
+    current_image_cam1 = _representative_capture_image(
+        current_stack_cam1,
+        current_dtypes_cam1[0],
+    )
+    shift_px = np.stack([shift_cam0, shift_cam1], axis=0)
+    capture_shift_mad_px = np.stack([mad_cam0, mad_cam1], axis=0)
+    if not np.isfinite(shift_px).all():
+        raise ValueError("shift_px must contain only finite values")
+    if not np.isfinite(capture_shift_mad_px).all():
+        raise ValueError("capture_shift_mad_px must contain only finite values")
+
     estimated_offset = estimate_stage_offset(calibration, shift_px)
     correction = -estimated_offset
-    shift_warnings = [
-        line
-        for line in (
-            *str(shift_cam0.attrs.get("warnings", "")).splitlines(),
-            *str(shift_cam1.attrs.get("warnings", "")).splitlines(),
-        )
-        if line
-    ]
+    shift_warnings = _format_correction_warning_lines(
+        warnings_cam0,
+        warnings_cam1,
+        capture_count,
+    )
     return xr.Dataset(
         data_vars={
             "shift_px": (("camera", "pixel_axis"), shift_px, {"units": "px"}),
+            "capture_shift_mad_px": (
+                ("camera", "pixel_axis"),
+                capture_shift_mad_px,
+                {
+                    "units": "px",
+                    "description": (
+                        "median absolute deviation of per-capture shift estimates"
+                    ),
+                },
+            ),
             "estimated_stage_offset_um": (
                 ("stage_axis",),
                 estimated_offset,
@@ -305,27 +389,180 @@ def get_correction(
             "x_cam1": np.arange(current_image_cam1.shape[1], dtype=np.int64),
         },
         attrs={
+            "capture_count": capture_count,
             "warnings": "\n".join(shift_warnings),
         },
     )
 
 
-def _as_image_arrays(name: str, images: Sequence[Any]) -> list[np.ndarray]:
-    image_arrays = [np.asarray(image, dtype=np.float64) for image in images]
-    if not image_arrays:
+def _as_reference_image(name: str, image: Any) -> np.ndarray:
+    image_array = np.asarray(image, dtype=np.float64)
+    if image_array.ndim != 2:
+        raise ValueError(f"{name} must be 2D, got {image_array.shape!r}")
+    if image_array.size == 0:
         raise ValueError(f"{name} must not be empty")
-    shape = image_arrays[0].shape
-    for index, image in enumerate(image_arrays):
-        if image.ndim != 2:
-            raise ValueError(f"{name}[{index}] must be 2D, got {image.shape!r}")
-        if image.shape != shape:
+    if not np.isfinite(image_array).all():
+        raise ValueError(f"{name} must contain only finite values")
+    return image_array
+
+
+def _as_capture_arrays(
+    name: str,
+    images: Sequence[Any],
+) -> tuple[list[np.ndarray], list[np.dtype]]:
+    image_values = [np.asarray(image) for image in images]
+    if not image_values:
+        raise ValueError(f"{name} must not be empty")
+    capture_arrays: list[np.ndarray] = []
+    image_dtypes: list[np.dtype] = []
+    first_shape: tuple[int, int] | None = None
+    first_capture_count: int | None = None
+    for index, image in enumerate(image_values):
+        if image.ndim != 3:
+            raise ValueError(f"{name}[{index}] must be 3D, got {image.shape!r}")
+        capture_array = image
+        if capture_array.shape[0] < 1:
+            raise ValueError(f"{name}[{index}] must contain at least one capture")
+        if capture_array.shape[1] == 0 or capture_array.shape[2] == 0:
+            raise ValueError(f"{name}[{index}] images must not be empty")
+        if first_capture_count is None:
+            first_capture_count = int(capture_array.shape[0])
+        elif capture_array.shape[0] != first_capture_count:
+            raise ValueError(
+                f"all capture stacks in {name} must have the same capture count; "
+                f"image 0 has {first_capture_count}, image {index} has "
+                f"{capture_array.shape[0]}"
+            )
+        image_shape = tuple(capture_array.shape[1:])
+        if first_shape is None:
+            first_shape = image_shape
+        elif image_shape != first_shape:
             raise ValueError(
                 f"all images in {name} must have the same shape; "
-                f"image 0 has {shape!r}, image {index} has {image.shape!r}"
+                f"image 0 has {first_shape!r}, image {index} has {image_shape!r}"
             )
-        if not np.isfinite(image).all():
+        try:
+            capture_float = np.asarray(capture_array, dtype=np.float64)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{name}[{index}] must be numeric") from exc
+        if not np.isfinite(capture_float).all():
             raise ValueError(f"{name}[{index}] must contain only finite values")
-    return image_arrays
+        capture_arrays.append(capture_float)
+        image_dtypes.append(image.dtype)
+    return capture_arrays, image_dtypes
+
+
+def _common_capture_count(
+    *capture_array_groups: Sequence[np.ndarray],
+) -> int:
+    capture_counts = [
+        int(capture_array.shape[0])
+        for capture_arrays in capture_array_groups
+        for capture_array in capture_arrays
+    ]
+    if not capture_counts:
+        raise ValueError("at least one capture stack is required")
+    capture_count = capture_counts[0]
+    if any(count != capture_count for count in capture_counts):
+        raise ValueError("all image capture stacks must have the same capture count")
+    return capture_count
+
+
+def _median_capture_image(capture_array: np.ndarray) -> np.ndarray:
+    return np.median(np.asarray(capture_array, dtype=np.float64), axis=0)
+
+
+def _representative_capture_image(
+    capture_array: np.ndarray,
+    dtype: np.dtype,
+) -> np.ndarray:
+    image = _median_capture_image(capture_array)
+    return _cast_representative_image(image, dtype)
+
+
+def _cast_representative_image(image: np.ndarray, dtype: np.dtype) -> np.ndarray:
+    if np.issubdtype(dtype, np.bool_):
+        return np.asarray(image >= 0.5, dtype=dtype)
+    if np.issubdtype(dtype, np.integer):
+        dtype_info = np.iinfo(dtype)
+        image = np.clip(np.rint(image), dtype_info.min, dtype_info.max)
+    return np.asarray(image, dtype=dtype)
+
+
+def _estimate_median_capture_shift(
+    reference: np.ndarray,
+    captures: np.ndarray,
+    **shift_kwargs: Any,
+) -> tuple[np.ndarray, np.ndarray, tuple[str, ...]]:
+    capture_count = int(captures.shape[0])
+    capture_shifts: list[np.ndarray] = []
+    warnings: list[str] = []
+    for capture_index, current in enumerate(captures):
+        try:
+            shift = estimate_shift(reference, current, **shift_kwargs)
+            shift_px = np.asarray(shift["shift_px"].values, dtype=np.float64)
+            capture_warnings = tuple(
+                line
+                for line in str(shift.attrs.get("warnings", "")).splitlines()
+                if line
+            )
+        except Exception as exc:
+            shift_px = np.array([np.nan, np.nan], dtype=np.float64)
+            capture_warnings = (f"shift estimation failed: {exc}",)
+
+        if shift_px.shape != (len(PIXEL_AXES),):
+            capture_warnings = (
+                *capture_warnings,
+                f"shift estimate has unexpected shape {shift_px.shape!r}",
+            )
+            shift_px = np.array([np.nan, np.nan], dtype=np.float64)
+        if not np.isfinite(shift_px).all():
+            capture_warnings = (
+                *capture_warnings,
+                "shift estimate is not finite",
+            )
+        capture_shifts.append(shift_px)
+        warnings.extend(
+            _format_capture_warning(line, capture_index, capture_count)
+            for line in capture_warnings
+            if line
+        )
+
+    shift_array = np.vstack(capture_shifts)
+    finite_rows = np.isfinite(shift_array).all(axis=1)
+    if not np.any(finite_rows):
+        raise ValueError("all capture shift estimates failed or were non-finite")
+    finite_shifts = shift_array[finite_rows]
+    median_shift = np.median(finite_shifts, axis=0)
+    shift_mad = np.median(np.abs(finite_shifts - median_shift), axis=0)
+    return median_shift, shift_mad, tuple(warnings)
+
+
+def _format_capture_warning(
+    warning: str,
+    capture_index: int,
+    capture_count: int,
+) -> str:
+    warning_text = str(warning).strip()
+    if not warning_text:
+        return ""
+    if capture_count == 1:
+        return warning_text
+    return f"capture {capture_index + 1}: {warning_text}"
+
+
+def _format_correction_warning_lines(
+    warnings_cam0: Sequence[str],
+    warnings_cam1: Sequence[str],
+    capture_count: int,
+) -> tuple[str, ...]:
+    if capture_count == 1:
+        return tuple(line for line in (*warnings_cam0, *warnings_cam1) if line)
+    lines = [
+        *(f"cam0 {line}" for line in warnings_cam0 if line),
+        *(f"cam1 {line}" for line in warnings_cam1 if line),
+    ]
+    return tuple(lines)
 
 
 def format_measurement_warning_lines(

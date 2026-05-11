@@ -5,7 +5,12 @@ from collections.abc import Callable
 import numpy as np
 import xarray as xr
 
-from merlin_track_position.instruments.cameras import capture_camera_pair
+from merlin_track_position.instruments.cameras import (
+    CameraPairPlugin,
+    capture_image_stack,
+    default_camera_pair,
+    normalize_capture_count,
+)
 from merlin_track_position.instruments.motors import get_positions, move_motors_and_wait
 from merlin_track_position.tracking.calibration_core import fit_calibration_from_images
 
@@ -42,17 +47,18 @@ def _make_calibration_path(
 
 
 def calibration_sample_count(n: int) -> int:
-    """Return the number of image pairs captured by ``run_calibration``."""
+    """Return the number of motor positions sampled by ``run_calibration``."""
     return int(_make_calibration_path(n, 1.0).shape[0] + 1)
 
 
 def run_calibration(
     n: int,
     step_um: float,
-    image_generator: Callable[[], tuple[np.ndarray, np.ndarray]] = capture_camera_pair,
+    camera_pair: CameraPairPlugin | None = None,
     *,
     origin_stability_um: float = 1.0,
     home_tolerance_um: float = 1.0,
+    capture_count: int = 5,
     step_callback: Callable[
         [int, float, float, float, np.ndarray, np.ndarray],
         None,
@@ -69,25 +75,32 @@ def run_calibration(
         return.
     step_um : float
         Step size in microns between adjacent grid points.
-    image_generator : Callable[[], tuple[np.ndarray, np.ndarray]]
-        Function that returns the current cam0 and cam1 images when called.
+    camera_pair : CameraPairPlugin | None
+        Camera plugin pair used to capture cam0 and cam1 images. If omitted, the
+        default framegrabber/Basler pair is used.
     origin_stability_um : float
         Warning threshold in microns for the final origin-return motor and image
         closure checks.
     home_tolerance_um : float, optional
         Tolerance in microns for returning to the home position at the end of the
         routine. Default is 1 micron.
-    step_callback : Callable[[int, float, float, float, np.ndarray, np.ndarray], None] | None, optional
-        Optional callback function that will be called after each move to a grid point,
+    capture_count : int, optional
+        Number of image pairs captured at each motor position. The per-step images are
+        aggregated during fitting. Default is 5.
+    step_callback
+        Optional callback function that will be called after each move to a grid point
         with the following arguments:
 
         - The index of the current step (0-based)
         - The x offset in microns for this step
         - The y offset in microns for this step
         - The z offset in microns for this step
-        - The cam0 image captured at this step as a 2D numpy array
-        - The cam1 image captured at this step as a 2D numpy array
+        - The representative cam0 image captured at this step as a 2D numpy array
+        - The representative cam1 image captured at this step as a 2D numpy array
     """
+    capture_count = normalize_capture_count(capture_count)
+    if camera_pair is None:
+        camera_pair = default_camera_pair()
     x0, y0, z0, polar, tilt, cam = get_positions(
         ("x", "y", "z", "p", "t", "cam")
     )
@@ -105,11 +118,18 @@ def run_calibration(
 
     def _update_step(idx, dx, dy, dz):
         actual_grid_um[idx, :] = [dx, dy, dz]
-        image_cam0, image_cam1 = image_generator()
+        image_cam0, image_cam1 = capture_image_stack(camera_pair, capture_count)
         images_cam0.append(image_cam0)
         images_cam1.append(image_cam1)
         if step_callback is not None:
-            step_callback(idx, dx, dy, dz, image_cam0, image_cam1)
+            step_callback(
+                idx,
+                dx,
+                dy,
+                dz,
+                _representative_image(image_cam0),
+                _representative_image(image_cam1),
+            )
 
     _update_step(0, 0.0, 0.0, 0.0)
     actual_grid_um[0, :] = [0.0, 0.0, 0.0]
@@ -177,3 +197,17 @@ def run_calibration(
             "tilt": tilt,
         },
     )
+
+
+def _representative_image(images: np.ndarray) -> np.ndarray:
+    representative = np.median(images, axis=0)
+    return _cast_representative_image(representative, images.dtype)
+
+
+def _cast_representative_image(image: np.ndarray, dtype: np.dtype) -> np.ndarray:
+    if np.issubdtype(dtype, np.bool_):
+        return np.asarray(image >= 0.5, dtype=dtype)
+    if np.issubdtype(dtype, np.integer):
+        dtype_info = np.iinfo(dtype)
+        image = np.clip(np.rint(image), dtype_info.min, dtype_info.max)
+    return np.asarray(image, dtype=dtype)

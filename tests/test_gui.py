@@ -85,8 +85,8 @@ class FakeCalibrationThread(QtCore.QObject):
         self.running = False
         self.started = False
 
-    def configure(self, n, step_um, image_generator, roi_metadata):
-        self.configured = (n, step_um, image_generator, roi_metadata)
+    def configure(self, n, step_um, camera_pair, roi_metadata):
+        self.configured = (n, step_um, camera_pair, roi_metadata)
 
     def isRunning(self):
         return self.running
@@ -641,17 +641,13 @@ class MainWindowGUISmokeTests(unittest.TestCase):
                 self.assertFalse(window.image_auto_refresh_checkbox.isEnabled())
                 self.assertTrue(window.image_auto_refresh_checkbox.isChecked())
 
-                n, step_um, image_generator, roi_metadata = thread.configured
+                n, step_um, camera_pair, roi_metadata = thread.configured
                 self.assertEqual(n, 2)
                 self.assertEqual(step_um, 1.0)
                 self.assertEqual(roi_metadata["roi_cam0_x"], roi_cam0[0])
                 self.assertEqual(roi_metadata["roi_cam1_x"], roi_cam1[0])
 
-                cropped_cam0, cropped_cam1 = image_generator()
-                np.testing.assert_array_equal(window._latest_images[0], fresh_cam0)
-                np.testing.assert_array_equal(window._latest_images[1], fresh_cam1)
-                _wait_for_image_item(app, window.image_items["cam0"], fresh_cam0)
-                _wait_for_image_item(app, window.image_items["cam1"], fresh_cam1)
+                cropped_cam0, cropped_cam1 = camera_pair.capture_pair()
                 np.testing.assert_array_equal(
                     cropped_cam0,
                     crop_image_to_roi(fresh_cam0, roi_cam0),

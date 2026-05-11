@@ -21,8 +21,9 @@ from merlin_track_position.constants import (
     IMAGE_WIDTH_CAM1,
 )
 from merlin_track_position.instruments.cameras import (
+    CallableCameraPlugin,
+    CameraPairPlugin,
     RoiGeometry,
-    make_cropped_camera_pair_capture,
 )
 from merlin_track_position.instruments.basler import (
     close_basler_camera,
@@ -312,8 +313,6 @@ class _MainWindowGUI(QtWidgets.QMainWindow):
 
 
 class MainWindow(_MainWindowGUI):
-    _sigCameraPairReady = QtCore.Signal(object, object)
-
     def __init__(self, parent: QtCore.QObject | None = None):
         super().__init__(parent)
 
@@ -390,7 +389,6 @@ class MainWindow(_MainWindowGUI):
             self._on_new_calibration_failed
         )
         self._calibration_thread.sigCalibrationStep.connect(self._on_calibration_step)
-        self._sigCameraPairReady.connect(self._on_camera_pair_ready)
         self.image_auto_refresh_checkbox.toggled.connect(
             self._on_image_auto_refresh_toggled
         )
@@ -442,19 +440,6 @@ class MainWindow(_MainWindowGUI):
     def _capture_cam1_image(self) -> np.ndarray:
         with self._image_capture_locks["cam1"]:
             return get_basler_image()
-
-    def _capture_images(self) -> tuple[np.ndarray, np.ndarray]:
-        images = (self._capture_cam0_image(), self._capture_cam1_image())
-        self._latest_images_by_camera["cam0"] = images[0]
-        self._latest_images_by_camera["cam1"] = images[1]
-        self._latest_images = images
-        self._sigCameraPairReady.emit(*images)
-        return images
-
-    @QtCore.Slot(object, object)
-    def _on_camera_pair_ready(self, image_cam0: object, image_cam1: object) -> None:
-        self._on_image_capture_ready("cam0", image_cam0)
-        self._on_image_capture_ready("cam1", image_cam1)
 
     @QtCore.Slot(str, object)
     def _on_image_capture_ready(self, camera: str, image: object) -> None:
@@ -572,17 +557,16 @@ class MainWindow(_MainWindowGUI):
             camera: self._get_roi_geometry(camera) for camera in CAMERA_IMAGE_SIZES
         }
         roi_metadata = _roi_metadata_from_geometries(roi_geometries)
-        image_generator = make_cropped_camera_pair_capture(
-            roi_geometries["cam0"],
-            roi_geometries["cam1"],
-            base_capture=self._capture_images,
-        )
+        camera_pair = CameraPairPlugin(
+            CallableCameraPlugin("cam0", self._capture_cam0_image),
+            CallableCameraPlugin("cam1", self._capture_cam1_image),
+        ).cropped(roi_geometries["cam0"], roi_geometries["cam1"])
         try:
             self._calibration_total_steps = calibration_sample_count(n)
             self._calibration_thread.configure(
                 n,
                 step_um,
-                image_generator,
+                camera_pair,
                 roi_metadata,
             )
         except Exception as exc:

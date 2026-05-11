@@ -7,9 +7,10 @@ from merlin_track_position import constants
 from merlin_track_position.instruments import basler
 from merlin_track_position.instruments.basler import get_basler_image
 from merlin_track_position.instruments.cameras import (
-    capture_camera_pair,
+    CallableCameraPlugin,
+    CameraPairPlugin,
+    capture_image_stack,
     crop_image_to_roi,
-    make_cropped_camera_pair_capture,
 )
 from merlin_track_position.instruments.framegrab import get_framegrabber_image
 from merlin_track_position.instruments.motors import move_motors_and_wait
@@ -294,17 +295,89 @@ class DevelopmentModeFramegrabTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "does not match constants"):
                 get_basler_image()
 
-    def test_capture_camera_pair_returns_both_images(self):
-        with patch.object(constants, "IS_DAQ_PC", False):
-            image_cam0, image_cam1 = capture_camera_pair()
+    def test_capture_image_stack_discards_repeated_fresh_camera_frames(self):
+        stale_cam0 = np.zeros((2, 3), dtype=np.uint16)
+        fresh_cam0 = stale_cam0 + 1
+        cam1 = np.ones((3, 4), dtype=np.uint16)
+        cam0_captures = [stale_cam0, stale_cam0, fresh_cam0]
+        cam1_captures = [cam1, cam1 + 2]
 
-        self.assertEqual(
-            image_cam0.shape,
-            (constants.IMAGE_HEIGHT_CAM0, constants.IMAGE_WIDTH_CAM0),
+        def capture_cam0():
+            return cam0_captures.pop(0)
+
+        def capture_cam1():
+            return cam1_captures.pop(0)
+
+        camera_pair = CameraPairPlugin(
+            CallableCameraPlugin("cam0", capture_cam0, fresh_frame_timeout_s=1.0),
+            CallableCameraPlugin("cam1", capture_cam1, fresh_frame_timeout_s=1.0),
         )
-        self.assertEqual(
-            image_cam1.shape,
-            (constants.IMAGE_HEIGHT_CAM1, constants.IMAGE_WIDTH_CAM1),
+        with patch("merlin_track_position.instruments.cameras.time.sleep") as sleep:
+            stack_cam0, stack_cam1 = capture_image_stack(camera_pair, 2)
+
+        self.assertEqual(len(cam0_captures), 0)
+        self.assertEqual(len(cam1_captures), 0)
+        sleep.assert_called_once()
+        np.testing.assert_array_equal(stack_cam0, np.stack([stale_cam0, fresh_cam0]))
+        np.testing.assert_array_equal(stack_cam1, np.stack([cam1, cam1 + 2]))
+
+    def test_capture_image_stack_rejects_empty_camera_list(self):
+        with self.assertRaisesRegex(ValueError, "at least one camera plugin"):
+            capture_image_stack((), 1)
+
+    def test_capture_image_stack_times_out_on_repeated_fresh_camera_frame(self):
+        image_cam0 = np.zeros((2, 3), dtype=np.uint16)
+        image_cam1 = np.ones((3, 4), dtype=np.uint16)
+        capture_count = {"cam0": 0, "cam1": 0}
+
+        def capture_cam0():
+            capture_count["cam0"] += 1
+            return image_cam0
+
+        def capture_cam1():
+            capture_count["cam1"] += 1
+            return image_cam1
+
+        camera_pair = CameraPairPlugin(
+            CallableCameraPlugin("cam0", capture_cam0, fresh_frame_timeout_s=0.0),
+            CallableCameraPlugin("cam1", capture_cam1, fresh_frame_timeout_s=0.0),
+        )
+        with self.assertRaisesRegex(TimeoutError, "cam0"):
+            capture_image_stack(camera_pair, 2)
+        self.assertEqual(capture_count["cam0"], 2)
+        self.assertEqual(capture_count["cam1"], 1)
+
+    def test_capture_image_stack_works_with_cropped_camera_callables(self):
+        stale_cam0 = np.arange(4 * 5).reshape(4, 5)
+        fresh_cam0 = stale_cam0 + 100
+        image_cam1_a = np.arange(6 * 7).reshape(6, 7)
+        image_cam1_b = image_cam1_a + 100
+        cam0_captures = [stale_cam0, stale_cam0, fresh_cam0]
+        cam1_captures = [image_cam1_a, image_cam1_b]
+
+        def capture_cam0():
+            return cam0_captures.pop(0)
+
+        def capture_cam1():
+            return cam1_captures.pop(0)
+
+        camera_pair = CameraPairPlugin(
+            CallableCameraPlugin("cam0", capture_cam0, fresh_frame_timeout_s=1.0),
+            CallableCameraPlugin("cam1", capture_cam1, fresh_frame_timeout_s=1.0),
+        ).cropped((1.0, 1.0, 3.0, 2.0), (2.0, 3.0, 2.0, 2.0))
+
+        with patch("merlin_track_position.instruments.cameras.time.sleep"):
+            stack_cam0, stack_cam1 = capture_image_stack(camera_pair, 2)
+
+        self.assertEqual(len(cam0_captures), 0)
+        self.assertEqual(len(cam1_captures), 0)
+        np.testing.assert_array_equal(
+            stack_cam0,
+            np.stack([stale_cam0[1:3, 1:4], fresh_cam0[1:3, 1:4]]),
+        )
+        np.testing.assert_array_equal(
+            stack_cam1,
+            np.stack([image_cam1_a[3:5, 2:4], image_cam1_b[3:5, 2:4]]),
         )
 
     def test_crop_image_to_roi_uses_integer_boundaries(self):
@@ -336,20 +409,16 @@ class DevelopmentModeFramegrabTests(unittest.TestCase):
 
         np.testing.assert_array_equal(cropped, image[4:5, 3:4])
 
-    def test_make_cropped_camera_pair_capture_wraps_base_capture(self):
+    def test_cropped_camera_pair_plugin_wraps_base_cameras(self):
         image_cam0 = np.arange(4 * 5).reshape(4, 5)
         image_cam1 = np.arange(6 * 7).reshape(6, 7)
 
-        def base_capture():
-            return image_cam0, image_cam1
+        camera_pair = CameraPairPlugin(
+            CallableCameraPlugin("cam0", lambda: image_cam0),
+            CallableCameraPlugin("cam1", lambda: image_cam1),
+        ).cropped((1.0, 1.0, 3.0, 2.0), (2.0, 3.0, 2.0, 2.0))
 
-        capture = make_cropped_camera_pair_capture(
-            (1.0, 1.0, 3.0, 2.0),
-            (2.0, 3.0, 2.0, 2.0),
-            base_capture=base_capture,
-        )
-
-        cropped_cam0, cropped_cam1 = capture()
+        cropped_cam0, cropped_cam1 = camera_pair.capture_pair()
 
         np.testing.assert_array_equal(cropped_cam0, image_cam0[1:3, 1:4])
         np.testing.assert_array_equal(cropped_cam1, image_cam1[3:5, 2:4])
