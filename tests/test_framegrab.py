@@ -5,7 +5,7 @@ import numpy as np
 
 from merlin_track_position import constants
 from merlin_track_position.instruments import basler
-from merlin_track_position.instruments.basler import CameraConfiguration, get_basler_image
+from merlin_track_position.instruments.basler import get_basler_image
 from merlin_track_position.instruments.cameras import (
     capture_camera_pair,
     crop_image_to_roi,
@@ -99,7 +99,7 @@ class DevelopmentModeFramegrabTests(unittest.TestCase):
             "merlin_track_position.instruments.basler.genicam.IsWritable",
             lambda node: node.writable,
         ):
-            CameraConfiguration().OnOpened(camera)
+            basler._configure_camera(camera)
 
         self.assertEqual(camera.UserSetSelector.Value, "Default")
         self.assertTrue(camera.UserSetLoad.executed)
@@ -111,14 +111,6 @@ class DevelopmentModeFramegrabTests(unittest.TestCase):
         self.assertEqual(camera.Width.Value, constants.IMAGE_WIDTH_CAM1)
         self.assertEqual(camera.Height.Value, constants.IMAGE_HEIGHT_CAM1)
         self.assertEqual(camera.PixelFormat.Value, "Mono10")
-
-    def test_basler_configuration_close_callbacks_are_noops(self):
-        configuration = CameraConfiguration()
-
-        configuration.OnClose()
-        configuration.OnClose(object())
-        configuration.OnClosed()
-        configuration.OnClosed(object())
 
     def test_daq_mode_basler_image_accepts_expected_shape(self):
         raw = np.arange(6, dtype=np.uint16).reshape(2, 3)

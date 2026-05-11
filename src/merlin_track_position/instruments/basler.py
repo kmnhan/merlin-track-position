@@ -14,70 +14,59 @@ from merlin_track_position.instruments.simulated_hardware import simulator
 logger = logging.getLogger("merlin_track_position.instruments.basler")
 
 
-class CameraConfiguration(pylon.ConfigurationEventHandler):
-    def OnClose(self, *_args):
-        pass
+def _configure_camera(camera: pylon.InstantCamera) -> None:
+    try:
+        if not genicam.IsWritable(camera.UserSetSelector):
+            raise genicam.RuntimeException("UserSetSelector is not writable")
+        camera.UserSetSelector.Value = "Default"
 
-    def OnClosed(self, *_args):
-        pass
+        if not genicam.IsWritable(camera.UserSetLoad):
+            raise genicam.RuntimeException("UserSetLoad is not executable")
+        camera.UserSetLoad.Execute()
 
-    def OnOpened(self, camera):
-        try:
-            if not genicam.IsWritable(camera.UserSetSelector):
-                raise genicam.RuntimeException("UserSetSelector is not writable")
-            camera.UserSetSelector.Value = "Default"
+        # # Flip image.
+        # if genicam.IsWritable(camera.ReverseX):
+        #     camera.ReverseX.Value = True
+        # if genicam.IsWritable(camera.ReverseY):
+        #     camera.ReverseY.Value = False
 
-            if not genicam.IsWritable(camera.UserSetLoad):
-                raise genicam.RuntimeException("UserSetLoad is not executable")
-            camera.UserSetLoad.Execute()
+        if genicam.IsWritable(camera.GainAuto):
+            logger.debug("Disabling automatic gain control.")
+            camera.GainAuto.Value = "Off"
 
-            # # Flip image.
-            # if genicam.IsWritable(camera.ReverseX):
-            #     camera.ReverseX.Value = True
-            # if genicam.IsWritable(camera.ReverseY):
-            #     camera.ReverseY.Value = False
+        if genicam.IsWritable(camera.GammaSelector):
+            logger.debug("Setting gamma selector to sRGB.")
+            camera.GammaSelector.Value = "sRGB"
 
-            if genicam.IsWritable(camera.GainAuto):
-                logger.debug("Disabling automatic gain control.")
-                camera.GainAuto.Value = "Off"
+        if genicam.IsWritable(camera.ExposureAuto):
+            logger.debug("Disabling automatic exposure control.")
+            camera.ExposureAuto.Value = "Off"
+        logger.debug("Setting exposure time.")
+        if not genicam.IsWritable(camera.ExposureTime):
+            raise genicam.RuntimeException("ExposureTime is not writable")
+        camera.ExposureTime.Value = constants.BASLER_EXPOSURE_US
 
-            if genicam.IsWritable(camera.GammaSelector):
-                logger.debug("Setting gamma selector to sRGB.")
-                camera.GammaSelector.Value = "sRGB"
+        if genicam.IsWritable(camera.GammaEnable):
+            logger.debug("Enabling gamma correction.")
+            camera.GammaEnable.Value = True
 
-            if genicam.IsWritable(camera.ExposureAuto):
-                logger.debug("Disabling automatic exposure control.")
-                camera.ExposureAuto.Value = "Off"
-            logger.debug("Setting exposure time.")
-            if not genicam.IsWritable(camera.ExposureTime):
-                raise genicam.RuntimeException("ExposureTime is not writable")
-            camera.ExposureTime.Value = constants.BASLER_EXPOSURE_US
+        for node, value, name in (
+            (camera.OffsetX, int(camera.OffsetX.Min), "OffsetX"),
+            (camera.OffsetY, int(camera.OffsetY.Min), "OffsetY"),
+            (camera.Width, constants.IMAGE_WIDTH_CAM1, "Width"),
+            (camera.Height, constants.IMAGE_HEIGHT_CAM1, "Height"),
+        ):
+            if not genicam.IsWritable(node):
+                raise genicam.RuntimeException(f"{name} is not writable")
+            node.Value = value
 
-            if genicam.IsWritable(camera.GammaEnable):
-                logger.debug("Enabling gamma correction.")
-                camera.GammaEnable.Value = True
+        # Set the pixel data format.
+        if not genicam.IsWritable(camera.PixelFormat):
+            raise genicam.RuntimeException("PixelFormat is not writable")
+        camera.PixelFormat.Value = "Mono10"
 
-            for node, value, name in (
-                (camera.OffsetX, int(camera.OffsetX.Min), "OffsetX"),
-                (camera.OffsetY, int(camera.OffsetY.Min), "OffsetY"),
-                (camera.Width, constants.IMAGE_WIDTH_CAM1, "Width"),
-                (camera.Height, constants.IMAGE_HEIGHT_CAM1, "Height"),
-            ):
-                if not genicam.IsWritable(node):
-                    raise genicam.RuntimeException(f"{name} is not writable")
-                node.Value = value
-
-            # Set the pixel data format.
-            if not genicam.IsWritable(camera.PixelFormat):
-                raise genicam.RuntimeException("PixelFormat is not writable")
-            camera.PixelFormat.Value = "Mono10"
-
-        except genicam.GenericException as e:
-            raise genicam.RuntimeException(
-                "Could not apply configuration. "
-                "GenICam::GenericException caught in OnOpened method: "
-                f"{e}"
-            ) from e
+    except genicam.GenericException as e:
+        raise genicam.RuntimeException(f"Could not apply configuration: {e}") from e
 
 
 def _get_camera_by_serial_number(serial_number: str) -> pylon.InstantCamera:
@@ -94,12 +83,10 @@ def _get_camera_by_serial_number(serial_number: str) -> pylon.InstantCamera:
 
 def _grab_single_image():
     camera = _get_camera_by_serial_number(constants.BASLER_CAMERA_SERIAL)
-    camera.RegisterConfiguration(
-        CameraConfiguration(), pylon.RegistrationMode_Append, pylon.Cleanup_Delete
-    )
     camera.Open()
 
     try:
+        _configure_camera(camera)
         camera.StartGrabbingMax(1, pylon.GrabStrategy_LatestImageOnly)
         grab_result = camera.RetrieveResult(5000, pylon.TimeoutHandling_ThrowException)
         try:
