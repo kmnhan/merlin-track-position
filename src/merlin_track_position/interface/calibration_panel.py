@@ -9,9 +9,11 @@ from qtpy import QtCore, QtWidgets
 
 from merlin_track_position.tracking.calibration_core import (
     CAMERAS,
+    MEASUREMENT_WARNING_SUMMARY,
     OBSERVATION_AXES,
     PIXEL_AXES,
     STAGE_AXES,
+    format_measurement_warning_lines,
 )
 
 RESIDUAL_PROJECTIONS: tuple[tuple[str, str, int, int], ...] = (
@@ -213,11 +215,20 @@ def _calibration_summary(dataset: xr.Dataset) -> dict[str, object]:
     condition_number = np.asarray(
         dataset["condition_number"].values, dtype=float
     ).reshape(-1)[0]
-    warnings = tuple(
+    warning_lines = [
         line.strip()
         for line in str(dataset.attrs.get("warnings", "")).splitlines()
         if line.strip()
-    )
+    ]
+    measurement_warning_lines = _measurement_warning_lines(dataset)
+    if measurement_warning_lines:
+        warning_lines = [
+            line
+            for line in warning_lines
+            if line != MEASUREMENT_WARNING_SUMMARY
+        ]
+        warning_lines.extend(measurement_warning_lines)
+    warnings = tuple(dict.fromkeys(warning_lines))
 
     repeatability: dict[str, float | int] | None = None
     if all(
@@ -262,6 +273,29 @@ def _calibration_summary(dataset: xr.Dataset) -> dict[str, object]:
         "warnings": warnings,
         "repeatability": repeatability,
     }
+
+
+def _measurement_warning_lines(dataset: xr.Dataset) -> tuple[str, ...]:
+    if "measurement_warnings" not in dataset:
+        return ()
+
+    stage = np.asarray(dataset["stage_um"].values, dtype=float)
+    warning_values = np.asarray(dataset["measurement_warnings"].values, dtype=str)
+    if warning_values.shape != (stage.shape[0], len(CAMERAS)):
+        return ()
+
+    measurement_warnings = tuple(
+        tuple(
+            tuple(
+                line.strip()
+                for line in str(warning_values[sample_index, camera_index]).splitlines()
+                if line.strip()
+            )
+            for camera_index in range(len(CAMERAS))
+        )
+        for sample_index in range(stage.shape[0])
+    )
+    return format_measurement_warning_lines(measurement_warnings, stage)
 
 
 class CalibrationPanel(QtWidgets.QWidget):

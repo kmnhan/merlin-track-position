@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import xarray as xr
@@ -126,6 +127,61 @@ class CalibrationTests(unittest.TestCase):
             estimate_stage_offset(calibration, shift),
             [30.0, 0.0, 0.0],
             atol=1.0,
+        )
+
+    def test_fit_calibration_reports_measurement_warning_step_and_camera(self):
+        stage_to_pixel = stereo_stage_to_pixel()
+        stage = calibration_stage()
+        image = np.zeros((16, 16), dtype=float)
+        images = [image for _ in range(stage.shape[0])]
+        call_count = 0
+
+        def fake_estimate_shift(reference, current, **kwargs):
+            del reference, current, kwargs
+            nonlocal call_count
+            sample_index, camera_index = divmod(call_count, len(CAMERAS))
+            call_count += 1
+            warnings = ""
+            if sample_index == 2 and camera_index == 1:
+                warnings = "low texture\nregistration error is not finite"
+            return xr.Dataset(
+                data_vars={
+                    "shift_px": (
+                        ("pixel_axis",),
+                        stage_to_pixel[camera_index] @ stage[sample_index],
+                    ),
+                },
+                coords={"pixel_axis": list(PIXEL_AXES)},
+                attrs={"warnings": warnings},
+            )
+
+        with patch(
+            "merlin_track_position.tracking.calibration_core.estimate_shift",
+            side_effect=fake_estimate_shift,
+        ):
+            calibration = fit_calibration_from_images(
+                images,
+                images,
+                stage,
+                origin_stability_um=ORIGIN_STABILITY_UM,
+                check_tiles=False,
+                clip_percentiles=None,
+            )
+
+        warning_lines = calibration.attrs["warnings"].splitlines()
+        self.assertEqual(call_count, stage.shape[0] * len(CAMERAS))
+        self.assertIn(
+            "step 3 (x=-30, y=0, z=0 um), cam1: low texture",
+            warning_lines,
+        )
+        self.assertIn(
+            "step 3 (x=-30, y=0, z=0 um), cam1: registration error is not finite",
+            warning_lines,
+        )
+        self.assertNotIn("one or more shift measurements", calibration.attrs["warnings"])
+        self.assertEqual(
+            calibration["measurement_warnings"].values[2, 1],
+            "low texture\nregistration error is not finite",
         )
 
     def test_h5_roundtrip_preserves_stereo_schema(self):

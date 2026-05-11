@@ -15,6 +15,9 @@ PIXEL_AXES = ("du_px", "dv_px")
 OBSERVATION_AXES = tuple(
     f"{camera}_{pixel_axis}" for camera in CAMERAS for pixel_axis in PIXEL_AXES
 )
+MEASUREMENT_WARNING_SUMMARY = (
+    "one or more shift measurements reported image-matching warnings"
+)
 
 
 def fit_calibration_from_images(
@@ -170,13 +173,9 @@ def fit_calibration_from_images(
         measurement_warnings,
         stage.shape[0],
     )
-    if any(
-        any(camera_warnings for camera_warnings in sample_warnings)
-        for sample_warnings in measurement_warnings_tuple
-    ):
-        warnings.append(
-            "one or more shift measurements reported image-matching warnings"
-        )
+    warnings.extend(
+        format_measurement_warning_lines(measurement_warnings_tuple, stage)
+    )
 
     sample_count = stage.shape[0]
     coords: dict[str, Any] = {
@@ -467,6 +466,42 @@ def _as_image_arrays(name: str, images: Sequence[Any]) -> list[np.ndarray]:
         if not np.isfinite(image).all():
             raise ValueError(f"{name}[{index}] must contain only finite values")
     return image_arrays
+
+
+def format_measurement_warning_lines(
+    measurement_warnings: Sequence[Sequence[Sequence[str]]] | None,
+    stage_um: Sequence[Sequence[float]],
+) -> tuple[str, ...]:
+    """Return display-ready per-step image matching warning lines."""
+    stage = np.asarray(stage_um, dtype=np.float64)
+    if stage.ndim != 2 or stage.shape[1] != len(STAGE_AXES):
+        raise ValueError("stage_um must have shape (sample, 3)")
+
+    warning_rows = _pad_warnings(measurement_warnings, stage.shape[0])
+    lines: list[str] = []
+    for sample_index, sample_warnings in enumerate(warning_rows):
+        stage_text = _format_stage_warning_context(stage[sample_index])
+        for camera, camera_warnings in zip(CAMERAS, sample_warnings, strict=True):
+            for warning in camera_warnings:
+                warning_text = str(warning).strip()
+                if warning_text:
+                    lines.append(
+                        f"step {sample_index + 1} ({stage_text}), "
+                        f"{camera}: {warning_text}"
+                    )
+    return tuple(lines)
+
+
+def _format_stage_warning_context(stage_row: np.ndarray) -> str:
+    axis_values = ", ".join(
+        f"{axis.removesuffix('_um')}={_format_warning_number(value)}"
+        for axis, value in zip(STAGE_AXES, stage_row, strict=True)
+    )
+    return f"{axis_values} um"
+
+
+def _format_warning_number(value: float) -> str:
+    return f"{float(value):.4g}"
 
 
 def _pixels_to_observations(pixels: np.ndarray) -> np.ndarray:

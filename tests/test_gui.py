@@ -31,6 +31,7 @@ from merlin_track_position.interface.main_window import (
 )
 from merlin_track_position.tracking.calibration_core import (
     CAMERAS,
+    MEASUREMENT_WARNING_SUMMARY,
     OBSERVATION_AXES,
     PIXEL_AXES,
     STAGE_AXES,
@@ -596,6 +597,57 @@ class CalibrationPanelSmokeTests(unittest.TestCase):
             )
             for residual_plot in panel.residual_plots.values():
                 self.assertIsInstance(residual_plot, pg.PlotItem)
+        finally:
+            panel.close()
+            app.processEvents()
+
+    def test_show_loaded_calibration_expands_measurement_warning_details(self):
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        panel = CalibrationPanel()
+        try:
+            stage_to_pixel = np.array(
+                [
+                    [[0.5, -0.1, 0.2], [0.2, 0.4, -0.1]],
+                    [[-0.3, 0.2, 0.4], [0.1, -0.2, 0.3]],
+                ]
+            )
+            stage = np.array(
+                [
+                    [0.0, 0.0, 0.0],
+                    [20.0, 0.0, 0.0],
+                    [0.0, 20.0, 0.0],
+                    [0.0, 0.0, 20.0],
+                ]
+            )
+            calibration = _synthetic_calibration(stage, stage_to_pixel)
+            measurement_warnings = np.full(
+                (stage.shape[0], len(CAMERAS)),
+                "",
+                dtype=object,
+            )
+            measurement_warnings[2, 1] = (
+                "low texture\nregistration error is not finite"
+            )
+            calibration = calibration.assign(
+                measurement_warnings=(
+                    ("sample", "camera"),
+                    measurement_warnings,
+                )
+            ).assign_attrs(warnings=MEASUREMENT_WARNING_SUMMARY)
+
+            panel.show_loaded_calibration(calibration, "calibration.h5")
+
+            warnings_text = panel.calibration_warnings_text.toPlainText()
+            self.assertNotIn(MEASUREMENT_WARNING_SUMMARY, warnings_text)
+            self.assertIn(
+                "step 3 (x=0, y=20, z=0 um), cam1: low texture",
+                warnings_text,
+            )
+            self.assertIn(
+                "step 3 (x=0, y=20, z=0 um), "
+                "cam1: registration error is not finite",
+                warnings_text,
+            )
         finally:
             panel.close()
             app.processEvents()
