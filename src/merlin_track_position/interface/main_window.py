@@ -22,6 +22,7 @@ from merlin_track_position.constants import (
 )
 from merlin_track_position.instruments.cameras import (
     RoiGeometry,
+    capture_camera_pair,
     make_cropped_camera_pair_capture,
 )
 from merlin_track_position.instruments.basler import get_basler_image
@@ -417,7 +418,7 @@ class MainWindow(_MainWindowGUI):
 
     def _capture_images(self) -> tuple[np.ndarray, np.ndarray]:
         with self._image_capture_lock:
-            images = (get_framegrabber_image(), get_basler_image())
+            images = capture_camera_pair(get_framegrabber_image, get_basler_image)
             self._latest_images = images
             return images
 
