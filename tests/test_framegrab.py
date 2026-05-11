@@ -1,4 +1,3 @@
-import threading
 import unittest
 from unittest.mock import patch
 
@@ -152,30 +151,6 @@ class DevelopmentModeFramegrabTests(unittest.TestCase):
             image_cam1.shape,
             (constants.IMAGE_HEIGHT_CAM1, constants.IMAGE_WIDTH_CAM1),
         )
-
-    def test_capture_camera_pair_runs_camera_acquisitions_concurrently(self):
-        image_cam0 = np.array([[1.0]])
-        image_cam1 = np.array([[2.0]])
-        cam0_started = threading.Event()
-        cam1_started = threading.Event()
-
-        def capture_cam0():
-            cam0_started.set()
-            self.assertTrue(cam1_started.wait(timeout=1.0))
-            return image_cam0
-
-        def capture_cam1():
-            self.assertTrue(cam0_started.wait(timeout=1.0))
-            cam1_started.set()
-            return image_cam1
-
-        captured_cam0, captured_cam1 = capture_camera_pair(
-            capture_cam0,
-            capture_cam1,
-        )
-
-        np.testing.assert_array_equal(captured_cam0, image_cam0)
-        np.testing.assert_array_equal(captured_cam1, image_cam1)
 
     def test_crop_image_to_roi_uses_integer_boundaries(self):
         image = np.arange(5 * 6).reshape(5, 6)

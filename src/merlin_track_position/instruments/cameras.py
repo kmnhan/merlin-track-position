@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import numpy.typing as npt
@@ -13,26 +12,11 @@ from merlin_track_position.instruments.basler import get_basler_image
 from merlin_track_position.instruments.framegrab import get_framegrabber_image
 
 RoiGeometry = tuple[float, float, float, float]
-CameraCapture = Callable[[], npt.NDArray]
 
 
-def capture_camera_pair(
-    cam0_capture: CameraCapture | None = None,
-    cam1_capture: CameraCapture | None = None,
-) -> tuple[npt.NDArray, npt.NDArray]:
+def capture_camera_pair() -> tuple[npt.NDArray, npt.NDArray]:
     """Capture the current cam0 and cam1 images."""
-    if cam0_capture is None:
-        cam0_capture = get_framegrabber_image
-    if cam1_capture is None:
-        cam1_capture = get_basler_image
-
-    with ThreadPoolExecutor(
-        max_workers=2,
-        thread_name_prefix="camera-capture",
-    ) as pool:
-        image_cam0 = pool.submit(cam0_capture)
-        image_cam1 = pool.submit(cam1_capture)
-        return image_cam0.result(), image_cam1.result()
+    return get_framegrabber_image(), get_basler_image()
 
 
 def crop_image_to_roi(

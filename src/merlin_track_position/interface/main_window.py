@@ -22,7 +22,6 @@ from merlin_track_position.constants import (
 )
 from merlin_track_position.instruments.cameras import (
     RoiGeometry,
-    capture_camera_pair,
     make_cropped_camera_pair_capture,
 )
 from merlin_track_position.instruments.basler import get_basler_image
@@ -171,17 +170,19 @@ class CalibrationStartDialog(QtWidgets.QDialog):
         return int(self.n_spin.value()), float(self.step_um_spin.value())
 
 
-class _ImageRefreshThread(QtCore.QThread):
-    sigImagesReady = QtCore.Signal(object)
-    sigImageCaptureFailed = QtCore.Signal(str)
+class _ImageCaptureThread(QtCore.QThread):
+    sigImageReady = QtCore.Signal(str, object)
+    sigImageCaptureFailed = QtCore.Signal(str, str)
 
     def __init__(
         self,
-        image_capture: Callable[[], tuple[np.ndarray, np.ndarray]],
+        camera: str,
+        image_capture: Callable[[], np.ndarray],
         interval_ms: int,
         parent: QtCore.QObject | None = None,
     ):
         super().__init__(parent)
+        self.camera = str(camera)
         self._image_capture = image_capture
         self.interval_ms = int(interval_ms)
         self._running = threading.Event()
@@ -209,11 +210,11 @@ class _ImageRefreshThread(QtCore.QThread):
 
                 self._wake.clear()
                 try:
-                    images = self._image_capture()
+                    image = self._image_capture()
                 except Exception as exc:
-                    self.sigImageCaptureFailed.emit(str(exc))
+                    self.sigImageCaptureFailed.emit(self.camera, str(exc))
                 else:
-                    self.sigImagesReady.emit(images)
+                    self.sigImageReady.emit(self.camera, image)
 
                 self._wake.wait(self.interval_ms / 1000.0)
                 self._wake.clear()
@@ -318,18 +319,30 @@ class MainWindow(_MainWindowGUI):
         self._calibration_total_steps = 0
         self._calibration_started_at: float | None = None
         self._latest_images: tuple[np.ndarray, np.ndarray] | None = None
-        self._image_capture_lock = threading.Lock()
-        self._image_refresh_thread = _ImageRefreshThread(
-            self._capture_images,
-            IMAGE_REFRESH_INTERVAL_MS,
-            self,
-        )
-        self._image_refresh_thread.sigImagesReady.connect(self._on_image_capture_ready)
-        self._image_refresh_thread.sigImageCaptureFailed.connect(
-            self._on_image_capture_failed
-        )
+        self._latest_images_by_camera: dict[str, np.ndarray] = {}
+        self._image_capture_locks = {
+            "cam0": threading.Lock(),
+            "cam1": threading.Lock(),
+        }
+        self._image_refresh_threads = {
+            "cam0": _ImageCaptureThread(
+                "cam0",
+                self._capture_cam0_image,
+                IMAGE_REFRESH_INTERVAL_MS,
+                self,
+            ),
+            "cam1": _ImageCaptureThread(
+                "cam1",
+                self._capture_cam1_image,
+                IMAGE_REFRESH_INTERVAL_MS,
+                self,
+            ),
+        }
+        for thread in self._image_refresh_threads.values():
+            thread.sigImageReady.connect(self._on_image_capture_ready)
+            thread.sigImageCaptureFailed.connect(self._on_image_capture_failed)
+            thread.start()
         self._image_auto_refresh_checked_before_calibration: bool | None = None
-        self._image_refresh_thread.start()
 
         for camera, (image_width, image_height) in CAMERA_IMAGE_SIZES.items():
             default_roi_geometry = _default_roi_geometry(image_width, image_height)
@@ -416,32 +429,52 @@ class MainWindow(_MainWindowGUI):
         self._set_roi_geometry(camera, geometry)
         self._persist_roi_geometry(camera, geometry)
 
+    def _capture_cam0_image(self) -> np.ndarray:
+        with self._image_capture_locks["cam0"]:
+            return get_framegrabber_image()
+
+    def _capture_cam1_image(self) -> np.ndarray:
+        with self._image_capture_locks["cam1"]:
+            return get_basler_image()
+
     def _capture_images(self) -> tuple[np.ndarray, np.ndarray]:
-        with self._image_capture_lock:
-            images = capture_camera_pair(get_framegrabber_image, get_basler_image)
-            self._latest_images = images
-            return images
+        images = (self._capture_cam0_image(), self._capture_cam1_image())
+        self._latest_images_by_camera["cam0"] = images[0]
+        self._latest_images_by_camera["cam1"] = images[1]
+        self._latest_images = images
+        return images
 
-    @QtCore.Slot(object)
-    def _on_image_capture_ready(self, images: object) -> None:
-        image_cam0, image_cam1 = images
-        self._latest_images = (image_cam0, image_cam1)
-        self.image_items["cam0"].setImage(image_cam0)
-        self.image_items["cam1"].setImage(image_cam1)
+    @QtCore.Slot(str, object)
+    def _on_image_capture_ready(self, camera: str, image: object) -> None:
+        if camera not in self.image_items:
+            logger.warning("Image refresh returned unknown camera %s", camera)
+            return
 
-    @QtCore.Slot(str)
-    def _on_image_capture_failed(self, error_message: str) -> None:
-        logger.warning("Image refresh failed: %s", error_message)
+        self._latest_images_by_camera[camera] = image
+        if {"cam0", "cam1"}.issubset(self._latest_images_by_camera):
+            self._latest_images = (
+                self._latest_images_by_camera["cam0"],
+                self._latest_images_by_camera["cam1"],
+            )
+        self.image_items[camera].setImage(image)
+
+    @QtCore.Slot(str, str)
+    def _on_image_capture_failed(self, camera: str, error_message: str) -> None:
+        logger.warning("Image refresh failed for %s: %s", camera, error_message)
 
     @QtCore.Slot(bool)
     def _on_image_auto_refresh_toggled(self, enabled: bool) -> None:
-        self._image_refresh_thread.set_enabled(enabled)
+        self._set_image_refresh_enabled(enabled)
+
+    def _set_image_refresh_enabled(self, enabled: bool) -> None:
+        for thread in self._image_refresh_threads.values():
+            thread.set_enabled(enabled)
 
     def _pause_image_auto_refresh_for_calibration(self) -> None:
         self._image_auto_refresh_checked_before_calibration = (
             self.image_auto_refresh_checkbox.isChecked()
         )
-        self._image_refresh_thread.set_enabled(False)
+        self._set_image_refresh_enabled(False)
         self.image_auto_refresh_checkbox.setEnabled(False)
 
     def _restore_image_auto_refresh_after_calibration(self) -> None:
@@ -455,7 +488,7 @@ class MainWindow(_MainWindowGUI):
         self.image_auto_refresh_checkbox.blockSignals(was_blocked)
         self.image_auto_refresh_checkbox.setEnabled(True)
 
-        self._image_refresh_thread.set_enabled(restore_checked)
+        self._set_image_refresh_enabled(restore_checked)
 
     @QtCore.Slot()
     def _on_load_calibration_clicked(self) -> None:
@@ -691,8 +724,10 @@ class MainWindow(_MainWindowGUI):
         return True
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
-        self._image_refresh_thread.stop()
-        self._image_refresh_thread.wait()
+        for thread in self._image_refresh_threads.values():
+            thread.stop()
+        for thread in self._image_refresh_threads.values():
+            thread.wait()
 
         self._calibration_thread.stop()
         self._calibration_thread.wait()

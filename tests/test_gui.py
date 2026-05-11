@@ -1,5 +1,6 @@
 import math
 import os
+import threading
 import time
 import unittest
 from unittest.mock import Mock, patch
@@ -190,6 +191,23 @@ def _wait_for_capture_count(app, get_cam0, get_cam1, expected_count):
         app.processEvents()
         QtCore.QThread.msleep(10)
     app.processEvents()
+    app.processEvents()
+
+
+def _image_refresh_threads_enabled(window):
+    return {
+        camera: thread.is_enabled()
+        for camera, thread in window._image_refresh_threads.items()
+    }
+
+
+def _wait_for_image_item(app, image_item, expected_image):
+    deadline = time.monotonic() + 2.0
+    while not np.array_equal(image_item.image, expected_image):
+        if time.monotonic() > deadline:
+            raise AssertionError("timed out waiting for image item update")
+        app.processEvents()
+        QtCore.QThread.msleep(10)
     app.processEvents()
 
 
@@ -429,11 +447,13 @@ class MainWindowGUISmokeTests(unittest.TestCase):
         ):
             window = MainWindow()
             try:
+                self.assertEqual(set(window._image_refresh_threads), {"cam0", "cam1"})
+                for thread in window._image_refresh_threads.values():
+                    self.assertEqual(thread.interval_ms, IMAGE_REFRESH_INTERVAL_MS)
                 self.assertEqual(
-                    window._image_refresh_thread.interval_ms,
-                    IMAGE_REFRESH_INTERVAL_MS,
+                    _image_refresh_threads_enabled(window),
+                    {"cam0": True, "cam1": True},
                 )
-                self.assertTrue(window._image_refresh_thread.is_enabled())
                 _wait_for_capture_count(app, get_cam0, get_cam1, 1)
 
                 self.assertIsInstance(window._latest_images, tuple)
@@ -448,10 +468,16 @@ class MainWindowGUISmokeTests(unittest.TestCase):
                 )
 
                 window.image_auto_refresh_checkbox.setChecked(False)
-                self.assertFalse(window._image_refresh_thread.is_enabled())
+                self.assertEqual(
+                    _image_refresh_threads_enabled(window),
+                    {"cam0": False, "cam1": False},
+                )
 
                 window.image_auto_refresh_checkbox.setChecked(True)
-                self.assertTrue(window._image_refresh_thread.is_enabled())
+                self.assertEqual(
+                    _image_refresh_threads_enabled(window),
+                    {"cam0": True, "cam1": True},
+                )
                 _wait_for_capture_count(app, get_cam0, get_cam1, 2)
                 window.image_auto_refresh_checkbox.setChecked(False)
 
@@ -466,6 +492,52 @@ class MainWindowGUISmokeTests(unittest.TestCase):
                 self.assertEqual(get_cam0.call_count, 2)
                 self.assertEqual(get_cam1.call_count, 2)
             finally:
+                window.close()
+                app.processEvents()
+
+    def test_camera_refresh_threads_update_independently(self):
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        image_cam0 = np.full((IMAGE_HEIGHT_CAM0, IMAGE_WIDTH_CAM0), 7.0)
+        image_cam1 = np.full((IMAGE_HEIGHT_CAM1, IMAGE_WIDTH_CAM1), 8.0)
+        cam1_started = threading.Event()
+        release_cam1 = threading.Event()
+        get_cam0 = Mock(return_value=image_cam0)
+
+        def get_cam1():
+            cam1_started.set()
+            self.assertTrue(release_cam1.wait(timeout=2.0))
+            return image_cam1
+
+        with (
+            patch(
+                "merlin_track_position.interface.main_window.MotorServer",
+                FakeMotorServer,
+            ),
+            patch(
+                "merlin_track_position.interface.main_window.QtCore.QSettings",
+                FakeSettings,
+            ),
+            patch(
+                "merlin_track_position.interface.main_window.get_framegrabber_image",
+                get_cam0,
+            ),
+            patch(
+                "merlin_track_position.interface.main_window.get_basler_image",
+                get_cam1,
+            ),
+        ):
+            window = MainWindow()
+            try:
+                self.assertTrue(cam1_started.wait(timeout=1.0))
+                _wait_for_image_item(app, window.image_items["cam0"], image_cam0)
+                self.assertIsNone(window._latest_images)
+                self.assertGreaterEqual(get_cam0.call_count, 1)
+
+                release_cam1.set()
+                _wait_for_image_item(app, window.image_items["cam1"], image_cam1)
+                self.assertIsInstance(window._latest_images, tuple)
+            finally:
+                release_cam1.set()
                 window.close()
                 app.processEvents()
 
@@ -528,7 +600,10 @@ class MainWindowGUISmokeTests(unittest.TestCase):
 
                 thread = window._calibration_thread
                 self.assertTrue(thread.started)
-                self.assertFalse(window._image_refresh_thread.is_enabled())
+                self.assertEqual(
+                    _image_refresh_threads_enabled(window),
+                    {"cam0": False, "cam1": False},
+                )
                 self.assertFalse(window.image_auto_refresh_checkbox.isEnabled())
                 self.assertTrue(window.image_auto_refresh_checkbox.isChecked())
 
@@ -555,7 +630,10 @@ class MainWindowGUISmokeTests(unittest.TestCase):
 
                 self.assertTrue(window.image_auto_refresh_checkbox.isEnabled())
                 self.assertTrue(window.image_auto_refresh_checkbox.isChecked())
-                self.assertTrue(window._image_refresh_thread.is_enabled())
+                self.assertEqual(
+                    _image_refresh_threads_enabled(window),
+                    {"cam0": True, "cam1": True},
+                )
                 _wait_for_capture_count(app, get_cam0, get_cam1, 3)
                 window.image_auto_refresh_checkbox.setChecked(False)
                 np.testing.assert_array_equal(window._latest_images[0], resumed_cam0)
@@ -613,7 +691,10 @@ class MainWindowGUISmokeTests(unittest.TestCase):
             try:
                 _wait_for_capture_count(app, get_cam0, get_cam1, 1)
                 window.image_auto_refresh_checkbox.setChecked(False)
-                self.assertFalse(window._image_refresh_thread.is_enabled())
+                self.assertEqual(
+                    _image_refresh_threads_enabled(window),
+                    {"cam0": False, "cam1": False},
+                )
 
                 window._pause_image_auto_refresh_for_calibration()
                 self.assertFalse(window.image_auto_refresh_checkbox.isEnabled())
@@ -622,7 +703,10 @@ class MainWindowGUISmokeTests(unittest.TestCase):
 
                 self.assertTrue(window.image_auto_refresh_checkbox.isEnabled())
                 self.assertFalse(window.image_auto_refresh_checkbox.isChecked())
-                self.assertFalse(window._image_refresh_thread.is_enabled())
+                self.assertEqual(
+                    _image_refresh_threads_enabled(window),
+                    {"cam0": False, "cam1": False},
+                )
                 self.assertEqual(get_cam0.call_count, 1)
                 self.assertEqual(get_cam1.call_count, 1)
             finally:
