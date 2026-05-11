@@ -41,6 +41,11 @@ def _make_calibration_path(
     return np.asarray(rows, dtype=float)
 
 
+def calibration_sample_count(n: int) -> int:
+    """Return the number of image pairs captured by ``run_calibration``."""
+    return int(_make_calibration_path(n, 1.0).shape[0] + 1)
+
+
 def run_calibration(
     n: int,
     step_um: float,

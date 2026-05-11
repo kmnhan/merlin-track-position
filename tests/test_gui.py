@@ -1,6 +1,7 @@
 import math
 import os
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 import pyqtgraph as pg
@@ -19,9 +20,13 @@ from merlin_track_position.interface.calibration_panel import (
     _calibration_summary,
 )
 from merlin_track_position.interface.main_window import (
+    CalibrationStartDialog,
+    MainWindow,
     _MainWindowGUI,
     _clamp_roi_geometry,
     _default_roi_geometry,
+    _roi_geometries_from_calibration_metadata,
+    _roi_metadata_from_geometries,
     _validate_calibration_dataset,
 )
 from merlin_track_position.tracking.calibration_core import (
@@ -30,7 +35,38 @@ from merlin_track_position.tracking.calibration_core import (
     PIXEL_AXES,
     STAGE_AXES,
 )
-from qtpy import QtWidgets
+from qtpy import QtCore, QtWidgets
+
+
+class FakeSettings:
+    def __init__(self, *args, **kwargs):
+        del args, kwargs
+        self.values = {}
+
+    def value(self, key, fallback=None):
+        return self.values.get(key, fallback)
+
+    def setValue(self, key, value):
+        self.values[key] = value
+
+    def sync(self):
+        pass
+
+
+class FakeMotorServer(QtCore.QObject):
+    sigMoveDetected = QtCore.Signal(int)
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def wait(self):
+        pass
+
+    def set_result(self, success, msg):
+        del success, msg
 
 
 def _synthetic_calibration(
@@ -237,6 +273,56 @@ class GUIHelperTests(unittest.TestCase):
             _default_roi_geometry(),
         )
 
+    def test_roi_metadata_round_trips_complete_geometries(self):
+        roi_geometries = {
+            "cam0": (10.0, 20.0, 30.0, 40.0),
+            "cam1": (100.0, 110.0, 120.0, 130.0),
+        }
+        calibration = _synthetic_calibration(
+            np.array(
+                [
+                    [0.0, 0.0, 0.0],
+                    [20.0, 0.0, 0.0],
+                    [0.0, 20.0, 0.0],
+                    [0.0, 0.0, 20.0],
+                ]
+            ),
+            np.array(
+                [
+                    [[0.5, -0.1, 0.2], [0.2, 0.4, -0.1]],
+                    [[-0.3, 0.2, 0.4], [0.1, -0.2, 0.3]],
+                ]
+            ),
+        )
+        calibration = calibration.assign_attrs(
+            _roi_metadata_from_geometries(roi_geometries)
+        )
+
+        self.assertEqual(
+            _roi_geometries_from_calibration_metadata(calibration),
+            roi_geometries,
+        )
+
+    def test_roi_metadata_helper_ignores_legacy_calibration_without_rois(self):
+        calibration = _synthetic_calibration(
+            np.array(
+                [
+                    [0.0, 0.0, 0.0],
+                    [20.0, 0.0, 0.0],
+                    [0.0, 20.0, 0.0],
+                    [0.0, 0.0, 20.0],
+                ]
+            ),
+            np.array(
+                [
+                    [[0.5, -0.1, 0.2], [0.2, 0.4, -0.1]],
+                    [[-0.3, 0.2, 0.4], [0.1, -0.2, 0.3]],
+                ]
+            ),
+        )
+
+        self.assertIsNone(_roi_geometries_from_calibration_metadata(calibration))
+
     def test_calibration_summary_reports_core_metrics_and_repeatability(self):
         stage_to_pixel = np.array(
             [
@@ -316,6 +402,106 @@ class MainWindowGUISmokeTests(unittest.TestCase):
             window.close()
             app.processEvents()
 
+    def test_calibration_start_dialog_defaults_to_requested_values(self):
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        dialog = CalibrationStartDialog()
+        try:
+            self.assertEqual(dialog.n_spin.value(), 5)
+            self.assertAlmostEqual(dialog.step_um_spin.value(), 15.0)
+            self.assertEqual(dialog.parameters(), (5, 15.0))
+        finally:
+            dialog.close()
+            app.processEvents()
+
+    def test_main_window_applies_roi_metadata_from_loaded_calibration(self):
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        roi_geometries = {
+            "cam0": (10.0, 20.0, 30.0, 40.0),
+            "cam1": (100.0, 110.0, 120.0, 130.0),
+        }
+        calibration = _synthetic_calibration(
+            np.array(
+                [
+                    [0.0, 0.0, 0.0],
+                    [20.0, 0.0, 0.0],
+                    [0.0, 20.0, 0.0],
+                    [0.0, 0.0, 20.0],
+                ]
+            ),
+            np.array(
+                [
+                    [[0.5, -0.1, 0.2], [0.2, 0.4, -0.1]],
+                    [[-0.3, 0.2, 0.4], [0.1, -0.2, 0.3]],
+                ]
+            ),
+        ).assign_attrs(_roi_metadata_from_geometries(roi_geometries))
+
+        with (
+            patch(
+                "merlin_track_position.interface.main_window.MotorServer",
+                FakeMotorServer,
+            ),
+            patch(
+                "merlin_track_position.interface.main_window.QtCore.QSettings",
+                FakeSettings,
+            ),
+        ):
+            window = MainWindow()
+        try:
+            self.assertTrue(window._apply_calibration_roi_metadata(calibration))
+            self.assertEqual(window._get_roi_geometry("cam0"), roi_geometries["cam0"])
+            self.assertEqual(window._get_roi_geometry("cam1"), roi_geometries["cam1"])
+        finally:
+            window.close()
+            app.processEvents()
+
+    def test_main_window_leaves_rois_for_legacy_calibration_without_metadata(self):
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        calibration = _synthetic_calibration(
+            np.array(
+                [
+                    [0.0, 0.0, 0.0],
+                    [20.0, 0.0, 0.0],
+                    [0.0, 20.0, 0.0],
+                    [0.0, 0.0, 20.0],
+                ]
+            ),
+            np.array(
+                [
+                    [[0.5, -0.1, 0.2], [0.2, 0.4, -0.1]],
+                    [[-0.3, 0.2, 0.4], [0.1, -0.2, 0.3]],
+                ]
+            ),
+        )
+
+        with (
+            patch(
+                "merlin_track_position.interface.main_window.MotorServer",
+                FakeMotorServer,
+            ),
+            patch(
+                "merlin_track_position.interface.main_window.QtCore.QSettings",
+                FakeSettings,
+            ),
+        ):
+            window = MainWindow()
+        try:
+            before = {
+                camera: window._get_roi_geometry(camera)
+                for camera in ("cam0", "cam1")
+            }
+            self.assertFalse(window._apply_calibration_roi_metadata(calibration))
+            self.assertEqual(
+                {
+                    camera: window._get_roi_geometry(camera)
+                    for camera in ("cam0", "cam1")
+                },
+                before,
+            )
+        finally:
+            window.close()
+            app.processEvents()
+
 
 class CalibrationPanelSmokeTests(unittest.TestCase):
     def test_reset_enables_new_calibration_without_loaded_calibration(self):
@@ -343,6 +529,31 @@ class CalibrationPanelSmokeTests(unittest.TestCase):
             self.assertFalse(panel.calibration_details_button.isEnabled())
             self.assertFalse(panel.new_calibration_button.isEnabled())
             self.assertIn("in progress", panel.calibration_status_label.text())
+            self.assertFalse(panel.calibration_progress_bar.isHidden())
+        finally:
+            panel.close()
+            app.processEvents()
+
+    def test_show_calibration_step_updates_progress_and_eta(self):
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        panel = CalibrationPanel()
+        try:
+            panel.show_calibration_in_progress(total_steps=4)
+            panel.show_calibration_step(
+                idx=1,
+                total_steps=4,
+                dx=1.0,
+                dy=2.0,
+                dz=3.0,
+                elapsed_s=10.0,
+                eta_s=10.0,
+            )
+
+            self.assertEqual(panel.calibration_progress_bar.value(), 2)
+            self.assertEqual(panel.calibration_progress_bar.maximum(), 4)
+            self.assertNotIn("2 / 4", panel.calibration_status_label.text())
+            self.assertNotIn("remaining", panel.calibration_status_label.text())
+            self.assertIn("ETA 0:10", panel.calibration_status_label.text())
         finally:
             panel.close()
             app.processEvents()

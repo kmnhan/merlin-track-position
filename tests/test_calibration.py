@@ -15,6 +15,7 @@ from merlin_track_position.tracking.calibration_core import (
     estimate_stage_offset,
     fit_calibration_from_images,
 )
+from merlin_track_position.tracking.calibrate import calibration_sample_count
 from merlin_track_position.tracking.sample_calibration import (
     build_sample_calibration_dataset,
 )
@@ -78,6 +79,14 @@ def make_stereo_images(stage, stage_to_pixel, *, seed0=20, seed1=21):
 
 
 class CalibrationTests(unittest.TestCase):
+    def test_calibration_sample_count_matches_path_shape(self):
+        self.assertEqual(calibration_sample_count(3), 16)
+        self.assertEqual(calibration_sample_count(5), 22)
+
+    def test_calibration_sample_count_rejects_too_few_axis_points(self):
+        with self.assertRaisesRegex(ValueError, "n must be >= 2"):
+            calibration_sample_count(1)
+
     def test_fit_calibration_from_stereo_numpy_arrays(self):
         stage_to_pixel = stereo_stage_to_pixel()
         stage = calibration_stage()

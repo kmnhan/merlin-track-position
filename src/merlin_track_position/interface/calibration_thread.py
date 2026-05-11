@@ -1,18 +1,15 @@
 from __future__ import annotations
 
 import threading
-import time
+from collections.abc import Callable, Mapping
 
-import xarray as xr
+import numpy as np
 from qtpy import QtCore
 
-from merlin_track_position import constants
 from merlin_track_position.interface.calibration_panel import (
     _validate_calibration_dataset,
 )
-from merlin_track_position.tracking.sample_calibration import (
-    DEFAULT_SAMPLE_CALIBRATION_PATH,
-)
+from merlin_track_position.tracking.calibrate import run_calibration
 
 __all__ = ("CalibrationThread",)
 
@@ -28,6 +25,27 @@ class CalibrationThread(QtCore.QThread):
     ):
         super().__init__(parent)
         self._running = threading.Event()
+        self._n: int | None = None
+        self._step_um: float | None = None
+        self._image_generator: Callable[[], tuple[np.ndarray, np.ndarray]] | None = None
+        self._roi_metadata: dict[str, float] = {}
+
+    def configure(
+        self,
+        n: int,
+        step_um: float,
+        image_generator: Callable[[], tuple[np.ndarray, np.ndarray]],
+        roi_metadata: Mapping[str, float],
+    ) -> None:
+        """Set the parameters for the next calibration run."""
+        if self.isRunning():
+            raise RuntimeError("cannot configure calibration while it is running")
+        self._n = int(n)
+        self._step_um = float(step_um)
+        self._image_generator = image_generator
+        self._roi_metadata = {
+            str(key): float(value) for key, value in roi_metadata.items()
+        }
 
     def run(self) -> None:
         self._running.set()
@@ -36,12 +54,19 @@ class CalibrationThread(QtCore.QThread):
                 return
 
             try:
-                time.sleep(3.0)  # Simulate a long-running calibration process.
-                with xr.open_dataset(
-                    DEFAULT_SAMPLE_CALIBRATION_PATH,
-                    engine="h5netcdf",
-                ) as dataset_on_disk:
-                    calibration = dataset_on_disk.load()
+                if (
+                    self._n is None
+                    or self._step_um is None
+                    or self._image_generator is None
+                ):
+                    raise RuntimeError("calibration thread has not been configured")
+                calibration = run_calibration(
+                    self._n,
+                    self._step_um,
+                    self._image_generator,
+                    step_callback=self._emit_step,
+                )
+                calibration = calibration.assign_attrs(self._roi_metadata)
                 _validate_calibration_dataset(calibration)
             except Exception as exc:
                 if self._running.is_set() and not self.isInterruptionRequested():
@@ -52,6 +77,18 @@ class CalibrationThread(QtCore.QThread):
                 self.sigCalibrationReady.emit(calibration)
         finally:
             self._running.clear()
+
+    def _emit_step(
+        self,
+        idx: int,
+        dx: float,
+        dy: float,
+        dz: float,
+        image_cam0: np.ndarray,
+        image_cam1: np.ndarray,
+    ) -> None:
+        if self._running.is_set() and not self.isInterruptionRequested():
+            self.sigCalibrationStep.emit(idx, dx, dy, dz, image_cam0, image_cam1)
 
     def stop(self) -> None:
         self._running.clear()

@@ -5,7 +5,11 @@ import numpy as np
 
 from merlin_track_position import constants
 from merlin_track_position.instruments.basler import get_basler_image
-from merlin_track_position.instruments.cameras import capture_camera_pair
+from merlin_track_position.instruments.cameras import (
+    capture_camera_pair,
+    crop_image_to_roi,
+    make_cropped_camera_pair_capture,
+)
 from merlin_track_position.instruments.framegrab import get_framegrabber_image
 from merlin_track_position.instruments.motors import move_motors_and_wait
 from merlin_track_position.instruments.simulated_hardware import simulator
@@ -56,6 +60,53 @@ class DevelopmentModeFramegrabTests(unittest.TestCase):
             image_cam1.shape,
             (constants.IMAGE_HEIGHT_CAM1, constants.IMAGE_WIDTH_CAM1),
         )
+
+    def test_crop_image_to_roi_uses_integer_boundaries(self):
+        image = np.arange(5 * 6).reshape(5, 6)
+
+        cropped = crop_image_to_roi(image, (1.0, 2.0, 3.0, 2.0))
+
+        np.testing.assert_array_equal(cropped, image[2:4, 1:4])
+        self.assertFalse(np.shares_memory(cropped, image))
+
+    def test_crop_image_to_roi_expands_fractional_boundaries(self):
+        image = np.arange(5 * 6).reshape(5, 6)
+
+        cropped = crop_image_to_roi(image, (1.2, 1.8, 2.1, 2.2))
+
+        np.testing.assert_array_equal(cropped, image[1:4, 1:4])
+
+    def test_crop_image_to_roi_clamps_to_image_bounds(self):
+        image = np.arange(5 * 6).reshape(5, 6)
+
+        cropped = crop_image_to_roi(image, (-3.0, 1.0, 4.0, 2.0))
+
+        np.testing.assert_array_equal(cropped, image[1:3, 0:4])
+
+    def test_crop_image_to_roi_enforces_one_pixel_minimum(self):
+        image = np.arange(5 * 6).reshape(5, 6)
+
+        cropped = crop_image_to_roi(image, (3.0, 4.0, -5.0, 0.0))
+
+        np.testing.assert_array_equal(cropped, image[4:5, 3:4])
+
+    def test_make_cropped_camera_pair_capture_wraps_base_capture(self):
+        image_cam0 = np.arange(4 * 5).reshape(4, 5)
+        image_cam1 = np.arange(6 * 7).reshape(6, 7)
+
+        def base_capture():
+            return image_cam0, image_cam1
+
+        capture = make_cropped_camera_pair_capture(
+            (1.0, 1.0, 3.0, 2.0),
+            (2.0, 3.0, 2.0, 2.0),
+            base_capture=base_capture,
+        )
+
+        cropped_cam0, cropped_cam1 = capture()
+
+        np.testing.assert_array_equal(cropped_cam0, image_cam0[1:3, 1:4])
+        np.testing.assert_array_equal(cropped_cam1, image_cam1[3:5, 2:4])
 
     def test_simulated_frame_shift_tracks_motor_positions(self):
         stage_um = np.array([60.0, -30.0, 20.0], dtype=np.float64)

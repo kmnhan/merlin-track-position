@@ -97,6 +97,17 @@ def _format_number(value: object) -> str:
     return f"{number:.4g}"
 
 
+def _format_duration(seconds: float | None) -> str:
+    if seconds is None or not math.isfinite(seconds) or seconds < 0.0:
+        return "n/a"
+    rounded = int(round(seconds))
+    minutes, second = divmod(rounded, 60)
+    hour, minute = divmod(minutes, 60)
+    if hour:
+        return f"{hour:d}:{minute:02d}:{second:02d}"
+    return f"{minute:d}:{second:02d}"
+
+
 def _validate_calibration_dataset(dataset: xr.Dataset) -> None:
     missing = tuple(
         name for name in REQUIRED_CALIBRATION_VARIABLES if name not in dataset
@@ -276,6 +287,11 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.calibration_status_label.setWordWrap(True)
         calibration_layout.addWidget(self.calibration_status_label)
 
+        self.calibration_progress_bar = QtWidgets.QProgressBar()
+        self.calibration_progress_bar.setObjectName("calibration_progress_bar")
+        self.calibration_progress_bar.setTextVisible(True)
+        calibration_layout.addWidget(self.calibration_progress_bar)
+
         content_layout = QtWidgets.QHBoxLayout()
         left_column = QtWidgets.QVBoxLayout()
         right_column = QtWidgets.QVBoxLayout()
@@ -340,6 +356,9 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.calibration_details_button.setEnabled(False)
         self.new_calibration_button.setEnabled(True)
         self.calibration_status_label.setText("No calibration loaded.")
+        self.calibration_progress_bar.setVisible(False)
+        self.calibration_progress_bar.setRange(0, 1)
+        self.calibration_progress_bar.setValue(0)
         self.calibration_warnings_text.setPlainText("No calibration loaded.")
         for label in self.metric_labels.values():
             label.setText("n/a")
@@ -349,12 +368,45 @@ class CalibrationPanel(QtWidgets.QWidget):
         for residual_plot in self.residual_plots.values():
             residual_plot.clear()
 
-    def show_calibration_in_progress(self) -> None:
+    def show_calibration_in_progress(self, total_steps: int | None = None) -> None:
         self.load_calibration_button.setEnabled(False)
         self.save_calibration_button.setEnabled(False)
         self.calibration_details_button.setEnabled(False)
         self.new_calibration_button.setEnabled(False)
         self.calibration_status_label.setText("New calibration in progress...")
+        self.calibration_progress_bar.setVisible(True)
+        if total_steps is None or total_steps < 1:
+            self.calibration_progress_bar.setRange(0, 0)
+            return
+        self.calibration_progress_bar.setRange(0, int(total_steps))
+        self.calibration_progress_bar.setValue(0)
+        self.calibration_progress_bar.setFormat(f"0 / {int(total_steps)} samples")
+
+    def show_calibration_step(
+        self,
+        *,
+        idx: int,
+        total_steps: int,
+        dx: float,
+        dy: float,
+        dz: float,
+        elapsed_s: float,
+        eta_s: float | None,
+    ) -> None:
+        completed = min(max(int(idx) + 1, 0), max(int(total_steps), 1))
+        total_steps = max(int(total_steps), completed, 1)
+        self.calibration_progress_bar.setVisible(True)
+        self.calibration_progress_bar.setRange(0, total_steps)
+        self.calibration_progress_bar.setValue(completed)
+        self.calibration_progress_bar.setFormat(
+            f"{completed} / {total_steps} samples"
+        )
+        self.calibration_status_label.setText(
+            "New calibration in progress. "
+            f"Stage ({_format_number(dx)}, {_format_number(dy)}, "
+            f"{_format_number(dz)}) um. "
+            f"Elapsed {_format_duration(elapsed_s)}, ETA {_format_duration(eta_s)}."
+        )
 
     def show_loaded_calibration(
         self,
@@ -366,6 +418,7 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.save_calibration_button.setEnabled(True)
         self.calibration_details_button.setEnabled(True)
         self.new_calibration_button.setEnabled(True)
+        self.calibration_progress_bar.setVisible(False)
         self.calibration_status_label.setText(
             f"Loaded calibration: {display_name} ({summary['sample_count']} samples)"
         )
