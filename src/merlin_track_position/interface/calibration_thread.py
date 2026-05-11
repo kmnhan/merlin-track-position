@@ -6,6 +6,7 @@ import time
 import xarray as xr
 from qtpy import QtCore
 
+from merlin_track_position import constants
 from merlin_track_position.interface.calibration_panel import (
     _validate_calibration_dataset,
 )
@@ -18,6 +19,7 @@ __all__ = ("CalibrationThread",)
 
 class CalibrationThread(QtCore.QThread):
     sigCalibrationReady = QtCore.Signal(object)
+    sigCalibrationStep = QtCore.Signal(int, float, float, float, object, object)
     sigCalibrationFailed = QtCore.Signal(str)
 
     def __init__(
