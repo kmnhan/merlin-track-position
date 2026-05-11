@@ -7,14 +7,30 @@ import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
 from numbers import Integral
+from typing import Any
 
 import numpy as np
 import numpy.typing as npt
 
+from merlin_track_position import constants
 from merlin_track_position.instruments.basler import get_basler_image
 from merlin_track_position.instruments.framegrab import get_framegrabber_image
 
 RoiGeometry = tuple[float, float, float, float]
+_NO_FRAME = object()
+
+
+class _ImageContentKey:
+    def __init__(self, image: npt.NDArray):
+        self.image = np.asarray(image).copy()
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, _ImageContentKey):
+            return NotImplemented
+        return (
+            self.image.shape == other.image.shape
+            and np.array_equal(self.image, other.image)
+        )
 
 
 class CameraPlugin(ABC):
@@ -36,15 +52,17 @@ class CameraPlugin(ABC):
             "fresh_frame_poll_interval_s",
             fresh_frame_poll_interval_s,
         )
-        self._last_frame: npt.NDArray | None = None
+        self._last_frame_key: Any = _NO_FRAME
+        self._capture_serial = 0
 
     def capture(self) -> npt.NDArray:
-        """Return the next image that differs from this camera's last frame."""
+        """Return the next frame this camera plugin considers fresh."""
         deadline = time.monotonic() + self.fresh_frame_timeout_s
         while True:
             image = np.asarray(self._capture_once())
-            if self._last_frame is None or not _same_image(image, self._last_frame):
-                self._last_frame = image.copy()
+            frame_key = self._frame_key(image)
+            if self._last_frame_key is _NO_FRAME or frame_key != self._last_frame_key:
+                self._last_frame_key = frame_key
                 return image
             if time.monotonic() >= deadline:
                 raise TimeoutError(
@@ -56,6 +74,12 @@ class CameraPlugin(ABC):
     @abstractmethod
     def _capture_once(self) -> npt.NDArray:
         """Return one image from the underlying camera source."""
+
+    def _frame_key(self, image: npt.NDArray) -> Any:
+        """Return a key that changes when this camera has a fresh frame."""
+        del image
+        self._capture_serial += 1
+        return self._capture_serial
 
     def cropped(self, roi_geometry: RoiGeometry) -> "CameraPlugin":
         """Return a camera plugin that crops this camera's captured images."""
@@ -80,6 +104,11 @@ class FramegrabberCameraPlugin(CameraPlugin):
 
     def _capture_once(self) -> npt.NDArray:
         return get_framegrabber_image()
+
+    def _frame_key(self, image: npt.NDArray) -> Any:
+        if constants.IS_DAQ_PC:
+            return _ImageContentKey(image)
+        return super()._frame_key(image)
 
 
 class BaslerCameraPlugin(CameraPlugin):
@@ -112,6 +141,7 @@ class CallableCameraPlugin(CameraPlugin):
         *,
         fresh_frame_timeout_s: float = 5.0,
         fresh_frame_poll_interval_s: float = 0.05,
+        use_image_content_key: bool = False,
     ):
         super().__init__(
             name,
@@ -119,9 +149,15 @@ class CallableCameraPlugin(CameraPlugin):
             fresh_frame_poll_interval_s=fresh_frame_poll_interval_s,
         )
         self._capture_image = capture_image
+        self._use_image_content_key = bool(use_image_content_key)
 
     def _capture_once(self) -> npt.NDArray:
         return self._capture_image()
+
+    def _frame_key(self, image: npt.NDArray) -> Any:
+        if self._use_image_content_key:
+            return _ImageContentKey(image)
+        return super()._frame_key(image)
 
 
 class CroppedCameraPlugin(CameraPlugin):
@@ -212,10 +248,6 @@ def _camera_plugins_tuple(
     if isinstance(cameras, CameraPairPlugin):
         return cameras.as_tuple()
     return tuple(cameras)
-
-
-def _same_image(left: npt.NDArray, right: npt.NDArray) -> bool:
-    return left.shape == right.shape and np.array_equal(left, right)
 
 
 def _validate_nonnegative_float(name: str, value: float) -> float:

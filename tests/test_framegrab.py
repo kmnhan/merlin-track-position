@@ -11,6 +11,7 @@ from merlin_track_position.instruments.cameras import (
     CameraPairPlugin,
     capture_image_stack,
     crop_image_to_roi,
+    default_camera_pair,
 )
 from merlin_track_position.instruments.framegrab import get_framegrabber_image
 from merlin_track_position.instruments.motors import move_motors_and_wait
@@ -309,7 +310,12 @@ class DevelopmentModeFramegrabTests(unittest.TestCase):
             return cam1_captures.pop(0)
 
         camera_pair = CameraPairPlugin(
-            CallableCameraPlugin("cam0", capture_cam0, fresh_frame_timeout_s=1.0),
+            CallableCameraPlugin(
+                "cam0",
+                capture_cam0,
+                fresh_frame_timeout_s=1.0,
+                use_image_content_key=True,
+            ),
             CallableCameraPlugin("cam1", capture_cam1, fresh_frame_timeout_s=1.0),
         )
         with patch("merlin_track_position.instruments.cameras.time.sleep") as sleep:
@@ -339,7 +345,12 @@ class DevelopmentModeFramegrabTests(unittest.TestCase):
             return image_cam1
 
         camera_pair = CameraPairPlugin(
-            CallableCameraPlugin("cam0", capture_cam0, fresh_frame_timeout_s=0.0),
+            CallableCameraPlugin(
+                "cam0",
+                capture_cam0,
+                fresh_frame_timeout_s=0.0,
+                use_image_content_key=True,
+            ),
             CallableCameraPlugin("cam1", capture_cam1, fresh_frame_timeout_s=0.0),
         )
         with self.assertRaisesRegex(TimeoutError, "cam0"):
@@ -362,7 +373,12 @@ class DevelopmentModeFramegrabTests(unittest.TestCase):
             return cam1_captures.pop(0)
 
         camera_pair = CameraPairPlugin(
-            CallableCameraPlugin("cam0", capture_cam0, fresh_frame_timeout_s=1.0),
+            CallableCameraPlugin(
+                "cam0",
+                capture_cam0,
+                fresh_frame_timeout_s=1.0,
+                use_image_content_key=True,
+            ),
             CallableCameraPlugin("cam1", capture_cam1, fresh_frame_timeout_s=1.0),
         ).cropped((1.0, 1.0, 3.0, 2.0), (2.0, 3.0, 2.0, 2.0))
 
@@ -379,6 +395,15 @@ class DevelopmentModeFramegrabTests(unittest.TestCase):
             stack_cam1,
             np.stack([image_cam1_a[3:5, 2:4], image_cam1_b[3:5, 2:4]]),
         )
+
+    def test_default_camera_pair_allows_identical_development_images(self):
+        with patch.object(constants, "IS_DAQ_PC", False):
+            stack_cam0, stack_cam1 = capture_image_stack(default_camera_pair(), 2)
+
+        self.assertEqual(stack_cam0.shape[0], 2)
+        self.assertEqual(stack_cam1.shape[0], 2)
+        np.testing.assert_array_equal(stack_cam0[0], stack_cam0[1])
+        np.testing.assert_array_equal(stack_cam1[0], stack_cam1[1])
 
     def test_crop_image_to_roi_uses_integer_boundaries(self):
         image = np.arange(5 * 6).reshape(5, 6)
