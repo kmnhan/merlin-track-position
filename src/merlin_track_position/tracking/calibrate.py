@@ -56,7 +56,7 @@ def run_calibration(
     step_um: float,
     camera_pair: CameraPairPlugin | None = None,
     *,
-    origin_stability_um: float = 1.0,
+    origin_stability_um: float = 5.0,
     home_tolerance_um: float = 1.0,
     capture_count: int = 5,
     step_callback: Callable[

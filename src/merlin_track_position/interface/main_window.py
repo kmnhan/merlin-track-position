@@ -594,7 +594,9 @@ class MainWindow(_MainWindowGUI):
         image_cam0: object,
         image_cam1: object,
     ) -> None:
-        del image_cam0, image_cam1
+        self._on_image_capture_ready("cam0", image_cam0)
+        self._on_image_capture_ready("cam1", image_cam1)
+
         total_steps = max(self._calibration_total_steps, int(idx) + 1, 1)
         started_at = self._calibration_started_at
         elapsed_s = 0.0 if started_at is None else time.monotonic() - started_at

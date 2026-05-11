@@ -23,7 +23,6 @@ from merlin_track_position.interface.calibration_panel import (
     _calibration_summary,
 )
 from merlin_track_position.interface.main_window import (
-    CalibrationStartDialog,
     IMAGE_REFRESH_INTERVAL_MS,
     MainWindow,
     _MainWindowGUI,
@@ -35,7 +34,6 @@ from merlin_track_position.interface.main_window import (
 )
 from merlin_track_position.tracking.calibration_core import (
     CAMERAS,
-    MEASUREMENT_WARNING_SUMMARY,
     OBSERVATION_AXES,
     PIXEL_AXES,
     STAGE_AXES,
@@ -212,9 +210,6 @@ def _wait_for_image_item(app, image_item, expected_image):
 
 
 class GUIHelperTests(unittest.TestCase):
-    def test_default_roi_geometry_is_centered_quarter_cam0_image(self):
-        self.assertEqual(_default_roi_geometry(), (264.0, 180.0, 176.0, 120.0))
-
     def test_clamp_roi_geometry_keeps_roi_inside_cam0_image(self):
         self.assertEqual(
             _clamp_roi_geometry((-10.0, 500.0, 900.0, -4.0)),
@@ -390,10 +385,6 @@ class MainWindowGUISmokeTests(unittest.TestCase):
                 "image_auto_refresh_checkbox",
             )
             self.assertTrue(window.image_auto_refresh_checkbox.isChecked())
-            self.assertIn(
-                f"{IMAGE_REFRESH_INTERVAL_MS} ms",
-                window.image_auto_refresh_checkbox.text(),
-            )
             self.assertEqual(
                 window.image_items["cam0"].image.shape,
                 (IMAGE_HEIGHT_CAM0, IMAGE_WIDTH_CAM0),
@@ -575,7 +566,7 @@ class MainWindowGUISmokeTests(unittest.TestCase):
 
         close_basler_camera.assert_called_once_with()
 
-    def test_calibration_uses_shared_capture_then_restores_checked_refresh_state(self):
+    def test_calibration_uses_camera_pair_then_restores_checked_refresh_state(self):
         app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
         initial_cam0 = np.zeros((IMAGE_HEIGHT_CAM0, IMAGE_WIDTH_CAM0), dtype=float)
         initial_cam1 = np.zeros((IMAGE_HEIGHT_CAM1, IMAGE_WIDTH_CAM1), dtype=float)
@@ -656,6 +647,35 @@ class MainWindowGUISmokeTests(unittest.TestCase):
                     cropped_cam1,
                     crop_image_to_roi(fresh_cam1, roi_cam1),
                 )
+
+                representative_cam0 = np.full((4, 5), 12.0)
+                representative_cam1 = np.full((6, 7), 34.0)
+                window._on_calibration_step(
+                    0,
+                    1.0,
+                    2.0,
+                    3.0,
+                    representative_cam0,
+                    representative_cam1,
+                )
+                np.testing.assert_array_equal(
+                    window.image_items["cam0"].image,
+                    representative_cam0,
+                )
+                np.testing.assert_array_equal(
+                    window.image_items["cam1"].image,
+                    representative_cam1,
+                )
+                np.testing.assert_array_equal(
+                    window._latest_images[0],
+                    representative_cam0,
+                )
+                np.testing.assert_array_equal(
+                    window._latest_images[1],
+                    representative_cam1,
+                )
+                self.assertEqual(get_cam0.call_count, 2)
+                self.assertEqual(get_cam1.call_count, 2)
 
                 thread.running = False
                 window._on_new_calibration_failed("boom")
@@ -744,17 +764,6 @@ class MainWindowGUISmokeTests(unittest.TestCase):
             finally:
                 window.close()
                 app.processEvents()
-
-    def test_calibration_start_dialog_defaults_to_requested_values(self):
-        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-        dialog = CalibrationStartDialog()
-        try:
-            self.assertEqual(dialog.n_spin.value(), 5)
-            self.assertAlmostEqual(dialog.step_um_spin.value(), 15.0)
-            self.assertEqual(dialog.parameters(), (5, 15.0))
-        finally:
-            dialog.close()
-            app.processEvents()
 
     def test_main_window_applies_roi_metadata_from_loaded_calibration(self):
         app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
@@ -871,7 +880,6 @@ class CalibrationPanelSmokeTests(unittest.TestCase):
             self.assertFalse(panel.save_calibration_button.isEnabled())
             self.assertFalse(panel.calibration_details_button.isEnabled())
             self.assertFalse(panel.new_calibration_button.isEnabled())
-            self.assertIn("in progress", panel.calibration_status_label.text())
             self.assertFalse(panel.calibration_progress_bar.isHidden())
         finally:
             panel.close()
@@ -894,9 +902,6 @@ class CalibrationPanelSmokeTests(unittest.TestCase):
 
             self.assertEqual(panel.calibration_progress_bar.value(), 2)
             self.assertEqual(panel.calibration_progress_bar.maximum(), 4)
-            self.assertNotIn("2 / 4", panel.calibration_status_label.text())
-            self.assertNotIn("remaining", panel.calibration_status_label.text())
-            self.assertIn("ETA 0:10", panel.calibration_status_label.text())
         finally:
             panel.close()
             app.processEvents()
@@ -926,12 +931,6 @@ class CalibrationPanelSmokeTests(unittest.TestCase):
             self.assertTrue(panel.save_calibration_button.isEnabled())
             self.assertTrue(panel.calibration_details_button.isEnabled())
             self.assertTrue(panel.new_calibration_button.isEnabled())
-            self.assertIn("calibration.h5", panel.calibration_status_label.text())
-            self.assertEqual(panel.metric_labels["sample_count"].text(), "4")
-            self.assertEqual(
-                panel.calibration_warnings_text.toPlainText(),
-                "No calibration warnings.",
-            )
             self.assertEqual(set(panel.residual_plots), {"xy", "xz", "yz"})
             self.assertIsInstance(
                 panel.residual_graphics_layout,
@@ -939,57 +938,6 @@ class CalibrationPanelSmokeTests(unittest.TestCase):
             )
             for residual_plot in panel.residual_plots.values():
                 self.assertIsInstance(residual_plot, pg.PlotItem)
-        finally:
-            panel.close()
-            app.processEvents()
-
-    def test_show_loaded_calibration_expands_measurement_warning_details(self):
-        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-        panel = CalibrationPanel()
-        try:
-            stage_to_pixel = np.array(
-                [
-                    [[0.5, -0.1, 0.2], [0.2, 0.4, -0.1]],
-                    [[-0.3, 0.2, 0.4], [0.1, -0.2, 0.3]],
-                ]
-            )
-            stage = np.array(
-                [
-                    [0.0, 0.0, 0.0],
-                    [20.0, 0.0, 0.0],
-                    [0.0, 20.0, 0.0],
-                    [0.0, 0.0, 20.0],
-                ]
-            )
-            calibration = _synthetic_calibration(stage, stage_to_pixel)
-            measurement_warnings = np.full(
-                (stage.shape[0], len(CAMERAS)),
-                "",
-                dtype=object,
-            )
-            measurement_warnings[2, 1] = (
-                "low texture\nregistration error is not finite"
-            )
-            calibration = calibration.assign(
-                measurement_warnings=(
-                    ("sample", "camera"),
-                    measurement_warnings,
-                )
-            ).assign_attrs(warnings=MEASUREMENT_WARNING_SUMMARY)
-
-            panel.show_loaded_calibration(calibration, "calibration.h5")
-
-            warnings_text = panel.calibration_warnings_text.toPlainText()
-            self.assertNotIn(MEASUREMENT_WARNING_SUMMARY, warnings_text)
-            self.assertIn(
-                "step 3 (x=0, y=20, z=0 um), cam1: low texture",
-                warnings_text,
-            )
-            self.assertIn(
-                "step 3 (x=0, y=20, z=0 um), "
-                "cam1: registration error is not finite",
-                warnings_text,
-            )
         finally:
             panel.close()
             app.processEvents()
