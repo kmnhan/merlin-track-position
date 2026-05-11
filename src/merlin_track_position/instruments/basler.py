@@ -74,7 +74,7 @@ def _get_camera_by_serial_number(serial_number: str) -> pylon.InstantCamera:
 
 
 def _grab_single_image():
-    camera = _get_camera_by_serial_number(constants.BASLER_CAMERA_ID)
+    camera = _get_camera_by_serial_number(constants.BASLER_CAMERA_SERIAL)
     camera.RegisterConfiguration(
         CameraConfiguration(), pylon.RegistrationMode_Append, pylon.Cleanup_Delete
     )

@@ -27,7 +27,7 @@ IMAGE_HEIGHT_CAM1: int = 1080
 FRAMEGRAB_SERVER_PORT: int = 6553
 
 # Change this if you change the Basler camera
-BASLER_CAMERA_ID = "40049666"
+BASLER_CAMERA_SERIAL = "40055360"
 BASLER_EXPOSURE_US: float = 300000.0  # 300 ms exposure time
 
 
