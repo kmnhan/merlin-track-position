@@ -63,7 +63,7 @@ def _configure_camera(camera: pylon.InstantCamera) -> None:
         # Set the pixel data format.
         if not genicam.IsWritable(camera.PixelFormat):
             raise genicam.RuntimeException("PixelFormat is not writable")
-        camera.PixelFormat.Value = "Mono10"
+        camera.PixelFormat.Value = "Mono12"
 
     except genicam.GenericException as e:
         raise genicam.RuntimeException(f"Could not apply configuration: {e}") from e
