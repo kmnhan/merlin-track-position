@@ -1,158 +1,86 @@
 # merlin-track-position
 
-Offline single-camera 2D shift detection for grayscale image pairs.
+Two-camera 3D sample shift detection and calibration for grayscale image pairs.
 
-The package estimates the subpixel image displacement between a reference image
-and a current image, then converts that image shift into two calibrated motor
+The package estimates subpixel image displacement in two camera views, then
+converts the four observed pixel shifts into calibrated `x`, `y`, and `z` motor
 axis corrections in microns.
-
-Depth-of-field information is intentionally ignored in this first version.
 
 ## Quick Start
 
 ```python
-import numpy as np
-from merlin_track_position.tracking.shift import estimate_shift
+from merlin_track_position.tracking.calibration import correct
 
-# reference and current are 2D grayscale NumPy arrays.
-reference = np.load("reference.npy")
-current = np.load("current.npy")
+result = correct(
+    calibration,
+    reference_cam0,
+    current_cam0,
+    reference_cam1,
+    current_cam1,
+)
 
-shift = estimate_shift(reference, current)
-print(shift["shift_px"].values)  # [du_px, dv_px]
-print(shift.attrs["warnings"])
+print(result["shift_px"].values)  # shape: (camera, pixel_axis)
+print(result["estimated_stage_offset_um"].values)  # [x_um, y_um, z_um]
+print(result["correction_um"].values)
+print(result.attrs["warnings"])
 ```
 
 ## Calibration
 
-Fit calibration directly from image arrays and known motor positions:
+Fit calibration directly from two image stacks and known motor positions:
 
 ```python
-import numpy as np
-from merlin_track_position.tracking.calibration import (
-    correct,
-    fit_calibration_from_images,
-)
-
-# images is a list of 2D grayscale NumPy arrays. The first image is the
-# reference image, and the final image is another image taken after returning
-# to the origin.
-# stage_um has one raw encoder displacement row per image, after subtracting
-# the encoder reading for the first image.
-images = [
-    img_center,
-    img_a_plus,
-    img_a_minus,
-    img_b_plus,
-    img_b_minus,
-    img_center_return,
-]
-stage_um = np.array([
-    [0.0, 0.0],
-    [50.0, 0.0],
-    [-50.0, 0.0],
-    [0.0, 50.0],
-    [0.0, -50.0],
-    [0.2, -0.1],
-])
+from merlin_track_position.tracking.calibration import fit_calibration_from_images
 
 calibration = fit_calibration_from_images(
-    images,
+    images_cam0,
+    images_cam1,
     stage_um,
     origin_stability_um=5.0,
 )
-reference = calibration["image"].isel(sample=0).values
-result = correct(calibration, reference, current)
-
-print(result["shift_px"].values)
-print(result["estimated_stage_offset_um"].values)
-print(result["correction_um"].values)
-print(result.attrs["warnings"])
 ```
 
 The calibration model is:
 
 ```text
-pixel_shift = J @ [stage_a_um, stage_b_um]
-motor_correction_um = -inv(J) @ measured_pixel_shift
+[du_cam0, dv_cam0, du_cam1, dv_cam1] = J @ [x_um, y_um, z_um]
+motor_correction_um = -pinv(J) @ measured_pixel_shift
 ```
 
-No assumption is made that the motor axes are aligned with camera pixel axes.
+No assumption is made that motor axes are aligned with camera pixel axes.
 
 ## Xarray And HDF5
 
-Calibration results are xarray datasets. The dataset keeps the calibration image
-stack, motor coordinates, measured shifts, fitted matrix, residuals,
-return-to-origin diagnostics, and warnings together. Sample 0 in the image stack
-is the reference image.
-
-```python
-import xarray as xr
-
-calibration.to_netcdf("calibration.h5", engine="h5netcdf")
-
-with xr.open_dataset("calibration.h5", engine="h5netcdf") as dataset_on_disk:
-    calibration = dataset_on_disk.load()
-```
+Calibration results are xarray datasets. `format_version` remains `"1"` for the
+current two-camera schema.
 
 The main dataset variables are:
 
-- `image(sample, y, x)`
+- `image_cam0(sample, y_cam0, x_cam0)`
+- `image_cam1(sample, y_cam1, x_cam1)`
 - `stage_um(sample, stage_axis)`
-- `measured_shift_px(sample, pixel_axis)`
-- `predicted_shift_px(sample, pixel_axis)`
-- `residual_shift_px(sample, pixel_axis)`
+- `measured_shift_px(sample, camera, pixel_axis)`
+- `predicted_shift_px(sample, camera, pixel_axis)`
+- `residual_shift_px(sample, camera, pixel_axis)`
 - `residual_stage_um(sample, stage_axis)`
-- `stage_to_pixel(pixel_axis, stage_axis)`
-- `pixel_to_stage(stage_axis, pixel_axis)`
+- `stage_to_pixel(camera, pixel_axis, stage_axis)`
+- `pixel_to_stage(stage_axis, observation_axis)`
 - `origin_stability_um`
 - `return_to_origin_motor_error_um(stage_axis)`
 - `return_to_origin_motor_error_norm_um`
-- `return_to_origin_image_error_px(pixel_axis)`
+- `return_to_origin_image_error_px(camera, pixel_axis)`
 - `return_to_origin_image_error_um(stage_axis)`
 - `return_to_origin_image_error_norm_um`
 
-## Recommended Data Collection
+## Hardware Notes
 
-Run a scout sweep from center on each motor axis with `5, 10, 25, 50, 100,
-200 um`. Pick a base step that produces roughly `20-100 px` image displacement
-while keeping the same features visible.
+Camera 0 uses the existing framegrabber path. Camera 1 has a Basler placeholder:
+development mode uses the simulator, while acquisition-PC mode raises
+`NotImplementedError` until the Basler framework is connected.
 
-For the first calibration, capture images at center, `+/-S` and `+/-2S` on each
-motor axis, and the four `(+/-S_A, +/-S_B)` corners. Capture one final image
-after returning to center. Three repeats per position are recommended for
-repeatability diagnostics.
-
-Motor movement and backlash-safe approach are handled outside this code. The
-stage positions you pass beside the arrays should record the final settled
-offsets.
-
-## Diagnostics
-
-Shift and calibration results include:
-
-- measured pixel shift
-- motor correction in microns
-- skimage registration error and phase difference
-- calibration residuals in pixels and microns
-- repeatability by calibration position
-- calibration matrix condition number
-- final return-to-origin motor and image error
-- warnings for low texture, ambiguous peaks, low confidence, inconsistent local
-  shifts, poorly conditioned calibration, and excess return-to-origin error
-
-## Accuracy And Morphology Limits
-
-`estimate_shift` uses `skimage.registration.phase_cross_correlation` for the
-subpixel solve. The default `upsample_factor=50` resolves the correlation peak
-on a `1/50 px` grid, so clean, well-textured synthetic images usually land
-within a few hundredths of a pixel. Real sample images should be judged from
-calibration residuals, repeat captures, and tile-consistency warnings.
-
-Whole-frame matching is most reliable when the moving sample structure dominates
-the field of view. If static background, repeated patterns, focus changes, or
-non-rigid sample deformation dominate, the returned shift can be biased even
-when a numerical correlation peak exists.
+Active motor correction from the reconstructed `x/y/z` displacement is still
+deferred; the UI move-trigger handler currently acknowledges the trigger and
+contains the TODO for that future control loop.
 
 ## Tests
 

@@ -7,9 +7,25 @@ import pyqtgraph as pg
 import xarray as xr
 from qtpy import QtCore, QtWidgets
 
+from merlin_track_position.tracking.calibration import (
+    CAMERAS,
+    OBSERVATION_AXES,
+    PIXEL_AXES,
+    STAGE_AXES,
+)
+
+RESIDUAL_PROJECTIONS: tuple[tuple[str, str, int, int], ...] = (
+    ("x", "y", 0, 1),
+    ("x", "z", 0, 2),
+    ("y", "z", 1, 2),
+)
+
 REQUIRED_CALIBRATION_VARIABLES: tuple[str, ...] = (
-    "image",
+    "image_cam0",
+    "image_cam1",
     "stage_um",
+    "measured_shift_px",
+    "predicted_shift_px",
     "residual_stage_um",
     "residual_shift_px",
     "stage_to_pixel",
@@ -27,7 +43,7 @@ METRIC_ROWS: tuple[tuple[str, str, str], ...] = (
     (
         "condition_number",
         "Condition number",
-        "Numerical sensitivity of the fitted calibration matrix. Lower is better; high values mean the two stage directions are hard to separate.",
+        "Numerical sensitivity of the fitted calibration matrix. Lower is better; high values mean the three stage directions are hard to separate.",
     ),
     (
         "residual_rms_px",
@@ -62,7 +78,7 @@ METRIC_ROWS: tuple[tuple[str, str, str], ...] = (
     (
         "return_to_origin_image_error_norm_um",
         "Return image error um",
-        "Length of the first-to-last image shift after converting it to stage units.",
+        "Length of the first-to-last two-camera image shift after converting it to stage units.",
     ),
 )
 REPEATABILITY_ROWS: tuple[tuple[str, str], ...] = (
@@ -91,12 +107,15 @@ def _validate_calibration_dataset(dataset: xr.Dataset) -> None:
         )
 
     stage = np.asarray(dataset["stage_um"].values, dtype=float)
+    measured_shift = np.asarray(dataset["measured_shift_px"].values, dtype=float)
+    predicted_shift = np.asarray(dataset["predicted_shift_px"].values, dtype=float)
     residual_stage = np.asarray(dataset["residual_stage_um"].values, dtype=float)
     residual_shift = np.asarray(dataset["residual_shift_px"].values, dtype=float)
     stage_to_pixel = np.asarray(dataset["stage_to_pixel"].values, dtype=float)
     pixel_to_stage = np.asarray(dataset["pixel_to_stage"].values, dtype=float)
     condition_number = np.asarray(dataset["condition_number"].values, dtype=float)
-    image = np.asarray(dataset["image"].values)
+    image_cam0 = np.asarray(dataset["image_cam0"].values)
+    image_cam1 = np.asarray(dataset["image_cam1"].values)
     origin_stability = np.asarray(dataset["origin_stability_um"].values, dtype=float)
     origin_motor = np.asarray(
         dataset["return_to_origin_motor_error_um"].values, dtype=float
@@ -114,34 +133,41 @@ def _validate_calibration_dataset(dataset: xr.Dataset) -> None:
         dataset["return_to_origin_image_error_norm_um"].values, dtype=float
     )
 
-    if stage.ndim != 2 or stage.shape[1] != 2 or stage.shape[0] == 0:
-        raise ValueError("stage_um must have shape (sample, 2)")
+    if stage.ndim != 2 or stage.shape[1] != len(STAGE_AXES) or stage.shape[0] == 0:
+        raise ValueError("stage_um must have shape (sample, 3)")
     if not np.allclose(stage[0], 0.0, rtol=0.0, atol=1e-9):
         raise ValueError("stage_um[0] must be the origin")
     if residual_stage.shape != stage.shape:
         raise ValueError("residual_stage_um must have the same shape as stage_um")
-    if residual_shift.shape != stage.shape:
-        raise ValueError("residual_shift_px must have the same shape as stage_um")
-    if image.ndim != 3 or image.shape[0] != stage.shape[0]:
-        raise ValueError("image must have shape (sample, y, x)")
-    if stage_to_pixel.shape != (2, 2):
-        raise ValueError("stage_to_pixel must have shape (2, 2)")
-    if pixel_to_stage.shape != (2, 2):
-        raise ValueError("pixel_to_stage must have shape (2, 2)")
+    expected_shift_shape = (stage.shape[0], len(CAMERAS), len(PIXEL_AXES))
+    if measured_shift.shape != expected_shift_shape:
+        raise ValueError("measured_shift_px must have shape (sample, camera, pixel_axis)")
+    if predicted_shift.shape != expected_shift_shape:
+        raise ValueError("predicted_shift_px must have shape (sample, camera, pixel_axis)")
+    if residual_shift.shape != expected_shift_shape:
+        raise ValueError("residual_shift_px must have shape (sample, camera, pixel_axis)")
+    if image_cam0.ndim != 3 or image_cam0.shape[0] != stage.shape[0]:
+        raise ValueError("image_cam0 must have shape (sample, y_cam0, x_cam0)")
+    if image_cam1.ndim != 3 or image_cam1.shape[0] != stage.shape[0]:
+        raise ValueError("image_cam1 must have shape (sample, y_cam1, x_cam1)")
+    if stage_to_pixel.shape != (len(CAMERAS), len(PIXEL_AXES), len(STAGE_AXES)):
+        raise ValueError("stage_to_pixel must have shape (camera, pixel_axis, stage_axis)")
+    if pixel_to_stage.shape != (len(STAGE_AXES), len(OBSERVATION_AXES)):
+        raise ValueError("pixel_to_stage must have shape (stage_axis, observation_axis)")
     if condition_number.size != 1:
         raise ValueError("condition_number must be scalar")
     if origin_stability.size != 1:
         raise ValueError("origin_stability_um must be scalar")
     if not np.isfinite(origin_stability).all() or float(origin_stability) <= 0.0:
         raise ValueError("origin_stability_um must be finite and positive")
-    if origin_motor.shape != (2,):
-        raise ValueError("return_to_origin_motor_error_um must have shape (2,)")
+    if origin_motor.shape != (len(STAGE_AXES),):
+        raise ValueError("return_to_origin_motor_error_um must have shape (3,)")
     if origin_motor_norm.size != 1:
         raise ValueError("return_to_origin_motor_error_norm_um must be scalar")
-    if origin_image_px.shape != (2,):
-        raise ValueError("return_to_origin_image_error_px must have shape (2,)")
-    if origin_image_um.shape != (2,):
-        raise ValueError("return_to_origin_image_error_um must have shape (2,)")
+    if origin_image_px.shape != (len(CAMERAS), len(PIXEL_AXES)):
+        raise ValueError("return_to_origin_image_error_px must have shape (camera, pixel_axis)")
+    if origin_image_um.shape != (len(STAGE_AXES),):
+        raise ValueError("return_to_origin_image_error_um must have shape (3,)")
     if origin_image_norm.size != 1:
         raise ValueError("return_to_origin_image_error_norm_um must be scalar")
 
@@ -151,7 +177,7 @@ def _calibration_summary(dataset: xr.Dataset) -> dict[str, object]:
 
     residual_shift = np.asarray(dataset["residual_shift_px"].values, dtype=float)
     residual_stage = np.asarray(dataset["residual_stage_um"].values, dtype=float)
-    residual_shift_norms = np.linalg.norm(residual_shift, axis=1)
+    residual_shift_norms = np.sqrt(np.sum(residual_shift * residual_shift, axis=(1, 2)))
     finite_shift_norms = residual_shift_norms[np.isfinite(residual_shift_norms)]
     if finite_shift_norms.size:
         residual_rms_px = float(
@@ -289,16 +315,22 @@ class CalibrationPanel(QtWidgets.QWidget):
             )
             self.repeatability_labels[key] = value_label
             repeatability_layout.addRow(label, value_label)
-        left_column.addWidget(self.repeatability_group)
         right_column.addWidget(warnings_group)
+        right_column.addWidget(self.repeatability_group)
 
-        self.residual_plot = pg.PlotWidget()
-        self.residual_plot.setMinimumHeight(240)
-        self.residual_plot.setLabel("bottom", "stage_a", units="um")
-        self.residual_plot.setLabel("left", "stage_b", units="um")
-        self.residual_plot.showGrid(x=True, y=True, alpha=0.25)
-        self.residual_plot.setAspectLocked(True)
-        calibration_layout.addWidget(self.residual_plot, stretch=1)
+        self.residual_graphics_layout = pg.GraphicsLayoutWidget()
+        self.residual_graphics_layout.setObjectName("residual_projections_layout")
+        self.residual_graphics_layout.setMinimumHeight(240)
+        self.residual_plots: dict[str, pg.PlotItem] = {}
+        for column, (x_label, y_label, _, _) in enumerate(RESIDUAL_PROJECTIONS):
+            residual_plot = self.residual_graphics_layout.addPlot(row=0, col=column)
+            residual_plot.setTitle(f"{x_label}-{y_label}")
+            residual_plot.setLabel("bottom", x_label, units="um")
+            residual_plot.setLabel("left", y_label, units="um")
+            residual_plot.showGrid(x=True, y=True, alpha=0.25)
+            residual_plot.setAspectLocked(True)
+            self.residual_plots[f"{x_label}{y_label}"] = residual_plot
+        calibration_layout.addWidget(self.residual_graphics_layout, stretch=1)
 
         self.reset()
 
@@ -314,7 +346,8 @@ class CalibrationPanel(QtWidgets.QWidget):
         for label in self.repeatability_labels.values():
             label.setText("n/a")
         self.repeatability_group.setVisible(False)
-        self.residual_plot.clear()
+        for residual_plot in self.residual_plots.values():
+            residual_plot.clear()
 
     def show_calibration_in_progress(self) -> None:
         self.load_calibration_button.setEnabled(False)
@@ -374,14 +407,17 @@ class CalibrationPanel(QtWidgets.QWidget):
         for title, row_labels, column_labels, values in (
             (
                 "stage_to_pixel",
-                ("du_px", "dv_px"),
-                ("stage_a_um", "stage_b_um"),
-                np.asarray(summary["stage_to_pixel"], dtype=float),
+                OBSERVATION_AXES,
+                STAGE_AXES,
+                np.asarray(summary["stage_to_pixel"], dtype=float).reshape(
+                    len(OBSERVATION_AXES),
+                    len(STAGE_AXES),
+                ),
             ),
             (
                 "pixel_to_stage",
-                ("stage_a_um", "stage_b_um"),
-                ("du_px", "dv_px"),
+                STAGE_AXES,
+                OBSERVATION_AXES,
                 np.asarray(summary["pixel_to_stage"], dtype=float),
             ),
         ):
@@ -427,16 +463,24 @@ class CalibrationPanel(QtWidgets.QWidget):
 
         headers = (
             "sample",
-            "stage_a_um",
-            "stage_b_um",
-            "measured_du_px",
-            "measured_dv_px",
-            "predicted_du_px",
-            "predicted_dv_px",
-            "residual_du_px",
-            "residual_dv_px",
-            "residual_stage_a_um",
-            "residual_stage_b_um",
+            "x_um",
+            "y_um",
+            "z_um",
+            "measured_cam0_du_px",
+            "measured_cam0_dv_px",
+            "measured_cam1_du_px",
+            "measured_cam1_dv_px",
+            "predicted_cam0_du_px",
+            "predicted_cam0_dv_px",
+            "predicted_cam1_du_px",
+            "predicted_cam1_dv_px",
+            "residual_cam0_du_px",
+            "residual_cam0_dv_px",
+            "residual_cam1_du_px",
+            "residual_cam1_dv_px",
+            "residual_x_um",
+            "residual_y_um",
+            "residual_z_um",
             "measurement_warnings",
         )
         stage = np.asarray(calibration["stage_um"].values, dtype=float)
@@ -462,19 +506,36 @@ class CalibrationPanel(QtWidgets.QWidget):
         )
         table.horizontalHeader().setMinimumSectionSize(72)
         for row in range(stage.shape[0]):
+            warning_row = warnings[row]
+            if np.ndim(warning_row) == 0:
+                warning_text = str(warning_row)
+            else:
+                warning_text = "; ".join(
+                    f"{camera}: {text}"
+                    for camera, text in zip(CAMERAS, warning_row, strict=True)
+                    if str(text)
+                )
             values = (
                 str(row),
                 _format_number(stage[row, 0]),
                 _format_number(stage[row, 1]),
-                _format_number(measured[row, 0]),
-                _format_number(measured[row, 1]),
-                _format_number(predicted[row, 0]),
-                _format_number(predicted[row, 1]),
-                _format_number(residual_px[row, 0]),
-                _format_number(residual_px[row, 1]),
+                _format_number(stage[row, 2]),
+                _format_number(measured[row, 0, 0]),
+                _format_number(measured[row, 0, 1]),
+                _format_number(measured[row, 1, 0]),
+                _format_number(measured[row, 1, 1]),
+                _format_number(predicted[row, 0, 0]),
+                _format_number(predicted[row, 0, 1]),
+                _format_number(predicted[row, 1, 0]),
+                _format_number(predicted[row, 1, 1]),
+                _format_number(residual_px[row, 0, 0]),
+                _format_number(residual_px[row, 0, 1]),
+                _format_number(residual_px[row, 1, 0]),
+                _format_number(residual_px[row, 1, 1]),
                 _format_number(residual_um[row, 0]),
                 _format_number(residual_um[row, 1]),
-                str(warnings[row]),
+                _format_number(residual_um[row, 2]),
+                warning_text,
             )
             for column, value in enumerate(values):
                 item = QtWidgets.QTableWidgetItem(value)
@@ -490,28 +551,39 @@ class CalibrationPanel(QtWidgets.QWidget):
 
         images_tab = QtWidgets.QWidget()
         images_layout = QtWidgets.QVBoxLayout(images_tab)
-        if "image" not in calibration:
+        if "image_cam0" not in calibration or "image_cam1" not in calibration:
             images_layout.addWidget(
                 QtWidgets.QLabel("No calibration images in dataset.")
             )
             images_layout.addStretch(1)
         else:
-            images = np.asarray(calibration["image"].values)
+            images_by_camera = {
+                "cam0": np.asarray(calibration["image_cam0"].values),
+                "cam1": np.asarray(calibration["image_cam1"].values),
+            }
             stage = np.asarray(calibration["stage_um"].values, dtype=float)
-            if images.ndim != 3 or images.shape[0] != stage.shape[0]:
+            if any(
+                images.ndim != 3 or images.shape[0] != stage.shape[0]
+                for images in images_by_camera.values()
+            ):
                 images_layout.addWidget(
-                    QtWidgets.QLabel("No usable calibration image stack.")
+                    QtWidgets.QLabel("No usable calibration image stacks.")
                 )
                 images_layout.addStretch(1)
             else:
                 controls_layout = QtWidgets.QHBoxLayout()
+                camera_selector = QtWidgets.QComboBox()
+                camera_selector.setObjectName("calibration_image_camera_selector")
+                camera_selector.addItems(CAMERAS)
                 sample_selector = QtWidgets.QSpinBox()
                 sample_selector.setObjectName("calibration_image_sample_selector")
-                sample_selector.setRange(0, images.shape[0] - 1)
+                sample_selector.setRange(0, stage.shape[0] - 1)
                 stage_label = QtWidgets.QLabel()
                 stage_label.setTextInteractionFlags(
                     QtCore.Qt.TextInteractionFlag.TextSelectableByMouse
                 )
+                controls_layout.addWidget(QtWidgets.QLabel("Camera"))
+                controls_layout.addWidget(camera_selector)
                 controls_layout.addWidget(QtWidgets.QLabel("Sample"))
                 controls_layout.addWidget(sample_selector)
                 controls_layout.addWidget(stage_label, stretch=1)
@@ -527,15 +599,20 @@ class CalibrationPanel(QtWidgets.QWidget):
                 image_plot.addItem(image_item)
                 images_layout.addWidget(image_plot, stretch=1)
 
-                def update_image(index: int) -> None:
+                def update_image() -> None:
+                    camera = str(camera_selector.currentText())
+                    index = int(sample_selector.value())
+                    images = images_by_camera[camera]
                     image_item.setImage(images[index], autoLevels=True)
                     stage_label.setText(
                         f"stage: ({_format_number(stage[index, 0])}, "
-                        f"{_format_number(stage[index, 1])}) um"
+                        f"{_format_number(stage[index, 1])}, "
+                        f"{_format_number(stage[index, 2])}) um"
                     )
 
-                sample_selector.valueChanged.connect(update_image)
-                update_image(0)
+                camera_selector.currentTextChanged.connect(lambda _: update_image())
+                sample_selector.valueChanged.connect(lambda _: update_image())
+                update_image()
         tabs.addTab(images_tab, "Images")
         layout.addWidget(tabs)
 
@@ -546,45 +623,51 @@ class CalibrationPanel(QtWidgets.QWidget):
         return dialog
 
     def _plot_residuals(self, calibration: xr.Dataset) -> None:
-        self.residual_plot.clear()
+        for residual_plot in self.residual_plots.values():
+            residual_plot.clear()
         stage = np.asarray(calibration["stage_um"].values, dtype=float)
         residual = np.asarray(calibration["residual_stage_um"].values, dtype=float)
-        self.residual_plot.plot(
-            stage[:, 0],
-            stage[:, 1],
-            pen=None,
-            symbol="o",
-            symbolBrush=pg.mkBrush("#1f77b4"),
-            symbolPen=pg.mkPen("#1f77b4"),
-        )
 
-        x_values: list[float] = []
-        y_values: list[float] = []
-        residual_x_values: list[float] = []
-        residual_y_values: list[float] = []
-        for stage_row, residual_row in zip(stage, residual, strict=True):
-            x0, y0 = stage_row
-            dx, dy = residual_row
-            if not np.isfinite((x0, y0, dx, dy)).all():
-                continue
-            x1 = x0 + dx
-            y1 = y0 + dy
-            x_values.extend([float(x0), float(x1), math.nan])
-            y_values.extend([float(y0), float(y1), math.nan])
-            residual_x_values.append(float(x1))
-            residual_y_values.append(float(y1))
-
-        if x_values:
-            self.residual_plot.plot(
-                x_values,
-                y_values,
-                pen=pg.mkPen("#d62728", width=2),
-            )
-            self.residual_plot.plot(
-                residual_x_values,
-                residual_y_values,
+        for x_label, y_label, x_index, y_index in RESIDUAL_PROJECTIONS:
+            residual_plot = self.residual_plots[f"{x_label}{y_label}"]
+            residual_plot.plot(
+                stage[:, x_index],
+                stage[:, y_index],
                 pen=None,
                 symbol="o",
-                symbolBrush=pg.mkBrush("#d62728"),
-                symbolPen=pg.mkPen("#d62728"),
+                symbolBrush=pg.mkBrush("#1f77b4"),
+                symbolPen=pg.mkPen("#1f77b4"),
             )
+
+            x_values: list[float] = []
+            y_values: list[float] = []
+            residual_x_values: list[float] = []
+            residual_y_values: list[float] = []
+            for stage_row, residual_row in zip(stage, residual, strict=True):
+                x0 = stage_row[x_index]
+                y0 = stage_row[y_index]
+                dx = residual_row[x_index]
+                dy = residual_row[y_index]
+                if not np.isfinite((x0, y0, dx, dy)).all():
+                    continue
+                x1 = x0 + dx
+                y1 = y0 + dy
+                x_values.extend([float(x0), float(x1), math.nan])
+                y_values.extend([float(y0), float(y1), math.nan])
+                residual_x_values.append(float(x1))
+                residual_y_values.append(float(y1))
+
+            if x_values:
+                residual_plot.plot(
+                    x_values,
+                    y_values,
+                    pen=pg.mkPen("#d62728", width=2),
+                )
+                residual_plot.plot(
+                    residual_x_values,
+                    residual_y_values,
+                    pen=None,
+                    symbol="o",
+                    symbolBrush=pg.mkBrush("#d62728"),
+                    symbolPen=pg.mkPen("#d62728"),
+                )

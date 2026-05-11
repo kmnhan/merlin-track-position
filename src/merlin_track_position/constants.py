@@ -17,9 +17,11 @@ MOTOR_NAMES = {
     "TD": "Cryostat Temp D",
 }
 
-# Image size for initial crop from the array returned by the framegrabber.
-IMAGE_WIDTH: int = 704
-IMAGE_HEIGHT: int = 480
+# Image size for initial crop from each camera array.
+IMAGE_WIDTH_CAM0: int = 704
+IMAGE_HEIGHT_CAM0: int = 480
+IMAGE_WIDTH_CAM1: int = 1440
+IMAGE_HEIGHT_CAM1: int = 1080
 
 # If you change this, make sure to also update FrameGrabbber FSM UI2.vi
 FRAMEGRAB_SERVER_PORT = 6553

@@ -41,6 +41,22 @@ class SyntheticCalibration:
     reference_stage_um: npt.NDArray[np.float64]
 
 
+CAM0_STAGE_TO_PIXEL_3D = np.array(
+    [
+        [0.27, -0.14, 0.07],
+        [0.09, 0.31, -0.12],
+    ],
+    dtype=np.float64,
+)
+CAM1_STAGE_TO_PIXEL_3D = np.array(
+    [
+        [-0.21, 0.18, 0.33],
+        [0.24, 0.05, 0.16],
+    ],
+    dtype=np.float64,
+)
+
+
 def _readonly_float64(array: npt.ArrayLike) -> npt.NDArray[np.float64]:
     result = np.asarray(array, dtype=np.float64).copy()
     result.flags.writeable = False
@@ -62,6 +78,22 @@ def load_synthetic_calibration() -> SyntheticCalibration:
                 stage_to_pixel=_readonly_float64(archive["stage_to_pixel"]),
                 reference_stage_um=_readonly_float64(archive["reference_stage_um"]),
             )
+
+
+@functools.cache
+def load_synthetic_cam1_reference() -> npt.NDArray[np.float64]:
+    """Generate a deterministic development-mode reference image for camera 1."""
+    rng = np.random.default_rng(20260507)
+    shape = (constants.IMAGE_HEIGHT_CAM1, constants.IMAGE_WIDTH_CAM1)
+    y, x = np.indices(shape, dtype=np.float64)
+    image = ndimage.gaussian_filter(rng.normal(size=shape), sigma=3.0, mode="wrap")
+    image += 0.25 * np.sin(x / 17.0) + 0.18 * np.cos(y / 23.0)
+    image += 0.08 * np.sin((x + y) / 41.0)
+    image -= float(np.min(image))
+    maximum = float(np.max(image))
+    if maximum > 0.0:
+        image /= maximum
+    return _readonly_float64(image)
 
 
 def _normalize_tolerances(
@@ -143,23 +175,55 @@ class SimulatedHardware:
     def get_reference_image(self) -> npt.NDArray[np.float64]:
         return load_synthetic_calibration().reference_image.copy()
 
-    def get_stage_to_pixel(self) -> npt.NDArray[np.float64]:
-        return load_synthetic_calibration().stage_to_pixel.copy()
+    def get_reference_image_cam1(self) -> npt.NDArray[np.float64]:
+        return load_synthetic_cam1_reference().copy()
+
+    def get_stage_to_pixel(self, camera: str | None = None) -> npt.NDArray[np.float64]:
+        if camera == "cam0":
+            return CAM0_STAGE_TO_PIXEL_3D.copy()
+        if camera == "cam1":
+            return CAM1_STAGE_TO_PIXEL_3D.copy()
+        return np.stack(
+            [CAM0_STAGE_TO_PIXEL_3D, CAM1_STAGE_TO_PIXEL_3D],
+            axis=0,
+        )
 
     def get_framegrabber_image(self) -> npt.NDArray[np.float64]:
-        calibration = load_synthetic_calibration()
-        x_mm, y_mm = self.get_positions(("x", "y"))
-        stage_offset_um = np.array([x_mm * 1000.0, y_mm * 1000.0], dtype=np.float64)
-        du_px, dv_px = calibration.stage_to_pixel @ stage_offset_um
+        x_mm, y_mm, z_mm = self.get_positions(("x", "y", "z"))
+        stage_offset_um = np.array(
+            [x_mm * 1000.0, y_mm * 1000.0, z_mm * 1000.0],
+            dtype=np.float64,
+        )
+        du_px, dv_px = CAM0_STAGE_TO_PIXEL_3D @ stage_offset_um
         shifted = ndimage.shift(
-            calibration.reference_image,
+            load_synthetic_calibration().reference_image,
             shift=(float(dv_px), float(du_px)),
             order=3,
             mode="nearest",
         )
         return (
             np.asarray(shifted, dtype=np.float64)[
-                : constants.IMAGE_HEIGHT, : constants.IMAGE_WIDTH
+                : constants.IMAGE_HEIGHT_CAM0, : constants.IMAGE_WIDTH_CAM0
+            ]
+            .copy()
+        )
+
+    def get_basler_image(self) -> npt.NDArray[np.float64]:
+        x_mm, y_mm, z_mm = self.get_positions(("x", "y", "z"))
+        stage_offset_um = np.array(
+            [x_mm * 1000.0, y_mm * 1000.0, z_mm * 1000.0],
+            dtype=np.float64,
+        )
+        du_px, dv_px = CAM1_STAGE_TO_PIXEL_3D @ stage_offset_um
+        shifted = ndimage.shift(
+            load_synthetic_cam1_reference(),
+            shift=(float(dv_px), float(du_px)),
+            order=3,
+            mode="nearest",
+        )
+        return (
+            np.asarray(shifted, dtype=np.float64)[
+                : constants.IMAGE_HEIGHT_CAM1, : constants.IMAGE_WIDTH_CAM1
             ]
             .copy()
         )

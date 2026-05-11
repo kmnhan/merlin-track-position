@@ -1,4 +1,4 @@
-"""2D motor-axis calibration from observed image shifts and stage positions."""
+"""Two-camera motor-axis calibration from observed image shifts."""
 
 from __future__ import annotations
 
@@ -9,12 +9,17 @@ import xarray as xr
 
 from merlin_track_position.tracking.shift import estimate_shift
 
-STAGE_AXES = ("stage_a_um", "stage_b_um")
+CAMERAS = ("cam0", "cam1")
+STAGE_AXES = ("x_um", "y_um", "z_um")
 PIXEL_AXES = ("du_px", "dv_px")
+OBSERVATION_AXES = tuple(
+    f"{camera}_{pixel_axis}" for camera in CAMERAS for pixel_axis in PIXEL_AXES
+)
 
 
 def fit_calibration_from_images(
-    images: Sequence[Any],
+    images_cam0: Sequence[Any],
+    images_cam1: Sequence[Any],
     stage_um: Sequence[Sequence[float]],
     *,
     origin_stability_um: float,
@@ -23,91 +28,121 @@ def fit_calibration_from_images(
     additional_context: dict[str, Any] | None = None,
     **shift_kwargs: Any,
 ) -> xr.Dataset:
-    """Fit calibration directly from grayscale image arrays and stage offsets.
+    """Fit a 3D stage calibration from two camera image stacks.
 
-    Parameters
-    ----------
-    images
-        Sequence of 2D grayscale images.
-    stage_um
-        Sequence of stage positions in microns corresponding to each image,
-        expressed as encoder displacements relative to the first image:
-        (stage_a_um, stage_b_um). The first row must be the origin.
-    origin_stability_um
-        Warning threshold in microns for the final return-to-origin motor and
-        image error checks.
+    The model is linear through the origin:
 
+    ``[du0, dv0, du1, dv1] = J @ [dx_um, dy_um, dz_um]``.
     """
 
-    image_arrays = [np.asarray(image, dtype=np.float64) for image in images]
-    stage = np.asarray(stage_um, dtype=np.float64)
-    origin_stability_um = float(origin_stability_um)
     if "reference_index" in shift_kwargs:
         raise TypeError(
             "fit_calibration_from_images() got an unexpected keyword argument "
             "'reference_index'"
         )
+
+    image_arrays_cam0 = _as_image_arrays("images_cam0", images_cam0)
+    image_arrays_cam1 = _as_image_arrays("images_cam1", images_cam1)
+    stage = np.asarray(stage_um, dtype=np.float64)
+    origin_stability_um = float(origin_stability_um)
+
     if not np.isfinite(origin_stability_um) or origin_stability_um <= 0.0:
         raise ValueError("origin_stability_um must be finite and positive")
-    if len(image_arrays) < 4:
-        raise ValueError("at least four calibration images are required")
-    if stage.ndim != 2 or stage.shape[1] != 2:
-        raise ValueError("stage_um must have shape (n, 2)")
+    if len(image_arrays_cam0) < 5:
+        raise ValueError("at least five calibration image pairs are required")
+    if len(image_arrays_cam0) != len(image_arrays_cam1):
+        raise ValueError(
+            "images_cam0 and images_cam1 must have the same length; "
+            f"got {len(image_arrays_cam0)} and {len(image_arrays_cam1)}"
+        )
+    if stage.ndim != 2 or stage.shape[1] != 3:
+        raise ValueError("stage_um must have shape (n, 3)")
     if not np.isfinite(stage).all():
         raise ValueError("stage_um must contain only finite values")
-    if len(image_arrays) != stage.shape[0]:
+    if len(image_arrays_cam0) != stage.shape[0]:
         raise ValueError(
-            f"images and stage_um must have the same length; "
-            f"got {len(image_arrays)} and {stage.shape[0]}"
+            f"image pairs and stage_um must have the same length; "
+            f"got {len(image_arrays_cam0)} and {stage.shape[0]}"
         )
     if not np.allclose(stage[0], 0.0, rtol=0.0, atol=1e-9):
         raise ValueError("stage_um[0] must be the origin")
-    shape = image_arrays[0].shape
-    for index, image in enumerate(image_arrays):
-        if image.shape != shape:
-            raise ValueError(
-                f"all images must have the same shape; image 0 has {shape!r}, "
-                f"image {index} has {image.shape!r}"
-            )
 
-    reference_image = image_arrays[0]
-    shifts: list[np.ndarray] = []
-    measurement_warnings: list[tuple[str, ...]] = []
-    for image in image_arrays:
-        shift = estimate_shift(reference_image, image, **shift_kwargs)
-        shifts.append(np.asarray(shift["shift_px"].values, dtype=np.float64))
+    reference_cam0 = image_arrays_cam0[0]
+    reference_cam1 = image_arrays_cam1[0]
+    shifts_cam0: list[np.ndarray] = []
+    shifts_cam1: list[np.ndarray] = []
+    measurement_warnings: list[tuple[tuple[str, ...], tuple[str, ...]]] = []
+    for image_cam0, image_cam1 in zip(
+        image_arrays_cam0,
+        image_arrays_cam1,
+        strict=True,
+    ):
+        shift_cam0 = estimate_shift(reference_cam0, image_cam0, **shift_kwargs)
+        shift_cam1 = estimate_shift(reference_cam1, image_cam1, **shift_kwargs)
+        shifts_cam0.append(
+            np.asarray(shift_cam0["shift_px"].values, dtype=np.float64)
+        )
+        shifts_cam1.append(
+            np.asarray(shift_cam1["shift_px"].values, dtype=np.float64)
+        )
         measurement_warnings.append(
-            tuple(str(shift.attrs.get("warnings", "")).splitlines())
+            (
+                tuple(str(shift_cam0.attrs.get("warnings", "")).splitlines()),
+                tuple(str(shift_cam1.attrs.get("warnings", "")).splitlines()),
+            )
         )
 
-    pixels = np.vstack(shifts)
-    images = np.stack(image_arrays, axis=0)
-    reference_stage_um = np.zeros(2, dtype=np.float64)
+    pixels = np.stack([np.vstack(shifts_cam0), np.vstack(shifts_cam1)], axis=1)
+    observations = _pixels_to_observations(pixels)
+    reference_stage_um = np.zeros(3, dtype=np.float64)
 
     rank = int(np.linalg.matrix_rank(stage))
-    if rank < 2:
-        raise ValueError("stage positions must span two independent motor directions")
+    if rank < 3:
+        raise ValueError("stage positions must span three independent motor axes")
 
-    coef, _, _, _ = np.linalg.lstsq(stage, pixels, rcond=None)
-    stage_to_pixel = coef.T
+    coef, _, _, _ = np.linalg.lstsq(stage, observations, rcond=None)
+    stage_to_observation = coef.T
+    singular_values = np.linalg.svd(stage_to_observation, compute_uv=False)
+    largest_singular_value = float(singular_values[0]) if singular_values.size else 0.0
+    calibration_rank_tolerance = 1e-3 * largest_singular_value
+    calibration_rank = int(
+        np.count_nonzero(singular_values > calibration_rank_tolerance)
+    )
+    if calibration_rank < 3:
+        raise ValueError(
+            "fitted two-camera calibration matrix must have rank 3; "
+            f"got rank {calibration_rank}"
+        )
+    stage_to_pixel = stage_to_observation.reshape(
+        len(CAMERAS),
+        len(PIXEL_AXES),
+        len(STAGE_AXES),
+    )
 
-    condition_number = float(np.linalg.cond(stage_to_pixel))
-    predicted = stage @ stage_to_pixel.T
+    condition_number = float(np.linalg.cond(stage_to_observation))
+    predicted_observations = stage @ coef
+    predicted = predicted_observations.reshape(
+        stage.shape[0],
+        len(CAMERAS),
+        len(PIXEL_AXES),
+    )
     residual_px = pixels - predicted
-    pixel_to_stage = np.linalg.inv(stage_to_pixel)
-    residual_um = residual_px @ pixel_to_stage.T
+    pixel_to_stage = np.linalg.pinv(stage_to_observation)
+    residual_um = _pixels_to_observations(residual_px) @ pixel_to_stage.T
     return_to_origin_motor_error_um = stage[-1]
     return_to_origin_motor_error_norm_um = float(
         np.linalg.norm(return_to_origin_motor_error_um)
     )
     return_to_origin_image_error_px = pixels[-1]
-    return_to_origin_image_error_um = return_to_origin_image_error_px @ pixel_to_stage.T
+    return_to_origin_image_error_um = observations[-1] @ pixel_to_stage.T
     return_to_origin_image_error_norm_um = float(
         np.linalg.norm(return_to_origin_image_error_um)
     )
 
     warnings: list[str] = []
-    residual_rms_px = float(np.sqrt(np.mean(np.sum(residual_px * residual_px, axis=1))))
+    residual_rms_px = float(
+        np.sqrt(np.mean(np.sum(residual_px * residual_px, axis=(1, 2))))
+    )
     if residual_rms_px > residual_warning_px:
         warnings.append(
             f"calibration residual RMS {residual_rms_px:.3g} px exceeds "
@@ -132,9 +167,13 @@ def fit_calibration_from_images(
         )
 
     measurement_warnings_tuple = _pad_warnings(
-        measurement_warnings, stage.shape[0]
+        measurement_warnings,
+        stage.shape[0],
     )
-    if any(measurement_warnings_tuple):
+    if any(
+        any(camera_warnings for camera_warnings in sample_warnings)
+        for sample_warnings in measurement_warnings_tuple
+    ):
         warnings.append(
             "one or more shift measurements reported image-matching warnings"
         )
@@ -143,17 +182,19 @@ def fit_calibration_from_images(
     coords: dict[str, Any] = {
         "sample": np.arange(sample_count, dtype=np.int64),
         "stage_axis": list(STAGE_AXES),
+        "camera": list(CAMERAS),
         "pixel_axis": list(PIXEL_AXES),
+        "observation_axis": list(OBSERVATION_AXES),
     }
     data_vars: dict[str, Any] = {
         "stage_to_pixel": (
-            ("pixel_axis", "stage_axis"),
+            ("camera", "pixel_axis", "stage_axis"),
             stage_to_pixel,
             {"units": "px/um"},
         ),
         "pixel_to_stage": (
-            ("stage_axis", "pixel_axis"),
-            np.linalg.inv(stage_to_pixel),
+            ("stage_axis", "observation_axis"),
+            pixel_to_stage,
             {"units": "um/px"},
         ),
         "reference_stage_um": (
@@ -174,7 +215,7 @@ def fit_calibration_from_images(
             {"units": "um"},
         ),
         "return_to_origin_image_error_px": (
-            ("pixel_axis",),
+            ("camera", "pixel_axis"),
             return_to_origin_image_error_px,
             {"units": "px"},
         ),
@@ -189,14 +230,34 @@ def fit_calibration_from_images(
             {"units": "um"},
         ),
         "stage_um": (("sample", "stage_axis"), stage, {"units": "um"}),
-        "measured_shift_px": (("sample", "pixel_axis"), pixels, {"units": "px"}),
-        "predicted_shift_px": (("sample", "pixel_axis"), predicted, {"units": "px"}),
-        "residual_shift_px": (("sample", "pixel_axis"), residual_px, {"units": "px"}),
-        "residual_stage_um": (("sample", "stage_axis"), residual_um, {"units": "um"}),
+        "measured_shift_px": (
+            ("sample", "camera", "pixel_axis"),
+            pixels,
+            {"units": "px"},
+        ),
+        "predicted_shift_px": (
+            ("sample", "camera", "pixel_axis"),
+            predicted,
+            {"units": "px"},
+        ),
+        "residual_shift_px": (
+            ("sample", "camera", "pixel_axis"),
+            residual_px,
+            {"units": "px"},
+        ),
+        "residual_stage_um": (
+            ("sample", "stage_axis"),
+            residual_um,
+            {"units": "um"},
+        ),
         "measurement_warnings": (
-            ("sample",),
+            ("sample", "camera"),
             np.asarray(
-                ["\n".join(items) for items in measurement_warnings_tuple], dtype=str
+                [
+                    ["\n".join(camera_warnings) for camera_warnings in sample_warnings]
+                    for sample_warnings in measurement_warnings_tuple
+                ],
+                dtype=str,
             ),
         ),
     }
@@ -210,7 +271,8 @@ def fit_calibration_from_images(
             repeatability_std,
         ) = repeatability
         coords["repeatability_position"] = np.arange(
-            repeatability_stage_um.shape[0], dtype=np.int64
+            repeatability_stage_um.shape[0],
+            dtype=np.int64,
         )
         data_vars["repeatability_stage_um"] = (
             ("repeatability_position", "stage_axis"),
@@ -222,33 +284,42 @@ def fit_calibration_from_images(
             repeatability_count,
         )
         data_vars["repeatability_mean_shift_px"] = (
-            ("repeatability_position", "pixel_axis"),
+            ("repeatability_position", "camera", "pixel_axis"),
             repeatability_mean,
             {"units": "px"},
         )
         data_vars["repeatability_std_shift_px"] = (
-            ("repeatability_position", "pixel_axis"),
+            ("repeatability_position", "camera", "pixel_axis"),
             repeatability_std,
             {"units": "px"},
         )
         data_vars["repeatability_rms_std_px"] = (
             ("repeatability_position",),
-            np.sqrt(np.mean(repeatability_std * repeatability_std, axis=1)),
+            np.sqrt(np.mean(repeatability_std * repeatability_std, axis=(1, 2))),
             {"units": "px"},
         )
 
-    if images is not None:
-        coords["y"] = np.arange(images.shape[1], dtype=np.int64)
-        coords["x"] = np.arange(images.shape[2], dtype=np.int64)
-        data_vars["image"] = (
-            ("sample", "y", "x"),
-            images,
-            {"description": "calibration grayscale image stack"},
-        )
+    images_cam0_stack = np.stack(image_arrays_cam0, axis=0)
+    images_cam1_stack = np.stack(image_arrays_cam1, axis=0)
+    coords["y_cam0"] = np.arange(images_cam0_stack.shape[1], dtype=np.int64)
+    coords["x_cam0"] = np.arange(images_cam0_stack.shape[2], dtype=np.int64)
+    coords["y_cam1"] = np.arange(images_cam1_stack.shape[1], dtype=np.int64)
+    coords["x_cam1"] = np.arange(images_cam1_stack.shape[2], dtype=np.int64)
+    data_vars["image_cam0"] = (
+        ("sample", "y_cam0", "x_cam0"),
+        images_cam0_stack,
+        {"description": "camera 0 calibration grayscale image stack"},
+    )
+    data_vars["image_cam1"] = (
+        ("sample", "y_cam1", "x_cam1"),
+        images_cam1_stack,
+        {"description": "camera 1 calibration grayscale image stack"},
+    )
 
     calibration_attrs = {
         "format": "merlin-track-position calibration",
         "format_version": "1",
+        "model": "through_origin_linear_stereo",
         "warnings": "\n".join(tuple(warnings)),
     }
 
@@ -259,56 +330,165 @@ def fit_calibration_from_images(
 
 
 def estimate_stage_offset(
-    calibration: xr.Dataset, shift: xr.Dataset | Sequence[float]
+    calibration: xr.Dataset,
+    shift: xr.Dataset | xr.DataArray | Sequence[float],
 ) -> np.ndarray:
-    """Convert an observed image shift to estimated stage-plane offset."""
+    """Convert observed two-camera image shifts to estimated stage offset."""
 
-    shift_px = (
-        np.asarray(shift["shift_px"].values, dtype=np.float64)
-        if isinstance(shift, xr.Dataset)
-        else np.asarray(shift, dtype=float)
-    )
+    if isinstance(shift, xr.Dataset):
+        shift_values = np.asarray(shift["shift_px"].values, dtype=np.float64)
+    elif isinstance(shift, xr.DataArray):
+        shift_values = np.asarray(shift.values, dtype=np.float64)
+    else:
+        shift_values = np.asarray(shift, dtype=np.float64)
+    observation = _shift_to_observation(shift_values)
     pixel_to_stage = np.asarray(calibration["pixel_to_stage"].values, dtype=np.float64)
-    return pixel_to_stage @ shift_px
+    return pixel_to_stage @ observation
 
 
 def correct(
     calibration: xr.Dataset,
-    reference: Any,
-    current: Any,
+    reference_cam0: Any,
+    current_cam0: Any,
+    reference_cam1: Any,
+    current_cam1: Any,
     **shift_kwargs: Any,
 ) -> xr.Dataset:
-    """Estimate image shift and return the calibrated motor correction."""
+    """Estimate two-camera image shift and return calibrated motor correction."""
 
-    shift = estimate_shift(reference, current, **shift_kwargs)
-    estimated_offset = estimate_stage_offset(calibration, shift)
+    shift_cam0 = estimate_shift(reference_cam0, current_cam0, **shift_kwargs)
+    shift_cam1 = estimate_shift(reference_cam1, current_cam1, **shift_kwargs)
+    shift_px = np.stack(
+        [
+            np.asarray(shift_cam0["shift_px"].values, dtype=np.float64),
+            np.asarray(shift_cam1["shift_px"].values, dtype=np.float64),
+        ],
+        axis=0,
+    )
+    estimated_offset = estimate_stage_offset(calibration, shift_px)
     correction = -estimated_offset
     calibration_warnings = str(calibration.attrs.get("warnings", "")).splitlines()
-    shift_warnings = str(shift.attrs.get("warnings", "")).splitlines()
+    shift_warnings = [
+        line
+        for line in (
+            *str(shift_cam0.attrs.get("warnings", "")).splitlines(),
+            *str(shift_cam1.attrs.get("warnings", "")).splitlines(),
+        )
+        if line
+    ]
     return xr.Dataset(
         data_vars={
-            "shift_px": shift["shift_px"],
+            "shift_px": (("camera", "pixel_axis"), shift_px, {"units": "px"}),
             "estimated_stage_offset_um": (
                 ("stage_axis",),
                 estimated_offset,
                 {"units": "um"},
             ),
             "correction_um": (("stage_axis",), correction, {"units": "um"}),
-            "registration_error": shift["registration_error"],
-            "phase_difference": shift["phase_difference"],
-            "texture_dynamic_range": shift["texture_dynamic_range"],
-            "texture_gradient_rms": shift["texture_gradient_rms"],
-            "tile_median_shift_px": shift["tile_median_shift_px"],
-            "tile_shift_std_px": shift["tile_shift_std_px"],
+            "registration_error": (
+                ("camera",),
+                [
+                    float(shift_cam0["registration_error"].values),
+                    float(shift_cam1["registration_error"].values),
+                ],
+            ),
+            "phase_difference": (
+                ("camera",),
+                [
+                    float(shift_cam0["phase_difference"].values),
+                    float(shift_cam1["phase_difference"].values),
+                ],
+            ),
+            "texture_dynamic_range": (
+                ("camera",),
+                [
+                    float(shift_cam0["texture_dynamic_range"].values),
+                    float(shift_cam1["texture_dynamic_range"].values),
+                ],
+            ),
+            "texture_gradient_rms": (
+                ("camera",),
+                [
+                    float(shift_cam0["texture_gradient_rms"].values),
+                    float(shift_cam1["texture_gradient_rms"].values),
+                ],
+            ),
+            "tile_median_shift_px": (
+                ("camera", "pixel_axis"),
+                np.stack(
+                    [
+                        np.asarray(
+                            shift_cam0["tile_median_shift_px"].values,
+                            dtype=np.float64,
+                        ),
+                        np.asarray(
+                            shift_cam1["tile_median_shift_px"].values,
+                            dtype=np.float64,
+                        ),
+                    ],
+                    axis=0,
+                ),
+                {"units": "px"},
+            ),
+            "tile_shift_std_px": (
+                ("camera",),
+                [
+                    float(shift_cam0["tile_shift_std_px"].values),
+                    float(shift_cam1["tile_shift_std_px"].values),
+                ],
+                {"units": "px"},
+            ),
         },
         coords={
+            "camera": list(CAMERAS),
             "pixel_axis": list(PIXEL_AXES),
             "stage_axis": list(STAGE_AXES),
         },
         attrs={
-            "method": "calibrated_shift_correction",
+            "method": "calibrated_stereo_shift_correction",
             "warnings": "\n".join([*calibration_warnings, *shift_warnings]),
         },
+    )
+
+
+def _as_image_arrays(name: str, images: Sequence[Any]) -> list[np.ndarray]:
+    image_arrays = [np.asarray(image, dtype=np.float64) for image in images]
+    if not image_arrays:
+        raise ValueError(f"{name} must not be empty")
+    shape = image_arrays[0].shape
+    for index, image in enumerate(image_arrays):
+        if image.ndim != 2:
+            raise ValueError(f"{name}[{index}] must be 2D, got {image.shape!r}")
+        if image.shape != shape:
+            raise ValueError(
+                f"all images in {name} must have the same shape; "
+                f"image 0 has {shape!r}, image {index} has {image.shape!r}"
+            )
+        if not np.isfinite(image).all():
+            raise ValueError(f"{name}[{index}] must contain only finite values")
+    return image_arrays
+
+
+def _pixels_to_observations(pixels: np.ndarray) -> np.ndarray:
+    pixels = np.asarray(pixels, dtype=np.float64)
+    if pixels.ndim == 2 and pixels.shape == (len(CAMERAS), len(PIXEL_AXES)):
+        return pixels.reshape(-1)
+    if pixels.ndim == 3 and pixels.shape[1:] == (len(CAMERAS), len(PIXEL_AXES)):
+        return pixels.reshape(pixels.shape[0], -1)
+    raise ValueError(
+        "pixel shifts must have shape (camera, pixel_axis) or "
+        "(sample, camera, pixel_axis)"
+    )
+
+
+def _shift_to_observation(shift_values: np.ndarray) -> np.ndarray:
+    values = np.asarray(shift_values, dtype=np.float64)
+    if values.shape == (len(CAMERAS), len(PIXEL_AXES)):
+        return values.reshape(-1)
+    if values.size == len(OBSERVATION_AXES):
+        return values.reshape(-1)
+    raise ValueError(
+        "shift must have shape (2, 2) or contain four observation values"
     )
 
 
@@ -316,9 +496,9 @@ def _repeatability(
     stage: np.ndarray,
     pixels: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
-    groups: dict[tuple[float, float], list[np.ndarray]] = {}
+    groups: dict[tuple[float, float, float], list[np.ndarray]] = {}
     for stage_row, pixel_row in zip(stage, pixels, strict=True):
-        key = (float(stage_row[0]), float(stage_row[1]))
+        key = (float(stage_row[0]), float(stage_row[1]), float(stage_row[2]))
         groups.setdefault(key, []).append(pixel_row)
 
     stage_rows: list[np.ndarray] = []
@@ -328,7 +508,7 @@ def _repeatability(
     for key, rows in groups.items():
         if len(rows) < 2:
             continue
-        values = np.vstack(rows)
+        values = np.stack(rows, axis=0)
         stage_rows.append(np.asarray(key, dtype=np.float64))
         counts.append(len(rows))
         means.append(np.mean(values, axis=0))
@@ -339,17 +519,29 @@ def _repeatability(
     return (
         np.vstack(stage_rows),
         np.asarray(counts, dtype=np.int64),
-        np.vstack(means),
-        np.vstack(stds),
+        np.stack(means, axis=0),
+        np.stack(stds, axis=0),
     )
 
 
 def _pad_warnings(
-    values: Sequence[Sequence[str]] | None,
+    values: Sequence[Sequence[Sequence[str]]] | None,
     count: int,
-) -> tuple[tuple[str, ...], ...]:
+) -> tuple[tuple[tuple[str, ...], tuple[str, ...]], ...]:
     if values is None:
-        return tuple(() for _ in range(count))
+        return tuple(((), ()) for _ in range(count))
     if len(values) != count:
         raise ValueError(f"expected {count} warning lists, got {len(values)}")
-    return tuple(tuple(item) for item in values)
+    result: list[tuple[tuple[str, ...], tuple[str, ...]]] = []
+    for sample_warnings in values:
+        if len(sample_warnings) != len(CAMERAS):
+            raise ValueError(
+                f"expected {len(CAMERAS)} camera warning lists per sample"
+            )
+        result.append(
+            (
+                tuple(sample_warnings[0]),
+                tuple(sample_warnings[1]),
+            )
+        )
+    return tuple(result)

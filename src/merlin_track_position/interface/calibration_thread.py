@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import threading
 import time
-from pathlib import Path
 
 import xarray as xr
 from qtpy import QtCore
 
 from merlin_track_position.interface.calibration_panel import (
     _validate_calibration_dataset,
+)
+from merlin_track_position.tracking.sample_calibration import (
+    DEFAULT_SAMPLE_CALIBRATION_PATH,
 )
 
 __all__ = ("CalibrationThread",)
@@ -38,7 +40,7 @@ class CalibrationThread(QtCore.QThread):
 
             try:
                 with xr.open_dataset(
-                    Path("/Users/khan/Downloads/cal_30.0um_origin.h5"),
+                    DEFAULT_SAMPLE_CALIBRATION_PATH,
                     engine="h5netcdf",
                 ) as dataset_on_disk:
                     calibration = dataset_on_disk.load()

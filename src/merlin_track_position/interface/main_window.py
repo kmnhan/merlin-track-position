@@ -10,7 +10,13 @@ import pyqtgraph as pg
 import xarray as xr
 from qtpy import QtCore, QtGui, QtWidgets
 
-from merlin_track_position.constants import IMAGE_HEIGHT, IMAGE_WIDTH
+from merlin_track_position.constants import (
+    IMAGE_HEIGHT_CAM0,
+    IMAGE_HEIGHT_CAM1,
+    IMAGE_WIDTH_CAM0,
+    IMAGE_WIDTH_CAM1,
+)
+from merlin_track_position.instruments.basler import get_basler_image
 from merlin_track_position.instruments.framegrab import get_framegrabber_image
 from merlin_track_position.interface.calibration_panel import (
     CalibrationPanel,
@@ -22,17 +28,24 @@ from merlin_track_position.server import MotorServer
 __all__ = ("MainWindow",)
 
 
-ROI_SETTINGS_KEYS: tuple[str, str, str, str] = (
-    "roi/x",
-    "roi/y",
-    "roi/width",
-    "roi/height",
-)
+CAMERA_IMAGE_SIZES: dict[str, tuple[int, int]] = {
+    "cam0": (IMAGE_WIDTH_CAM0, IMAGE_HEIGHT_CAM0),
+    "cam1": (IMAGE_WIDTH_CAM1, IMAGE_HEIGHT_CAM1),
+}
+ROI_SETTINGS_KEYS: dict[str, tuple[str, str, str, str]] = {
+    camera: (
+        f"roi/{camera}/x",
+        f"roi/{camera}/y",
+        f"roi/{camera}/width",
+        f"roi/{camera}/height",
+    )
+    for camera in CAMERA_IMAGE_SIZES
+}
 
 
 def _default_roi_geometry(
-    image_width: float = IMAGE_WIDTH,
-    image_height: float = IMAGE_HEIGHT,
+    image_width: float = IMAGE_WIDTH_CAM0,
+    image_height: float = IMAGE_HEIGHT_CAM0,
 ) -> tuple[float, float, float, float]:
     width = 0.25 * image_width
     height = 0.25 * image_height
@@ -46,8 +59,8 @@ def _default_roi_geometry(
 
 def _clamp_roi_geometry(
     geometry: tuple[float, float, float, float],
-    image_width: float = IMAGE_WIDTH,
-    image_height: float = IMAGE_HEIGHT,
+    image_width: float = IMAGE_WIDTH_CAM0,
+    image_height: float = IMAGE_HEIGHT_CAM0,
 ) -> tuple[float, float, float, float]:
     x, y, width, height = geometry
     if not all(math.isfinite(value) for value in geometry):
@@ -73,39 +86,53 @@ class _MainWindowGUI(QtWidgets.QMainWindow):
         splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
         main_layout.addWidget(splitter)
 
-        self.image_plot = pg.PlotWidget()
-        self.image_plot.setAspectLocked(True)
-        self.image_plot.setLabel("bottom", "x", units="px")
-        self.image_plot.setLabel("left", "y", units="px")
-        self.image_plot.showGrid(x=True, y=True, alpha=0.2)
-        self.image_plot.invertY(True)
+        self.image_graphics_layout = pg.GraphicsLayoutWidget()
+        self.image_plots: dict[str, pg.PlotItem] = {}
+        self.image_items: dict[str, pg.ImageItem] = {}
+        self.image_rois: dict[str, pg.RectROI] = {}
+        for row, (camera, (image_width, image_height)) in enumerate(
+            CAMERA_IMAGE_SIZES.items()
+        ):
+            image_plot = self.image_graphics_layout.addPlot(row=row, col=0)
+            image_plot.setTitle(camera)
+            image_plot.setAspectLocked(True)
+            image_plot.setLabel("bottom", "x", units="px")
+            image_plot.setLabel("left", "y", units="px")
+            image_plot.showGrid(x=True, y=True, alpha=0.2)
+            image_plot.invertY(True)
 
-        self.image_item = pg.ImageItem(axisOrder="row-major")
-        sample_img = np.ones((int(IMAGE_HEIGHT), int(IMAGE_WIDTH)), dtype=np.int64)
-        sample_img[0, 0] = 0
-        self.image_item.setImage(sample_img)
-        self.image_plot.addItem(self.image_item)
-        self.image_plot.plotItem.vb.setRange(
-            rect=QtCore.QRectF(0, 0, IMAGE_WIDTH, IMAGE_HEIGHT), padding=0
-        )
+            image_item = pg.ImageItem(axisOrder="row-major")
+            sample_img = np.ones((int(image_height), int(image_width)), dtype=np.int64)
+            sample_img[0, 0] = 0
+            image_item.setImage(sample_img)
+            image_plot.addItem(image_item)
+            image_plot.vb.setRange(
+                rect=QtCore.QRectF(0, 0, image_width, image_height),
+                padding=0,
+            )
 
-        roi_geometry = _default_roi_geometry()
-        self.image_roi = pg.RectROI(
-            roi_geometry[:2],
-            roi_geometry[2:],
-            sideScalers=True,
-            maxBounds=QtCore.QRectF(0.0, 0.0, IMAGE_WIDTH, IMAGE_HEIGHT),
-            pen=pg.mkPen("#008c99", width=2),
-            hoverPen=pg.mkPen("#00c2d1", width=2),
-        )
-        self.image_roi.addScaleHandle((0.0, 0.0), (1.0, 1.0))
-        self.image_roi.addScaleHandle((1.0, 0.0), (0.0, 1.0))
-        self.image_roi.addScaleHandle((0.0, 1.0), (1.0, 0.0))
-        self.image_roi.addScaleHandle((0.5, 0.0), (0.5, 1.0))
-        self.image_roi.addScaleHandle((0.0, 0.5), (1.0, 0.5))
-        self.image_roi.setZValue(10)
-        self.image_plot.addItem(self.image_roi)
-        splitter.addWidget(self.image_plot)
+            roi_geometry = _default_roi_geometry(image_width, image_height)
+            image_roi = pg.RectROI(
+                roi_geometry[:2],
+                roi_geometry[2:],
+                sideScalers=True,
+                maxBounds=QtCore.QRectF(0.0, 0.0, image_width, image_height),
+                pen=pg.mkPen("#008c99", width=2),
+                hoverPen=pg.mkPen("#00c2d1", width=2),
+            )
+            image_roi.addScaleHandle((0.0, 0.0), (1.0, 1.0))
+            image_roi.addScaleHandle((1.0, 0.0), (0.0, 1.0))
+            image_roi.addScaleHandle((0.0, 1.0), (1.0, 0.0))
+            image_roi.addScaleHandle((0.5, 0.0), (0.5, 1.0))
+            image_roi.addScaleHandle((0.0, 0.5), (1.0, 0.5))
+            image_roi.setZValue(10)
+            image_plot.addItem(image_roi)
+
+            self.image_plots[camera] = image_plot
+            self.image_items[camera] = image_item
+            self.image_rois[camera] = image_roi
+
+        splitter.addWidget(self.image_graphics_layout)
 
         self.calibration_panel = CalibrationPanel()
         splitter.addWidget(self.calibration_panel)
@@ -126,19 +153,28 @@ class MainWindow(_MainWindowGUI):
         self._calibration_path: Path | None = None
         self._calibration_thread = CalibrationThread(self)
 
-        default_roi_geometry = _default_roi_geometry()
-        roi_values: list[float] = []
-        for key, fallback in zip(ROI_SETTINGS_KEYS, default_roi_geometry, strict=True):
-            value = self._settings.value(key, fallback)
-            try:
-                roi_values.append(float(value))
-            except (TypeError, ValueError):
-                roi_values.append(fallback)
-        self._set_roi_geometry(_clamp_roi_geometry(tuple(roi_values)))
-
-        self.image_roi.sigRegionChangeFinished.connect(
-            self._on_roi_region_change_finished
-        )
+        for camera, (image_width, image_height) in CAMERA_IMAGE_SIZES.items():
+            default_roi_geometry = _default_roi_geometry(image_width, image_height)
+            roi_values: list[float] = []
+            for key, fallback in zip(
+                ROI_SETTINGS_KEYS[camera],
+                default_roi_geometry,
+                strict=True,
+            ):
+                value = self._settings.value(key, fallback)
+                try:
+                    roi_values.append(float(value))
+                except (TypeError, ValueError):
+                    roi_values.append(fallback)
+            self._set_roi_geometry(
+                camera,
+                _clamp_roi_geometry(tuple(roi_values), image_width, image_height),
+            )
+            self.image_rois[camera].sigRegionChangeFinished.connect(
+                lambda _roi=None, camera=camera: self._on_roi_region_change_finished(
+                    camera
+                )
+            )
         self.calibration_panel.load_calibration_button.clicked.connect(
             self._on_load_calibration_clicked
         )
@@ -174,29 +210,34 @@ class MainWindow(_MainWindowGUI):
 
     @QtCore.Slot(int)
     def _on_move_detected(self, target: int) -> None:
+        # TODO: Estimate xyz displacement from both cameras and move x/y/z.
+        del target
         self._server.set_result(True, "")
 
-    @QtCore.Slot(object)
-    def _on_roi_region_change_finished(self, roi: object | None = None) -> None:
-        del roi
-        position = self.image_roi.pos()
-        size = self.image_roi.size()
+    def _on_roi_region_change_finished(self, camera: str) -> None:
+        image_width, image_height = CAMERA_IMAGE_SIZES[camera]
+        roi = self.image_rois[camera]
+        position = roi.pos()
+        size = roi.size()
         geometry = _clamp_roi_geometry(
             (
                 float(position.x()),
                 float(position.y()),
                 float(size.x()),
                 float(size.y()),
-            )
+            ),
+            image_width,
+            image_height,
         )
-        self._set_roi_geometry(geometry)
-        for key, value in zip(ROI_SETTINGS_KEYS, geometry, strict=True):
+        self._set_roi_geometry(camera, geometry)
+        for key, value in zip(ROI_SETTINGS_KEYS[camera], geometry, strict=True):
             self._settings.setValue(key, float(value))
         self._settings.sync()
 
     @QtCore.Slot()
     def _refresh_image(self) -> None:
-        self.image_item.setImage(get_framegrabber_image())
+        self.image_items["cam0"].setImage(get_framegrabber_image())
+        self.image_items["cam1"].setImage(get_basler_image())
 
     @QtCore.Slot()
     def _on_load_calibration_clicked(self) -> None:
@@ -308,10 +349,20 @@ class MainWindow(_MainWindowGUI):
         )
         self.calibration_panel.show_loaded_calibration(self._calibration, display_name)
 
-    def _set_roi_geometry(self, geometry: tuple[float, float, float, float]) -> None:
-        x, y, width, height = _clamp_roi_geometry(geometry)
-        self.image_roi.setPos((x, y), update=False, finish=False)
-        self.image_roi.setSize((width, height), update=True, finish=False)
+    def _set_roi_geometry(
+        self,
+        camera: str,
+        geometry: tuple[float, float, float, float],
+    ) -> None:
+        image_width, image_height = CAMERA_IMAGE_SIZES[camera]
+        x, y, width, height = _clamp_roi_geometry(
+            geometry,
+            image_width,
+            image_height,
+        )
+        image_roi = self.image_rois[camera]
+        image_roi.setPos((x, y), update=False, finish=False)
+        image_roi.setSize((width, height), update=True, finish=False)
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
         self._calibration_thread.stop()

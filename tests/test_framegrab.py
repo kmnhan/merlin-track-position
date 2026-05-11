@@ -4,6 +4,8 @@ from unittest.mock import patch
 import numpy as np
 
 from merlin_track_position import constants
+from merlin_track_position.instruments.basler import get_basler_image
+from merlin_track_position.instruments.cameras import capture_camera_pair
 from merlin_track_position.instruments.framegrab import get_framegrabber_image
 from merlin_track_position.instruments.motors import move_motors_and_wait
 from merlin_track_position.instruments.simulated_hardware import simulator
@@ -27,23 +29,46 @@ class DevelopmentModeFramegrabTests(unittest.TestCase):
         np.testing.assert_allclose(
             image,
             simulator.get_reference_image()[
-                : constants.IMAGE_HEIGHT, : constants.IMAGE_WIDTH
+                : constants.IMAGE_HEIGHT_CAM0, : constants.IMAGE_WIDTH_CAM0
             ],
         )
         self.assertEqual(image.dtype, np.float64)
 
+    def test_development_mode_basler_placeholder_uses_simulator(self):
+        with patch.object(constants, "IS_DAQ_PC", False):
+            image = get_basler_image()
+
+        self.assertEqual(
+            image.shape,
+            (constants.IMAGE_HEIGHT_CAM1, constants.IMAGE_WIDTH_CAM1),
+        )
+        self.assertEqual(image.dtype, np.float64)
+
+    def test_capture_camera_pair_returns_both_images(self):
+        with patch.object(constants, "IS_DAQ_PC", False):
+            image_cam0, image_cam1 = capture_camera_pair()
+
+        self.assertEqual(
+            image_cam0.shape,
+            (constants.IMAGE_HEIGHT_CAM0, constants.IMAGE_WIDTH_CAM0),
+        )
+        self.assertEqual(
+            image_cam1.shape,
+            (constants.IMAGE_HEIGHT_CAM1, constants.IMAGE_WIDTH_CAM1),
+        )
+
     def test_simulated_frame_shift_tracks_motor_positions(self):
-        stage_um = np.array([60.0, -30.0], dtype=np.float64)
+        stage_um = np.array([60.0, -30.0, 20.0], dtype=np.float64)
 
         with (
             patch.object(constants, "IS_DAQ_PC", False),
             patch("merlin_track_position.instruments.simulated_hardware.time.sleep"),
         ):
             reference = get_framegrabber_image()
-            move_motors_and_wait(("x", "y"), stage_um * 1e-3)
+            move_motors_and_wait(("x", "y", "z"), stage_um * 1e-3)
             shifted = get_framegrabber_image()
 
-        expected_shift_px = simulator.get_stage_to_pixel() @ stage_um
+        expected_shift_px = simulator.get_stage_to_pixel("cam0") @ stage_um
         measured = estimate_shift(
             reference,
             shifted,
