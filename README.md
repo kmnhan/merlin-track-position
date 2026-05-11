@@ -9,7 +9,7 @@ axis corrections in microns.
 ## Quick Start
 
 ```python
-from merlin_track_position.tracking.calibration import correct
+from merlin_track_position.tracking.calibration_core import correct
 
 result = correct(
     calibration,
@@ -30,7 +30,7 @@ print(result.attrs["warnings"])
 Fit calibration directly from two image stacks and known motor positions:
 
 ```python
-from merlin_track_position.tracking.calibration import fit_calibration_from_images
+from merlin_track_position.tracking.calibration_core import fit_calibration_from_images
 
 calibration = fit_calibration_from_images(
     images_cam0,

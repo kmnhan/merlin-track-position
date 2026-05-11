@@ -7,7 +7,7 @@ import pyqtgraph as pg
 import xarray as xr
 from qtpy import QtCore, QtWidgets
 
-from merlin_track_position.tracking.calibration import (
+from merlin_track_position.tracking.calibration_core import (
     CAMERAS,
     OBSERVATION_AXES,
     PIXEL_AXES,

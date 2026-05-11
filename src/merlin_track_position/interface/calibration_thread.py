@@ -23,22 +23,18 @@ class CalibrationThread(QtCore.QThread):
     def __init__(
         self,
         parent: QtCore.QObject | None = None,
-        *,
-        sleep_seconds: float = 5.0,
     ):
         super().__init__(parent)
-
-        self._sleep_seconds = sleep_seconds
         self._running = threading.Event()
 
     def run(self) -> None:
         self._running.set()
         try:
-            time.sleep(self._sleep_seconds)
             if not self._running.is_set() or self.isInterruptionRequested():
                 return
 
             try:
+                time.sleep(3.0)  # Simulate a long-running calibration process.
                 with xr.open_dataset(
                     DEFAULT_SAMPLE_CALIBRATION_PATH,
                     engine="h5netcdf",

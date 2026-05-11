@@ -24,7 +24,7 @@ from merlin_track_position.interface.main_window import (
     _default_roi_geometry,
     _validate_calibration_dataset,
 )
-from merlin_track_position.tracking.calibration import (
+from merlin_track_position.tracking.calibration_core import (
     CAMERAS,
     OBSERVATION_AXES,
     PIXEL_AXES,

@@ -7,7 +7,7 @@ import xarray as xr
 
 from merlin_track_position.instruments.cameras import capture_camera_pair
 from merlin_track_position.instruments.motors import get_positions, move_motors_and_wait
-from merlin_track_position.tracking.calibration import fit_calibration_from_images
+from merlin_track_position.tracking.calibration_core import fit_calibration_from_images
 
 logger = logging.getLogger("merlin_track_position.tracking.calibrate")
 

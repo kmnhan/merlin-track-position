@@ -14,7 +14,7 @@ from merlin_track_position.constants import (
     IMAGE_WIDTH_CAM0,
     IMAGE_WIDTH_CAM1,
 )
-from merlin_track_position.tracking.calibration import (
+from merlin_track_position.tracking.calibration_core import (
     CAMERAS,
     OBSERVATION_AXES,
     PIXEL_AXES,
