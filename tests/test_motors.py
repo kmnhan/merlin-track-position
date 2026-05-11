@@ -167,10 +167,9 @@ class MoveMotorsAndWaitTests(unittest.TestCase):
                 tolerance=(0.05,),
             )
 
-    def test_backlash_correction_prepositions_below_current_when_already_below_target(self):
+    def test_positive_moves_on_backlash_axes_do_not_preposition(self):
         server = FakeBCSServer(
             [
-                (-0.025, -0.03),
                 (0.02, 2.0, 0.04),
             ],
             initial_positions=(0.005, 2.5, 0.0),
@@ -185,14 +184,15 @@ class MoveMotorsAndWaitTests(unittest.TestCase):
             )
 
         self.assertEqual(positions, (0.02, 2.0, 0.04))
-        self.assertEqual(server.move_calls[0][0], (MOTOR_NAMES["x"], MOTOR_NAMES["z"]))
-        self.assertAlmostEqual(server.move_calls[0][1][0], -0.025)
-        self.assertAlmostEqual(server.move_calls[0][1][1], -0.03)
         self.assertEqual(
-            server.move_calls[1][0],
-            (MOTOR_NAMES["x"], MOTOR_NAMES["y"], MOTOR_NAMES["z"]),
+            server.move_calls,
+            [
+                (
+                    (MOTOR_NAMES["x"], MOTOR_NAMES["y"], MOTOR_NAMES["z"]),
+                    (0.02, 2.0, 0.04),
+                )
+            ],
         )
-        self.assertEqual(server.move_calls[1][1], (0.02, 2.0, 0.04))
 
     def test_backlash_correction_prepositions_below_target_when_above_target(self):
         server = FakeBCSServer(
@@ -232,10 +232,9 @@ class MoveMotorsAndWaitTests(unittest.TestCase):
         self.assertEqual(positions, (0.02, 2.0, 0.04))
         self.assertEqual(server.move_calls, [])
 
-    def test_only_changed_z_axis_gets_backlash_and_final_move(self):
+    def test_positive_z_move_does_not_get_backlash_preposition(self):
         server = FakeBCSServer(
             [
-                (-0.03,),
                 (0.04,),
             ],
             initial_positions=(0.02, 2.0, 0.0),
@@ -253,10 +252,32 @@ class MoveMotorsAndWaitTests(unittest.TestCase):
         self.assertEqual(
             server.move_calls,
             [
-                ((MOTOR_NAMES["z"],), (-0.03,)),
                 ((MOTOR_NAMES["z"],), (0.04,)),
             ],
         )
+
+    def test_negative_z_move_gets_backlash_and_final_move(self):
+        server = FakeBCSServer(
+            [
+                (-0.03,),
+                (0.04,),
+            ],
+            initial_positions=(0.02, 2.0, 0.08),
+        )
+
+        with patch("merlin_track_position.instruments.motors.time.sleep"):
+            positions = _move_motors_and_wait(
+                server,
+                ("x", "y", "z"),
+                (0.0204, 2.0005, 0.04),
+                backlash_correction={"x": 0.030, "z": 0.030},
+            )
+
+        self.assertEqual(positions, (0.02, 2.0, 0.04))
+        self.assertEqual(len(server.move_calls), 2)
+        self.assertEqual(server.move_calls[0][0], (MOTOR_NAMES["z"],))
+        self.assertAlmostEqual(server.move_calls[0][1][0], 0.01)
+        self.assertEqual(server.move_calls[1], ((MOTOR_NAMES["z"],), (0.04,)))
 
     def test_only_changed_y_axis_moves_without_backlash(self):
         server = FakeBCSServer([(2.01,)], initial_positions=(0.02, 2.0, 0.04))
@@ -275,7 +296,6 @@ class MoveMotorsAndWaitTests(unittest.TestCase):
     def test_mixed_move_omits_unchanged_backlash_axis(self):
         server = FakeBCSServer(
             [
-                (-0.015,),
                 (0.02, 0.02),
             ],
             initial_positions=(0.0, 0.0, 0.0),
@@ -293,7 +313,6 @@ class MoveMotorsAndWaitTests(unittest.TestCase):
         self.assertEqual(
             server.move_calls,
             [
-                ((MOTOR_NAMES["x"],), (-0.015,)),
                 ((MOTOR_NAMES["x"], MOTOR_NAMES["y"]), (0.02, 0.02)),
             ],
         )
@@ -301,7 +320,6 @@ class MoveMotorsAndWaitTests(unittest.TestCase):
     def test_explicit_tolerance_overrides_default_deadband(self):
         server = FakeBCSServer(
             [
-                (-0.015,),
                 (0.0008,),
             ],
             initial_positions=(0.0,),
@@ -320,7 +338,6 @@ class MoveMotorsAndWaitTests(unittest.TestCase):
         self.assertEqual(
             server.move_calls,
             [
-                ((MOTOR_NAMES["x"],), (-0.015,)),
                 ((MOTOR_NAMES["x"],), (0.0008,)),
             ],
         )

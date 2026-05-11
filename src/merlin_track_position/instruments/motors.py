@@ -119,7 +119,10 @@ def _move_motors_and_wait(
         active_goals = _items_at(goals, active_indices)
 
         pre_indices = tuple(
-            index for index in active_indices if backlash_corrections[index] > 0.0
+            index
+            for index in active_indices
+            if backlash_corrections[index] > 0.0
+            and goals[index] < current_positions[index]
         )
         if pre_indices:
             pre_aliases = _items_at(motor_aliases, pre_indices)
