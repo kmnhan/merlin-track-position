@@ -4,7 +4,7 @@ import sys
 import pathlib
 
 # Mapping from shorthand motor names to actual motor names at the beamline.
-MOTOR_NAMES = {
+MOTOR_NAMES: dict[str, str] = {
     "x": "Sample X",
     "y": "Sample Y (Vert)",
     "z": "Sample Z",
@@ -24,14 +24,19 @@ IMAGE_WIDTH_CAM1: int = 1440
 IMAGE_HEIGHT_CAM1: int = 1080
 
 # If you change this, make sure to also update FrameGrabbber FSM UI2.vi
-FRAMEGRAB_SERVER_PORT = 6553
+FRAMEGRAB_SERVER_PORT: int = 6553
+
+# Change this if you change the Basler camera
+BASLER_CAMERA_ID = "40049666"
+BASLER_EXPOSURE_US: float = 300000.0  # 300 ms exposure time
+
 
 # If you change this, make sure to also update TrackTemperatureBL403 BCS Driver.vi
-MOTOR_SERVER_PORT = 6554
+MOTOR_SERVER_PORT: int = 6554
 
 # These are default settings for BCS API server, probably shouldn't need to be changed.
-BCS_SERVER_HOST = "localhost"
-BCS_SERVER_PORT = 5577
+BCS_SERVER_HOST: str = "localhost"
+BCS_SERVER_PORT: int = 5577
 
 # Flag to indicate whether we're running on the acquisition PC (True) or a development
 # machine (False). This can be used to determine file paths and other

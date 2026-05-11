@@ -47,4 +47,4 @@ def get_framegrabber_image(timeout_ms: int = 5000) -> npt.NDArray[np.float64]:
             : constants.IMAGE_HEIGHT_CAM0, : constants.IMAGE_WIDTH_CAM0
         ]
         .copy()
-    )
+    ).astype(np.float64)
