@@ -15,6 +15,12 @@ logger = logging.getLogger("merlin_track_position.instruments.basler")
 
 
 class CameraConfiguration(pylon.ConfigurationEventHandler):
+    def OnClose(self, *_args):
+        pass
+
+    def OnClosed(self, *_args):
+        pass
+
     def OnOpened(self, camera):
         try:
             if not genicam.IsWritable(camera.UserSetSelector):

@@ -112,6 +112,14 @@ class DevelopmentModeFramegrabTests(unittest.TestCase):
         self.assertEqual(camera.Height.Value, constants.IMAGE_HEIGHT_CAM1)
         self.assertEqual(camera.PixelFormat.Value, "Mono10")
 
+    def test_basler_configuration_close_callbacks_are_noops(self):
+        configuration = CameraConfiguration()
+
+        configuration.OnClose()
+        configuration.OnClose(object())
+        configuration.OnClosed()
+        configuration.OnClosed(object())
+
     def test_daq_mode_basler_image_accepts_expected_shape(self):
         raw = np.arange(6, dtype=np.uint16).reshape(2, 3)
 
