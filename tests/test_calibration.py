@@ -12,9 +12,9 @@ from merlin_track_position.tracking.calibration_core import (
     CAMERAS,
     PIXEL_AXES,
     STAGE_AXES,
-    correct,
     estimate_stage_offset,
     fit_calibration_from_images,
+    get_correction,
 )
 from merlin_track_position.tracking.calibrate import calibration_sample_count, run_calibration
 from merlin_track_position.tracking.sample_calibration import (
@@ -260,7 +260,7 @@ class CalibrationTests(unittest.TestCase):
             dataset["stage_to_pixel"].values,
         )
 
-    def test_correct_uses_two_camera_shift(self):
+    def test_get_correction_uses_two_camera_shift(self):
         stage_to_pixel = stereo_stage_to_pixel()
         stage = calibration_stage()
         images_cam0, images_cam1 = make_stereo_images(stage, stage_to_pixel)
@@ -287,7 +287,7 @@ class CalibrationTests(unittest.TestCase):
             mode="wrap",
         )
 
-        result = correct(
+        result = get_correction(
             calibration,
             calibration["image_cam0"].isel(sample=0).values,
             current_cam0,
@@ -308,6 +308,9 @@ class CalibrationTests(unittest.TestCase):
             atol=1.0,
         )
         self.assertEqual(result["shift_px"].shape, (len(CAMERAS), len(PIXEL_AXES)))
+        np.testing.assert_allclose(result["current_cam0"].values, current_cam0)
+        np.testing.assert_allclose(result["current_cam1"].values, current_cam1)
+        self.assertNotIn("method", result.attrs)
 
     def test_fit_calibration_requires_independent_stage_axes(self):
         stage = np.array(

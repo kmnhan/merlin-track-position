@@ -9,9 +9,9 @@ axis corrections in microns.
 ## Quick Start
 
 ```python
-from merlin_track_position.tracking.calibration_core import correct
+from merlin_track_position.tracking.calibration_core import get_correction
 
-result = correct(
+result = get_correction(
     calibration,
     reference_cam0,
     current_cam0,

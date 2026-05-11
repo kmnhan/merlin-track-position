@@ -82,12 +82,8 @@ def fit_calibration_from_images(
     ):
         shift_cam0 = estimate_shift(reference_cam0, image_cam0, **shift_kwargs)
         shift_cam1 = estimate_shift(reference_cam1, image_cam1, **shift_kwargs)
-        shifts_cam0.append(
-            np.asarray(shift_cam0["shift_px"].values, dtype=np.float64)
-        )
-        shifts_cam1.append(
-            np.asarray(shift_cam1["shift_px"].values, dtype=np.float64)
-        )
+        shifts_cam0.append(np.asarray(shift_cam0["shift_px"].values, dtype=np.float64))
+        shifts_cam1.append(np.asarray(shift_cam1["shift_px"].values, dtype=np.float64))
         measurement_warnings.append(
             (
                 tuple(str(shift_cam0.attrs.get("warnings", "")).splitlines()),
@@ -130,9 +126,7 @@ def fit_calibration_from_images(
     )
     residual_px = pixels - predicted
     pixel_to_stage = np.linalg.pinv(stage_to_observation)
-    return_to_origin_motor_error_norm_um = float(
-        np.linalg.norm(stage[-1])
-    )
+    return_to_origin_motor_error_norm_um = float(np.linalg.norm(stage[-1]))
     return_to_origin_image_error_um = observations[-1] @ pixel_to_stage.T
     return_to_origin_image_error_norm_um = float(
         np.linalg.norm(return_to_origin_image_error_um)
@@ -169,9 +163,7 @@ def fit_calibration_from_images(
         measurement_warnings,
         stage.shape[0],
     )
-    warnings.extend(
-        format_measurement_warning_lines(measurement_warnings_tuple, stage)
-    )
+    warnings.extend(format_measurement_warning_lines(measurement_warnings_tuple, stage))
 
     sample_count = stage.shape[0]
     coords: dict[str, Any] = {
@@ -260,7 +252,7 @@ def estimate_stage_offset(
     return pixel_to_stage @ observation
 
 
-def correct(
+def get_correction(
     calibration: xr.Dataset,
     reference_cam0: Any,
     current_cam0: Any,
@@ -272,6 +264,8 @@ def correct(
 
     shift_cam0 = estimate_shift(reference_cam0, current_cam0, **shift_kwargs)
     shift_cam1 = estimate_shift(reference_cam1, current_cam1, **shift_kwargs)
+    current_image_cam0 = np.asarray(current_cam0, dtype=np.float64)
+    current_image_cam1 = np.asarray(current_cam1, dtype=np.float64)
     shift_px = np.stack(
         [
             np.asarray(shift_cam0["shift_px"].values, dtype=np.float64),
@@ -281,7 +275,6 @@ def correct(
     )
     estimated_offset = estimate_stage_offset(calibration, shift_px)
     correction = -estimated_offset
-    calibration_warnings = str(calibration.attrs.get("warnings", "")).splitlines()
     shift_warnings = [
         line
         for line in (
@@ -299,68 +292,20 @@ def correct(
                 {"units": "um"},
             ),
             "correction_um": (("stage_axis",), correction, {"units": "um"}),
-            "registration_error": (
-                ("camera",),
-                [
-                    float(shift_cam0["registration_error"].values),
-                    float(shift_cam1["registration_error"].values),
-                ],
-            ),
-            "phase_difference": (
-                ("camera",),
-                [
-                    float(shift_cam0["phase_difference"].values),
-                    float(shift_cam1["phase_difference"].values),
-                ],
-            ),
-            "texture_dynamic_range": (
-                ("camera",),
-                [
-                    float(shift_cam0["texture_dynamic_range"].values),
-                    float(shift_cam1["texture_dynamic_range"].values),
-                ],
-            ),
-            "texture_gradient_rms": (
-                ("camera",),
-                [
-                    float(shift_cam0["texture_gradient_rms"].values),
-                    float(shift_cam1["texture_gradient_rms"].values),
-                ],
-            ),
-            "tile_median_shift_px": (
-                ("camera", "pixel_axis"),
-                np.stack(
-                    [
-                        np.asarray(
-                            shift_cam0["tile_median_shift_px"].values,
-                            dtype=np.float64,
-                        ),
-                        np.asarray(
-                            shift_cam1["tile_median_shift_px"].values,
-                            dtype=np.float64,
-                        ),
-                    ],
-                    axis=0,
-                ),
-                {"units": "px"},
-            ),
-            "tile_shift_std_px": (
-                ("camera",),
-                [
-                    float(shift_cam0["tile_shift_std_px"].values),
-                    float(shift_cam1["tile_shift_std_px"].values),
-                ],
-                {"units": "px"},
-            ),
+            "current_cam0": (("y_cam0", "x_cam0"), current_image_cam0),
+            "current_cam1": (("y_cam1", "x_cam1"), current_image_cam1),
         },
         coords={
             "camera": list(CAMERAS),
             "pixel_axis": list(PIXEL_AXES),
             "stage_axis": list(STAGE_AXES),
+            "y_cam0": np.arange(current_image_cam0.shape[0], dtype=np.int64),
+            "x_cam0": np.arange(current_image_cam0.shape[1], dtype=np.int64),
+            "y_cam1": np.arange(current_image_cam1.shape[0], dtype=np.int64),
+            "x_cam1": np.arange(current_image_cam1.shape[1], dtype=np.int64),
         },
         attrs={
-            "method": "calibrated_stereo_shift_correction",
-            "warnings": "\n".join([*calibration_warnings, *shift_warnings]),
+            "warnings": "\n".join(shift_warnings),
         },
     )
 
@@ -437,9 +382,7 @@ def _shift_to_observation(shift_values: np.ndarray) -> np.ndarray:
         return values.reshape(-1)
     if values.size == len(OBSERVATION_AXES):
         return values.reshape(-1)
-    raise ValueError(
-        "shift must have shape (2, 2) or contain four observation values"
-    )
+    raise ValueError("shift must have shape (2, 2) or contain four observation values")
 
 
 def _pad_warnings(
@@ -453,9 +396,7 @@ def _pad_warnings(
     result: list[tuple[tuple[str, ...], tuple[str, ...]]] = []
     for sample_warnings in values:
         if len(sample_warnings) != len(CAMERAS):
-            raise ValueError(
-                f"expected {len(CAMERAS)} camera warning lists per sample"
-            )
+            raise ValueError(f"expected {len(CAMERAS)} camera warning lists per sample")
         result.append(
             (
                 tuple(sample_warnings[0]),
