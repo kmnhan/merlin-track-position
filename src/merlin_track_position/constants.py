@@ -17,11 +17,18 @@ MOTOR_NAMES: dict[str, str] = {
     "TD": "Cryostat Temp D",
 }
 
-# Manual backlash correction for motors that has no built-in correction in LabVIEW.
-# Values are in mm and will be applied when moving towards smaller motor positions.
+# Manual backlash correction for motors that have no built-in correction in LabVIEW.
+# Values are in each motor's command units. For x and z, this is mm.
 MOTOR_BACKLASH_CORRECTION: dict[str, float] = {
     "x": 0.1,
     "z": 0.1,
+}
+
+# Default no-op deadbands in each motor's command units. For x/y/z, this is mm.
+MOTOR_MOVE_DEADBAND: dict[str, float] = {
+    "x": 0.001,
+    "y": 0.001,
+    "z": 0.001,
 }
 
 # Image size for initial crop from each camera array.

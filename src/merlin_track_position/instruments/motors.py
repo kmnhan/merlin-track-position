@@ -88,48 +88,74 @@ def _move_motors_and_wait(
         logger.error("Move failed: max_retries must be non-negative.")
         return get_positions(motor_aliases)
 
-    if tolerance is None:
-        tolerances = None
-    elif np.isscalar(tolerance):
-        tolerances = (float(tolerance),) * len(motor_aliases)
-    else:
-        tolerances = tuple(float(t) for t in tolerance)
-
+    tolerances = _move_tolerances(motor_aliases, tolerance)
+    deadbands = _move_deadbands(motor_aliases, tolerances)
     backlash_corrections = _backlash_corrections(
         motor_aliases,
         backlash_correction,
     )
-    motor_names = [constants.MOTOR_NAMES[m] for m in motor_aliases]
+    current_positions = _get_positions(bcs_server, motor_aliases)
+    final_positions = current_positions
 
     for _ in range(max_retries + 1):
-        if any(correction > 0.0 for correction in backlash_corrections):
-            current_positions = _get_positions(bcs_server, motor_aliases)
-            pre_goals = _backlash_pre_goals(
-                current_positions,
+        active_indices = _active_move_indices(
+            current_positions,
+            goals,
+            deadbands,
+        )
+        if not active_indices:
+            logger.debug(
+                "Skipping move because all requested axes are already within "
+                "deadband: motor_aliases=%s, goals=%s, current_positions=%s, "
+                "deadbands=%s",
+                motor_aliases,
                 goals,
-                backlash_corrections,
+                current_positions,
+                deadbands,
+            )
+            return current_positions
+
+        active_aliases = _items_at(motor_aliases, active_indices)
+        active_goals = _items_at(goals, active_indices)
+
+        pre_indices = tuple(
+            index for index in active_indices if backlash_corrections[index] > 0.0
+        )
+        if pre_indices:
+            pre_aliases = _items_at(motor_aliases, pre_indices)
+            pre_goals = _backlash_pre_goals(
+                _items_at(current_positions, pre_indices),
+                _items_at(goals, pre_indices),
+                _items_at(backlash_corrections, pre_indices),
             )
             logger.debug(
                 "Backlash pre-position: motor_aliases=%s, current_positions=%s, "
                 "pre_goals=%s, final_goals=%s",
-                motor_aliases,
-                current_positions,
+                pre_aliases,
+                _items_at(current_positions, pre_indices),
                 pre_goals,
-                goals,
+                _items_at(goals, pre_indices),
             )
-            bcs_server.move_motor(motors=motor_names, goals=list(pre_goals))
+            bcs_server.move_motor(
+                motors=[constants.MOTOR_NAMES[alias] for alias in pre_aliases],
+                goals=list(pre_goals),
+            )
             time.sleep(0.2)
-            _wait_until_move_complete(bcs_server, motor_aliases)
+            _wait_until_move_complete(bcs_server, pre_aliases)
 
-        bcs_server.move_motor(motors=motor_names, goals=list(goals))
+        bcs_server.move_motor(
+            motors=[constants.MOTOR_NAMES[alias] for alias in active_aliases],
+            goals=list(active_goals),
+        )
         # wait just a bit to let the move begin.
         time.sleep(0.2)
-        final_positions = _wait_until_move_complete(bcs_server, motor_aliases)
+        _wait_until_move_complete(bcs_server, active_aliases)
+        final_positions = _get_positions(bcs_server, motor_aliases)
 
         logger.debug(
-            "Move attempt: motor_aliases=%s, goals=%s, final_positions=%s",
-            motor_aliases,
-            goals,
+            "Move attempt: active_aliases=%s, active_goals=%s, final_positions=%s",
+            active_aliases,
+            active_goals,
             final_positions,
         )
 
@@ -140,6 +166,7 @@ def _move_motors_and_wait(
             )
         ):
             return final_positions
+        current_positions = final_positions
 
     position_errors = tuple(
         position - goal for position, goal in zip(final_positions, goals, strict=True)
@@ -156,6 +183,62 @@ def _move_motors_and_wait(
         tolerances,
     )
     return final_positions
+
+
+def _move_tolerances(
+    motor_aliases: Iterable[str],
+    tolerance: float | Iterable[float] | None,
+) -> tuple[float, ...] | None:
+    aliases = tuple(motor_aliases)
+    if tolerance is None:
+        return None
+    if np.isscalar(tolerance):
+        tolerances = (float(tolerance),) * len(aliases)
+    else:
+        tolerances = tuple(float(t) for t in tolerance)
+        if len(tolerances) != len(aliases):
+            raise ValueError(
+                "tolerance must be a scalar or have one value per motor alias"
+            )
+
+    if any(not np.isfinite(value) or value < 0.0 for value in tolerances):
+        raise ValueError("tolerance values must be finite and non-negative")
+    return tolerances
+
+
+def _move_deadbands(
+    motor_aliases: Iterable[str],
+    tolerances: tuple[float, ...] | None,
+) -> tuple[float, ...]:
+    if tolerances is not None:
+        return tolerances
+
+    deadbands = []
+    for alias in motor_aliases:
+        deadband = float(constants.MOTOR_MOVE_DEADBAND.get(alias, 0.0))
+        if not np.isfinite(deadband) or deadband < 0.0:
+            raise ValueError("move deadbands must be finite and non-negative")
+        deadbands.append(deadband)
+    return tuple(deadbands)
+
+
+def _active_move_indices(
+    current_positions: Iterable[float],
+    goals: Iterable[float],
+    deadbands: Iterable[float],
+) -> tuple[int, ...]:
+    return tuple(
+        index
+        for index, (current, goal, deadband) in enumerate(
+            zip(current_positions, goals, deadbands, strict=True)
+        )
+        if abs(float(goal) - float(current)) > float(deadband)
+    )
+
+
+def _items_at(values: Iterable, indices: Iterable[int]) -> tuple:
+    values_tuple = tuple(values)
+    return tuple(values_tuple[index] for index in indices)
 
 
 def _backlash_corrections(
@@ -231,7 +314,8 @@ def move_motors_and_wait(
         Optional tolerance(s) for verifying that the final positions are within
         tolerance of the goals. If a single float is provided, it will be used for all
         motors. If an iterable of floats is provided, it must have the same length as
-        motor_aliases and specify a tolerance for each motor.
+        motor_aliases and specify a tolerance for each motor. The same values are used
+        as the no-op deadband when deciding which axes actually need to move.
     max_retries
         Maximum number of times to retry the move if the final positions are not within
         tolerance of the goals. Default is 4.
