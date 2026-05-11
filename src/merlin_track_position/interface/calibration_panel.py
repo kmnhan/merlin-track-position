@@ -27,67 +27,172 @@ REQUIRED_CALIBRATION_VARIABLES: tuple[str, ...] = (
     "image_cam1",
     "stage_um",
     "measured_shift_px",
-    "predicted_shift_px",
-    "residual_stage_um",
-    "residual_shift_px",
     "stage_to_pixel",
-    "pixel_to_stage",
-    "condition_number",
-    "origin_stability_um",
-    "return_to_origin_motor_error_um",
-    "return_to_origin_motor_error_norm_um",
-    "return_to_origin_image_error_px",
-    "return_to_origin_image_error_um",
-    "return_to_origin_image_error_norm_um",
 )
+
+
+def _tooltip_html(
+    computed: tuple[str, ...],
+    interpretation: tuple[str, ...],
+) -> str:
+    paragraphs = "".join(f"<p>{item}</p>" for item in (*computed, *interpretation))
+    return (
+        "<qt><div style='white-space: normal; width: 360px;'>"
+        f"{paragraphs}"
+        "</div></qt>"
+    )
+
+
 METRIC_ROWS: tuple[tuple[str, str, str], ...] = (
-    ("sample_count", "Samples", "Number of calibration positions used in the fit."),
+    (
+        "sample_count",
+        "Samples",
+        _tooltip_html(
+            (
+                "Number of calibration image pairs: <tt>stage_um.shape[0]</tt>.",
+                "Includes the first origin sample and final return-to-origin sample.",
+            ),
+            (
+                "More samples can constrain the fit better.",
+                "Use residuals and condition number as the real quality checks.",
+            ),
+        ),
+    ),
     (
         "condition_number",
         "Condition number",
-        "Numerical sensitivity of the fitted calibration matrix. Lower is better; high values mean the three stage directions are hard to separate.",
+        _tooltip_html(
+            (
+                "<tt>np.linalg.cond(stage_to_observation)</tt>.",
+                "<tt>stage_to_observation</tt> is <tt>stage_to_pixel</tt> reshaped "
+                "into the 4x3 mapping from x/y/z microns to two-camera pixel shifts.",
+            ),
+            (
+                "Lower is better.",
+                "High values mean the camera observations do not separate the three "
+                "stage axes cleanly.",
+                "Small pixel errors can then become large stage errors.",
+            ),
+        ),
     ),
     (
         "residual_rms_px",
         "Residual RMS px",
-        "Root-mean-square length of the pixel residuals after fitting. Lower means measured shifts match the model more closely.",
+        _tooltip_html(
+            (
+                "Predicted shifts come from <tt>stage_um</tt> and "
+                "<tt>stage_to_pixel</tt>.",
+                "Residual is <tt>measured_shift_px - predicted_shift_px</tt>.",
+                "<tt>sqrt(mean(sum(residual^2)))</tt> across both cameras and pixel axes.",
+            ),
+            (
+                "Lower means measured image shifts match the linear model better.",
+                "High values indicate noisy images or bad motor positions.",
+            ),
+        ),
     ),
     (
         "residual_max_px",
         "Residual max px",
-        "Largest pixel residual length across all calibration samples.",
+        _tooltip_html(
+            (
+                "Largest per-sample pixel residual length.",
+                "Uses the same two-camera residual vector as Residual RMS px.",
+            ),
+            (
+                "Shows the worst sample in pixel units.",
+                "A large max with modest RMS usually points to one bad image match or motor position.",
+            ),
+        ),
     ),
     (
         "residual_rms_um",
         "Residual RMS um",
-        "Root-mean-square residual after converting pixel fit error back to stage units.",
+        _tooltip_html(
+            (
+                "Pixel residuals are converted to stage space with "
+                "<tt>pinv(stage_to_pixel)</tt>.",
+                "Then reduced as RMS Euclidean length in x/y/z microns.",
+            ),
+            (
+                "Approximate stage-space size of the calibration fit error.",
+                "Lower is better and is usually easier to reason about than pixel residuals.",
+            ),
+        ),
     ),
     (
         "residual_max_um",
         "Residual max um",
-        "Largest converted stage-space residual across all calibration samples.",
+        _tooltip_html(
+            (
+                "Largest stage-space residual length after converting pixel fit error to x/y/z microns.",
+            ),
+            (
+                "Shows the worst calibration sample in stage units.",
+                "Use it to spot outliers hidden by the RMS average.",
+            ),
+        ),
     ),
     (
-        "origin_stability_um",
-        "Origin stability um",
-        "Configured threshold for final return-to-origin motor and image error warnings.",
-    ),
-    (
-        "return_to_origin_motor_error_norm_um",
+        "return_to_origin_motor_error_um",
         "Return motor error um",
-        "Length of the final encoder displacement relative to the first calibration image.",
+        _tooltip_html(
+            (
+                "Final row of <tt>stage_um</tt>.",
+                "This is the measured motor offset vector (x, y, z) after return-to-origin.",
+            ),
+            (
+                "Ideally near <tt>(0, 0, 0)</tt>.",
+                "Component signs show the direction of remaining motor offset.",
+            ),
+        ),
     ),
     (
-        "return_to_origin_image_error_norm_um",
+        "return_to_origin_image_error_um",
         "Return image error um",
-        "Length of the first-to-last two-camera image shift after converting it to stage units.",
+        _tooltip_html(
+            (
+                "Final row of <tt>measured_shift_px</tt>.",
+                "Converted to x/y/z stage displacement with <tt>pinv(stage_to_pixel)</tt>.",
+            ),
+            (
+                "Estimates how far the final image looks from the first image.",
+                "Ideally near <tt>(0, 0, 0)</tt>.",
+                "Disagreement with Return motor error means encoders and image content disagree.",
+            ),
+        ),
     ),
 )
-REPEATABILITY_ROWS: tuple[tuple[str, str], ...] = (
-    ("position_count", "Positions"),
-    ("capture_count", "Captures"),
-    ("mean_rms_std_px", "Mean RMS std px"),
-    ("max_rms_std_px", "Max RMS std px"),
+REPEATABILITY_ROWS: tuple[tuple[str, str, str], ...] = (
+    (
+        "mean_rms_std_px",
+        "Mean RMS std px",
+        _tooltip_html(
+            (
+                "Samples are grouped by identical <tt>stage_um</tt> positions.",
+                "For groups with at least two captures, compute sample std for each camera/pixel component.",
+                "RMS-combine the four component stds, then average across repeated positions.",
+            ),
+            (
+                "Lower means repeated captures at the same motor position agree better.",
+                "With only the origin repeated, this equals Max RMS std px.",
+            ),
+        ),
+    ),
+    (
+        "max_rms_std_px",
+        "Max RMS std px",
+        _tooltip_html(
+            (
+                "Same per-position RMS standard deviation as Mean RMS std px.",
+                "Reports the largest value among repeated <tt>stage_um</tt> positions.",
+            ),
+            (
+                "Highlights the worst repeated-position image stability.",
+                "With only the origin repeated, this equals Mean RMS std px.",
+            ),
+        ),
+    ),
 )
 
 
@@ -97,6 +202,16 @@ def _format_number(value: object) -> str:
     except (TypeError, ValueError):
         return "n/a"
     return f"{number:.4g}"
+
+
+def _format_metric_value(value: object) -> str:
+    try:
+        values = np.asarray(value, dtype=float)
+    except (TypeError, ValueError):
+        return _format_number(value)
+    if values.ndim == 0 or values.size == 1:
+        return _format_number(values.reshape(-1)[0])
+    return "(" + ", ".join(_format_number(item) for item in values.reshape(-1)) + ")"
 
 
 def _format_duration(seconds: float | None) -> str:
@@ -110,6 +225,64 @@ def _format_duration(seconds: float | None) -> str:
     return f"{minute:d}:{second:02d}"
 
 
+def _calibration_arrays(dataset: xr.Dataset) -> dict[str, np.ndarray]:
+    stage = np.asarray(dataset["stage_um"].values, dtype=float)
+    measured_shift = np.asarray(dataset["measured_shift_px"].values, dtype=float)
+    stage_to_pixel = np.asarray(dataset["stage_to_pixel"].values, dtype=float)
+    stage_to_observation = stage_to_pixel.reshape(
+        len(OBSERVATION_AXES),
+        len(STAGE_AXES),
+    )
+    pixel_to_stage = np.linalg.pinv(stage_to_observation)
+    predicted_shift = (stage @ stage_to_observation.T).reshape(
+        stage.shape[0],
+        len(CAMERAS),
+        len(PIXEL_AXES),
+    )
+    residual_shift = measured_shift - predicted_shift
+    residual_stage = residual_shift.reshape(
+        stage.shape[0],
+        len(OBSERVATION_AXES),
+    ) @ pixel_to_stage.T
+    return {
+        "stage": stage,
+        "measured_shift": measured_shift,
+        "stage_to_pixel": stage_to_pixel,
+        "stage_to_observation": stage_to_observation,
+        "pixel_to_stage": pixel_to_stage,
+        "predicted_shift": predicted_shift,
+        "residual_shift": residual_shift,
+        "residual_stage": residual_stage,
+    }
+
+
+def _repeatability_summary(
+    stage: np.ndarray,
+    measured_shift: np.ndarray,
+) -> dict[str, float] | None:
+    groups: dict[tuple[float, float, float], list[np.ndarray]] = {}
+    for stage_row, shift_row in zip(stage, measured_shift, strict=True):
+        key = (float(stage_row[0]), float(stage_row[1]), float(stage_row[2]))
+        groups.setdefault(key, []).append(shift_row)
+
+    rms_std_px: list[float] = []
+    for rows in groups.values():
+        if len(rows) < 2:
+            continue
+        values = np.stack(rows, axis=0)
+        std = np.std(values, axis=0, ddof=1)
+        rms_std_px.append(float(np.sqrt(np.mean(std * std))))
+
+    finite_rms = np.asarray(rms_std_px, dtype=float)
+    finite_rms = finite_rms[np.isfinite(finite_rms)]
+    if not finite_rms.size:
+        return None
+    return {
+        "mean_rms_std_px": float(np.mean(finite_rms)),
+        "max_rms_std_px": float(np.max(finite_rms)),
+    }
+
+
 def _validate_calibration_dataset(dataset: xr.Dataset) -> None:
     missing = tuple(
         name for name in REQUIRED_CALIBRATION_VARIABLES if name not in dataset
@@ -121,75 +294,40 @@ def _validate_calibration_dataset(dataset: xr.Dataset) -> None:
 
     stage = np.asarray(dataset["stage_um"].values, dtype=float)
     measured_shift = np.asarray(dataset["measured_shift_px"].values, dtype=float)
-    predicted_shift = np.asarray(dataset["predicted_shift_px"].values, dtype=float)
-    residual_stage = np.asarray(dataset["residual_stage_um"].values, dtype=float)
-    residual_shift = np.asarray(dataset["residual_shift_px"].values, dtype=float)
     stage_to_pixel = np.asarray(dataset["stage_to_pixel"].values, dtype=float)
-    pixel_to_stage = np.asarray(dataset["pixel_to_stage"].values, dtype=float)
-    condition_number = np.asarray(dataset["condition_number"].values, dtype=float)
     image_cam0 = np.asarray(dataset["image_cam0"].values)
     image_cam1 = np.asarray(dataset["image_cam1"].values)
-    origin_stability = np.asarray(dataset["origin_stability_um"].values, dtype=float)
-    origin_motor = np.asarray(
-        dataset["return_to_origin_motor_error_um"].values, dtype=float
-    )
-    origin_motor_norm = np.asarray(
-        dataset["return_to_origin_motor_error_norm_um"].values, dtype=float
-    )
-    origin_image_px = np.asarray(
-        dataset["return_to_origin_image_error_px"].values, dtype=float
-    )
-    origin_image_um = np.asarray(
-        dataset["return_to_origin_image_error_um"].values, dtype=float
-    )
-    origin_image_norm = np.asarray(
-        dataset["return_to_origin_image_error_norm_um"].values, dtype=float
-    )
 
     if stage.ndim != 2 or stage.shape[1] != len(STAGE_AXES) or stage.shape[0] == 0:
         raise ValueError("stage_um must have shape (sample, 3)")
     if not np.allclose(stage[0], 0.0, rtol=0.0, atol=1e-9):
         raise ValueError("stage_um[0] must be the origin")
-    if residual_stage.shape != stage.shape:
-        raise ValueError("residual_stage_um must have the same shape as stage_um")
+    if not np.isfinite(stage).all():
+        raise ValueError("stage_um must contain only finite values")
     expected_shift_shape = (stage.shape[0], len(CAMERAS), len(PIXEL_AXES))
     if measured_shift.shape != expected_shift_shape:
         raise ValueError("measured_shift_px must have shape (sample, camera, pixel_axis)")
-    if predicted_shift.shape != expected_shift_shape:
-        raise ValueError("predicted_shift_px must have shape (sample, camera, pixel_axis)")
-    if residual_shift.shape != expected_shift_shape:
-        raise ValueError("residual_shift_px must have shape (sample, camera, pixel_axis)")
+    if not np.isfinite(measured_shift).all():
+        raise ValueError("measured_shift_px must contain only finite values")
     if image_cam0.ndim != 3 or image_cam0.shape[0] != stage.shape[0]:
         raise ValueError("image_cam0 must have shape (sample, y_cam0, x_cam0)")
     if image_cam1.ndim != 3 or image_cam1.shape[0] != stage.shape[0]:
         raise ValueError("image_cam1 must have shape (sample, y_cam1, x_cam1)")
     if stage_to_pixel.shape != (len(CAMERAS), len(PIXEL_AXES), len(STAGE_AXES)):
         raise ValueError("stage_to_pixel must have shape (camera, pixel_axis, stage_axis)")
-    if pixel_to_stage.shape != (len(STAGE_AXES), len(OBSERVATION_AXES)):
-        raise ValueError("pixel_to_stage must have shape (stage_axis, observation_axis)")
-    if condition_number.size != 1:
-        raise ValueError("condition_number must be scalar")
-    if origin_stability.size != 1:
-        raise ValueError("origin_stability_um must be scalar")
-    if not np.isfinite(origin_stability).all() or float(origin_stability) <= 0.0:
-        raise ValueError("origin_stability_um must be finite and positive")
-    if origin_motor.shape != (len(STAGE_AXES),):
-        raise ValueError("return_to_origin_motor_error_um must have shape (3,)")
-    if origin_motor_norm.size != 1:
-        raise ValueError("return_to_origin_motor_error_norm_um must be scalar")
-    if origin_image_px.shape != (len(CAMERAS), len(PIXEL_AXES)):
-        raise ValueError("return_to_origin_image_error_px must have shape (camera, pixel_axis)")
-    if origin_image_um.shape != (len(STAGE_AXES),):
-        raise ValueError("return_to_origin_image_error_um must have shape (3,)")
-    if origin_image_norm.size != 1:
-        raise ValueError("return_to_origin_image_error_norm_um must be scalar")
+    if not np.isfinite(stage_to_pixel).all():
+        raise ValueError("stage_to_pixel must contain only finite values")
 
 
 def _calibration_summary(dataset: xr.Dataset) -> dict[str, object]:
     _validate_calibration_dataset(dataset)
 
-    residual_shift = np.asarray(dataset["residual_shift_px"].values, dtype=float)
-    residual_stage = np.asarray(dataset["residual_stage_um"].values, dtype=float)
+    arrays = _calibration_arrays(dataset)
+    stage = arrays["stage"]
+    measured_shift = arrays["measured_shift"]
+    residual_shift = arrays["residual_shift"]
+    residual_stage = arrays["residual_stage"]
+    pixel_to_stage = arrays["pixel_to_stage"]
     residual_shift_norms = np.sqrt(np.sum(residual_shift * residual_shift, axis=(1, 2)))
     finite_shift_norms = residual_shift_norms[np.isfinite(residual_shift_norms)]
     if finite_shift_norms.size:
@@ -212,9 +350,7 @@ def _calibration_summary(dataset: xr.Dataset) -> dict[str, object]:
         residual_rms_um = math.nan
         residual_max_um = math.nan
 
-    condition_number = np.asarray(
-        dataset["condition_number"].values, dtype=float
-    ).reshape(-1)[0]
+    condition_number = float(np.linalg.cond(arrays["stage_to_observation"]))
     warning_lines = [
         line.strip()
         for line in str(dataset.attrs.get("warnings", "")).splitlines()
@@ -230,46 +366,38 @@ def _calibration_summary(dataset: xr.Dataset) -> dict[str, object]:
         warning_lines.extend(measurement_warning_lines)
     warnings = tuple(dict.fromkeys(warning_lines))
 
-    repeatability: dict[str, float | int] | None = None
-    if all(
-        name in dataset for name in ("repeatability_count", "repeatability_rms_std_px")
-    ):
-        counts = np.asarray(dataset["repeatability_count"].values, dtype=float).ravel()
+    repeatability = _repeatability_summary(stage, measured_shift)
+    if repeatability is None and "repeatability_rms_std_px" in dataset:
         rms_std = np.asarray(
-            dataset["repeatability_rms_std_px"].values, dtype=float
+            dataset["repeatability_rms_std_px"].values,
+            dtype=float,
         ).ravel()
-        if counts.size and counts.shape == rms_std.shape:
-            finite_rms = rms_std[np.isfinite(rms_std)]
-            if finite_rms.size:
-                repeatability = {
-                    "position_count": int(counts.size),
-                    "capture_count": int(np.nansum(counts)),
-                    "mean_rms_std_px": float(np.nanmean(finite_rms)),
-                    "max_rms_std_px": float(np.nanmax(finite_rms)),
-                }
+        finite_rms = rms_std[np.isfinite(rms_std)]
+        if finite_rms.size:
+            repeatability = {
+                "mean_rms_std_px": float(np.nanmean(finite_rms)),
+                "max_rms_std_px": float(np.nanmax(finite_rms)),
+            }
 
+    return_to_origin_image_error_um = measured_shift[-1].reshape(-1) @ pixel_to_stage.T
     return {
-        "sample_count": int(np.asarray(dataset["stage_um"].values).shape[0]),
+        "sample_count": int(stage.shape[0]),
         "condition_number": float(condition_number),
         "residual_rms_px": residual_rms_px,
         "residual_max_px": residual_max_px,
         "residual_rms_um": residual_rms_um,
         "residual_max_um": residual_max_um,
-        "origin_stability_um": float(
-            np.asarray(dataset["origin_stability_um"].values, dtype=float).reshape(-1)[0]
+        "return_to_origin_motor_error_um": tuple(
+            float(value) for value in np.asarray(stage[-1], dtype=float).reshape(-1)
         ),
-        "return_to_origin_motor_error_norm_um": float(
-            np.asarray(
-                dataset["return_to_origin_motor_error_norm_um"].values, dtype=float
-            ).reshape(-1)[0]
+        "return_to_origin_image_error_um": tuple(
+            float(value)
+            for value in np.asarray(return_to_origin_image_error_um, dtype=float).reshape(
+                -1
+            )
         ),
-        "return_to_origin_image_error_norm_um": float(
-            np.asarray(
-                dataset["return_to_origin_image_error_norm_um"].values, dtype=float
-            ).reshape(-1)[0]
-        ),
-        "stage_to_pixel": np.asarray(dataset["stage_to_pixel"].values, dtype=float),
-        "pixel_to_stage": np.asarray(dataset["pixel_to_stage"].values, dtype=float),
+        "stage_to_pixel": arrays["stage_to_pixel"],
+        "pixel_to_stage": pixel_to_stage,
         "warnings": warnings,
         "repeatability": repeatability,
     }
@@ -358,13 +486,16 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.repeatability_group = QtWidgets.QGroupBox("Repeatability")
         repeatability_layout = QtWidgets.QFormLayout(self.repeatability_group)
         self.repeatability_labels: dict[str, QtWidgets.QLabel] = {}
-        for key, label in REPEATABILITY_ROWS:
+        for key, label, tooltip in REPEATABILITY_ROWS:
+            name_label = QtWidgets.QLabel(label)
+            name_label.setToolTip(tooltip)
             value_label = QtWidgets.QLabel()
+            value_label.setToolTip(tooltip)
             value_label.setTextInteractionFlags(
                 QtCore.Qt.TextInteractionFlag.TextSelectableByMouse
             )
             self.repeatability_labels[key] = value_label
-            repeatability_layout.addRow(label, value_label)
+            repeatability_layout.addRow(name_label, value_label)
         right_column.addWidget(warnings_group)
         right_column.addWidget(self.repeatability_group)
 
@@ -375,8 +506,12 @@ class CalibrationPanel(QtWidgets.QWidget):
         for column, (x_label, y_label, _, _) in enumerate(RESIDUAL_PROJECTIONS):
             residual_plot = self.residual_graphics_layout.addPlot(row=0, col=column)
             residual_plot.setTitle(f"{x_label}-{y_label}")
-            residual_plot.setLabel("bottom", x_label, units="um")
-            residual_plot.setLabel("left", y_label, units="um")
+            residual_plot.setLabel(
+                "bottom", x_label, units="um", siPrefixEnableRanges=()
+            )
+            residual_plot.setLabel(
+                "left", y_label, units="um", siPrefixEnableRanges=()
+            )
             residual_plot.showGrid(x=True, y=True, alpha=0.25)
             residual_plot.setAspectLocked(True)
             self.residual_plots[f"{x_label}{y_label}"] = residual_plot
@@ -462,7 +597,7 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.calibration_warnings_text.setPlainText(warnings_text)
 
         for key, _, _ in METRIC_ROWS:
-            self.metric_labels[key].setText(_format_number(summary[key]))
+            self.metric_labels[key].setText(_format_metric_value(summary[key]))
 
         repeatability = summary["repeatability"]
         self.repeatability_group.setVisible(repeatability is not None)
@@ -482,6 +617,7 @@ class CalibrationPanel(QtWidgets.QWidget):
         calibration: xr.Dataset,
     ) -> QtWidgets.QDialog:
         summary = _calibration_summary(calibration)
+        arrays = _calibration_arrays(calibration)
         dialog = QtWidgets.QDialog(self)
         dialog.setWindowTitle("Calibration Details")
         layout = QtWidgets.QVBoxLayout(dialog)
@@ -570,15 +706,15 @@ class CalibrationPanel(QtWidgets.QWidget):
             "residual_z_um",
             "measurement_warnings",
         )
-        stage = np.asarray(calibration["stage_um"].values, dtype=float)
-        measured = np.asarray(calibration["measured_shift_px"].values, dtype=float)
-        predicted = np.asarray(calibration["predicted_shift_px"].values, dtype=float)
-        residual_px = np.asarray(calibration["residual_shift_px"].values, dtype=float)
-        residual_um = np.asarray(calibration["residual_stage_um"].values, dtype=float)
+        stage = arrays["stage"]
+        measured = arrays["measured_shift"]
+        predicted = arrays["predicted_shift"]
+        residual_px = arrays["residual_shift"]
+        residual_um = arrays["residual_stage"]
         warnings = (
             np.asarray(calibration["measurement_warnings"].values, dtype=str)
             if "measurement_warnings" in calibration
-            else np.full(stage.shape[0], "", dtype=str)
+            else np.full((stage.shape[0], len(CAMERAS)), "", dtype=str)
         )
 
         table = QtWidgets.QTableWidget(stage.shape[0], len(headers))
@@ -680,8 +816,12 @@ class CalibrationPanel(QtWidgets.QWidget):
                 image_plot.setObjectName("calibration_image_plot")
                 image_plot.setAspectLocked(True)
                 image_plot.invertY(True)
-                image_plot.setLabel("bottom", "x", units="px")
-                image_plot.setLabel("left", "y", units="px")
+                image_plot.setLabel(
+                    "bottom", "x", units="px", siPrefixEnableRanges=()
+                )
+                image_plot.setLabel(
+                    "left", "y", units="px", siPrefixEnableRanges=()
+                )
                 image_item = pg.ImageItem(axisOrder="row-major")
                 image_plot.addItem(image_item)
                 images_layout.addWidget(image_plot, stretch=1)
@@ -712,8 +852,9 @@ class CalibrationPanel(QtWidgets.QWidget):
     def _plot_residuals(self, calibration: xr.Dataset) -> None:
         for residual_plot in self.residual_plots.values():
             residual_plot.clear()
-        stage = np.asarray(calibration["stage_um"].values, dtype=float)
-        residual = np.asarray(calibration["residual_stage_um"].values, dtype=float)
+        arrays = _calibration_arrays(calibration)
+        stage = arrays["stage"]
+        residual = arrays["residual_stage"]
 
         for x_label, y_label, x_index, y_index in RESIDUAL_PROJECTIONS:
             residual_plot = self.residual_plots[f"{x_label}{y_label}"]

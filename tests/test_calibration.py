@@ -16,7 +16,7 @@ from merlin_track_position.tracking.calibration_core import (
     estimate_stage_offset,
     fit_calibration_from_images,
 )
-from merlin_track_position.tracking.calibrate import calibration_sample_count
+from merlin_track_position.tracking.calibrate import calibration_sample_count, run_calibration
 from merlin_track_position.tracking.sample_calibration import (
     build_sample_calibration_dataset,
 )
@@ -88,6 +88,50 @@ class CalibrationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "n must be >= 2"):
             calibration_sample_count(1)
 
+    def test_run_calibration_records_initial_stage_and_tilt_attrs(self):
+        image = np.zeros((8, 8), dtype=float)
+        captured_kwargs = {}
+
+        def fake_image_generator():
+            return image, image
+
+        def fake_move_motors_and_wait(motor_aliases, goals, **kwargs):
+            del motor_aliases, kwargs
+            return tuple(float(goal) for goal in goals)
+
+        def fake_fit_calibration_from_images(**kwargs):
+            captured_kwargs.update(kwargs)
+            return xr.Dataset(attrs=kwargs["additional_context"])
+
+        with (
+            patch(
+                "merlin_track_position.tracking.calibrate.get_positions",
+                return_value=(1.2, 2.3, 3.4, 4.5, 6.7, 5.0),
+            ),
+            patch(
+                "merlin_track_position.tracking.calibrate.move_motors_and_wait",
+                side_effect=fake_move_motors_and_wait,
+            ),
+            patch(
+                "merlin_track_position.tracking.calibrate.fit_calibration_from_images",
+                side_effect=fake_fit_calibration_from_images,
+            ),
+            patch("merlin_track_position.tracking.calibrate.time.sleep"),
+        ):
+            calibration = run_calibration(
+                2,
+                10.0,
+                fake_image_generator,
+                origin_stability_um=ORIGIN_STABILITY_UM,
+            )
+
+        self.assertEqual(calibration.attrs["initial_x_mm"], 1.2)
+        self.assertEqual(calibration.attrs["initial_y_mm"], 2.3)
+        self.assertEqual(calibration.attrs["initial_z_mm"], 3.4)
+        self.assertEqual(calibration.attrs["polar"], 4.5)
+        self.assertEqual(calibration.attrs["tilt"], 6.7)
+        np.testing.assert_allclose(captured_kwargs["stage_um"][0], [0.0, 0.0, 0.0])
+
     def test_fit_calibration_from_stereo_numpy_arrays(self):
         stage_to_pixel = stereo_stage_to_pixel()
         stage = calibration_stage()
@@ -104,7 +148,19 @@ class CalibrationTests(unittest.TestCase):
 
         self.assertEqual(calibration.attrs["format_version"], "1")
         self.assertEqual(calibration["stage_to_pixel"].dims, ("camera", "pixel_axis", "stage_axis"))
-        self.assertEqual(calibration["pixel_to_stage"].dims, ("stage_axis", "observation_axis"))
+        for derived_name in (
+            "condition_number",
+            "origin_stability_um",
+            "pixel_to_stage",
+            "predicted_shift_px",
+            "residual_shift_px",
+            "residual_stage_um",
+            "return_to_origin_image_error_norm_um",
+            "return_to_origin_motor_error_norm_um",
+            "repeatability_mean_rms_std_px",
+            "repeatability_max_rms_std_px",
+        ):
+            self.assertNotIn(derived_name, calibration.data_vars)
         self.assertEqual(calibration["stage_um"].shape[1], 3)
         np.testing.assert_allclose(
             calibration["stage_to_pixel"].values,
@@ -112,15 +168,7 @@ class CalibrationTests(unittest.TestCase):
             atol=0.04,
         )
         np.testing.assert_allclose(calibration["stage_um"].values, stage)
-        np.testing.assert_allclose(
-            calibration["return_to_origin_motor_error_um"].values,
-            [0.0, 0.0, 0.0],
-        )
-        np.testing.assert_allclose(
-            calibration["return_to_origin_image_error_px"].values,
-            np.zeros((2, 2)),
-            atol=0.2,
-        )
+        self.assertNotIn("return_to_origin_motor_error_um", calibration.data_vars)
 
         shift = np.einsum("cpk,k->cp", stage_to_pixel, np.array([30.0, 0.0, 0.0]))
         np.testing.assert_allclose(
@@ -345,10 +393,7 @@ class CalibrationTests(unittest.TestCase):
         )
 
         self.assertIn("return-to-origin image error", calibration.attrs["warnings"])
-        self.assertGreater(
-            float(calibration["return_to_origin_image_error_norm_um"].values),
-            ORIGIN_STABILITY_UM,
-        )
+        self.assertNotIn("return_to_origin_image_error_norm_um", calibration.data_vars)
 
     def test_sample_calibration_generator_uses_two_camera_schema(self):
         dataset = build_sample_calibration_dataset(
@@ -363,10 +408,13 @@ class CalibrationTests(unittest.TestCase):
 
         _validate_calibration_dataset(loaded)
         self.assertEqual(loaded.attrs["format_version"], "1")
-        self.assertEqual(loaded.attrs["model"], "through_origin_linear_stereo")
+        self.assertNotIn("format", loaded.attrs)
+        self.assertNotIn("model", loaded.attrs)
         self.assertEqual(loaded["stage_um"].shape, (8, len(STAGE_AXES)))
         self.assertEqual(loaded["stage_to_pixel"].shape, (2, 2, 3))
-        self.assertEqual(loaded["pixel_to_stage"].shape, (3, 4))
+        self.assertNotIn("pixel_to_stage", loaded.data_vars)
+        self.assertNotIn("origin_stability_um", loaded.data_vars)
+        self.assertNotIn("repeatability_mean_rms_std_px", loaded.data_vars)
         self.assertEqual(loaded["image_cam0"].dtype, np.float32)
         self.assertEqual(loaded["image_cam1"].dtype, np.float32)
         self.assertEqual(loaded["image_cam0"].shape, (8, 48, 64))

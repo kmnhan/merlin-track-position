@@ -97,7 +97,6 @@ def fit_calibration_from_images(
 
     pixels = np.stack([np.vstack(shifts_cam0), np.vstack(shifts_cam1)], axis=1)
     observations = _pixels_to_observations(pixels)
-    reference_stage_um = np.zeros(3, dtype=np.float64)
 
     rank = int(np.linalg.matrix_rank(stage))
     if rank < 3:
@@ -131,12 +130,9 @@ def fit_calibration_from_images(
     )
     residual_px = pixels - predicted
     pixel_to_stage = np.linalg.pinv(stage_to_observation)
-    residual_um = _pixels_to_observations(residual_px) @ pixel_to_stage.T
-    return_to_origin_motor_error_um = stage[-1]
     return_to_origin_motor_error_norm_um = float(
-        np.linalg.norm(return_to_origin_motor_error_um)
+        np.linalg.norm(stage[-1])
     )
-    return_to_origin_image_error_px = pixels[-1]
     return_to_origin_image_error_um = observations[-1] @ pixel_to_stage.T
     return_to_origin_image_error_norm_um = float(
         np.linalg.norm(return_to_origin_image_error_um)
@@ -183,7 +179,6 @@ def fit_calibration_from_images(
         "stage_axis": list(STAGE_AXES),
         "camera": list(CAMERAS),
         "pixel_axis": list(PIXEL_AXES),
-        "observation_axis": list(OBSERVATION_AXES),
     }
     data_vars: dict[str, Any] = {
         "stage_to_pixel": (
@@ -191,65 +186,20 @@ def fit_calibration_from_images(
             stage_to_pixel,
             {"units": "px/um"},
         ),
-        "pixel_to_stage": (
-            ("stage_axis", "observation_axis"),
-            pixel_to_stage,
-            {"units": "um/px"},
-        ),
-        "reference_stage_um": (
-            ("stage_axis",),
-            np.asarray(reference_stage_um, dtype=np.float64),
-            {"units": "um"},
-        ),
-        "condition_number": ((), float(condition_number)),
-        "origin_stability_um": ((), origin_stability_um, {"units": "um"}),
-        "return_to_origin_motor_error_um": (
-            ("stage_axis",),
-            return_to_origin_motor_error_um,
-            {"units": "um"},
-        ),
-        "return_to_origin_motor_error_norm_um": (
-            (),
-            return_to_origin_motor_error_norm_um,
-            {"units": "um"},
-        ),
-        "return_to_origin_image_error_px": (
-            ("camera", "pixel_axis"),
-            return_to_origin_image_error_px,
-            {"units": "px"},
-        ),
-        "return_to_origin_image_error_um": (
-            ("stage_axis",),
-            return_to_origin_image_error_um,
-            {"units": "um"},
-        ),
-        "return_to_origin_image_error_norm_um": (
-            (),
-            return_to_origin_image_error_norm_um,
-            {"units": "um"},
-        ),
         "stage_um": (("sample", "stage_axis"), stage, {"units": "um"}),
         "measured_shift_px": (
             ("sample", "camera", "pixel_axis"),
             pixels,
             {"units": "px"},
         ),
-        "predicted_shift_px": (
-            ("sample", "camera", "pixel_axis"),
-            predicted,
-            {"units": "px"},
-        ),
-        "residual_shift_px": (
-            ("sample", "camera", "pixel_axis"),
-            residual_px,
-            {"units": "px"},
-        ),
-        "residual_stage_um": (
-            ("sample", "stage_axis"),
-            residual_um,
-            {"units": "um"},
-        ),
-        "measurement_warnings": (
+    }
+    if any(
+        warning
+        for sample_warnings in measurement_warnings_tuple
+        for camera_warnings in sample_warnings
+        for warning in camera_warnings
+    ):
+        data_vars["measurement_warnings"] = (
             ("sample", "camera"),
             np.asarray(
                 [
@@ -258,44 +208,6 @@ def fit_calibration_from_images(
                 ],
                 dtype=str,
             ),
-        ),
-    }
-
-    repeatability = _repeatability(stage, pixels)
-    if repeatability is not None:
-        (
-            repeatability_stage_um,
-            repeatability_count,
-            repeatability_mean,
-            repeatability_std,
-        ) = repeatability
-        coords["repeatability_position"] = np.arange(
-            repeatability_stage_um.shape[0],
-            dtype=np.int64,
-        )
-        data_vars["repeatability_stage_um"] = (
-            ("repeatability_position", "stage_axis"),
-            repeatability_stage_um,
-            {"units": "um"},
-        )
-        data_vars["repeatability_count"] = (
-            ("repeatability_position",),
-            repeatability_count,
-        )
-        data_vars["repeatability_mean_shift_px"] = (
-            ("repeatability_position", "camera", "pixel_axis"),
-            repeatability_mean,
-            {"units": "px"},
-        )
-        data_vars["repeatability_std_shift_px"] = (
-            ("repeatability_position", "camera", "pixel_axis"),
-            repeatability_std,
-            {"units": "px"},
-        )
-        data_vars["repeatability_rms_std_px"] = (
-            ("repeatability_position",),
-            np.sqrt(np.mean(repeatability_std * repeatability_std, axis=(1, 2))),
-            {"units": "px"},
         )
 
     images_cam0_stack = np.stack(image_arrays_cam0, axis=0)
@@ -316,9 +228,7 @@ def fit_calibration_from_images(
     )
 
     calibration_attrs = {
-        "format": "merlin-track-position calibration",
         "format_version": "1",
-        "model": "through_origin_linear_stereo",
         "warnings": "\n".join(tuple(warnings)),
     }
 
@@ -341,7 +251,12 @@ def estimate_stage_offset(
     else:
         shift_values = np.asarray(shift, dtype=np.float64)
     observation = _shift_to_observation(shift_values)
-    pixel_to_stage = np.asarray(calibration["pixel_to_stage"].values, dtype=np.float64)
+    stage_to_pixel = np.asarray(calibration["stage_to_pixel"].values, dtype=np.float64)
+    stage_to_observation = stage_to_pixel.reshape(
+        len(OBSERVATION_AXES),
+        len(STAGE_AXES),
+    )
+    pixel_to_stage = np.linalg.pinv(stage_to_observation)
     return pixel_to_stage @ observation
 
 
@@ -524,38 +439,6 @@ def _shift_to_observation(shift_values: np.ndarray) -> np.ndarray:
         return values.reshape(-1)
     raise ValueError(
         "shift must have shape (2, 2) or contain four observation values"
-    )
-
-
-def _repeatability(
-    stage: np.ndarray,
-    pixels: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
-    groups: dict[tuple[float, float, float], list[np.ndarray]] = {}
-    for stage_row, pixel_row in zip(stage, pixels, strict=True):
-        key = (float(stage_row[0]), float(stage_row[1]), float(stage_row[2]))
-        groups.setdefault(key, []).append(pixel_row)
-
-    stage_rows: list[np.ndarray] = []
-    counts: list[int] = []
-    means: list[np.ndarray] = []
-    stds: list[np.ndarray] = []
-    for key, rows in groups.items():
-        if len(rows) < 2:
-            continue
-        values = np.stack(rows, axis=0)
-        stage_rows.append(np.asarray(key, dtype=np.float64))
-        counts.append(len(rows))
-        means.append(np.mean(values, axis=0))
-        stds.append(np.std(values, axis=0, ddof=1))
-
-    if not stage_rows:
-        return None
-    return (
-        np.vstack(stage_rows),
-        np.asarray(counts, dtype=np.int64),
-        np.stack(means, axis=0),
-        np.stack(stds, axis=0),
     )
 
 

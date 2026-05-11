@@ -189,8 +189,10 @@ class _MainWindowGUI(QtWidgets.QMainWindow):
             image_plot = self.image_graphics_layout.addPlot(row=row, col=0)
             image_plot.setTitle(camera)
             image_plot.setAspectLocked(True)
-            image_plot.setLabel("bottom", "x", units="px")
-            image_plot.setLabel("left", "y", units="px")
+            image_plot.setLabel(
+                "bottom", "x", units="px", siPrefixEnableRanges=()
+            )
+            image_plot.setLabel("left", "y", units="px", siPrefixEnableRanges=())
             image_plot.showGrid(x=True, y=True, alpha=0.2)
             image_plot.invertY(True)
 

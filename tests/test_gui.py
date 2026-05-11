@@ -84,20 +84,11 @@ def _synthetic_calibration(
         len(CAMERAS),
         len(PIXEL_AXES),
     )
-    predicted = measured.copy()
-    residual_px = measured - predicted
-    pixel_to_stage = np.linalg.pinv(stage_to_observation)
-    residual_um = residual_px.reshape(stage.shape[0], len(OBSERVATION_AXES)) @ pixel_to_stage.T
-    return_to_origin_motor_error_um = stage[-1]
-    return_to_origin_image_error_px = measured[-1]
-    return_to_origin_image_error_um = return_to_origin_image_error_px.reshape(-1) @ pixel_to_stage.T
-
     coords = {
         "sample": np.arange(stage.shape[0], dtype=np.int64),
         "stage_axis": list(STAGE_AXES),
         "camera": list(CAMERAS),
         "pixel_axis": list(PIXEL_AXES),
-        "observation_axis": list(OBSERVATION_AXES),
     }
     data_vars = {
         "stage_to_pixel": (
@@ -105,87 +96,13 @@ def _synthetic_calibration(
             stage_to_pixel,
             {"units": "px/um"},
         ),
-        "pixel_to_stage": (
-            ("stage_axis", "observation_axis"),
-            pixel_to_stage,
-            {"units": "um/px"},
-        ),
-        "reference_stage_um": (
-            ("stage_axis",),
-            np.zeros(len(STAGE_AXES), dtype=float),
-            {"units": "um"},
-        ),
-        "condition_number": ((), float(np.linalg.cond(stage_to_observation))),
-        "origin_stability_um": ((), 5.0, {"units": "um"}),
-        "return_to_origin_motor_error_um": (
-            ("stage_axis",),
-            return_to_origin_motor_error_um,
-            {"units": "um"},
-        ),
-        "return_to_origin_motor_error_norm_um": (
-            (),
-            float(np.linalg.norm(return_to_origin_motor_error_um)),
-            {"units": "um"},
-        ),
-        "return_to_origin_image_error_px": (
-            ("camera", "pixel_axis"),
-            return_to_origin_image_error_px,
-            {"units": "px"},
-        ),
-        "return_to_origin_image_error_um": (
-            ("stage_axis",),
-            return_to_origin_image_error_um,
-            {"units": "um"},
-        ),
-        "return_to_origin_image_error_norm_um": (
-            (),
-            float(np.linalg.norm(return_to_origin_image_error_um)),
-            {"units": "um"},
-        ),
         "stage_um": (("sample", "stage_axis"), stage, {"units": "um"}),
         "measured_shift_px": (
             ("sample", "camera", "pixel_axis"),
             measured,
             {"units": "px"},
         ),
-        "predicted_shift_px": (
-            ("sample", "camera", "pixel_axis"),
-            predicted,
-            {"units": "px"},
-        ),
-        "residual_shift_px": (
-            ("sample", "camera", "pixel_axis"),
-            residual_px,
-            {"units": "px"},
-        ),
-        "residual_stage_um": (("sample", "stage_axis"), residual_um, {"units": "um"}),
-        "measurement_warnings": (
-            ("sample", "camera"),
-            np.full((stage.shape[0], len(CAMERAS)), "", dtype=str),
-        ),
     }
-
-    repeatability = _synthetic_repeatability(stage, measured)
-    if repeatability is not None:
-        repeatability_stage, repeatability_count, _, repeatability_std = repeatability
-        coords["repeatability_position"] = np.arange(
-            repeatability_stage.shape[0],
-            dtype=np.int64,
-        )
-        data_vars["repeatability_stage_um"] = (
-            ("repeatability_position", "stage_axis"),
-            repeatability_stage,
-            {"units": "um"},
-        )
-        data_vars["repeatability_count"] = (
-            ("repeatability_position",),
-            repeatability_count,
-        )
-        data_vars["repeatability_rms_std_px"] = (
-            ("repeatability_position",),
-            np.sqrt(np.mean(repeatability_std * repeatability_std, axis=(1, 2))),
-            {"units": "px"},
-        )
 
     if images_cam0 is None:
         images_cam0 = np.zeros((stage.shape[0], 4, 5), dtype=float)
@@ -212,45 +129,9 @@ def _synthetic_calibration(
         data_vars=data_vars,
         coords=coords,
         attrs={
-            "format": "merlin-track-position calibration",
             "format_version": "1",
-            "model": "through_origin_linear_stereo",
             "warnings": "",
         },
-    )
-
-
-def _synthetic_repeatability(
-    stage: np.ndarray,
-    pixels: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
-    groups: dict[tuple[float, float, float], list[np.ndarray]] = {}
-    for stage_row, pixel_row in zip(stage, pixels, strict=True):
-        groups.setdefault(
-            (float(stage_row[0]), float(stage_row[1]), float(stage_row[2])),
-            [],
-        ).append(pixel_row)
-
-    stage_rows: list[np.ndarray] = []
-    counts: list[int] = []
-    means: list[np.ndarray] = []
-    stds: list[np.ndarray] = []
-    for key, rows in groups.items():
-        if len(rows) < 2:
-            continue
-        values = np.stack(rows, axis=0)
-        stage_rows.append(np.asarray(key, dtype=float))
-        counts.append(len(rows))
-        means.append(np.mean(values, axis=0))
-        stds.append(np.std(values, axis=0, ddof=1))
-
-    if not stage_rows:
-        return None
-    return (
-        np.vstack(stage_rows),
-        np.asarray(counts, dtype=np.int64),
-        np.stack(means, axis=0),
-        np.stack(stds, axis=0),
     )
 
 
@@ -324,7 +205,7 @@ class GUIHelperTests(unittest.TestCase):
 
         self.assertIsNone(_roi_geometries_from_calibration_metadata(calibration))
 
-    def test_calibration_summary_reports_core_metrics_and_repeatability(self):
+    def test_calibration_summary_reports_core_metrics_and_repeatability_std(self):
         stage_to_pixel = np.array(
             [
                 [[0.5, -0.1, 0.2], [0.2, 0.4, -0.1]],
@@ -350,10 +231,55 @@ class GUIHelperTests(unittest.TestCase):
         self.assertAlmostEqual(summary["residual_max_px"], 0.0)
         self.assertAlmostEqual(summary["residual_rms_um"], 0.0)
         np.testing.assert_allclose(summary["stage_to_pixel"], stage_to_pixel)
+        np.testing.assert_allclose(
+            summary["return_to_origin_image_error_um"],
+            [0.0, 20.0, 0.0],
+            atol=1e-12,
+        )
         self.assertEqual(summary["warnings"], ())
-        self.assertEqual(summary["repeatability"]["position_count"], 2)
-        self.assertEqual(summary["repeatability"]["capture_count"], 4)
+        self.assertNotIn("position_count", summary["repeatability"])
+        self.assertNotIn("capture_count", summary["repeatability"])
         self.assertAlmostEqual(summary["repeatability"]["max_rms_std_px"], 0.0)
+
+    def test_calibration_summary_reads_legacy_repeatability_without_count_metrics(self):
+        stage_to_pixel = np.array(
+            [
+                [[0.5, -0.1, 0.2], [0.2, 0.4, -0.1]],
+                [[-0.3, 0.2, 0.4], [0.1, -0.2, 0.3]],
+            ]
+        )
+        stage = np.array(
+            [
+                [0.0, 0.0, 0.0],
+                [20.0, 0.0, 0.0],
+                [0.0, 20.0, 0.0],
+                [0.0, 0.0, 20.0],
+            ]
+        )
+        calibration = _synthetic_calibration(stage, stage_to_pixel)
+        calibration = calibration.drop_vars(
+            ["repeatability_mean_rms_std_px", "repeatability_max_rms_std_px"],
+            errors="ignore",
+        )
+        calibration = calibration.assign_coords(
+            repeatability_position=np.arange(2, dtype=np.int64)
+        )
+        calibration["repeatability_count"] = (
+            ("repeatability_position",),
+            np.array([2, 3], dtype=np.int64),
+        )
+        calibration["repeatability_rms_std_px"] = (
+            ("repeatability_position",),
+            np.array([0.25, 0.75], dtype=float),
+            {"units": "px"},
+        )
+
+        summary = _calibration_summary(calibration)
+
+        self.assertNotIn("position_count", summary["repeatability"])
+        self.assertNotIn("capture_count", summary["repeatability"])
+        self.assertAlmostEqual(summary["repeatability"]["mean_rms_std_px"], 0.5)
+        self.assertAlmostEqual(summary["repeatability"]["max_rms_std_px"], 0.75)
 
     def test_validate_calibration_dataset_rejects_missing_required_field(self):
         stage_to_pixel = np.array(
@@ -371,9 +297,9 @@ class GUIHelperTests(unittest.TestCase):
             ]
         )
         calibration = _synthetic_calibration(stage, stage_to_pixel)
-        broken = calibration.drop_vars("residual_stage_um")
+        broken = calibration.drop_vars("measured_shift_px")
 
-        with self.assertRaisesRegex(ValueError, "residual_stage_um"):
+        with self.assertRaisesRegex(ValueError, "measured_shift_px"):
             _validate_calibration_dataset(broken)
 
 

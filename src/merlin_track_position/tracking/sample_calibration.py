@@ -56,14 +56,11 @@ def build_sample_calibration_dataset(
         len(OBSERVATION_AXES),
         len(STAGE_AXES),
     )
-    pixel_to_stage = np.linalg.pinv(stage_to_observation)
     measured = (SAMPLE_STAGE_UM @ stage_to_observation.T).reshape(
         SAMPLE_STAGE_UM.shape[0],
         len(CAMERAS),
         len(PIXEL_AXES),
     )
-    residual_shift = np.zeros_like(measured)
-    residual_stage = np.zeros_like(SAMPLE_STAGE_UM)
 
     images_cam0 = _shifted_stack(_texture(image_shape_cam0, 1100), measured[:, 0, :])
     images_cam1 = _shifted_stack(_texture(image_shape_cam1, 2200), measured[:, 1, :])
@@ -73,16 +70,11 @@ def build_sample_calibration_dataset(
         "stage_axis": list(STAGE_AXES),
         "camera": list(CAMERAS),
         "pixel_axis": list(PIXEL_AXES),
-        "observation_axis": list(OBSERVATION_AXES),
-        "repeatability_position": np.arange(1, dtype=np.int64),
         "y_cam0": np.arange(image_shape_cam0[0], dtype=np.int64),
         "x_cam0": np.arange(image_shape_cam0[1], dtype=np.int64),
         "y_cam1": np.arange(image_shape_cam1[0], dtype=np.int64),
         "x_cam1": np.arange(image_shape_cam1[1], dtype=np.int64),
     }
-    repeatability_shift = measured[[0, -1]]
-    repeatability_std = np.std(repeatability_shift, axis=0, ddof=1)
-    repeatability_mean = np.mean(repeatability_shift, axis=0)
 
     return xr.Dataset(
         data_vars={
@@ -91,35 +83,6 @@ def build_sample_calibration_dataset(
                 SAMPLE_STAGE_TO_PIXEL,
                 {"units": "px/um"},
             ),
-            "pixel_to_stage": (
-                ("stage_axis", "observation_axis"),
-                pixel_to_stage,
-                {"units": "um/px"},
-            ),
-            "reference_stage_um": (
-                ("stage_axis",),
-                np.zeros(len(STAGE_AXES), dtype=np.float64),
-                {"units": "um"},
-            ),
-            "condition_number": ((), float(np.linalg.cond(stage_to_observation))),
-            "origin_stability_um": ((), 5.0, {"units": "um"}),
-            "return_to_origin_motor_error_um": (
-                ("stage_axis",),
-                np.zeros(len(STAGE_AXES), dtype=np.float64),
-                {"units": "um"},
-            ),
-            "return_to_origin_motor_error_norm_um": ((), 0.0, {"units": "um"}),
-            "return_to_origin_image_error_px": (
-                ("camera", "pixel_axis"),
-                np.zeros((len(CAMERAS), len(PIXEL_AXES)), dtype=np.float64),
-                {"units": "px"},
-            ),
-            "return_to_origin_image_error_um": (
-                ("stage_axis",),
-                np.zeros(len(STAGE_AXES), dtype=np.float64),
-                {"units": "um"},
-            ),
-            "return_to_origin_image_error_norm_um": ((), 0.0, {"units": "um"}),
             "stage_um": (
                 ("sample", "stage_axis"),
                 SAMPLE_STAGE_UM,
@@ -128,52 +91,6 @@ def build_sample_calibration_dataset(
             "measured_shift_px": (
                 ("sample", "camera", "pixel_axis"),
                 measured,
-                {"units": "px"},
-            ),
-            "predicted_shift_px": (
-                ("sample", "camera", "pixel_axis"),
-                measured.copy(),
-                {"units": "px"},
-            ),
-            "residual_shift_px": (
-                ("sample", "camera", "pixel_axis"),
-                residual_shift,
-                {"units": "px"},
-            ),
-            "residual_stage_um": (
-                ("sample", "stage_axis"),
-                residual_stage,
-                {"units": "um"},
-            ),
-            "measurement_warnings": (
-                ("sample", "camera"),
-                np.full((SAMPLE_STAGE_UM.shape[0], len(CAMERAS)), "", dtype=str),
-            ),
-            "repeatability_stage_um": (
-                ("repeatability_position", "stage_axis"),
-                np.zeros((1, len(STAGE_AXES)), dtype=np.float64),
-                {"units": "um"},
-            ),
-            "repeatability_count": (
-                ("repeatability_position",),
-                np.array([2], dtype=np.int64),
-            ),
-            "repeatability_mean_shift_px": (
-                ("repeatability_position", "camera", "pixel_axis"),
-                repeatability_mean.reshape(1, len(CAMERAS), len(PIXEL_AXES)),
-                {"units": "px"},
-            ),
-            "repeatability_std_shift_px": (
-                ("repeatability_position", "camera", "pixel_axis"),
-                repeatability_std.reshape(1, len(CAMERAS), len(PIXEL_AXES)),
-                {"units": "px"},
-            ),
-            "repeatability_rms_std_px": (
-                ("repeatability_position",),
-                np.array(
-                    [float(np.sqrt(np.mean(repeatability_std * repeatability_std)))],
-                    dtype=np.float64,
-                ),
                 {"units": "px"},
             ),
             "image_cam0": (
@@ -189,9 +106,7 @@ def build_sample_calibration_dataset(
         },
         coords=coords,
         attrs={
-            "format": "merlin-track-position calibration",
             "format_version": "1",
-            "model": "through_origin_linear_stereo",
             "warnings": "",
         },
     )

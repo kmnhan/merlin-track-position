@@ -60,17 +60,13 @@ The main dataset variables are:
 - `image_cam1(sample, y_cam1, x_cam1)`
 - `stage_um(sample, stage_axis)`
 - `measured_shift_px(sample, camera, pixel_axis)`
-- `predicted_shift_px(sample, camera, pixel_axis)`
-- `residual_shift_px(sample, camera, pixel_axis)`
-- `residual_stage_um(sample, stage_axis)`
 - `stage_to_pixel(camera, pixel_axis, stage_axis)`
-- `pixel_to_stage(stage_axis, observation_axis)`
-- `origin_stability_um`
-- `return_to_origin_motor_error_um(stage_axis)`
-- `return_to_origin_motor_error_norm_um`
-- `return_to_origin_image_error_px(camera, pixel_axis)`
-- `return_to_origin_image_error_um(stage_axis)`
-- `return_to_origin_image_error_norm_um`
+- `measurement_warnings(sample, camera)` when image matching reports warnings
+
+Saved calibration attributes include `format_version`, `warnings`, initial
+motor context (`initial_x_mm`, `initial_y_mm`, `initial_z_mm`, `polar`,
+`tilt`), and GUI ROI bounds (`roi_cam0_*`, `roi_cam1_*`) when created from the
+GUI.
 
 ## Hardware Notes
 

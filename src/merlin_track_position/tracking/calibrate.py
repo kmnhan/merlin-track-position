@@ -88,7 +88,9 @@ def run_calibration(
         - The cam0 image captured at this step as a 2D numpy array
         - The cam1 image captured at this step as a 2D numpy array
     """
-    x0, y0, z0, polar, cam = get_positions(("x", "y", "z", "p", "cam"))
+    x0, y0, z0, polar, tilt, cam = get_positions(
+        ("x", "y", "z", "p", "t", "cam")
+    )
 
     if not np.isclose(cam, 5.0):
         # Wait for camera to change to #5, which is the position for the sample view.
@@ -167,5 +169,11 @@ def run_calibration(
         stage_um=actual_grid_um,
         origin_stability_um=origin_stability_um,
         check_tiles=True,
-        additional_context={"polar": polar},
+        additional_context={
+            "initial_x_mm": x0,
+            "initial_y_mm": y0,
+            "initial_z_mm": z0,
+            "polar": polar,
+            "tilt": tilt,
+        },
     )
