@@ -1,7 +1,8 @@
 import math
 import os
+import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 import pyqtgraph as pg
@@ -15,12 +16,14 @@ from merlin_track_position.constants import (
     IMAGE_WIDTH_CAM0,
     IMAGE_WIDTH_CAM1,
 )
+from merlin_track_position.instruments.cameras import crop_image_to_roi
 from merlin_track_position.interface.calibration_panel import (
     CalibrationPanel,
     _calibration_summary,
 )
 from merlin_track_position.interface.main_window import (
     CalibrationStartDialog,
+    IMAGE_REFRESH_INTERVAL_MS,
     MainWindow,
     _MainWindowGUI,
     _clamp_roi_geometry,
@@ -68,6 +71,45 @@ class FakeMotorServer(QtCore.QObject):
 
     def set_result(self, success, msg):
         del success, msg
+
+
+class FakeCalibrationThread(QtCore.QObject):
+    sigCalibrationReady = QtCore.Signal(object)
+    sigCalibrationStep = QtCore.Signal(int, float, float, float, object, object)
+    sigCalibrationFailed = QtCore.Signal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.configured = None
+        self.running = False
+        self.started = False
+
+    def configure(self, n, step_um, image_generator, roi_metadata):
+        self.configured = (n, step_um, image_generator, roi_metadata)
+
+    def isRunning(self):
+        return self.running
+
+    def start(self):
+        self.started = True
+        self.running = True
+
+    def stop(self):
+        self.running = False
+
+    def wait(self):
+        pass
+
+
+class FakeAcceptedCalibrationStartDialog:
+    def __init__(self, parent=None):
+        del parent
+
+    def exec(self):
+        return QtWidgets.QDialog.DialogCode.Accepted
+
+    def parameters(self):
+        return (2, 1.0)
 
 
 def _synthetic_calibration(
@@ -133,6 +175,22 @@ def _synthetic_calibration(
             "warnings": "",
         },
     )
+
+
+def _wait_for_capture_count(app, get_cam0, get_cam1, expected_count):
+    deadline = time.monotonic() + 2.0
+    while (
+        get_cam0.call_count < expected_count
+        or get_cam1.call_count < expected_count
+    ):
+        if time.monotonic() > deadline:
+            raise AssertionError(
+                f"timed out waiting for {expected_count} image captures"
+            )
+        app.processEvents()
+        QtCore.QThread.msleep(10)
+    app.processEvents()
+    app.processEvents()
 
 
 class GUIHelperTests(unittest.TestCase):
@@ -310,6 +368,15 @@ class MainWindowGUISmokeTests(unittest.TestCase):
         try:
             self.assertIsInstance(window.image_graphics_layout, pg.GraphicsLayoutWidget)
             self.assertEqual(
+                window.image_auto_refresh_checkbox.objectName(),
+                "image_auto_refresh_checkbox",
+            )
+            self.assertTrue(window.image_auto_refresh_checkbox.isChecked())
+            self.assertIn(
+                f"{IMAGE_REFRESH_INTERVAL_MS} ms",
+                window.image_auto_refresh_checkbox.text(),
+            )
+            self.assertEqual(
                 window.image_items["cam0"].image.shape,
                 (IMAGE_HEIGHT_CAM0, IMAGE_WIDTH_CAM0),
             )
@@ -328,6 +395,239 @@ class MainWindowGUISmokeTests(unittest.TestCase):
         finally:
             window.close()
             app.processEvents()
+
+    def test_main_window_auto_refresh_checkbox_controls_thread_and_cache(self):
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        images_cam0 = [
+            np.full((IMAGE_HEIGHT_CAM0, IMAGE_WIDTH_CAM0), 1.0),
+            np.full((IMAGE_HEIGHT_CAM0, IMAGE_WIDTH_CAM0), 2.0),
+        ]
+        images_cam1 = [
+            np.full((IMAGE_HEIGHT_CAM1, IMAGE_WIDTH_CAM1), 3.0),
+            np.full((IMAGE_HEIGHT_CAM1, IMAGE_WIDTH_CAM1), 4.0),
+        ]
+        get_cam0 = Mock(side_effect=images_cam0)
+        get_cam1 = Mock(side_effect=images_cam1)
+
+        with (
+            patch(
+                "merlin_track_position.interface.main_window.MotorServer",
+                FakeMotorServer,
+            ),
+            patch(
+                "merlin_track_position.interface.main_window.QtCore.QSettings",
+                FakeSettings,
+            ),
+            patch(
+                "merlin_track_position.interface.main_window.get_framegrabber_image",
+                get_cam0,
+            ),
+            patch(
+                "merlin_track_position.interface.main_window.get_basler_image",
+                get_cam1,
+            ),
+        ):
+            window = MainWindow()
+            try:
+                self.assertEqual(
+                    window._image_refresh_thread.interval_ms,
+                    IMAGE_REFRESH_INTERVAL_MS,
+                )
+                self.assertTrue(window._image_refresh_thread.is_enabled())
+                _wait_for_capture_count(app, get_cam0, get_cam1, 1)
+
+                self.assertIsInstance(window._latest_images, tuple)
+                self.assertEqual(len(window._latest_images), 2)
+                np.testing.assert_array_equal(
+                    window._latest_images[0],
+                    images_cam0[0],
+                )
+                np.testing.assert_array_equal(
+                    window._latest_images[1],
+                    images_cam1[0],
+                )
+
+                window.image_auto_refresh_checkbox.setChecked(False)
+                self.assertFalse(window._image_refresh_thread.is_enabled())
+
+                window.image_auto_refresh_checkbox.setChecked(True)
+                self.assertTrue(window._image_refresh_thread.is_enabled())
+                _wait_for_capture_count(app, get_cam0, get_cam1, 2)
+                window.image_auto_refresh_checkbox.setChecked(False)
+
+                np.testing.assert_array_equal(
+                    window._latest_images[0],
+                    images_cam0[1],
+                )
+                np.testing.assert_array_equal(
+                    window._latest_images[1],
+                    images_cam1[1],
+                )
+                self.assertEqual(get_cam0.call_count, 2)
+                self.assertEqual(get_cam1.call_count, 2)
+            finally:
+                window.close()
+                app.processEvents()
+
+    def test_calibration_uses_shared_capture_then_restores_checked_refresh_state(self):
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        initial_cam0 = np.zeros((IMAGE_HEIGHT_CAM0, IMAGE_WIDTH_CAM0), dtype=float)
+        initial_cam1 = np.zeros((IMAGE_HEIGHT_CAM1, IMAGE_WIDTH_CAM1), dtype=float)
+        fresh_cam0 = np.arange(
+            IMAGE_HEIGHT_CAM0 * IMAGE_WIDTH_CAM0,
+            dtype=float,
+        ).reshape(IMAGE_HEIGHT_CAM0, IMAGE_WIDTH_CAM0)
+        fresh_cam1 = np.arange(
+            IMAGE_HEIGHT_CAM1 * IMAGE_WIDTH_CAM1,
+            dtype=float,
+        ).reshape(IMAGE_HEIGHT_CAM1, IMAGE_WIDTH_CAM1)
+        resumed_cam0 = np.full((IMAGE_HEIGHT_CAM0, IMAGE_WIDTH_CAM0), -1.0)
+        resumed_cam1 = np.full((IMAGE_HEIGHT_CAM1, IMAGE_WIDTH_CAM1), -2.0)
+        get_cam0 = Mock(side_effect=[initial_cam0, fresh_cam0, resumed_cam0])
+        get_cam1 = Mock(side_effect=[initial_cam1, fresh_cam1, resumed_cam1])
+        roi_cam0 = (2.0, 3.0, 5.0, 4.0)
+        roi_cam1 = (4.0, 5.0, 6.0, 7.0)
+
+        with (
+            patch(
+                "merlin_track_position.interface.main_window.MotorServer",
+                FakeMotorServer,
+            ),
+            patch(
+                "merlin_track_position.interface.main_window.CalibrationThread",
+                FakeCalibrationThread,
+            ),
+            patch(
+                "merlin_track_position.interface.main_window.CalibrationStartDialog",
+                FakeAcceptedCalibrationStartDialog,
+            ),
+            patch(
+                "merlin_track_position.interface.main_window.QtCore.QSettings",
+                FakeSettings,
+            ),
+            patch(
+                "merlin_track_position.interface.main_window.QtWidgets.QMessageBox.critical",
+                Mock(),
+            ),
+            patch(
+                "merlin_track_position.interface.main_window.get_framegrabber_image",
+                get_cam0,
+            ),
+            patch(
+                "merlin_track_position.interface.main_window.get_basler_image",
+                get_cam1,
+            ),
+        ):
+            window = MainWindow()
+            try:
+                _wait_for_capture_count(app, get_cam0, get_cam1, 1)
+                window._set_roi_geometry("cam0", roi_cam0)
+                window._set_roi_geometry("cam1", roi_cam1)
+
+                window._on_new_calibration_clicked()
+
+                thread = window._calibration_thread
+                self.assertTrue(thread.started)
+                self.assertFalse(window._image_refresh_thread.is_enabled())
+                self.assertFalse(window.image_auto_refresh_checkbox.isEnabled())
+                self.assertTrue(window.image_auto_refresh_checkbox.isChecked())
+
+                n, step_um, image_generator, roi_metadata = thread.configured
+                self.assertEqual(n, 2)
+                self.assertEqual(step_um, 1.0)
+                self.assertEqual(roi_metadata["roi_cam0_x"], roi_cam0[0])
+                self.assertEqual(roi_metadata["roi_cam1_x"], roi_cam1[0])
+
+                cropped_cam0, cropped_cam1 = image_generator()
+                np.testing.assert_array_equal(window._latest_images[0], fresh_cam0)
+                np.testing.assert_array_equal(window._latest_images[1], fresh_cam1)
+                np.testing.assert_array_equal(
+                    cropped_cam0,
+                    crop_image_to_roi(fresh_cam0, roi_cam0),
+                )
+                np.testing.assert_array_equal(
+                    cropped_cam1,
+                    crop_image_to_roi(fresh_cam1, roi_cam1),
+                )
+
+                thread.running = False
+                window._on_new_calibration_failed("boom")
+
+                self.assertTrue(window.image_auto_refresh_checkbox.isEnabled())
+                self.assertTrue(window.image_auto_refresh_checkbox.isChecked())
+                self.assertTrue(window._image_refresh_thread.is_enabled())
+                _wait_for_capture_count(app, get_cam0, get_cam1, 3)
+                window.image_auto_refresh_checkbox.setChecked(False)
+                np.testing.assert_array_equal(window._latest_images[0], resumed_cam0)
+                np.testing.assert_array_equal(window._latest_images[1], resumed_cam1)
+                self.assertEqual(get_cam0.call_count, 3)
+                self.assertEqual(get_cam1.call_count, 3)
+            finally:
+                window.close()
+                app.processEvents()
+
+    def test_calibration_ready_restores_unchecked_refresh_state(self):
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        get_cam0 = Mock(
+            return_value=np.zeros((IMAGE_HEIGHT_CAM0, IMAGE_WIDTH_CAM0), dtype=float)
+        )
+        get_cam1 = Mock(
+            return_value=np.zeros((IMAGE_HEIGHT_CAM1, IMAGE_WIDTH_CAM1), dtype=float)
+        )
+        calibration = _synthetic_calibration(
+            np.array(
+                [
+                    [0.0, 0.0, 0.0],
+                    [20.0, 0.0, 0.0],
+                    [0.0, 20.0, 0.0],
+                    [0.0, 0.0, 20.0],
+                ]
+            ),
+            np.array(
+                [
+                    [[0.5, -0.1, 0.2], [0.2, 0.4, -0.1]],
+                    [[-0.3, 0.2, 0.4], [0.1, -0.2, 0.3]],
+                ]
+            ),
+        )
+
+        with (
+            patch(
+                "merlin_track_position.interface.main_window.MotorServer",
+                FakeMotorServer,
+            ),
+            patch(
+                "merlin_track_position.interface.main_window.QtCore.QSettings",
+                FakeSettings,
+            ),
+            patch(
+                "merlin_track_position.interface.main_window.get_framegrabber_image",
+                get_cam0,
+            ),
+            patch(
+                "merlin_track_position.interface.main_window.get_basler_image",
+                get_cam1,
+            ),
+        ):
+            window = MainWindow()
+            try:
+                _wait_for_capture_count(app, get_cam0, get_cam1, 1)
+                window.image_auto_refresh_checkbox.setChecked(False)
+                self.assertFalse(window._image_refresh_thread.is_enabled())
+
+                window._pause_image_auto_refresh_for_calibration()
+                self.assertFalse(window.image_auto_refresh_checkbox.isEnabled())
+
+                window._on_new_calibration_ready(calibration)
+
+                self.assertTrue(window.image_auto_refresh_checkbox.isEnabled())
+                self.assertFalse(window.image_auto_refresh_checkbox.isChecked())
+                self.assertFalse(window._image_refresh_thread.is_enabled())
+                self.assertEqual(get_cam0.call_count, 1)
+                self.assertEqual(get_cam1.call_count, 1)
+            finally:
+                window.close()
+                app.processEvents()
 
     def test_calibration_start_dialog_defaults_to_requested_values(self):
         app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
