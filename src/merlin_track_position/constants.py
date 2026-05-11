@@ -20,8 +20,8 @@ MOTOR_NAMES: dict[str, str] = {
 # Manual backlash correction for motors that has no built-in correction in LabVIEW.
 # Values are in mm and will be applied when moving towards smaller motor positions.
 MOTOR_BACKLASH_CORRECTION: dict[str, float] = {
-    "x": 0.030,
-    "z": 0.030,
+    "x": 0.1,
+    "z": 0.1,
 }
 
 # Image size for initial crop from each camera array.
