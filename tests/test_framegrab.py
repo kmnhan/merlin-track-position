@@ -4,7 +4,8 @@ from unittest.mock import patch
 import numpy as np
 
 from merlin_track_position import constants
-from merlin_track_position.instruments.basler import get_basler_image
+from merlin_track_position.instruments import basler
+from merlin_track_position.instruments.basler import CameraConfiguration, get_basler_image
 from merlin_track_position.instruments.cameras import (
     capture_camera_pair,
     crop_image_to_roi,
@@ -14,6 +15,49 @@ from merlin_track_position.instruments.framegrab import get_framegrabber_image
 from merlin_track_position.instruments.motors import move_motors_and_wait
 from merlin_track_position.instruments.simulated_hardware import simulator
 from merlin_track_position.tracking.shift import estimate_shift
+
+
+class FakeNode:
+    def __init__(
+        self,
+        value=None,
+        *,
+        minimum=0,
+        maximum=10_000,
+        increment=1,
+        writable=True,
+    ):
+        self.Value = value
+        self.Min = minimum
+        self.Max = maximum
+        self.Inc = increment
+        self.writable = writable
+
+
+class FakeCommand:
+    writable = True
+
+    def __init__(self):
+        self.executed = False
+
+    def Execute(self):
+        self.executed = True
+
+
+class FakeBaslerCamera:
+    def __init__(self):
+        self.UserSetSelector = FakeNode()
+        self.UserSetLoad = FakeCommand()
+        self.GainAuto = FakeNode("Continuous")
+        self.GammaSelector = FakeNode()
+        self.ExposureAuto = FakeNode("Continuous")
+        self.ExposureTime = FakeNode()
+        self.GammaEnable = FakeNode(False)
+        self.OffsetX = FakeNode(100, minimum=0)
+        self.OffsetY = FakeNode(50, minimum=0)
+        self.Width = FakeNode(maximum=constants.IMAGE_WIDTH_CAM1)
+        self.Height = FakeNode(maximum=constants.IMAGE_HEIGHT_CAM1)
+        self.PixelFormat = FakeNode()
 
 
 class DevelopmentModeFramegrabTests(unittest.TestCase):
@@ -47,6 +91,53 @@ class DevelopmentModeFramegrabTests(unittest.TestCase):
             (constants.IMAGE_HEIGHT_CAM1, constants.IMAGE_WIDTH_CAM1),
         )
         self.assertEqual(image.dtype, np.float64)
+
+    def test_basler_configuration_sets_manual_exposure_and_expected_aoi(self):
+        camera = FakeBaslerCamera()
+
+        with patch(
+            "merlin_track_position.instruments.basler.genicam.IsWritable",
+            lambda node: node.writable,
+        ):
+            CameraConfiguration().OnOpened(camera)
+
+        self.assertEqual(camera.UserSetSelector.Value, "Default")
+        self.assertTrue(camera.UserSetLoad.executed)
+        self.assertEqual(camera.GainAuto.Value, "Off")
+        self.assertEqual(camera.ExposureAuto.Value, "Off")
+        self.assertEqual(camera.ExposureTime.Value, constants.BASLER_EXPOSURE_US)
+        self.assertEqual(camera.OffsetX.Value, camera.OffsetX.Min)
+        self.assertEqual(camera.OffsetY.Value, camera.OffsetY.Min)
+        self.assertEqual(camera.Width.Value, constants.IMAGE_WIDTH_CAM1)
+        self.assertEqual(camera.Height.Value, constants.IMAGE_HEIGHT_CAM1)
+        self.assertEqual(camera.PixelFormat.Value, "Mono10")
+
+    def test_daq_mode_basler_image_accepts_expected_shape(self):
+        raw = np.arange(6, dtype=np.uint16).reshape(2, 3)
+
+        with (
+            patch.object(constants, "IS_DAQ_PC", True),
+            patch.object(constants, "IMAGE_HEIGHT_CAM1", 2),
+            patch.object(constants, "IMAGE_WIDTH_CAM1", 3),
+            patch.object(basler, "_grab_single_image", return_value=raw),
+        ):
+            image = get_basler_image()
+
+        np.testing.assert_array_equal(image, raw.astype(np.float64))
+        self.assertEqual(image.shape, (2, 3))
+        self.assertEqual(image.dtype, np.float64)
+
+    def test_daq_mode_basler_image_rejects_mismatched_frame_shape(self):
+        raw = np.zeros((3, 4), dtype=np.uint16)
+
+        with (
+            patch.object(constants, "IS_DAQ_PC", True),
+            patch.object(constants, "IMAGE_HEIGHT_CAM1", 2),
+            patch.object(constants, "IMAGE_WIDTH_CAM1", 3),
+            patch.object(basler, "_grab_single_image", return_value=raw),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "does not match constants"):
+                get_basler_image()
 
     def test_capture_camera_pair_returns_both_images(self):
         with patch.object(constants, "IS_DAQ_PC", False):
