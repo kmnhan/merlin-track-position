@@ -22,7 +22,8 @@ class ShiftTests(unittest.TestCase):
         result = estimate_shift(reference, current, check_tiles=False)
 
         np.testing.assert_allclose(result["shift_px"].values, [-11.0, 7.0], atol=0.15)
-        self.assertLess(float(result["registration_error"].values), 0.5)
+        self.assertEqual(set(result.data_vars), {"shift_px"})
+        self.assertEqual(set(result.attrs), {"warnings"})
 
     def test_subpixel_shift(self):
         reference = textured_image(seed=2)

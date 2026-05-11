@@ -98,7 +98,6 @@ def estimate_shift(
         )
         shift_px = np.array([np.nan, np.nan], dtype=np.float64)
         registration_error = np.inf
-        phase_difference = np.nan
     else:
         reference_norm = normalize_intensity(
             reference_image, clip_percentiles=clip_percentiles
@@ -106,7 +105,7 @@ def estimate_shift(
         current_norm = normalize_intensity(
             current_image, clip_percentiles=clip_percentiles
         )
-        shift_px, registration_error, phase_difference, skimage_warnings = (
+        shift_px, registration_error, _, skimage_warnings = (
             _estimate_translation(
                 reference_norm,
                 current_norm,
@@ -129,44 +128,23 @@ def estimate_shift(
             f"high registration error: {registration_error:.3g} > {high_error_threshold:.3g}"
         )
 
-    tile_median_shift = np.array([np.nan, np.nan], dtype=np.float64)
-    tile_shift_std = np.nan
     if check_tiles and np.isfinite(shift_px).all():
-        tile_diagnostic = _tile_consistency(
+        tile_warning = _tile_consistency(
             reference_norm,
             current_norm,
             shift_px,
             use_window=use_window,
             normalization=normalization,
         )
-        if tile_diagnostic is not None:
-            tile_median_shift, tile_shift_std, tile_warning = tile_diagnostic
-            if tile_warning is not None:
-                diagnostic_warnings.append(tile_warning)
+        if tile_warning is not None:
+            diagnostic_warnings.append(tile_warning)
 
     return xr.Dataset(
         data_vars={
             "shift_px": (("pixel_axis",), shift_px, {"units": "px"}),
-            "registration_error": ((), float(registration_error)),
-            "phase_difference": ((), float(phase_difference)),
-            "texture_dynamic_range": ((), dynamic_range),
-            "texture_gradient_rms": ((), gradient_rms),
-            "tile_median_shift_px": (
-                ("pixel_axis",),
-                tile_median_shift,
-                {"units": "px"},
-            ),
-            "tile_shift_std_px": ((), float(tile_shift_std), {"units": "px"}),
         },
         coords={"pixel_axis": list(PIXEL_AXES)},
-        attrs={
-            "method": "skimage.registration.phase_cross_correlation",
-            "image_height": int(reference_image.shape[0]),
-            "image_width": int(reference_image.shape[1]),
-            "upsample_factor": int(upsample_factor),
-            "skimage_normalization": "none" if normalization is None else normalization,
-            "warnings": "\n".join(diagnostic_warnings),
-        },
+        attrs={"warnings": "\n".join(diagnostic_warnings)},
     )
 
 
@@ -218,7 +196,7 @@ def _tile_consistency(
     *,
     use_window: bool,
     normalization: str | None,
-) -> tuple[np.ndarray, float, str | None] | None:
+) -> str | None:
     height, width = reference_norm.shape
     grid = 3 if min(height, width) >= 192 else 2
     tile_height = height // grid
@@ -262,4 +240,4 @@ def _tile_consistency(
             "tile shift estimates are inconsistent with the whole-frame shift; "
             "static background or low contrast within ROI may be influencing the match"
         )
-    return median, tile_std, warning
+    return warning

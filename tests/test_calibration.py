@@ -17,6 +17,7 @@ from merlin_track_position.tracking.calibration_core import (
     get_correction,
 )
 from merlin_track_position.tracking.calibrate import calibration_sample_count, run_calibration
+from merlin_track_position.tracking.correct import do_correction
 from merlin_track_position.tracking.sample_calibration import (
     build_sample_calibration_dataset,
 )
@@ -311,6 +312,295 @@ class CalibrationTests(unittest.TestCase):
         np.testing.assert_allclose(result["current_cam0"].values, current_cam0)
         np.testing.assert_allclose(result["current_cam1"].values, current_cam1)
         self.assertNotIn("method", result.attrs)
+
+    def test_do_correction_uses_reference_images_and_applies_motor_move(self):
+        reference_cam0 = np.array([[1.0, 2.0], [3.0, 4.0]])
+        reference_cam1 = np.array([[5.0, 6.0], [7.0, 8.0]])
+        other_cam0 = reference_cam0 + 10.0
+        other_cam1 = reference_cam1 + 10.0
+        current_cam0 = reference_cam0 + 0.5
+        current_cam1 = reference_cam1 + 0.5
+        calibration = xr.Dataset(
+            data_vars={
+                "image_cam0": (
+                    ("sample", "y_cam0", "x_cam0"),
+                    np.stack([reference_cam0, other_cam0], axis=0),
+                ),
+                "image_cam1": (
+                    ("sample", "y_cam1", "x_cam1"),
+                    np.stack([reference_cam1, other_cam1], axis=0),
+                ),
+            },
+            attrs={
+                "roi_cam0_x": 0.0,
+                "roi_cam0_y": 0.0,
+                "roi_cam0_width": 1.0,
+                "roi_cam0_height": 1.0,
+                "roi_cam1_x": 0.0,
+                "roi_cam1_y": 0.0,
+                "roi_cam1_width": 1.0,
+                "roi_cam1_height": 1.0,
+            },
+        )
+        correction_dataset = xr.Dataset(
+            data_vars={
+                "correction_um": (
+                    ("stage_axis",),
+                    np.array([10.0, -20.0, 30.0]),
+                ),
+            },
+            coords={"stage_axis": list(STAGE_AXES)},
+        )
+        captured = {}
+
+        def image_generator():
+            return current_cam0, current_cam1
+
+        def fake_get_correction(
+            calibration_arg,
+            reference_cam0_arg,
+            current_cam0_arg,
+            reference_cam1_arg,
+            current_cam1_arg,
+            **shift_kwargs,
+        ):
+            captured["calibration"] = calibration_arg
+            captured["reference_cam0"] = reference_cam0_arg
+            captured["current_cam0"] = current_cam0_arg
+            captured["reference_cam1"] = reference_cam1_arg
+            captured["current_cam1"] = current_cam1_arg
+            captured["shift_kwargs"] = shift_kwargs
+            return correction_dataset
+
+        with (
+            patch(
+                "merlin_track_position.tracking.correct.get_correction",
+                side_effect=fake_get_correction,
+            ),
+            patch(
+                "merlin_track_position.tracking.correct.get_positions",
+                return_value=(1.0, 2.0, 3.0),
+            ),
+            patch(
+                "merlin_track_position.tracking.correct.move_motors_and_wait",
+                return_value=(1.01, 1.98, 3.03),
+            ) as move_motors_and_wait,
+        ):
+            result = do_correction(
+                calibration,
+                image_generator,
+                move_tolerance_um=(1.0, 2.0, 3.0),
+                max_retries=7,
+                check_tiles=False,
+                clip_percentiles=None,
+            )
+
+        self.assertIs(captured["calibration"], calibration)
+        np.testing.assert_allclose(captured["reference_cam0"], reference_cam0)
+        np.testing.assert_allclose(captured["reference_cam1"], reference_cam1)
+        self.assertIs(captured["current_cam0"], current_cam0)
+        self.assertIs(captured["current_cam1"], current_cam1)
+        self.assertEqual(
+            captured["shift_kwargs"],
+            {"check_tiles": False, "clip_percentiles": None},
+        )
+        move_motors_and_wait.assert_called_once_with(
+            ("x", "y", "z"),
+            (1.01, 1.98, 3.03),
+            tolerance=(0.001, 0.002, 0.003),
+            max_retries=7,
+        )
+        self.assertTrue(result.attrs["correction_applied"])
+        self.assertEqual(result.attrs["pre_move_x_mm"], 1.0)
+        self.assertEqual(result.attrs["pre_move_y_mm"], 2.0)
+        self.assertEqual(result.attrs["pre_move_z_mm"], 3.0)
+        self.assertEqual(result.attrs["requested_x_mm"], 1.01)
+        self.assertEqual(result.attrs["requested_y_mm"], 1.98)
+        self.assertEqual(result.attrs["requested_z_mm"], 3.03)
+        self.assertEqual(result.attrs["final_x_mm"], 1.01)
+        self.assertEqual(result.attrs["final_y_mm"], 1.98)
+        self.assertEqual(result.attrs["final_z_mm"], 3.03)
+
+    def test_do_correction_crops_raw_images_from_calibration_roi_metadata(self):
+        raw_cam0 = np.arange(5 * 6, dtype=float).reshape(5, 6)
+        raw_cam1 = np.arange(6 * 7, dtype=float).reshape(6, 7)
+        reference_cam0 = raw_cam0[2:4, 1:4]
+        reference_cam1 = raw_cam1[3:5, 2:4]
+        calibration = xr.Dataset(
+            data_vars={
+                "image_cam0": (
+                    ("sample", "y_cam0", "x_cam0"),
+                    reference_cam0[None, ...],
+                ),
+                "image_cam1": (
+                    ("sample", "y_cam1", "x_cam1"),
+                    reference_cam1[None, ...],
+                ),
+            },
+            attrs={
+                "roi_cam0_x": 1.0,
+                "roi_cam0_y": 2.0,
+                "roi_cam0_width": 3.0,
+                "roi_cam0_height": 2.0,
+                "roi_cam1_x": 2.0,
+                "roi_cam1_y": 3.0,
+                "roi_cam1_width": 2.0,
+                "roi_cam1_height": 2.0,
+            },
+        )
+        correction_dataset = xr.Dataset(
+            data_vars={
+                "correction_um": (
+                    ("stage_axis",),
+                    np.array([0.0, 0.0, 0.0]),
+                ),
+            },
+            coords={"stage_axis": list(STAGE_AXES)},
+        )
+        captured = {}
+
+        def image_generator():
+            return raw_cam0, raw_cam1
+
+        def fake_get_correction(
+            calibration_arg,
+            reference_cam0_arg,
+            current_cam0_arg,
+            reference_cam1_arg,
+            current_cam1_arg,
+            **shift_kwargs,
+        ):
+            del calibration_arg, reference_cam0_arg, reference_cam1_arg, shift_kwargs
+            captured["current_cam0"] = current_cam0_arg
+            captured["current_cam1"] = current_cam1_arg
+            return correction_dataset
+
+        with (
+            patch(
+                "merlin_track_position.tracking.correct.get_correction",
+                side_effect=fake_get_correction,
+            ),
+            patch(
+                "merlin_track_position.tracking.correct.get_positions",
+                return_value=(1.0, 2.0, 3.0),
+            ),
+            patch(
+                "merlin_track_position.tracking.correct.move_motors_and_wait",
+                return_value=(1.0, 2.0, 3.0),
+            ),
+        ):
+            do_correction(calibration, image_generator)
+
+        np.testing.assert_array_equal(captured["current_cam0"], reference_cam0)
+        np.testing.assert_array_equal(captured["current_cam1"], reference_cam1)
+        self.assertFalse(np.shares_memory(captured["current_cam0"], raw_cam0))
+        self.assertFalse(np.shares_memory(captured["current_cam1"], raw_cam1))
+
+    def test_do_correction_computes_expected_correction_from_current_images(self):
+        stage_to_pixel = stereo_stage_to_pixel()
+        stage = calibration_stage()
+        images_cam0, images_cam1 = make_stereo_images(stage, stage_to_pixel)
+        calibration = fit_calibration_from_images(
+            images_cam0,
+            images_cam1,
+            stage,
+            origin_stability_um=ORIGIN_STABILITY_UM,
+            check_tiles=False,
+            clip_percentiles=None,
+        )
+        offset_um = np.array([8.0, -4.0, 6.0])
+        shifts = np.einsum("cpk,k->cp", stage_to_pixel, offset_um)
+        current_cam0 = ndimage.shift(
+            images_cam0[0],
+            shift=(shifts[0, 1], shifts[0, 0]),
+            order=3,
+            mode="wrap",
+        )
+        current_cam1 = ndimage.shift(
+            images_cam1[0],
+            shift=(shifts[1, 1], shifts[1, 0]),
+            order=3,
+            mode="wrap",
+        )
+
+        def image_generator():
+            return current_cam0, current_cam1
+
+        with (
+            patch(
+                "merlin_track_position.tracking.correct.get_positions",
+                return_value=(1.0, 2.0, 3.0),
+            ),
+            patch(
+                "merlin_track_position.tracking.correct.move_motors_and_wait",
+                return_value=(0.992, 2.004, 2.994),
+            ) as move_motors_and_wait,
+        ):
+            result = do_correction(
+                calibration,
+                image_generator,
+                move_tolerance_um=2.5,
+                check_tiles=False,
+                clip_percentiles=None,
+            )
+
+        np.testing.assert_allclose(
+            result["estimated_stage_offset_um"].values,
+            offset_um,
+            atol=1.0,
+        )
+        np.testing.assert_allclose(
+            result["correction_um"].values,
+            -offset_um,
+            atol=1.0,
+        )
+        _, requested_position_mm = move_motors_and_wait.call_args.args
+        np.testing.assert_allclose(
+            requested_position_mm,
+            np.array([1.0, 2.0, 3.0]) + result["correction_um"].values * 1e-3,
+        )
+        self.assertEqual(move_motors_and_wait.call_args.kwargs["tolerance"], 0.0025)
+        self.assertEqual(move_motors_and_wait.call_args.kwargs["max_retries"], 4)
+        self.assertTrue(result.attrs["correction_applied"])
+
+    def test_do_correction_rejects_non_finite_correction_before_move(self):
+        image = np.zeros((2, 2), dtype=float)
+        calibration = xr.Dataset(
+            data_vars={
+                "image_cam0": (("sample", "y_cam0", "x_cam0"), image[None, ...]),
+                "image_cam1": (("sample", "y_cam1", "x_cam1"), image[None, ...]),
+            }
+        )
+        correction_dataset = xr.Dataset(
+            data_vars={
+                "correction_um": (
+                    ("stage_axis",),
+                    np.array([1.0, np.nan, 3.0]),
+                ),
+            },
+            coords={"stage_axis": list(STAGE_AXES)},
+        )
+
+        def image_generator():
+            return image, image
+
+        with (
+            patch(
+                "merlin_track_position.tracking.correct.get_correction",
+                return_value=correction_dataset,
+            ),
+            patch(
+                "merlin_track_position.tracking.correct.get_positions",
+            ) as get_positions,
+            patch(
+                "merlin_track_position.tracking.correct.move_motors_and_wait",
+            ) as move_motors_and_wait,
+        ):
+            with self.assertRaisesRegex(ValueError, "finite values"):
+                do_correction(calibration, image_generator)
+
+        get_positions.assert_not_called()
+        move_motors_and_wait.assert_not_called()
 
     def test_fit_calibration_requires_independent_stage_axes(self):
         stage = np.array(
