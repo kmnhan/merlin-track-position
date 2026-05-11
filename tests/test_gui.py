@@ -650,6 +650,8 @@ class MainWindowGUISmokeTests(unittest.TestCase):
                 cropped_cam0, cropped_cam1 = image_generator()
                 np.testing.assert_array_equal(window._latest_images[0], fresh_cam0)
                 np.testing.assert_array_equal(window._latest_images[1], fresh_cam1)
+                _wait_for_image_item(app, window.image_items["cam0"], fresh_cam0)
+                _wait_for_image_item(app, window.image_items["cam1"], fresh_cam1)
                 np.testing.assert_array_equal(
                     cropped_cam0,
                     crop_image_to_roi(fresh_cam0, roi_cam0),

@@ -1,7 +1,7 @@
 import contextlib
 import logging
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 
 import numpy as np
 
@@ -65,17 +65,19 @@ def _move_motors_and_wait(
     *,
     tolerance: float | Iterable[float] | None = None,
     max_retries: int = 4,
+    backlash_correction: Mapping[str, float] | None = None,
 ) -> tuple[float, ...]:
+    motor_aliases = tuple(motor_aliases)
+    goals = tuple(float(goal) for goal in goals)
     logger.debug(
-        "Requesting move: motor_aliases=%s, goals=%s, tolerance=%s, max_retries=%d",
+        "Requesting move: motor_aliases=%s, goals=%s, tolerance=%s, "
+        "max_retries=%d, backlash_correction=%s",
         motor_aliases,
         goals,
         tolerance,
         max_retries,
+        backlash_correction,
     )
-
-    motor_aliases = tuple(motor_aliases)
-    goals = tuple(float(goal) for goal in goals)
 
     if len(goals) != len(motor_aliases):
         logger.error(
@@ -93,9 +95,32 @@ def _move_motors_and_wait(
     else:
         tolerances = tuple(float(t) for t in tolerance)
 
+    backlash_corrections = _backlash_corrections(
+        motor_aliases,
+        backlash_correction,
+    )
     motor_names = [constants.MOTOR_NAMES[m] for m in motor_aliases]
 
     for _ in range(max_retries + 1):
+        if any(correction > 0.0 for correction in backlash_corrections):
+            current_positions = _get_positions(bcs_server, motor_aliases)
+            pre_goals = _backlash_pre_goals(
+                current_positions,
+                goals,
+                backlash_corrections,
+            )
+            logger.debug(
+                "Backlash pre-position: motor_aliases=%s, current_positions=%s, "
+                "pre_goals=%s, final_goals=%s",
+                motor_aliases,
+                current_positions,
+                pre_goals,
+                goals,
+            )
+            bcs_server.move_motor(motors=motor_names, goals=list(pre_goals))
+            time.sleep(0.2)
+            _wait_until_move_complete(bcs_server, motor_aliases)
+
         bcs_server.move_motor(motors=motor_names, goals=list(goals))
         # wait just a bit to let the move begin.
         time.sleep(0.2)
@@ -133,6 +158,42 @@ def _move_motors_and_wait(
     return final_positions
 
 
+def _backlash_corrections(
+    motor_aliases: Iterable[str],
+    backlash_correction: Mapping[str, float] | None,
+) -> tuple[float, ...]:
+    if backlash_correction is None:
+        return (0.0,) * len(tuple(motor_aliases))
+
+    corrections = []
+    for alias in motor_aliases:
+        correction = float(backlash_correction.get(alias, 0.0))
+        if not np.isfinite(correction) or correction < 0.0:
+            raise ValueError(
+                "backlash correction values must be finite and non-negative"
+            )
+        corrections.append(correction)
+    return tuple(corrections)
+
+
+def _backlash_pre_goals(
+    current_positions: Iterable[float],
+    goals: Iterable[float],
+    backlash_corrections: Iterable[float],
+) -> tuple[float, ...]:
+    return tuple(
+        min(float(current), float(goal)) - float(correction)
+        if correction > 0.0
+        else float(goal)
+        for current, goal, correction in zip(
+            current_positions,
+            goals,
+            backlash_corrections,
+            strict=True,
+        )
+    )
+
+
 def get_positions(motor_aliases: Iterable[str]) -> tuple[float, ...]:
     """Get current positions of the specified motor aliases."""
     if not constants.IS_DAQ_PC:
@@ -156,6 +217,7 @@ def move_motors_and_wait(
     *,
     tolerance: float | Iterable[float] | None = None,
     max_retries: int = 4,
+    backlash_correction: Mapping[str, float] | None = None,
 ) -> tuple[float, ...]:
     """Move the specified motor aliases and wait until move is complete.
 
@@ -173,6 +235,11 @@ def move_motors_and_wait(
     max_retries
         Maximum number of times to retry the move if the final positions are not within
         tolerance of the goals. Default is 4.
+    backlash_correction
+        Mapping from motor alias to backlash take-up distance in that motor's command
+        units. For x and z this is millimeters. When omitted,
+        :data:`merlin_track_position.constants.MOTOR_BACKLASH_CORRECTION` is used.
+        Pass an empty mapping to disable backlash correction for a move.
 
     Raises
     ------
@@ -189,6 +256,9 @@ def move_motors_and_wait(
             max_retries=max_retries,
         )
 
+    if backlash_correction is None:
+        backlash_correction = constants.MOTOR_BACKLASH_CORRECTION
+
     with _bcs_server_context() as server:
         return _move_motors_and_wait(
             server,
@@ -196,4 +266,5 @@ def move_motors_and_wait(
             goals,
             tolerance=tolerance,
             max_retries=max_retries,
+            backlash_correction=backlash_correction,
         )

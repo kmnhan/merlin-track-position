@@ -312,6 +312,8 @@ class _MainWindowGUI(QtWidgets.QMainWindow):
 
 
 class MainWindow(_MainWindowGUI):
+    _sigCameraPairReady = QtCore.Signal(object, object)
+
     def __init__(self, parent: QtCore.QObject | None = None):
         super().__init__(parent)
 
@@ -388,6 +390,7 @@ class MainWindow(_MainWindowGUI):
             self._on_new_calibration_failed
         )
         self._calibration_thread.sigCalibrationStep.connect(self._on_calibration_step)
+        self._sigCameraPairReady.connect(self._on_camera_pair_ready)
         self.image_auto_refresh_checkbox.toggled.connect(
             self._on_image_auto_refresh_toggled
         )
@@ -445,7 +448,13 @@ class MainWindow(_MainWindowGUI):
         self._latest_images_by_camera["cam0"] = images[0]
         self._latest_images_by_camera["cam1"] = images[1]
         self._latest_images = images
+        self._sigCameraPairReady.emit(*images)
         return images
+
+    @QtCore.Slot(object, object)
+    def _on_camera_pair_ready(self, image_cam0: object, image_cam1: object) -> None:
+        self._on_image_capture_ready("cam0", image_cam0)
+        self._on_image_capture_ready("cam1", image_cam1)
 
     @QtCore.Slot(str, object)
     def _on_image_capture_ready(self, camera: str, image: object) -> None:
