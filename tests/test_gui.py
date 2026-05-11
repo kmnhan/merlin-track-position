@@ -541,6 +541,40 @@ class MainWindowGUISmokeTests(unittest.TestCase):
                 window.close()
                 app.processEvents()
 
+    def test_main_window_close_closes_basler_camera_session(self):
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        image_cam0 = np.zeros((IMAGE_HEIGHT_CAM0, IMAGE_WIDTH_CAM0), dtype=float)
+        image_cam1 = np.zeros((IMAGE_HEIGHT_CAM1, IMAGE_WIDTH_CAM1), dtype=float)
+        close_basler_camera = Mock()
+
+        with (
+            patch(
+                "merlin_track_position.interface.main_window.MotorServer",
+                FakeMotorServer,
+            ),
+            patch(
+                "merlin_track_position.interface.main_window.QtCore.QSettings",
+                FakeSettings,
+            ),
+            patch(
+                "merlin_track_position.interface.main_window.get_framegrabber_image",
+                Mock(return_value=image_cam0),
+            ),
+            patch(
+                "merlin_track_position.interface.main_window.get_basler_image",
+                Mock(return_value=image_cam1),
+            ),
+            patch(
+                "merlin_track_position.interface.main_window.close_basler_camera",
+                close_basler_camera,
+            ),
+        ):
+            window = MainWindow()
+            window.close()
+            app.processEvents()
+
+        close_basler_camera.assert_called_once_with()
+
     def test_calibration_uses_shared_capture_then_restores_checked_refresh_state(self):
         app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
         initial_cam0 = np.zeros((IMAGE_HEIGHT_CAM0, IMAGE_WIDTH_CAM0), dtype=float)

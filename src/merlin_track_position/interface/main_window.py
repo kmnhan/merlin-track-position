@@ -24,7 +24,10 @@ from merlin_track_position.instruments.cameras import (
     RoiGeometry,
     make_cropped_camera_pair_capture,
 )
-from merlin_track_position.instruments.basler import get_basler_image
+from merlin_track_position.instruments.basler import (
+    close_basler_camera,
+    get_basler_image,
+)
 from merlin_track_position.instruments.framegrab import get_framegrabber_image
 from merlin_track_position.interface.calibration_panel import (
     CalibrationPanel,
@@ -731,6 +734,8 @@ class MainWindow(_MainWindowGUI):
 
         self._calibration_thread.stop()
         self._calibration_thread.wait()
+
+        close_basler_camera()
 
         self._server.stop()
         self._server.wait()

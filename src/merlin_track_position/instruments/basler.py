@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import atexit
 import logging
+import threading
 
 import numpy as np
 import numpy.typing as npt
@@ -12,6 +14,19 @@ from merlin_track_position import constants
 from merlin_track_position.instruments.simulated_hardware import simulator
 
 logger = logging.getLogger("merlin_track_position.instruments.basler")
+
+
+def _close_camera(camera: pylon.InstantCamera) -> None:
+    try:
+        if hasattr(camera, "IsGrabbing") and camera.IsGrabbing():
+            camera.StopGrabbing()
+    except Exception:
+        logger.exception("Failed to stop Basler camera grabbing")
+
+    try:
+        camera.Close()
+    except Exception:
+        logger.exception("Failed to close Basler camera")
 
 
 def _configure_camera(camera: pylon.InstantCamera) -> None:
@@ -82,14 +97,57 @@ def _get_camera_by_serial_number(serial_number: str) -> pylon.InstantCamera:
     raise ValueError(f"No camera found with serial number {serial_number}")
 
 
-def _grab_single_image():
-    camera = _get_camera_by_serial_number(constants.BASLER_CAMERA_SERIAL)
-    camera.Open()
+class _BaslerCameraSession:
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._camera: pylon.InstantCamera | None = None
+        self._latest_image: npt.NDArray | None = None
 
-    try:
-        _configure_camera(camera)
-        camera.StartGrabbingMax(1, pylon.GrabStrategy_LatestImageOnly)
-        grab_result = camera.RetrieveResult(5000, pylon.TimeoutHandling_ThrowException)
+    def get_image(self, timeout_ms: int = 5000) -> npt.NDArray:
+        with self._lock:
+            camera = self._ensure_camera()
+            try:
+                image = self._retrieve_image(camera, timeout_ms)
+            except Exception:
+                self.close()
+                raise
+            self._latest_image = image
+            return image
+
+    def close(self) -> None:
+        with self._lock:
+            camera = self._camera
+            self._camera = None
+            self._latest_image = None
+            if camera is not None:
+                _close_camera(camera)
+
+    def _ensure_camera(self) -> pylon.InstantCamera:
+        if self._camera is not None:
+            return self._camera
+
+        camera = _get_camera_by_serial_number(constants.BASLER_CAMERA_SERIAL)
+        camera.Open()
+        try:
+            _configure_camera(camera)
+            camera.MaxNumBuffer = 5
+            camera.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
+        except Exception:
+            _close_camera(camera)
+            raise
+
+        self._camera = camera
+        return camera
+
+    @staticmethod
+    def _retrieve_image(
+        camera: pylon.InstantCamera,
+        timeout_ms: int,
+    ) -> npt.NDArray:
+        grab_result = camera.RetrieveResult(
+            int(timeout_ms),
+            pylon.TimeoutHandling_ThrowException,
+        )
         try:
             if not grab_result.GrabSucceeded():
                 raise RuntimeError(
@@ -99,8 +157,18 @@ def _grab_single_image():
             return grab_result.GetArray(raw=False).copy()
         finally:
             grab_result.Release()
-    finally:
-        camera.Close()
+
+
+_SESSION = _BaslerCameraSession()
+
+
+def close_basler_camera() -> None:
+    """Close the cached Basler camera session if it is open."""
+    _SESSION.close()
+
+
+def _grab_single_image(timeout_ms: int = 5000):
+    return _SESSION.get_image(timeout_ms)
 
 
 def get_basler_image() -> npt.NDArray:
@@ -116,3 +184,6 @@ def get_basler_image() -> npt.NDArray:
             "or the camera AOI configuration."
         )
     return image.astype(np.float64)
+
+
+atexit.register(close_basler_camera)

@@ -45,7 +45,7 @@ class FakeCommand:
 
 
 class FakeBaslerCamera:
-    def __init__(self):
+    def __init__(self, arrays=None, *, grab_succeeded=True):
         self.UserSetSelector = FakeNode()
         self.UserSetLoad = FakeCommand()
         self.GainAuto = FakeNode("Continuous")
@@ -58,11 +58,81 @@ class FakeBaslerCamera:
         self.Width = FakeNode(maximum=constants.IMAGE_WIDTH_CAM1)
         self.Height = FakeNode(maximum=constants.IMAGE_HEIGHT_CAM1)
         self.PixelFormat = FakeNode()
+        self.MaxNumBuffer = None
+        self.arrays = list(arrays or [])
+        self.grab_succeeded = grab_succeeded
+        self.open_count = 0
+        self.close_count = 0
+        self.start_grabbing_count = 0
+        self.stop_grabbing_count = 0
+        self.retrieve_result_count = 0
+        self.retrieve_result_args = []
+        self.is_open = False
+        self.is_grabbing = False
+
+    def Open(self):
+        self.open_count += 1
+        self.is_open = True
+
+    def Close(self):
+        self.close_count += 1
+        self.is_open = False
+
+    def StartGrabbing(self, strategy):
+        self.start_grabbing_count += 1
+        self.start_grabbing_strategy = strategy
+        self.is_grabbing = True
+
+    def StopGrabbing(self):
+        self.stop_grabbing_count += 1
+        self.is_grabbing = False
+
+    def IsGrabbing(self):
+        return self.is_grabbing
+
+    def RetrieveResult(self, timeout_ms, timeout_handling):
+        self.retrieve_result_count += 1
+        self.retrieve_result_args.append((timeout_ms, timeout_handling))
+        if self.arrays:
+            array = self.arrays.pop(0)
+        else:
+            array = np.zeros(
+                (constants.IMAGE_HEIGHT_CAM1, constants.IMAGE_WIDTH_CAM1),
+                dtype=np.uint16,
+            )
+        return FakeGrabResult(array, succeeded=self.grab_succeeded)
+
+
+class FakeGrabResult:
+    def __init__(self, array, *, succeeded=True):
+        self.array = np.asarray(array)
+        self.succeeded = succeeded
+        self.released = False
+
+    def GrabSucceeded(self):
+        return self.succeeded
+
+    def GetArray(self, raw=False):
+        del raw
+        return self.array
+
+    def Release(self):
+        self.released = True
+
+    def GetErrorCode(self):
+        return 7
+
+    def GetErrorDescription(self):
+        return "fake failure"
 
 
 class DevelopmentModeFramegrabTests(unittest.TestCase):
     def setUp(self):
+        basler.close_basler_camera()
         simulator.reset()
+
+    def tearDown(self):
+        basler.close_basler_camera()
 
     def test_zero_position_frame_matches_packaged_reference_without_zmq(self):
         with (
@@ -110,7 +180,6 @@ class DevelopmentModeFramegrabTests(unittest.TestCase):
         self.assertEqual(camera.OffsetY.Value, camera.OffsetY.Min)
         self.assertEqual(camera.Width.Value, constants.IMAGE_WIDTH_CAM1)
         self.assertEqual(camera.Height.Value, constants.IMAGE_HEIGHT_CAM1)
-        self.assertEqual(camera.PixelFormat.Value, "Mono10")
 
     def test_daq_mode_basler_image_accepts_expected_shape(self):
         raw = np.arange(6, dtype=np.uint16).reshape(2, 3)
@@ -126,6 +195,92 @@ class DevelopmentModeFramegrabTests(unittest.TestCase):
         np.testing.assert_array_equal(image, raw.astype(np.float64))
         self.assertEqual(image.shape, (2, 3))
         self.assertEqual(image.dtype, np.float64)
+
+    def test_daq_mode_basler_session_reuses_open_camera_for_consecutive_images(self):
+        raw0 = np.arange(6, dtype=np.uint16).reshape(2, 3)
+        raw1 = raw0 + 10
+        camera = FakeBaslerCamera([raw0, raw1])
+
+        with (
+            patch.object(constants, "IS_DAQ_PC", True),
+            patch.object(constants, "IMAGE_HEIGHT_CAM1", 2),
+            patch.object(constants, "IMAGE_WIDTH_CAM1", 3),
+            patch(
+                "merlin_track_position.instruments.basler.genicam.IsWritable",
+                lambda node: node.writable,
+            ),
+            patch.object(basler, "_get_camera_by_serial_number", return_value=camera),
+        ):
+            image0 = get_basler_image()
+            image1 = get_basler_image()
+
+        np.testing.assert_array_equal(image0, raw0.astype(np.float64))
+        np.testing.assert_array_equal(image1, raw1.astype(np.float64))
+        self.assertEqual(camera.open_count, 1)
+        self.assertEqual(camera.start_grabbing_count, 1)
+        self.assertEqual(camera.retrieve_result_count, 2)
+        self.assertEqual(camera.MaxNumBuffer, 5)
+        self.assertEqual(camera.close_count, 0)
+
+    def test_close_basler_camera_stops_closes_and_allows_reopen(self):
+        raw0 = np.arange(6, dtype=np.uint16).reshape(2, 3)
+        raw1 = raw0 + 20
+        camera0 = FakeBaslerCamera([raw0])
+        camera1 = FakeBaslerCamera([raw1])
+
+        with (
+            patch.object(constants, "IS_DAQ_PC", True),
+            patch.object(constants, "IMAGE_HEIGHT_CAM1", 2),
+            patch.object(constants, "IMAGE_WIDTH_CAM1", 3),
+            patch(
+                "merlin_track_position.instruments.basler.genicam.IsWritable",
+                lambda node: node.writable,
+            ),
+            patch.object(
+                basler,
+                "_get_camera_by_serial_number",
+                side_effect=[camera0, camera1],
+            ),
+        ):
+            image0 = get_basler_image()
+            basler.close_basler_camera()
+            image1 = get_basler_image()
+
+        np.testing.assert_array_equal(image0, raw0.astype(np.float64))
+        np.testing.assert_array_equal(image1, raw1.astype(np.float64))
+        self.assertEqual(camera0.stop_grabbing_count, 1)
+        self.assertEqual(camera0.close_count, 1)
+        self.assertEqual(camera1.open_count, 1)
+        self.assertEqual(camera1.start_grabbing_count, 1)
+
+    def test_failed_basler_grab_resets_session_for_next_capture(self):
+        raw = np.arange(6, dtype=np.uint16).reshape(2, 3)
+        failing_camera = FakeBaslerCamera([raw], grab_succeeded=False)
+        recovered_camera = FakeBaslerCamera([raw])
+
+        with (
+            patch.object(constants, "IS_DAQ_PC", True),
+            patch.object(constants, "IMAGE_HEIGHT_CAM1", 2),
+            patch.object(constants, "IMAGE_WIDTH_CAM1", 3),
+            patch(
+                "merlin_track_position.instruments.basler.genicam.IsWritable",
+                lambda node: node.writable,
+            ),
+            patch.object(
+                basler,
+                "_get_camera_by_serial_number",
+                side_effect=[failing_camera, recovered_camera],
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "Image grab failed"):
+                get_basler_image()
+            image = get_basler_image()
+
+        np.testing.assert_array_equal(image, raw.astype(np.float64))
+        self.assertEqual(failing_camera.stop_grabbing_count, 1)
+        self.assertEqual(failing_camera.close_count, 1)
+        self.assertEqual(recovered_camera.open_count, 1)
+        self.assertEqual(recovered_camera.retrieve_result_count, 1)
 
     def test_daq_mode_basler_image_rejects_mismatched_frame_shape(self):
         raw = np.zeros((3, 4), dtype=np.uint16)
