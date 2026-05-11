@@ -42,9 +42,9 @@ def _configure_camera(camera: pylon.InstantCamera) -> None:
             logger.debug("Disabling automatic exposure control.")
             camera.ExposureAuto.Value = "Off"
         logger.debug("Setting exposure time.")
-        if not genicam.IsWritable(camera.ExposureTime):
-            raise genicam.RuntimeException("ExposureTime is not writable")
-        camera.ExposureTime.Value = constants.BASLER_EXPOSURE_US
+        if not genicam.IsWritable(camera.ExposureTimeAbs):
+            raise genicam.RuntimeException("ExposureTimeAbs is not writable")
+        camera.ExposureTimeAbs.Value = constants.BASLER_EXPOSURE
 
         if genicam.IsWritable(camera.GammaEnable):
             logger.debug("Enabling gamma correction.")

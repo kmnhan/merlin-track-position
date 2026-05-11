@@ -28,7 +28,7 @@ FRAMEGRAB_SERVER_PORT: int = 6553
 
 # Change this if you change the Basler camera
 BASLER_CAMERA_SERIAL = "40055360"
-BASLER_EXPOSURE_US: float = 300000.0  # 300 ms exposure time
+BASLER_EXPOSURE: int = 300000  # exposure time
 
 
 # If you change this, make sure to also update TrackTemperatureBL403 BCS Driver.vi
