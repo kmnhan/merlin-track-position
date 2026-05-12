@@ -476,15 +476,15 @@ class CalibrationPanel(QtWidgets.QWidget):
         content_layout.addLayout(right_column, stretch=1)
         calibration_layout.addLayout(content_layout)
 
-        warnings_group = QtWidgets.QGroupBox("Warnings")
-        warnings_layout = QtWidgets.QVBoxLayout(warnings_group)
+        self.warnings_group = QtWidgets.QGroupBox("Warnings")
+        warnings_layout = QtWidgets.QVBoxLayout(self.warnings_group)
         self.calibration_warnings_text = QtWidgets.QPlainTextEdit()
         self.calibration_warnings_text.setReadOnly(True)
         self.calibration_warnings_text.setMaximumHeight(90)
         warnings_layout.addWidget(self.calibration_warnings_text)
 
-        metrics_group = QtWidgets.QGroupBox("Metrics")
-        metrics_layout = QtWidgets.QFormLayout(metrics_group)
+        self.metrics_group = QtWidgets.QGroupBox("Metrics")
+        metrics_layout = QtWidgets.QFormLayout(self.metrics_group)
         self.metric_labels: dict[str, QtWidgets.QLabel] = {}
         for key, label, tooltip in METRIC_ROWS:
             name_label = QtWidgets.QLabel(label)
@@ -496,7 +496,7 @@ class CalibrationPanel(QtWidgets.QWidget):
             )
             self.metric_labels[key] = value_label
             metrics_layout.addRow(name_label, value_label)
-        left_column.addWidget(metrics_group)
+        left_column.addWidget(self.metrics_group)
 
         self.repeatability_group = QtWidgets.QGroupBox("Repeatability")
         repeatability_layout = QtWidgets.QFormLayout(self.repeatability_group)
@@ -511,8 +511,8 @@ class CalibrationPanel(QtWidgets.QWidget):
             )
             self.repeatability_labels[key] = value_label
             repeatability_layout.addRow(name_label, value_label)
-        right_column.addWidget(warnings_group)
-        right_column.addWidget(self.repeatability_group)
+        left_column.addWidget(self.repeatability_group)
+        right_column.addWidget(self.warnings_group)
 
         self.correction_steps_group = QtWidgets.QGroupBox("Correction Steps")
         correction_steps_layout = QtWidgets.QVBoxLayout(self.correction_steps_group)
@@ -683,7 +683,19 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.correction_steps_table.setRowCount(0)
         self.correction_steps_group.setVisible(False)
 
-    def _show_correction_steps(self, result: xr.Dataset) -> None:
+    def _show_pending_correction_steps(self) -> None:
+        self.correction_steps_summary_label.setText(
+            "Capturing initial correction measurement before first move."
+        )
+        self.correction_steps_table.setRowCount(0)
+        self.correction_steps_group.setVisible(True)
+
+    def _show_correction_steps(
+        self,
+        result: xr.Dataset,
+        *,
+        in_progress: bool = False,
+    ) -> None:
         move_delta = _correction_move_delta_mm(result)
         pre_residual = _correction_move_residuals(
             result,
@@ -721,7 +733,10 @@ class CalibrationPanel(QtWidgets.QWidget):
                 f"Applied total: {_format_axis_triplet_um(np.sum(move_delta, axis=0))}."
             )
         else:
-            summary_lines.append("No correction moves were applied.")
+            if in_progress:
+                summary_lines.append("No correction moves have been applied yet.")
+            else:
+                summary_lines.append("No correction moves were applied.")
 
         if "estimated_command_offset_mm" in result:
             summary_lines.append(
@@ -749,7 +764,7 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.new_calibration_button.setText("Clear calibration")
         self.calibration_progress_bar.setVisible(True)
         self.calibration_progress_bar.setRange(0, 0)
-        self._clear_correction_steps()
+        self._show_pending_correction_steps()
         self.calibration_status_label.setText("Correction in progress...")
 
     def show_correction_progress(self, result: xr.Dataset) -> None:
@@ -765,10 +780,16 @@ class CalibrationPanel(QtWidgets.QWidget):
             if residual_values.size:
                 residual = float(residual_values[-1])
 
-        self.calibration_status_label.setText(
-            "Correction in progress after "
-            f"{moves} move(s); current residual {_format_number(residual)} px."
-        )
+        if moves == 0:
+            self.calibration_status_label.setText(
+                "Correction in progress before first move; current residual "
+                f"{_format_number(residual)} px."
+            )
+        else:
+            self.calibration_status_label.setText(
+                "Correction in progress after "
+                f"{moves} move(s); current residual {_format_number(residual)} px."
+            )
         warning_lines = [
             line.strip()
             for line in str(result.attrs.get("warnings", "")).splitlines()
@@ -777,7 +798,7 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.calibration_warnings_text.setPlainText(
             "\n".join(warning_lines) if warning_lines else "No correction warnings."
         )
-        self._show_correction_steps(result)
+        self._show_correction_steps(result, in_progress=True)
 
     def show_correction_result(self, result: xr.Dataset) -> None:
         converged = bool(result.attrs.get("correction_converged", False))

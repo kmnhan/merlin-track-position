@@ -251,6 +251,9 @@ def do_correction(
         logger.info("Saved correction progress: completed=%s", completed)
         return progress
 
+    # Publish the initial measurement and planned correction before any motor move.
+    save_progress(completed=False)
+
     while not converged and move_count < max_moves:
         logger.info(
             "Correction iteration %d starting: residual=%.6g px, gain=%g, mu=%g",
@@ -692,15 +695,17 @@ def _reported_next_correction(
 ) -> np.ndarray:
     if converged:
         return np.zeros(len(COMMAND_AXES), dtype=np.float64)
-    return solve_damped_command_correction(
-        jacobian,
-        measurement,
-        axis_scale,
-        gain=gain,
-        damping_mu=damping_mu,
-        max_normalized_step=max_normalized_step,
-        min_axis_predicted_shift_px=min_axis_predicted_shift_px,
-        weights=weights,
+    return _zero_deadband_axis_corrections(
+        solve_damped_command_correction(
+            jacobian,
+            measurement,
+            axis_scale,
+            gain=gain,
+            damping_mu=damping_mu,
+            max_normalized_step=max_normalized_step,
+            min_axis_predicted_shift_px=min_axis_predicted_shift_px,
+            weights=weights,
+        )
     )
 
 

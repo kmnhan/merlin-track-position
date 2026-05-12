@@ -686,13 +686,22 @@ class CorrectionTests(unittest.TestCase):
             hardware_patches = self.patch_hardware(
                 [shift_dataset(p0), shift_dataset(p1)]
             )
+
+            def fake_move_motors_and_wait(*args, **kwargs):
+                self.assertEqual(len(progress_results), 1)
+                first_progress = progress_results[0]
+                self.assertFalse(first_progress.attrs["correction_history_completed"])
+                self.assertEqual(first_progress.sizes["move"], 0)
+                self.assertIn("correction_cmd_mm", first_progress)
+                return (10.0, 20.0, 30.0)
+
             with (
                 hardware_patches[0],
                 hardware_patches[1],
                 hardware_patches[2],
                 patch(
                     "merlin_track_position.tracking.correct.move_motors_and_wait",
-                    return_value=(10.0, 20.0, 30.0),
+                    side_effect=fake_move_motors_and_wait,
                 ),
             ):
                 result = do_correction(
@@ -702,8 +711,10 @@ class CorrectionTests(unittest.TestCase):
                     progress_callback=progress_results.append,
                 )
 
-        self.assertEqual(len(progress_results), 1)
-        progress = progress_results[0]
+        self.assertEqual(len(progress_results), 2)
+        initial_progress, progress = progress_results
+        self.assertFalse(initial_progress.attrs["correction_history_completed"])
+        self.assertEqual(initial_progress.sizes["move"], 0)
         self.assertFalse(progress.attrs["correction_history_completed"])
         self.assertEqual(progress.sizes["move"], 1)
         self.assertEqual(result.attrs["correction_history_completed"], True)

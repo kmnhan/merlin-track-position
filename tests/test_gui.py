@@ -253,6 +253,34 @@ def correction_result_with_moves() -> xr.Dataset:
     )
 
 
+def correction_result_before_first_move() -> xr.Dataset:
+    return xr.Dataset(
+        data_vars={
+            "iteration_weighted_residual_px": (
+                ("iteration",),
+                np.asarray([1.0], dtype=float),
+            ),
+            "estimated_command_offset_mm": (
+                ("command_axis",),
+                np.asarray([0.004, -0.005, 0.006], dtype=float),
+            ),
+            "correction_cmd_mm": (
+                ("command_axis",),
+                np.asarray([0.0015, -0.002, 0.0], dtype=float),
+            ),
+        },
+        coords={
+            "iteration": np.arange(1),
+            "command_axis": list(COMMAND_AXES),
+        },
+        attrs={
+            "correction_converged": False,
+            "correction_iterations": 0,
+            "warnings": "",
+        },
+    )
+
+
 def write_sample_calibration(path: Path) -> xr.Dataset:
     calibration = build_sample_calibration_dataset(
         image_shape_cam0=(4, 5),
@@ -371,6 +399,48 @@ class CalibrationPanelTests(unittest.TestCase):
         self.assertFalse(panel.calibration_details_button.isEnabled())
         self.assertFalse(panel.correct_sample_button.isEnabled())
         self.assertFalse(panel.new_calibration_button.isEnabled())
+        self.assertFalse(panel.correction_steps_group.isHidden())
+        self.assertEqual(panel.correction_steps_table.rowCount(), 0)
+        self.assertIn(
+            "initial correction measurement",
+            panel.correction_steps_summary_label.text(),
+        )
+
+    def test_repeatability_section_is_below_metrics(self):
+        get_qapp()
+        panel = CalibrationPanel()
+
+        content_layout = panel.layout().itemAt(3).layout()
+        left_column = content_layout.itemAt(0).layout()
+        right_column = content_layout.itemAt(1).layout()
+
+        self.assertIs(left_column.itemAt(0).widget(), panel.metrics_group)
+        self.assertIs(left_column.itemAt(1).widget(), panel.repeatability_group)
+        self.assertIs(right_column.itemAt(0).widget(), panel.warnings_group)
+        self.assertIs(right_column.itemAt(1).widget(), panel.correction_steps_group)
+
+    def test_correction_progress_before_first_move_shows_plan(self):
+        get_qapp()
+        panel = CalibrationPanel()
+        result = correction_result_before_first_move()
+
+        panel.show_correction_in_progress()
+        panel.show_correction_progress(result)
+
+        table = panel.correction_steps_table
+        self.assertFalse(panel.correction_steps_group.isHidden())
+        self.assertEqual(table.rowCount(), 0)
+        self.assertIn(
+            "before first move",
+            panel.calibration_status_label.text(),
+        )
+        summary = panel.correction_steps_summary_label.text()
+        self.assertIn("No correction moves have been applied yet.", summary)
+        self.assertIn(
+            "Estimated command offset: x=4 um, y=-5 um, z=6 um.",
+            summary,
+        )
+        self.assertIn("Next correction: x=1.5 um, y=-2 um, z=0 um.", summary)
 
     def test_correction_result_displays_move_steps_in_microns(self):
         get_qapp()
