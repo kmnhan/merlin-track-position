@@ -19,6 +19,8 @@ from merlin_track_position.constants import (
     IMAGE_HEIGHT_CAM1,
     IMAGE_WIDTH_CAM0,
     IMAGE_WIDTH_CAM1,
+    DEFAULT_CALIBRATION_N,
+    DEFAULT_CALIBRATION_STEP_UM,
 )
 from merlin_track_position.instruments.cameras import (
     CallableCameraPlugin,
@@ -46,8 +48,6 @@ CAMERA_IMAGE_SIZES: dict[str, tuple[int, int]] = {
     "cam0": (IMAGE_WIDTH_CAM0, IMAGE_HEIGHT_CAM0),
     "cam1": (IMAGE_WIDTH_CAM1, IMAGE_HEIGHT_CAM1),
 }
-DEFAULT_CALIBRATION_N = 3
-DEFAULT_CALIBRATION_STEP_UM = 30.0
 IMAGE_REFRESH_INTERVAL_MS = 400
 ROI_SETTINGS_KEYS: dict[str, tuple[str, str, str, str]] = {
     camera: (
