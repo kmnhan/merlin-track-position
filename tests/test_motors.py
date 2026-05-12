@@ -106,7 +106,7 @@ class MoveMotorsAndWaitTests(unittest.TestCase):
         self.assertEqual(len(created), 1)
         self.assertTrue(created[0]._zmq_socket.closed)
 
-    def test_public_helper_forwards_tolerance_and_retry_arguments(self):
+    def test_public_helper_forwards_retry_arguments(self):
         server = object()
 
         @contextlib.contextmanager
@@ -124,22 +124,19 @@ class MoveMotorsAndWaitTests(unittest.TestCase):
                 return_value=(1.0,),
             ) as move,
         ):
-            positions = move_motors_and_wait(
-                ("x",), (1.0,), tolerance=0.01, max_retries=2
-            )
+            positions = move_motors_and_wait(("x",), (1.0,), max_retries=2)
 
         self.assertEqual(positions, (1.0,))
         move.assert_called_once_with(
             server,
             ("x",),
             (1.0,),
-            tolerance=0.01,
             max_retries=2,
             backlash_correction=constants.MOTOR_BACKLASH_CORRECTION,
             move_timeout_s=60.0,
         )
 
-    def test_returns_after_one_move_when_tolerance_is_not_requested(self):
+    def test_move_complete_status_is_trusted_without_readback_validation(self):
         server = FakeBCSServer([(9.5, 2.5), (10.0, 2.0)])
 
         with patch("merlin_track_position.instruments.motors.time.sleep"):
@@ -153,13 +150,19 @@ class MoveMotorsAndWaitTests(unittest.TestCase):
         self.assertEqual(positions, (9.5, 2.5))
         self.assertEqual(len(server.move_calls), 1)
 
-    def test_accepts_position_readback_when_move_complete_status_is_stale(self):
+    def test_stale_status_accepts_position_readback_after_delay(self):
         server = FakeBCSServer(
-            [(10.0, 2.0)],
+            [(10.0005, 1.9995)],
             status=0,
         )
 
-        with patch("merlin_track_position.instruments.motors.time.sleep"):
+        with (
+            patch("merlin_track_position.instruments.motors.time.sleep"),
+            patch(
+                "merlin_track_position.instruments.motors.time.monotonic",
+                side_effect=[0.0, constants.MOTOR_STALE_READBACK_DELAY_S],
+            ),
+        ):
             positions = _move_motors_and_wait(
                 server,
                 ("x", "y"),
@@ -167,7 +170,53 @@ class MoveMotorsAndWaitTests(unittest.TestCase):
                 max_retries=3,
             )
 
-        self.assertEqual(positions, (10.0, 2.0))
+        self.assertEqual(positions, (10.0005, 1.9995))
+        self.assertEqual(len(server.move_calls), 1)
+
+    def test_stale_status_does_not_accept_position_readback_before_delay(self):
+        server = FakeBCSServer(
+            [(10.0, 2.0)],
+            status=0,
+        )
+
+        with (
+            patch("merlin_track_position.instruments.motors.time.sleep"),
+            patch(
+                "merlin_track_position.instruments.motors.time.monotonic",
+                side_effect=[0.0, 0.0, constants.MOTOR_STALE_READBACK_DELAY_S - 0.1],
+            ),
+            self.assertRaisesRegex(TimeoutError, "Timed out waiting"),
+        ):
+            _move_motors_and_wait(
+                server,
+                ("x", "y"),
+                (10.0, 2.0),
+                move_timeout_s=constants.MOTOR_STALE_READBACK_DELAY_S - 0.1,
+            )
+
+        self.assertEqual(len(server.move_calls), 1)
+
+    def test_stale_status_outside_readback_deadband_times_out(self):
+        server = FakeBCSServer(
+            [(10.002, 2.0)],
+            status=0,
+        )
+
+        with (
+            patch("merlin_track_position.instruments.motors.time.sleep"),
+            patch(
+                "merlin_track_position.instruments.motors.time.monotonic",
+                side_effect=[0.0, constants.MOTOR_STALE_READBACK_DELAY_S],
+            ),
+            self.assertRaisesRegex(TimeoutError, "Timed out waiting"),
+        ):
+            _move_motors_and_wait(
+                server,
+                ("x", "y"),
+                (10.0, 2.0),
+                move_timeout_s=constants.MOTOR_STALE_READBACK_DELAY_S,
+            )
+
         self.assertEqual(len(server.move_calls), 1)
 
     def test_raises_when_move_status_and_position_do_not_complete_before_timeout(self):
@@ -188,67 +237,6 @@ class MoveMotorsAndWaitTests(unittest.TestCase):
             )
 
         self.assertEqual(len(server.move_calls), 1)
-
-    def test_retries_until_positions_are_within_scalar_tolerance(self):
-        server = FakeBCSServer([(9.5, 2.5), (10.2, 2.0), (10.03,)])
-
-        with patch("merlin_track_position.instruments.motors.time.sleep"):
-            positions = _move_motors_and_wait(
-                server,
-                ("x", "y"),
-                (10.0, 2.0),
-                tolerance=0.05,
-                max_retries=4,
-            )
-
-        self.assertEqual(positions, (10.03, 2.0))
-        self.assertEqual(len(server.move_calls), 3)
-        self.assertEqual(
-            server.move_calls[0],
-            ((MOTOR_NAMES["x"], MOTOR_NAMES["y"]), (10.0, 2.0)),
-        )
-        self.assertEqual(server.move_calls[2], ((MOTOR_NAMES["x"],), (10.0,)))
-
-    def test_accepts_per_motor_tolerances(self):
-        server = FakeBCSServer([(10.04, 2.2), (2.08,)])
-
-        with patch("merlin_track_position.instruments.motors.time.sleep"):
-            positions = _move_motors_and_wait(
-                server,
-                ("x", "y"),
-                (10.0, 2.0),
-                tolerance=(0.05, 0.1),
-                max_retries=1,
-            )
-
-        self.assertEqual(positions, (10.04, 2.08))
-        self.assertEqual(len(server.move_calls), 2)
-        self.assertEqual(server.move_calls[1], ((MOTOR_NAMES["y"],), (2.0,)))
-
-    def test_raises_after_retry_limit_is_exhausted(self):
-        server = FakeBCSServer([(9.5, 2.5), (9.75, 2.25)])
-
-        with patch("merlin_track_position.instruments.motors.time.sleep"):
-            _move_motors_and_wait(
-                server,
-                ("x", "y"),
-                (10.0, 2.0),
-                tolerance=0.05,
-                max_retries=1,
-            )
-
-        self.assertEqual(len(server.move_calls), 2)
-
-    def test_validates_tolerance_length(self):
-        server = FakeBCSServer([(10.0, 2.0)])
-
-        with self.assertRaises(ValueError):
-            _move_motors_and_wait(
-                server,
-                ("x", "y"),
-                (10.0, 2.0),
-                tolerance=(0.05,),
-            )
 
     def test_positive_moves_on_backlash_axes_do_not_preposition(self):
         server = FakeBCSServer(
@@ -301,8 +289,11 @@ class MoveMotorsAndWaitTests(unittest.TestCase):
         self.assertEqual(server.move_calls[1][0], (MOTOR_NAMES["x"], MOTOR_NAMES["y"]))
         self.assertEqual(server.move_calls[1][1], (0.02, 2.0))
 
-    def test_skips_axes_within_default_deadband(self):
-        server = FakeBCSServer([], initial_positions=(0.02, 2.0, 0.04))
+    def test_requested_axes_are_sent_even_when_already_close(self):
+        server = FakeBCSServer(
+            [(0.0205, 2.0, 0.0409)],
+            initial_positions=(0.02, 2.0, 0.04),
+        )
 
         with patch("merlin_track_position.instruments.motors.time.sleep"):
             positions = _move_motors_and_wait(
@@ -312,13 +303,21 @@ class MoveMotorsAndWaitTests(unittest.TestCase):
                 backlash_correction={"x": 0.030, "z": 0.030},
             )
 
-        self.assertEqual(positions, (0.02, 2.0, 0.04))
-        self.assertEqual(server.move_calls, [])
+        self.assertEqual(positions, (0.0205, 2.0, 0.0409))
+        self.assertEqual(
+            server.move_calls,
+            [
+                (
+                    (MOTOR_NAMES["x"], MOTOR_NAMES["y"], MOTOR_NAMES["z"]),
+                    (0.0205, 2.0, 0.0409),
+                )
+            ],
+        )
 
     def test_positive_z_move_does_not_get_backlash_preposition(self):
         server = FakeBCSServer(
             [
-                (0.04,),
+                (0.0204, 2.0005, 0.04),
             ],
             initial_positions=(0.02, 2.0, 0.0),
         )
@@ -331,11 +330,14 @@ class MoveMotorsAndWaitTests(unittest.TestCase):
                 backlash_correction={"x": 0.030, "z": 0.030},
             )
 
-        self.assertEqual(positions, (0.02, 2.0, 0.04))
+        self.assertEqual(positions, (0.0204, 2.0005, 0.04))
         self.assertEqual(
             server.move_calls,
             [
-                ((MOTOR_NAMES["z"],), (0.04,)),
+                (
+                    (MOTOR_NAMES["x"], MOTOR_NAMES["y"], MOTOR_NAMES["z"]),
+                    (0.0204, 2.0005, 0.04),
+                ),
             ],
         )
 
@@ -343,7 +345,7 @@ class MoveMotorsAndWaitTests(unittest.TestCase):
         server = FakeBCSServer(
             [
                 (-0.03,),
-                (0.04,),
+                (0.0204, 2.0005, 0.04),
             ],
             initial_positions=(0.02, 2.0, 0.08),
         )
@@ -356,30 +358,47 @@ class MoveMotorsAndWaitTests(unittest.TestCase):
                 backlash_correction={"x": 0.030, "z": 0.030},
             )
 
-        self.assertEqual(positions, (0.02, 2.0, 0.04))
+        self.assertEqual(positions, (0.0204, 2.0005, 0.04))
         self.assertEqual(len(server.move_calls), 2)
         self.assertEqual(server.move_calls[0][0], (MOTOR_NAMES["z"],))
         self.assertAlmostEqual(server.move_calls[0][1][0], 0.01)
-        self.assertEqual(server.move_calls[1], ((MOTOR_NAMES["z"],), (0.04,)))
+        self.assertEqual(
+            server.move_calls[1],
+            (
+                (MOTOR_NAMES["x"], MOTOR_NAMES["y"], MOTOR_NAMES["z"]),
+                (0.0204, 2.0005, 0.04),
+            ),
+        )
 
-    def test_only_changed_y_axis_moves_without_backlash(self):
-        server = FakeBCSServer([(2.02,)], initial_positions=(0.02, 2.0, 0.04))
+    def test_all_requested_axes_move_without_backlash(self):
+        server = FakeBCSServer(
+            [(0.0205, 2.02, 0.0405)],
+            initial_positions=(0.02, 2.0, 0.04),
+        )
 
         with patch("merlin_track_position.instruments.motors.time.sleep"):
             positions = _move_motors_and_wait(
                 server,
                 ("x", "y", "z"),
-                (0.0205, 2.02, 0.0395),
+                (0.0205, 2.02, 0.0405),
                 backlash_correction={"x": 0.030, "z": 0.030},
             )
 
-        self.assertEqual(positions, (0.02, 2.02, 0.04))
-        self.assertEqual(server.move_calls, [((MOTOR_NAMES["y"],), (2.02,))])
+        self.assertEqual(positions, (0.0205, 2.02, 0.0405))
+        self.assertEqual(
+            server.move_calls,
+            [
+                (
+                    (MOTOR_NAMES["x"], MOTOR_NAMES["y"], MOTOR_NAMES["z"]),
+                    (0.0205, 2.02, 0.0405),
+                )
+            ],
+        )
 
-    def test_mixed_move_omits_unchanged_backlash_axis(self):
+    def test_mixed_move_keeps_all_requested_axes(self):
         server = FakeBCSServer(
             [
-                (0.02, 0.02),
+                (0.02, 0.02, 0.0005),
             ],
             initial_positions=(0.0, 0.0, 0.0),
         )
@@ -392,36 +411,14 @@ class MoveMotorsAndWaitTests(unittest.TestCase):
                 backlash_correction={"x": 0.015, "z": 0.030},
             )
 
-        self.assertEqual(positions, (0.02, 0.02, 0.0))
+        self.assertEqual(positions, (0.02, 0.02, 0.0005))
         self.assertEqual(
             server.move_calls,
             [
-                ((MOTOR_NAMES["x"], MOTOR_NAMES["y"]), (0.02, 0.02)),
-            ],
-        )
-
-    def test_explicit_tolerance_overrides_default_deadband(self):
-        server = FakeBCSServer(
-            [
-                (0.0008,),
-            ],
-            initial_positions=(0.0,),
-        )
-
-        with patch("merlin_track_position.instruments.motors.time.sleep"):
-            positions = _move_motors_and_wait(
-                server,
-                ("x",),
-                (0.0008,),
-                tolerance=0.0005,
-                backlash_correction={"x": 0.015},
-            )
-
-        self.assertEqual(positions, (0.0008,))
-        self.assertEqual(
-            server.move_calls,
-            [
-                ((MOTOR_NAMES["x"],), (0.0008,)),
+                (
+                    (MOTOR_NAMES["x"], MOTOR_NAMES["y"], MOTOR_NAMES["z"]),
+                    (0.02, 0.02, 0.0005),
+                ),
             ],
         )
 

@@ -621,6 +621,13 @@ class CorrectionTests(unittest.TestCase):
         self.assertFalse(result.attrs["correction_converged"])
         self.assertIn("below the minimum command norm", result.attrs["warnings"])
 
+    def test_correction_command_deadband_uses_correction_specific_constants(self):
+        correction = correct_module._zero_deadband_axis_corrections(
+            np.array([0.005, 0.011, -0.0051], dtype=float)
+        )
+
+        np.testing.assert_allclose(correction, [0.0, 0.011, -0.0051])
+
     def test_zeroed_axes_are_not_sent_to_motor_move(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = self.save_calibration(tmpdir)

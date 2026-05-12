@@ -92,22 +92,6 @@ def load_synthetic_cam1_reference() -> npt.NDArray[np.float64]:
     return _readonly_float64(image)
 
 
-def _normalize_tolerances(
-    tolerance: float | Iterable[float] | None,
-    count: int,
-) -> tuple[float, ...] | None:
-    if tolerance is None:
-        return None
-    if np.isscalar(tolerance):
-        return (float(tolerance),) * count
-    tolerances = tuple(float(t) for t in tolerance)
-    if len(tolerances) != count:
-        raise ValueError(
-            f"expected {count} tolerance values, got {len(tolerances)}"
-        )
-    return tolerances
-
-
 class SimulatedHardware:
     """Shared deterministic fake hardware state for local development."""
 
@@ -135,7 +119,6 @@ class SimulatedHardware:
         motor_aliases: Iterable[str],
         goals: Iterable[float],
         *,
-        tolerance: float | Iterable[float] | None = None,
         max_retries: int = 4,
     ) -> tuple[float, ...]:
         aliases = tuple(motor_aliases)
@@ -150,8 +133,6 @@ class SimulatedHardware:
         if max_retries < 0:
             logger.error("Simulated move failed: max_retries must be non-negative.")
             return self.get_positions(aliases)
-
-        _normalize_tolerances(tolerance, len(aliases))
 
         with self._move_lock:
             with self._lock:

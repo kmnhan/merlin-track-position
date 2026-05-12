@@ -24,8 +24,13 @@ MOTOR_BACKLASH_CORRECTION: dict[str, float] = {
     "z": 0.1,
 }
 
-# Default no-op deadbands in each motor's command units. For x/y/z, this is mm.
-MOTOR_MOVE_DEADBAND: dict[str, float] = {
+# Stale-status readback fallback for motor moves. Values are in each motor's
+# command units. For x/y/z this is mm.
+MOTOR_STALE_READBACK_DEADBAND: float = 0.001
+MOTOR_STALE_READBACK_DELAY_S: float = 5.0
+
+# Correction command pruning thresholds. Values are in commanded mm.
+CORRECTION_COMMAND_DEADBAND_MM_BY_AXIS: dict[str, float] = {
     "x": 0.005,
     "y": 0.01,
     "z": 0.005,

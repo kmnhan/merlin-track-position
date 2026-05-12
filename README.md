@@ -322,7 +322,7 @@ $$
 \texttt{DEFAULT\_CORRECTION\_MIN\_AXIS\_PREDICTED\_SHIFT\_PX}.
 $$
 
-Components at or below the configured motor move deadband are also set to zero.
+Components at or below the configured correction command deadband are also set to zero.
 If the remaining command vector is effectively zero, correction stops before
 issuing another motor command and reports non-convergence with a warning.
 

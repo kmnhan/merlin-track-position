@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -61,7 +61,6 @@ def do_correction(
     camera_pair: CameraPairPlugin | None = None,
     *,
     calibration_path: str | Path | None = None,
-    move_tolerance_mm: float | Iterable[float] | None = None,
     max_retries: int = 4,
     capture_count: int = constants.DEFAULT_CAPTURE_COUNT,
     pixel_tolerance_px: float = constants.DEFAULT_CORRECTION_PIXEL_TOLERANCE_PX,
@@ -328,7 +327,6 @@ def do_correction(
         move_motors_and_wait(
             active_axes,
             active_requested_position_mm,
-            tolerance=_active_move_tolerance(move_tolerance_mm, active_indices),
             max_retries=max_retries,
         )
         logger.info("Correction motor move returned; reading final x/y/z positions.")
@@ -1255,9 +1253,13 @@ def _stack_jacobian_or_empty(rows: Sequence[np.ndarray]) -> np.ndarray:
 def _zero_deadband_axis_corrections(correction_cmd_mm: np.ndarray) -> np.ndarray:
     correction = np.asarray(correction_cmd_mm, dtype=np.float64).copy()
     for index, axis in enumerate(COMMAND_AXES):
-        deadband = float(constants.MOTOR_MOVE_DEADBAND.get(axis, 0.0))
+        deadband = float(
+            constants.CORRECTION_COMMAND_DEADBAND_MM_BY_AXIS.get(axis, 0.0)
+        )
         if not np.isfinite(deadband) or deadband < 0.0:
-            raise ValueError("move deadbands must be finite and non-negative")
+            raise ValueError(
+                "correction command deadbands must be finite and non-negative"
+            )
         if abs(correction[index]) <= deadband:
             correction[index] = 0.0
     return correction
@@ -1269,18 +1271,6 @@ def _active_correction_indices(correction_cmd_mm: np.ndarray) -> tuple[int, ...]
         for index, value in enumerate(np.asarray(correction_cmd_mm, dtype=np.float64))
         if value != 0.0
     )
-
-
-def _active_move_tolerance(
-    tolerance: float | Iterable[float] | None,
-    active_indices: Sequence[int],
-) -> float | tuple[float, ...] | None:
-    if tolerance is None or np.isscalar(tolerance):
-        return tolerance
-    values = tuple(float(value) for value in tolerance)
-    if len(values) != len(COMMAND_AXES):
-        raise ValueError("move_tolerance_mm must be scalar or have x/y/z values")
-    return tuple(values[index] for index in active_indices)
 
 
 def _crop_current_stack_if_needed(
