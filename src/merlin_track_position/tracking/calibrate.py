@@ -21,8 +21,9 @@ from merlin_track_position.tracking.calibration_core import (
     COMMAND_AXES,
     fit_visual_jacobian_calibration,
     load_calibration_dataset,
-    save_calibration_dataset,
+    save_calibration_dataset_deferred,
 )
+from merlin_track_position.tracking.persistence import persistence_result_attrs
 
 logger = logging.getLogger("merlin_track_position.tracking.calibrate")
 
@@ -181,8 +182,13 @@ def run_calibration(
         additional_context=context,
         **shift_options,
     )
-    save_calibration_dataset(calibration, output_path)
-    return load_calibration_dataset(output_path)
+    persistence = save_calibration_dataset_deferred(calibration, output_path)
+    if persistence.flushed:
+        saved = load_calibration_dataset(output_path)
+    else:
+        saved = calibration.load().copy(deep=True)
+        saved.attrs["calibration_path"] = str(output_path)
+    return saved.assign_attrs(persistence_result_attrs("calibration", persistence))
 
 
 def _make_visual_probe_deltas(

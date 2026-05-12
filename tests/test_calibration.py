@@ -1,8 +1,10 @@
+import os
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+import h5py
 import numpy as np
 import xarray as xr
 
@@ -12,20 +14,26 @@ from merlin_track_position.tracking.calibration_core import (
     COMMAND_AXES,
     PIXEL_AXES,
     derive_axis_scale_from_jacobian,
+    flush_pending_calibration_datasets,
     fit_visual_jacobian_calibration,
     load_calibration_dataset,
     refine_visual_jacobian_from_observations,
     save_calibration_dataset,
+    save_calibration_dataset_deferred,
     solve_damped_command_correction,
     validate_visual_calibration_dataset,
     weighted_pixel_residual,
 )
+import merlin_track_position.tracking.calibration_core as calibration_core
+import merlin_track_position.tracking.correct as correct_module
 from merlin_track_position.tracking.calibrate import visual_calibration_probe_count
 from merlin_track_position.tracking.correct import (
     correction_history_path,
     do_correction,
+    flush_pending_correction_history_datasets,
     load_latest_correction_history_dataset,
 )
+from merlin_track_position.tracking.persistence import pending_entry_count
 
 
 def visual_jacobian():
@@ -86,6 +94,10 @@ def shift_dataset(values):
         },
         attrs={"warnings": ""},
     )
+
+
+def x_shift(value: float) -> np.ndarray:
+    return np.array([[float(value), 0.0], [0.0, 0.0]], dtype=float)
 
 
 def calibration_dataset(jacobian=None):
@@ -328,6 +340,43 @@ class VisualCalibrationTests(unittest.TestCase):
             self.assertNotIn(name, raw_dataset.attrs)
         self.assertEqual(loaded.attrs["calibration_path"], str(path))
 
+    def test_stale_queued_calibration_write_is_not_flushed_over_changed_target(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            spool_path = tmp_path / "spool"
+            path = tmp_path / "calibration.h5"
+            original_save = calibration_core.save_calibration_dataset
+            original_save(
+                calibration_dataset().assign_attrs(jacobian_refinement_count=0),
+                path,
+            )
+
+            queued = calibration_dataset().assign_attrs(jacobian_refinement_count=1)
+            replacement = calibration_dataset().assign_attrs(
+                jacobian_refinement_count=99
+            )
+
+            with patch.dict(
+                os.environ,
+                {"MERLIN_TRACK_POSITION_SPOOL_DIR": str(spool_path)},
+            ):
+                with patch(
+                    "merlin_track_position.tracking.calibration_core."
+                    "save_calibration_dataset",
+                    side_effect=OSError("locked"),
+                ):
+                    result = save_calibration_dataset_deferred(queued, path)
+
+                self.assertTrue(result.pending)
+                original_save(replacement, path)
+                flush_results = flush_pending_calibration_datasets(path)
+                loaded = load_calibration_dataset(path)
+
+            self.assertEqual(int(loaded.attrs["jacobian_refinement_count"]), 99)
+            self.assertEqual(len(flush_results), 1)
+            self.assertFalse(flush_results[0].flushed)
+            self.assertFalse(flush_results[0].pending)
+
     def test_small_image_shifts_below_threshold_are_rejected(self):
         command_delta = np.eye(3)
         measured = np.zeros((3, 2, 2), dtype=float)
@@ -488,14 +537,14 @@ class CorrectionTests(unittest.TestCase):
     def test_damped_correction_uses_command_state_not_readback_state(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = self.save_calibration(tmpdir)
-            p0 = np.array([[6.0, -4.0], [2.0, 1.0]])
+            p0 = np.array([[60.0, -40.0], [20.0, 10.0]], dtype=float)
             p1 = np.zeros((2, 2), dtype=float)
             expected_delta = solve_damped_command_correction(
                 calibration_dataset()["visual_jacobian_px_per_cmd_mm"].values,
                 shift_dataset(p0),
                 calibration_dataset()["axis_scale_cmd_mm"].values,
                 gain=0.3,
-                damping_mu=1e-2,
+                damping_mu=constants.DEFAULT_CORRECTION_DAMPING_MU,
             )
             hardware_patches = self.patch_hardware(
                 [shift_dataset(p0), shift_dataset(p1)],
@@ -575,8 +624,8 @@ class CorrectionTests(unittest.TestCase):
     def test_zeroed_axes_are_not_sent_to_motor_move(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = self.save_calibration(tmpdir)
-            p0 = np.array([[3.0, 0.0], [0.0, 0.0]])
-            p1 = np.array([[1.0, 0.0], [0.0, 0.0]])
+            p0 = x_shift(20.0)
+            p1 = x_shift(10.0)
             hardware_patches = self.patch_hardware(
                 [shift_dataset(p0), shift_dataset(p1)]
             )
@@ -592,13 +641,16 @@ class CorrectionTests(unittest.TestCase):
                 result = do_correction(path, capture_count=1, max_moves=1)
 
         self.assertEqual(move.call_args.args[0], ("x",))
-        self.assertEqual(result["move_active_axis_mask"].values.tolist(), [[True, False, False]])
+        self.assertEqual(
+            result["move_active_axis_mask"].values.tolist(),
+            [[True, False, False]],
+        )
 
     def test_residual_improvement_refines_jacobian_and_updates_file(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = self.save_calibration(tmpdir)
-            p0 = np.array([[3.0, 0.0], [0.0, 0.0]])
-            p1 = np.array([[1.0, 0.0], [0.0, 0.0]])
+            p0 = x_shift(300.0)
+            p1 = x_shift(100.0)
             hardware_patches = self.patch_hardware(
                 [shift_dataset(p0), shift_dataset(p1)]
             )
@@ -644,8 +696,8 @@ class CorrectionTests(unittest.TestCase):
     def test_correction_history_file_records_move_diagnostics(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = self.save_calibration(tmpdir)
-            p0 = np.array([[3.0, 0.0], [0.0, 0.0]])
-            p1 = np.array([[1.0, 0.0], [0.0, 0.0]])
+            p0 = x_shift(30.0)
+            p1 = x_shift(10.0)
             hardware_patches = self.patch_hardware(
                 [shift_dataset(p0), shift_dataset(p1)]
             )
@@ -677,11 +729,148 @@ class CorrectionTests(unittest.TestCase):
         self.assertIn("move_visual_jacobian_before_px_per_cmd_mm", saved)
         self.assertIn("move_visual_jacobian_after_px_per_cmd_mm", saved)
 
+    def test_locked_correction_history_is_queued_and_flushes_later(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            path = self.save_calibration(tmpdir)
+            history_path = correction_history_path(path)
+            spool_path = tmp_path / "spool"
+            with h5py.File(history_path, "w") as history_file:
+                history_file.attrs["format"] = (
+                    "merlin_track_position_correction_history"
+                )
+            history_reader = h5py.File(history_path, "r")
+            try:
+                p0 = x_shift(30.0)
+                p1 = x_shift(10.0)
+                hardware_patches = self.patch_hardware(
+                    [shift_dataset(p0), shift_dataset(p1)]
+                )
+                with (
+                    patch.dict(
+                        os.environ,
+                        {"MERLIN_TRACK_POSITION_SPOOL_DIR": str(spool_path)},
+                    ),
+                    hardware_patches[0],
+                    hardware_patches[1],
+                    hardware_patches[2],
+                    patch(
+                        "merlin_track_position.tracking.correct.move_motors_and_wait",
+                        return_value=(10.0, 20.0, 30.0),
+                    ),
+                ):
+                    result = do_correction(path, capture_count=1, max_moves=1)
+                    pending = load_latest_correction_history_dataset(path)
+
+                    self.assertEqual(
+                        result.attrs["correction_history_persistence_status"],
+                        "pending",
+                    )
+                    self.assertIsNotNone(pending)
+                    assert pending is not None
+                    self.assertEqual(
+                        pending.attrs["correction_history_persistence_status"],
+                        "pending",
+                    )
+                    self.assertTrue(pending.attrs["correction_history_completed"])
+            finally:
+                history_reader.close()
+
+            with patch.dict(
+                os.environ,
+                {"MERLIN_TRACK_POSITION_SPOOL_DIR": str(spool_path)},
+            ):
+                flush_results = flush_pending_correction_history_datasets(history_path)
+                loaded = load_latest_correction_history_dataset(path)
+                remaining_pending = pending_entry_count()
+
+            self.assertTrue(any(result.flushed for result in flush_results))
+            self.assertEqual(remaining_pending, 0)
+            self.assertIsNotNone(loaded)
+            assert loaded is not None
+            self.assertTrue(loaded.attrs["correction_history_completed"])
+            self.assertEqual(loaded.sizes["move"], 1)
+
+    def test_pending_history_is_used_for_refinement_before_flush(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            path = self.save_calibration(tmpdir)
+            history_path = correction_history_path(path)
+            spool_path = tmp_path / "spool"
+            with h5py.File(history_path, "w") as history_file:
+                history_file.attrs["format"] = (
+                    "merlin_track_position_correction_history"
+                )
+            history_reader = h5py.File(history_path, "r")
+            try:
+                p0 = x_shift(30.0)
+                p1 = x_shift(10.0)
+                first_patches = self.patch_hardware(
+                    [shift_dataset(p0), shift_dataset(p1)]
+                )
+                with (
+                    patch.dict(
+                        os.environ,
+                        {"MERLIN_TRACK_POSITION_SPOOL_DIR": str(spool_path)},
+                    ),
+                    first_patches[0],
+                    first_patches[1],
+                    first_patches[2],
+                    patch(
+                        "merlin_track_position.tracking.correct.move_motors_and_wait",
+                        return_value=(10.0, 20.0, 30.0),
+                    ),
+                ):
+                    do_correction(path, capture_count=1, max_moves=1)
+
+                observed_refinement_rows: list[int] = []
+                original_refine = (
+                    correct_module.refine_visual_jacobian_from_observations
+                )
+
+                def spy_refine(calibration, correction_delta, measured_delta, **kwargs):
+                    observed_refinement_rows.append(
+                        np.asarray(correction_delta).shape[0]
+                    )
+                    return original_refine(
+                        calibration,
+                        correction_delta,
+                        measured_delta,
+                        **kwargs,
+                    )
+
+                second_patches = self.patch_hardware(
+                    [shift_dataset(p0), shift_dataset(p1)]
+                )
+                with (
+                    patch.dict(
+                        os.environ,
+                        {"MERLIN_TRACK_POSITION_SPOOL_DIR": str(spool_path)},
+                    ),
+                    second_patches[0],
+                    second_patches[1],
+                    second_patches[2],
+                    patch(
+                        "merlin_track_position.tracking.correct.move_motors_and_wait",
+                        return_value=(10.0, 20.0, 30.0),
+                    ),
+                    patch(
+                        "merlin_track_position.tracking.correct."
+                        "refine_visual_jacobian_from_observations",
+                        side_effect=spy_refine,
+                    ),
+                ):
+                    do_correction(path, capture_count=1, max_moves=1)
+            finally:
+                history_reader.close()
+
+        self.assertEqual(observed_refinement_rows[0], 2)
+
     def test_progress_callback_receives_intermediate_correction_result(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = self.save_calibration(tmpdir)
-            p0 = np.array([[3.0, 0.0], [0.0, 0.0]])
-            p1 = np.array([[1.0, 0.0], [0.0, 0.0]])
+            p0 = x_shift(30.0)
+            p1 = x_shift(10.0)
             progress_results = []
             hardware_patches = self.patch_hardware(
                 [shift_dataset(p0), shift_dataset(p1)]
@@ -722,8 +911,8 @@ class CorrectionTests(unittest.TestCase):
     def test_latest_correction_history_dataset_can_be_reloaded(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = self.save_calibration(tmpdir)
-            p0 = np.array([[3.0, 0.0], [0.0, 0.0]])
-            p1 = np.array([[1.0, 0.0], [0.0, 0.0]])
+            p0 = x_shift(30.0)
+            p1 = x_shift(10.0)
             hardware_patches = self.patch_hardware(
                 [shift_dataset(p0), shift_dataset(p1)]
             )
@@ -750,8 +939,8 @@ class CorrectionTests(unittest.TestCase):
     def test_residual_increase_reduces_gain_increases_damping_and_skips_update(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = self.save_calibration(tmpdir)
-            p0 = np.array([[3.0, 0.0], [0.0, 0.0]])
-            p1 = np.array([[4.0, 0.0], [0.0, 0.0]])
+            p0 = x_shift(30.0)
+            p1 = x_shift(40.0)
             hardware_patches = self.patch_hardware(
                 [shift_dataset(p0), shift_dataset(p1)]
             )
@@ -770,14 +959,14 @@ class CorrectionTests(unittest.TestCase):
 
         self.assertFalse(bool(result["move_jacobian_refined"].values[0]))
         self.assertAlmostEqual(float(result.attrs["correction_final_gain"]), 0.15)
-        self.assertAlmostEqual(float(result.attrs["correction_final_damping_mu"]), 0.02)
+        self.assertAlmostEqual(float(result.attrs["correction_final_damping_mu"]), 2.0)
         self.assertEqual(int(reloaded.attrs["jacobian_refinement_count"]), 0)
 
     def test_non_convergence_returns_false_without_raising_after_motion(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = self.save_calibration(tmpdir)
-            p0 = np.array([[3.0, 0.0], [0.0, 0.0]])
-            p1 = np.array([[2.0, 0.0], [0.0, 0.0]])
+            p0 = x_shift(30.0)
+            p1 = x_shift(20.0)
             hardware_patches = self.patch_hardware(
                 [shift_dataset(p0), shift_dataset(p1)]
             )

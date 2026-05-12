@@ -888,6 +888,26 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                 finally:
                     window.close()
 
+    def test_correction_result_shows_pending_persistence_warning(self):
+        get_qapp()
+        panel = CalibrationPanel()
+        try:
+            result = correction_result(warnings="").assign_attrs(
+                {
+                    "correction_history_persistence_status": "pending",
+                    "correction_history_persistence_message": "locked",
+                }
+            )
+
+            panel.show_correction_result(result)
+
+            self.assertIn(
+                "Correction history file write pending: locked",
+                panel.calibration_warnings_text.toPlainText(),
+            )
+        finally:
+            panel.close()
+
 
 class CalibrationStartDialogTests(unittest.TestCase):
     def test_dialog_exposes_save_path(self):

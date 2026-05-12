@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 
 import numpy as np
 import pyqtgraph as pg
@@ -438,6 +439,25 @@ def _measurement_warning_lines(dataset: xr.Dataset) -> tuple[str, ...]:
     return format_probe_warning_lines(measurement_warnings, command_delta)
 
 
+def _persistence_warning_lines(attrs: Mapping[str, object]) -> tuple[str, ...]:
+    lines: list[str] = []
+    labels = {
+        "calibration": "Calibration file",
+        "correction_history": "Correction history file",
+    }
+    for prefix, label in labels.items():
+        if attrs.get(f"{prefix}_persistence_status") != "pending":
+            continue
+        message = str(
+            attrs.get(
+                f"{prefix}_persistence_message",
+                "write is queued until the target file becomes writable",
+            )
+        )
+        lines.append(f"{label} write pending: {message}")
+    return tuple(lines)
+
+
 class CalibrationPanel(QtWidgets.QWidget):
     def __init__(self, parent: QtWidgets.QWidget | None = None):
         super().__init__(parent)
@@ -661,6 +681,7 @@ class CalibrationPanel(QtWidgets.QWidget):
         )
 
         warnings = summary["warnings"]
+        warnings += _persistence_warning_lines(calibration.attrs)
         warnings_text = "\n".join(warnings) if warnings else "No calibration warnings."
         self.calibration_warnings_text.setPlainText(warnings_text)
 
@@ -795,6 +816,7 @@ class CalibrationPanel(QtWidgets.QWidget):
             for line in str(result.attrs.get("warnings", "")).splitlines()
             if line.strip()
         ]
+        warning_lines.extend(_persistence_warning_lines(result.attrs))
         self.calibration_warnings_text.setPlainText(
             "\n".join(warning_lines) if warning_lines else "No correction warnings."
         )
@@ -825,6 +847,7 @@ class CalibrationPanel(QtWidgets.QWidget):
             for line in str(result.attrs.get("warnings", "")).splitlines()
             if line.strip()
         ]
+        warning_lines.extend(_persistence_warning_lines(result.attrs))
         self.calibration_warnings_text.setPlainText(
             "\n".join(warning_lines) if warning_lines else "No correction warnings."
         )

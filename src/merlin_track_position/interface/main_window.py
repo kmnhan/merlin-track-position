@@ -41,11 +41,19 @@ from merlin_track_position.interface.correction_thread import CorrectionThread
 from merlin_track_position.server import MotorServer
 from merlin_track_position.tracking.calibrate import visual_calibration_probe_count
 from merlin_track_position.tracking.calibration_core import (
+    flush_pending_calibration_datasets,
     load_calibration_dataset,
-    save_calibration_dataset,
+    save_calibration_dataset_deferred,
     validate_visual_calibration_dataset,
 )
-from merlin_track_position.tracking.correct import load_latest_correction_history_dataset
+from merlin_track_position.tracking.correct import (
+    flush_pending_correction_history_datasets,
+    load_latest_correction_history_dataset,
+)
+from merlin_track_position.tracking.persistence import (
+    pending_entry_count,
+    persistence_result_attrs,
+)
 
 __all__ = ("CalibrationStartDialog", "MainWindow")
 
@@ -79,6 +87,7 @@ CAMERA_IMAGE_SIZES: dict[str, tuple[int, int]] = {
     "cam1": (IMAGE_WIDTH_CAM1, IMAGE_HEIGHT_CAM1),
 }
 IMAGE_REFRESH_INTERVAL_MS = 400
+PERSISTENCE_FLUSH_INTERVAL_MS = 5000
 ROI_SETTINGS_KEYS: dict[str, tuple[str, str, str, str]] = {
     camera: (
         f"roi/{camera}/x",
@@ -503,6 +512,11 @@ class MainWindow(_MainWindowGUI):
         self._server.sigMoveDetected.connect(self._on_move_detected)
         self._server.start()
 
+        self._persistence_flush_timer = QtCore.QTimer(self)
+        self._persistence_flush_timer.setInterval(PERSISTENCE_FLUSH_INTERVAL_MS)
+        self._persistence_flush_timer.timeout.connect(self._flush_pending_persistence)
+        self._flush_pending_persistence()
+
         self._on_image_auto_refresh_toggled(
             self.image_auto_refresh_checkbox.isChecked()
         )
@@ -510,6 +524,62 @@ class MainWindow(_MainWindowGUI):
     @staticmethod
     def _load_calibration_from_path(path: Path) -> xr.Dataset:
         return load_calibration_dataset(path)
+
+    def _calibration_after_correction_result(self, result: xr.Dataset) -> xr.Dataset:
+        if self._calibration_path is None:
+            raise RuntimeError("correction finished without a calibration path")
+        if (
+            result.attrs.get("calibration_persistence_status") == "pending"
+            and self._calibration is not None
+            and "visual_jacobian_px_per_cmd_mm" in result
+        ):
+            calibration = self._calibration.load().copy(deep=True)
+            calibration["visual_jacobian_px_per_cmd_mm"] = result[
+                "visual_jacobian_px_per_cmd_mm"
+            ]
+            if "calibration_jacobian_refinement_count" in result.attrs:
+                calibration.attrs["jacobian_refinement_count"] = int(
+                    result.attrs["calibration_jacobian_refinement_count"]
+                )
+            for key, value in result.attrs.items():
+                if (
+                    key.startswith("calibration_persistence_")
+                    or key == "calibration_pending_spool_path"
+                ):
+                    calibration.attrs[key] = value
+            calibration.attrs["calibration_path"] = str(self._calibration_path)
+            validate_visual_calibration_dataset(calibration)
+            return calibration
+        return self._load_calibration_from_path(self._calibration_path)
+
+    def _flush_pending_persistence(self) -> None:
+        results = [
+            *flush_pending_calibration_datasets(),
+            *flush_pending_correction_history_datasets(),
+        ]
+        for result in results:
+            if result.pending:
+                logger.info(
+                    "HDF5 persistence still pending for %s: %s",
+                    result.target_path,
+                    result.message,
+                )
+            else:
+                logger.info(
+                    "HDF5 persistence update for %s: %s",
+                    result.target_path,
+                    result.message,
+                )
+        self._schedule_persistence_flush_if_needed()
+
+    def _schedule_persistence_flush_if_needed(self) -> None:
+        if not hasattr(self, "_persistence_flush_timer"):
+            return
+        if pending_entry_count() > 0:
+            if not self._persistence_flush_timer.isActive():
+                self._persistence_flush_timer.start()
+        elif self._persistence_flush_timer.isActive():
+            self._persistence_flush_timer.stop()
 
     @QtCore.Slot(int)
     def _on_move_detected(self, target: int) -> None:
@@ -716,6 +786,7 @@ class MainWindow(_MainWindowGUI):
         if self._correction_thread.isRunning():
             return
 
+        self._flush_pending_persistence()
         file_name, _ = QtWidgets.QFileDialog.getOpenFileName(
             self,
             "Load calibration",
@@ -742,6 +813,7 @@ class MainWindow(_MainWindowGUI):
         self._set_roi_editing_enabled(False)
         self.calibration_panel.show_loaded_calibration(calibration, path.name)
         self._restore_latest_correction_result(path)
+        self._schedule_persistence_flush_if_needed()
 
     @QtCore.Slot()
     def _on_save_calibration_clicked(self) -> None:
@@ -769,8 +841,15 @@ class MainWindow(_MainWindowGUI):
 
         path = Path(file_name)
         try:
-            save_calibration_dataset(self._calibration, path)
-            self._calibration = load_calibration_dataset(path)
+            persistence = save_calibration_dataset_deferred(self._calibration, path)
+            if persistence.flushed:
+                self._calibration = load_calibration_dataset(path)
+            else:
+                self._calibration = self._calibration.load().copy(deep=True)
+                self._calibration.attrs["calibration_path"] = str(path)
+                self._calibration = self._calibration.assign_attrs(
+                    persistence_result_attrs("calibration", persistence)
+                )
         except Exception as exc:
             QtWidgets.QMessageBox.critical(
                 self,
@@ -781,7 +860,14 @@ class MainWindow(_MainWindowGUI):
 
         self._calibration_path = path
         self._set_roi_editing_enabled(False)
-        self.calibration_panel.show_saved_calibration(path.name)
+        if persistence.pending:
+            self.calibration_panel.show_loaded_calibration(self._calibration, path.name)
+            self.calibration_panel.calibration_status_label.setText(
+                f"Calibration queued for save: {path.name}"
+            )
+            self._schedule_persistence_flush_if_needed()
+        else:
+            self.calibration_panel.show_saved_calibration(path.name)
 
     @QtCore.Slot()
     def _on_new_calibration_clicked(self) -> None:
@@ -963,6 +1049,7 @@ class MainWindow(_MainWindowGUI):
             else "new calibration"
         )
         self.calibration_panel.show_loaded_calibration(calibration, display_name)
+        self._schedule_persistence_flush_if_needed()
 
     @QtCore.Slot(str)
     def _on_new_calibration_failed(self, error_message: str) -> None:
@@ -987,7 +1074,7 @@ class MainWindow(_MainWindowGUI):
             self._last_correction_result = result
             if self._calibration_path is None:
                 raise RuntimeError("correction finished without a calibration path")
-            calibration = self._load_calibration_from_path(self._calibration_path)
+            calibration = self._calibration_after_correction_result(result)
             self._apply_calibration_roi_metadata(calibration, persist=False)
 
             self._calibration = calibration
@@ -999,6 +1086,7 @@ class MainWindow(_MainWindowGUI):
             )
             self.calibration_panel.show_loaded_calibration(calibration, display_name)
             self.calibration_panel.show_correction_result(result)
+            self._flush_pending_persistence()
         except Exception as exc:
             self._restore_calibration_idle_state()
             self._reply_to_pending_server_correction(False, str(exc))
@@ -1150,6 +1238,9 @@ class MainWindow(_MainWindowGUI):
         return True
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        if hasattr(self, "_persistence_flush_timer"):
+            self._persistence_flush_timer.stop()
+
         for thread in self._image_refresh_threads.values():
             thread.stop()
         for thread in self._image_refresh_threads.values():

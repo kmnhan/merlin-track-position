@@ -363,18 +363,18 @@ class MoveMotorsAndWaitTests(unittest.TestCase):
         self.assertEqual(server.move_calls[1], ((MOTOR_NAMES["z"],), (0.04,)))
 
     def test_only_changed_y_axis_moves_without_backlash(self):
-        server = FakeBCSServer([(2.01,)], initial_positions=(0.02, 2.0, 0.04))
+        server = FakeBCSServer([(2.02,)], initial_positions=(0.02, 2.0, 0.04))
 
         with patch("merlin_track_position.instruments.motors.time.sleep"):
             positions = _move_motors_and_wait(
                 server,
                 ("x", "y", "z"),
-                (0.0205, 2.01, 0.0395),
+                (0.0205, 2.02, 0.0395),
                 backlash_correction={"x": 0.030, "z": 0.030},
             )
 
-        self.assertEqual(positions, (0.02, 2.01, 0.04))
-        self.assertEqual(server.move_calls, [((MOTOR_NAMES["y"],), (2.01,))])
+        self.assertEqual(positions, (0.02, 2.02, 0.04))
+        self.assertEqual(server.move_calls, [((MOTOR_NAMES["y"],), (2.02,))])
 
     def test_mixed_move_omits_unchanged_backlash_axis(self):
         server = FakeBCSServer(

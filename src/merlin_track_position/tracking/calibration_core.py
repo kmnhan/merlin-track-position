@@ -13,6 +13,19 @@ import numpy as np
 import xarray as xr
 
 from merlin_track_position import constants
+from merlin_track_position.tracking.persistence import (
+    PendingEntry,
+    PersistenceResult,
+    discard_spool_entry,
+    fingerprint_matches,
+    iter_pending_entries,
+    load_spooled_dataset,
+    mark_spool_entry_stale,
+    normalize_target_path,
+    persistence_result_attrs,
+    stage_dataset,
+    target_fingerprint,
+)
 from merlin_track_position.tracking.shift import estimate_shift
 
 CAMERAS = ("cam0", "cam1")
@@ -466,15 +479,178 @@ def save_calibration_dataset(
     return output_path
 
 
+def save_calibration_dataset_deferred(
+    dataset: xr.Dataset,
+    path: str | Path,
+) -> PersistenceResult:
+    """Save calibration through a local spool, then flush to the target path."""
+
+    output_path = normalize_target_path(path)
+    dataset = _canonical_visual_calibration_dataset(dataset)
+    validate_visual_calibration_dataset(dataset)
+    saved = dataset.load().copy(deep=True)
+    entry = stage_dataset(
+        saved,
+        output_path,
+        operation="calibration",
+        metadata={"base_target_fingerprint": target_fingerprint(output_path)},
+    )
+    try:
+        save_calibration_dataset(saved, output_path)
+    except Exception as exc:
+        return PersistenceResult(
+            target_path=output_path,
+            spool_path=entry.path,
+            flushed=False,
+            pending=True,
+            message=f"queued calibration write because target is unavailable: {exc}",
+        )
+
+    discard_spool_entry(entry)
+    _discard_pending_calibration_entries(output_path)
+    return PersistenceResult(
+        target_path=output_path,
+        spool_path=entry.path,
+        flushed=True,
+        pending=False,
+        message="calibration write flushed to target",
+    )
+
+
+def flush_pending_calibration_datasets(
+    target_path: str | Path | None = None,
+) -> list[PersistenceResult]:
+    """Flush queued calibration saves whose target files are writable."""
+
+    results: list[PersistenceResult] = []
+    for entry in _superseded_pending_calibration_entries(target_path):
+        discard_spool_entry(entry)
+
+    for entry in _latest_pending_calibration_entries(target_path):
+        target = Path(str(entry.metadata["target_path"]))
+        base_fingerprint = entry.metadata.get("base_target_fingerprint")
+        if not fingerprint_matches(target, base_fingerprint):
+            stale_path = mark_spool_entry_stale(
+                entry,
+                "target calibration changed before queued write could flush",
+            )
+            results.append(
+                PersistenceResult(
+                    target_path=target,
+                    spool_path=stale_path,
+                    flushed=False,
+                    pending=False,
+                    message=(
+                        "skipped stale calibration write because the target file "
+                        "changed before it became writable"
+                    ),
+                )
+            )
+            continue
+
+        dataset = load_spooled_dataset(entry)
+        try:
+            save_calibration_dataset(dataset, target)
+        except Exception as exc:
+            results.append(
+                PersistenceResult(
+                    target_path=target,
+                    spool_path=entry.path,
+                    flushed=False,
+                    pending=True,
+                    message=(
+                        "queued calibration write is still pending because target "
+                        f"is unavailable: {exc}"
+                    ),
+                )
+            )
+            continue
+
+        discard_spool_entry(entry)
+        _discard_pending_calibration_entries(target)
+        results.append(
+            PersistenceResult(
+                target_path=target,
+                spool_path=entry.path,
+                flushed=True,
+                pending=False,
+                message="queued calibration write flushed to target",
+            )
+        )
+    return results
+
+
 def load_calibration_dataset(path: str | Path) -> xr.Dataset:
     """Load and validate a calibration dataset from disk."""
 
     input_path = Path(path)
-    with xr.open_dataset(input_path, engine="h5netcdf") as dataset_on_disk:
-        dataset = _canonical_visual_calibration_dataset(dataset_on_disk.load())
+    pending = _latest_pending_calibration_dataset(input_path)
+    if pending is None:
+        with xr.open_dataset(input_path, engine="h5netcdf") as dataset_on_disk:
+            dataset = _canonical_visual_calibration_dataset(dataset_on_disk.load())
+    else:
+        dataset = _canonical_visual_calibration_dataset(pending)
     dataset.attrs["calibration_path"] = str(input_path)
     validate_visual_calibration_dataset(dataset)
     return dataset
+
+
+def _latest_pending_calibration_dataset(path: str | Path) -> xr.Dataset | None:
+    latest_dataset: xr.Dataset | None = None
+    for entry in _latest_pending_calibration_entries(path):
+        base_fingerprint = entry.metadata.get("base_target_fingerprint")
+        if not fingerprint_matches(path, base_fingerprint):
+            continue
+        latest_dataset = load_spooled_dataset(entry).assign_attrs(
+            persistence_result_attrs(
+                "calibration",
+                PersistenceResult(
+                    target_path=Path(str(entry.metadata["target_path"])),
+                    spool_path=entry.path,
+                    flushed=False,
+                    pending=True,
+                    message="calibration write is pending flush to target",
+                ),
+            )
+        )
+    return latest_dataset
+
+
+def _latest_pending_calibration_entries(
+    path: str | Path | None,
+) -> list[PendingEntry]:
+    entries_by_target: dict[str, PendingEntry] = {}
+    for entry in iter_pending_entries(
+        operation="calibration",
+        target_path=path,
+    ):
+        entries_by_target[str(entry.metadata["target_path"])] = entry
+    return list(entries_by_target.values())
+
+
+def _superseded_pending_calibration_entries(
+    path: str | Path | None,
+) -> list[PendingEntry]:
+    entries_by_target: dict[str, list[PendingEntry]] = {}
+    for entry in iter_pending_entries(
+        operation="calibration",
+        target_path=path,
+    ):
+        entries_by_target.setdefault(str(entry.metadata["target_path"]), []).append(
+            entry
+        )
+    superseded: list[PendingEntry] = []
+    for entries in entries_by_target.values():
+        superseded.extend(entries[:-1])
+    return superseded
+
+
+def _discard_pending_calibration_entries(path: str | Path) -> None:
+    for entry in iter_pending_entries(
+        operation="calibration",
+        target_path=path,
+    ):
+        discard_spool_entry(entry)
 
 
 def assign_refined_visual_jacobian(
@@ -500,7 +676,11 @@ def assign_refined_visual_jacobian(
     validate_visual_calibration_dataset(updated)
 
     if save_path is not None:
-        save_calibration_dataset(updated, save_path)
+        persistence = save_calibration_dataset_deferred(updated, save_path)
+        updated = updated.assign_attrs(
+            persistence_result_attrs("calibration", persistence)
+        )
+        updated.attrs["calibration_path"] = str(normalize_target_path(save_path))
     return updated
 
 

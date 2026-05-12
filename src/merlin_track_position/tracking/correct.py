@@ -32,6 +32,16 @@ from merlin_track_position.tracking.calibration_core import (
     validate_visual_calibration_dataset,
     weighted_pixel_residual,
 )
+from merlin_track_position.tracking.persistence import (
+    PendingEntry,
+    PersistenceResult,
+    discard_spool_entry,
+    iter_pending_entries,
+    load_spooled_dataset,
+    normalize_target_path,
+    persistence_result_attrs,
+    stage_dataset,
+)
 
 logger = logging.getLogger("merlin_track_position.tracking.correct")
 
@@ -241,10 +251,14 @@ def do_correction(
             correction_log_path,
         )
         progress = build_result(completed)
-        save_correction_history_dataset(
+        progress = _apply_calibration_persistence_attrs(progress, calibration)
+        persistence = save_correction_history_dataset_deferred(
             progress,
             correction_log_path,
             run_id=correction_run_id,
+        )
+        progress = progress.assign_attrs(
+            persistence_result_attrs("correction_history", persistence)
         )
         if progress_callback is not None and not completed:
             progress_callback(progress)
@@ -359,6 +373,7 @@ def do_correction(
                         move_jacobian_refined,
                         correction_cmd_mm,
                         measured_delta_px,
+                        exclude_run_id=correction_run_id,
                     )
                 )
                 calibration = refine_visual_jacobian_from_observations(
@@ -484,6 +499,23 @@ def correction_history_path(calibration_path: str | Path) -> Path:
     return path.with_name(f"{path.stem}_corrections{suffix}")
 
 
+def _apply_calibration_persistence_attrs(
+    result: xr.Dataset,
+    calibration: xr.Dataset,
+) -> xr.Dataset:
+    attrs = {
+        key: value
+        for key, value in calibration.attrs.items()
+        if key.startswith("calibration_persistence_")
+        or key == "calibration_pending_spool_path"
+    }
+    if "jacobian_refinement_count" in calibration.attrs:
+        attrs["calibration_jacobian_refinement_count"] = int(
+            calibration.attrs["jacobian_refinement_count"]
+        )
+    return result.assign_attrs(attrs) if attrs else result
+
+
 def _jacobian_refinement_observations(
     history_path: Path,
     run_command_delta_mm: Sequence[np.ndarray],
@@ -491,8 +523,13 @@ def _jacobian_refinement_observations(
     run_jacobian_refined: Sequence[bool],
     current_command_delta_mm: np.ndarray,
     current_measured_delta_px: np.ndarray,
+    *,
+    exclude_run_id: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    history_delta, history_measured = _load_jacobian_refinement_history(history_path)
+    history_delta, history_measured = _load_jacobian_refinement_history(
+        history_path,
+        exclude_run_id=exclude_run_id,
+    )
     rows: list[np.ndarray] = [*history_delta]
     measurements: list[np.ndarray] = [*history_measured]
     rows.extend(
@@ -518,37 +555,84 @@ def _jacobian_refinement_observations(
     return np.stack(rows, axis=0), np.stack(measurements, axis=0)
 
 
-def _load_jacobian_refinement_history(path: Path) -> tuple[np.ndarray, np.ndarray]:
-    if not path.exists():
-        return _empty_refinement_observations()
-
+def _load_jacobian_refinement_history(
+    path: Path,
+    *,
+    exclude_run_id: int | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
     command_rows: list[np.ndarray] = []
     measured_rows: list[np.ndarray] = []
-    with h5py.File(path, "r") as history_file:
-        for group_name in sorted(history_file.keys()):
-            group = history_file[group_name]
-            required = (
-                "move_command_delta_mm",
-                "move_measured_delta_px",
-                "move_jacobian_refined",
-            )
-            if not all(name in group for name in required):
-                continue
-            updated = np.asarray(group["move_jacobian_refined"], dtype=bool)
-            if updated.size == 0 or not np.any(updated):
-                continue
-            command_rows.extend(
-                np.asarray(row, dtype=np.float64)
-                for row in np.asarray(group["move_command_delta_mm"])[updated]
-            )
-            measured_rows.extend(
-                np.asarray(row, dtype=np.float64)
-                for row in np.asarray(group["move_measured_delta_px"])[updated]
-            )
+    if path.exists():
+        with h5py.File(path, "r") as history_file:
+            for group_name in sorted(history_file.keys()):
+                run_id = _correction_history_run_id(group_name)
+                if run_id is not None and run_id == exclude_run_id:
+                    continue
+                _extend_refinement_rows_from_group(
+                    history_file[group_name],
+                    command_rows,
+                    measured_rows,
+                )
+
+    for dataset in _pending_correction_history_datasets(
+        path,
+        exclude_run_id=exclude_run_id,
+    ):
+        _extend_refinement_rows_from_dataset(dataset, command_rows, measured_rows)
 
     if not command_rows:
         return _empty_refinement_observations()
     return np.stack(command_rows, axis=0), np.stack(measured_rows, axis=0)
+
+
+def _extend_refinement_rows_from_group(
+    group: h5py.Group,
+    command_rows: list[np.ndarray],
+    measured_rows: list[np.ndarray],
+) -> None:
+    required = (
+        "move_command_delta_mm",
+        "move_measured_delta_px",
+        "move_jacobian_refined",
+    )
+    if not all(name in group for name in required):
+        return
+    updated = np.asarray(group["move_jacobian_refined"], dtype=bool)
+    if updated.size == 0 or not np.any(updated):
+        return
+    command_rows.extend(
+        np.asarray(row, dtype=np.float64)
+        for row in np.asarray(group["move_command_delta_mm"])[updated]
+    )
+    measured_rows.extend(
+        np.asarray(row, dtype=np.float64)
+        for row in np.asarray(group["move_measured_delta_px"])[updated]
+    )
+
+
+def _extend_refinement_rows_from_dataset(
+    dataset: xr.Dataset,
+    command_rows: list[np.ndarray],
+    measured_rows: list[np.ndarray],
+) -> None:
+    required = (
+        "move_command_delta_mm",
+        "move_measured_delta_px",
+        "move_jacobian_refined",
+    )
+    if not all(name in dataset for name in required):
+        return
+    updated = np.asarray(dataset["move_jacobian_refined"].values, dtype=bool)
+    if updated.size == 0 or not np.any(updated):
+        return
+    command_rows.extend(
+        np.asarray(row, dtype=np.float64)
+        for row in np.asarray(dataset["move_command_delta_mm"].values)[updated]
+    )
+    measured_rows.extend(
+        np.asarray(row, dtype=np.float64)
+        for row in np.asarray(dataset["move_measured_delta_px"].values)[updated]
+    )
 
 
 def _empty_refinement_observations() -> tuple[np.ndarray, np.ndarray]:
@@ -590,25 +674,139 @@ def save_correction_history_dataset(
     return output_path
 
 
+def save_correction_history_dataset_deferred(
+    result: xr.Dataset,
+    path: str | Path,
+    *,
+    run_id: int,
+) -> PersistenceResult:
+    """Save correction history through a local spool before appending to HDF5."""
+
+    output_path = normalize_target_path(path)
+    group_name = _correction_history_group_name(run_id)
+    saved = _netcdf_safe_correction_result(result.load().copy(deep=True))
+    entry = stage_dataset(
+        saved,
+        output_path,
+        operation="correction_history",
+        metadata={
+            "run_id": int(run_id),
+            "group_name": group_name,
+            "calibration_path": str(saved.attrs.get("calibration_path", "")),
+            "completed": bool(saved.attrs.get("correction_history_completed", False)),
+        },
+    )
+    try:
+        save_correction_history_dataset(result, output_path, run_id=run_id)
+    except Exception as exc:
+        return PersistenceResult(
+            target_path=output_path,
+            spool_path=entry.path,
+            flushed=False,
+            pending=True,
+            message=(
+                "queued correction history write because target is unavailable: "
+                f"{exc}"
+            ),
+        )
+
+    discard_spool_entry(entry)
+    _discard_pending_correction_history_run(output_path, int(run_id))
+    return PersistenceResult(
+        target_path=output_path,
+        spool_path=entry.path,
+        flushed=True,
+        pending=False,
+        message="correction history write flushed to target",
+    )
+
+
+def flush_pending_correction_history_datasets(
+    target_path: str | Path | None = None,
+) -> list[PersistenceResult]:
+    """Flush queued correction history snapshots whose target files are writable."""
+
+    results: list[PersistenceResult] = []
+    for stale_entry in _superseded_pending_correction_history_entries(target_path):
+        discard_spool_entry(stale_entry)
+
+    pending_entries = _latest_pending_correction_history_entries_by_run(target_path)
+    for entry in pending_entries.values():
+        target = Path(str(entry.metadata["target_path"]))
+        run_id = int(entry.metadata["run_id"])
+        dataset = load_spooled_dataset(entry)
+        try:
+            save_correction_history_dataset(dataset, target, run_id=run_id)
+        except Exception as exc:
+            results.append(
+                PersistenceResult(
+                    target_path=target,
+                    spool_path=entry.path,
+                    flushed=False,
+                    pending=True,
+                    message=(
+                        "queued correction history write is still pending because "
+                        f"target is unavailable: {exc}"
+                    ),
+                )
+            )
+            continue
+
+        discard_spool_entry(entry)
+        _discard_pending_correction_history_run(target, run_id)
+        results.append(
+            PersistenceResult(
+                target_path=target,
+                spool_path=entry.path,
+                flushed=True,
+                pending=False,
+                message="queued correction history write flushed to target",
+            )
+        )
+    return results
+
+
 def load_latest_correction_history_dataset(
     calibration_path: str | Path,
 ) -> xr.Dataset | None:
     """Load the most recent correction run for a calibration, if one exists."""
 
     history_path = correction_history_path(calibration_path)
-    if not history_path.exists():
+    target_run_id = _latest_correction_history_run_id(history_path)
+    pending = _latest_pending_correction_history_entry(history_path)
+    pending_run_id = (
+        int(pending.metadata["run_id"]) if pending is not None else None
+    )
+
+    if target_run_id is None and pending_run_id is None:
         return None
 
-    group_name = _latest_correction_history_group_name(history_path)
-    if group_name is None:
-        return None
-
-    with xr.open_dataset(
-        history_path,
-        engine="h5netcdf",
-        group=group_name,
-    ) as dataset_on_disk:
-        result = dataset_on_disk.load()
+    if pending is not None and (
+        target_run_id is None
+        or pending_run_id is None
+        or pending_run_id >= target_run_id
+    ):
+        result = load_spooled_dataset(pending)
+        result = result.assign_attrs(
+            persistence_result_attrs(
+                "correction_history",
+                PersistenceResult(
+                    target_path=Path(str(pending.metadata["target_path"])),
+                    spool_path=pending.path,
+                    flushed=False,
+                    pending=True,
+                    message="correction history write is pending flush to target",
+                ),
+            )
+        )
+    else:
+        assert target_run_id is not None
+        with xr.open_dataset(
+            history_path,
+            engine="h5netcdf",
+            group=_correction_history_group_name(target_run_id),
+        ) as dataset_on_disk:
+            result = dataset_on_disk.load()
 
     result = _restore_netcdf_safe_correction_result(result)
     result.attrs.setdefault("calibration_path", str(calibration_path))
@@ -644,33 +842,49 @@ def _restore_netcdf_safe_correction_result(result: xr.Dataset) -> xr.Dataset:
     return restored
 
 
-def _latest_correction_history_group_name(path: Path) -> str | None:
+def _latest_correction_history_run_id(path: Path) -> int | None:
+    if not path.exists():
+        return None
     with h5py.File(path, "r") as history_file:
         latest_attr = history_file.attrs.get("latest_run_group")
         if isinstance(latest_attr, bytes):
             latest_attr = latest_attr.decode()
-        if isinstance(latest_attr, str) and latest_attr in history_file:
-            return latest_attr
+        latest_run_id = (
+            _correction_history_run_id(latest_attr)
+            if isinstance(latest_attr, str) and latest_attr in history_file
+            else None
+        )
+        if latest_run_id is not None:
+            return latest_run_id
 
         run_ids = [
-            int(name.removeprefix("run_"))
-            for name in history_file.keys()
-            if name.startswith("run_") and name.removeprefix("run_").isdigit()
+            run_id
+            for run_id in (
+                _correction_history_run_id(name) for name in history_file.keys()
+            )
+            if run_id is not None
         ]
-    if not run_ids:
-        return None
-    return _correction_history_group_name(max(run_ids))
+    return max(run_ids, default=None)
 
 
 def _next_correction_history_run_id(path: Path) -> int:
-    if not path.exists():
-        return 0
-    with h5py.File(path, "r") as history_file:
-        run_ids = [
-            int(name.removeprefix("run_"))
-            for name in history_file.keys()
-            if name.startswith("run_") and name.removeprefix("run_").isdigit()
-        ]
+    run_ids: list[int] = []
+    if path.exists():
+        with h5py.File(path, "r") as history_file:
+            run_ids.extend(
+                run_id
+                for run_id in (
+                    _correction_history_run_id(name) for name in history_file.keys()
+                )
+                if run_id is not None
+            )
+    run_ids.extend(
+        int(entry.metadata["run_id"])
+        for entry in iter_pending_entries(
+            operation="correction_history",
+            target_path=path,
+        )
+    )
     return max(run_ids, default=-1) + 1
 
 
@@ -679,6 +893,79 @@ def _correction_history_group_name(run_id: int) -> str:
     if run_id < 0:
         raise ValueError("run_id must be non-negative")
     return f"run_{run_id:06d}"
+
+
+def _correction_history_run_id(group_name: str | None) -> int | None:
+    if (
+        not isinstance(group_name, str)
+        or not group_name.startswith("run_")
+        or not group_name.removeprefix("run_").isdigit()
+    ):
+        return None
+    return int(group_name.removeprefix("run_"))
+
+
+def _pending_correction_history_datasets(
+    path: Path,
+    *,
+    exclude_run_id: int | None = None,
+) -> list[xr.Dataset]:
+    datasets: list[xr.Dataset] = []
+    for entry in _latest_pending_correction_history_entries_by_run(path).values():
+        run_id = int(entry.metadata["run_id"])
+        if run_id == exclude_run_id:
+            continue
+        datasets.append(
+            _restore_netcdf_safe_correction_result(load_spooled_dataset(entry))
+        )
+    return datasets
+
+
+def _latest_pending_correction_history_entry(path: Path) -> PendingEntry | None:
+    entries = _latest_pending_correction_history_entries_by_run(path)
+    if not entries:
+        return None
+    return entries[max(entries)]
+
+
+def _latest_pending_correction_history_entries_by_run(
+    path: Path | str | None,
+) -> dict[int, PendingEntry]:
+    entries_by_run: dict[int, PendingEntry] = {}
+    for entry in iter_pending_entries(
+        operation="correction_history",
+        target_path=path,
+    ):
+        run_id = int(entry.metadata["run_id"])
+        entries_by_run[run_id] = entry
+    return entries_by_run
+
+
+def _superseded_pending_correction_history_entries(
+    path: Path | str | None,
+) -> list[PendingEntry]:
+    all_entries: dict[int, list[PendingEntry]] = {}
+    for entry in iter_pending_entries(
+        operation="correction_history",
+        target_path=path,
+    ):
+        all_entries.setdefault(int(entry.metadata["run_id"]), []).append(entry)
+    superseded: list[PendingEntry] = []
+    for entries in all_entries.values():
+        superseded.extend(entries[:-1])
+    return superseded
+
+
+def _discard_pending_correction_history_run(
+    path: Path | str,
+    run_id: int,
+) -> None:
+    for entry in iter_pending_entries(
+        operation="correction_history",
+        target_path=path,
+    ):
+        if int(entry.metadata["run_id"]) == int(run_id):
+            discard_spool_entry(entry)
 
 
 def _reported_next_correction(
