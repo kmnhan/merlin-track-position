@@ -1,4 +1,4 @@
-"""Generate deterministic sample visual-Jacobian calibration datasets."""
+"""Generate deterministic sample calibration datasets."""
 
 from __future__ import annotations
 

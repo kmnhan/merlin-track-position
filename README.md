@@ -541,7 +541,7 @@ print(result.attrs["warnings"])
 
 ## Calibration Entry Point
 
-Visual-Jacobian calibration can be initiated from before/after commanded-mm
+Calibration can be initiated from before/after commanded-mm
 probe moves:
 
 ```python
@@ -565,7 +565,7 @@ BCS-mm deltas and measured image deltas.
 
 ## Xarray and HDF5
 
-Calibration results are xarray datasets using a single visual-Jacobian schema.
+Calibration results are xarray datasets.
 
 The main dataset variables are:
 

@@ -341,7 +341,6 @@ class CalibrationPanelTests(unittest.TestCase):
         axes_table = dialog.findChild(QtWidgets.QTableWidget, "calibration_axes_table")
 
         self.assertIn("test.h5", panel.calibration_status_label.text())
-        self.assertIn("visual-Jacobian", panel.calibration_status_label.text())
         self.assertEqual(panel.new_calibration_button.text(), "Clear calibration")
         self.assertTrue(panel.correct_sample_button.isEnabled())
         self.assertNotEqual(panel.metric_labels["axis_scale_cmd_mm"].text(), "n/a")
@@ -400,7 +399,9 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                     window.calibration_panel.new_calibration_button.text(),
                     "New calibration",
                 )
-                self.assertFalse(window.calibration_panel.correct_sample_button.isEnabled())
+                self.assertFalse(
+                    window.calibration_panel.correct_sample_button.isEnabled()
+                )
                 self.assertTrue(roi_handles_visible(window))
                 self.assertTrue(roi_editing_enabled(window))
             finally:
@@ -422,7 +423,9 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                     window.calibration_panel.new_calibration_button.text(),
                     "Clear calibration",
                 )
-                self.assertTrue(window.calibration_panel.correct_sample_button.isEnabled())
+                self.assertTrue(
+                    window.calibration_panel.correct_sample_button.isEnabled()
+                )
                 self.assertFalse(roi_handles_visible(window))
                 self.assertFalse(roi_editing_enabled(window))
 
@@ -439,7 +442,9 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                     window.calibration_panel.new_calibration_button.text(),
                     "New calibration",
                 )
-                self.assertFalse(window.calibration_panel.correct_sample_button.isEnabled())
+                self.assertFalse(
+                    window.calibration_panel.correct_sample_button.isEnabled()
+                )
                 self.assertTrue(roi_handles_visible(window))
                 self.assertTrue(roi_editing_enabled(window))
             finally:
@@ -567,7 +572,9 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                 finally:
                     window.close()
 
-    def test_correction_success_stores_result_reloads_calibration_and_reports_status(self):
+    def test_correction_success_stores_result_reloads_calibration_and_reports_status(
+        self,
+    ):
         get_qapp()
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "calibration.h5"
@@ -631,9 +638,7 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                     self.assertIsNotNone(window._last_correction_result)
                     assert window._last_correction_result is not None
                     self.assertEqual(
-                        window._last_correction_result.attrs[
-                            "correction_history_path"
-                        ],
+                        window._last_correction_result.attrs["correction_history_path"],
                         str(history_path),
                     )
                     self.assertIn(
@@ -678,7 +683,6 @@ class CalibrationStartDialogTests(unittest.TestCase):
         get_qapp()
         dialog = CalibrationStartDialog()
 
-        self.assertIn("Visual-Jacobian", dialog.windowTitle())
         self.assertIsNotNone(
             dialog.findChild(QtWidgets.QLineEdit, "calibration_output_path_edit")
         )

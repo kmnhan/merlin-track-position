@@ -172,7 +172,7 @@ def _remove_roi_scale_handles(roi: pg.ROI) -> None:
 class CalibrationStartDialog(QtWidgets.QDialog):
     def __init__(self, parent: QtWidgets.QWidget | None = None):
         super().__init__(parent)
-        self.setWindowTitle("New Visual-Jacobian Calibration")
+        self.setWindowTitle("New Calibration")
 
         layout = QtWidgets.QVBoxLayout(self)
         form_layout = QtWidgets.QFormLayout()
@@ -214,7 +214,7 @@ class CalibrationStartDialog(QtWidgets.QDialog):
     def _browse_output_path(self) -> None:
         file_name, _ = QtWidgets.QFileDialog.getSaveFileName(
             self,
-            "Save visual-Jacobian calibration",
+            "Save calibration",
             self.path_edit.text(),
             "Calibration files (*.h5 *.hdf5 *.nc);;All files (*)",
         )
@@ -225,7 +225,7 @@ class CalibrationStartDialog(QtWidgets.QDialog):
         if not self.path_edit.text().strip():
             QtWidgets.QMessageBox.warning(
                 self,
-                "Visual-Jacobian calibration path required",
+                "Calibration path required",
                 "Choose a file path for the calibration dataset.",
             )
             return
@@ -584,7 +584,7 @@ class MainWindow(_MainWindowGUI):
 
         file_name, _ = QtWidgets.QFileDialog.getOpenFileName(
             self,
-            "Load visual-Jacobian calibration",
+            "Load calibration",
             "",
             "Calibration files (*.h5 *.hdf5 *.nc);;All files (*)",
         )
@@ -619,7 +619,7 @@ class MainWindow(_MainWindowGUI):
         )
         file_name, _ = QtWidgets.QFileDialog.getSaveFileName(
             self,
-            "Save visual-Jacobian calibration",
+            "Save calibration",
             str(default_path),
             "Calibration files (*.h5 *.hdf5 *.nc);;All files (*)",
         )

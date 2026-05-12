@@ -1,4 +1,4 @@
-"""Visual-Jacobian calibration and correction in commanded-mm space."""
+"""Calibration and correction in commanded-mm space."""
 
 from __future__ import annotations
 
@@ -324,7 +324,7 @@ def fit_visual_jacobian_calibration(
 
 
 def validate_visual_calibration_dataset(dataset: xr.Dataset) -> None:
-    """Validate the required visual-Jacobian calibration schema."""
+    """Validate the required calibration schema."""
 
     missing = tuple(
         name for name in REQUIRED_CALIBRATION_VARIABLES if name not in dataset
@@ -1239,7 +1239,7 @@ def derive_axis_scale_from_jacobian(
     visual_jacobian: np.ndarray,
     command_delta: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
-    """Derive correction damping scales from fitted visual-Jacobian sensitivity."""
+    """Derive correction damping scales from fitted sensitivity."""
 
     axis_sensitivity = np.linalg.norm(_jacobian_to_observation(visual_jacobian), axis=0)
     if not np.isfinite(axis_sensitivity).all() or np.any(axis_sensitivity <= 0.0):

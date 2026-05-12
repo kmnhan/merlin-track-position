@@ -55,7 +55,7 @@ def run_calibration(
     | None = None,
     **shift_kwargs: Any,
 ) -> xr.Dataset:
-    """Run and save a visual-Jacobian calibration.
+    """Run and save a calibration.
 
     Motor positions are treated as commanded-mm coordinates. Readback positions are
     recorded only as diagnostics; they are not used to fit the Jacobian.
@@ -79,7 +79,7 @@ def run_calibration(
         time.sleep(4.0)
 
     logger.info(
-        "Starting visual-Jacobian calibration with %d probes",
+        "Starting calibration with %d probes",
         len(probe_deltas),
     )
     reference_stacks, _ = capture_image_and_display_stacks(

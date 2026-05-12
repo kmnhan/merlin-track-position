@@ -39,9 +39,7 @@ def _tooltip_html(
 ) -> str:
     paragraphs = "".join(f"<p>{item}</p>" for item in (*computed, *interpretation))
     return (
-        "<qt><div style='white-space: normal; width: 360px;'>"
-        f"{paragraphs}"
-        "</div></qt>"
+        f"<qt><div style='white-space: normal; width: 360px;'>{paragraphs}</div></qt>"
     )
 
 
@@ -72,23 +70,15 @@ METRIC_ROWS: tuple[tuple[str, str, str], ...] = (
         "axis_scale_cmd_mm",
         "Axis scale cmd mm",
         _tooltip_html(
-            (
-                "Saved x/y/z command scales used by normalized damped correction.",
-            ),
-            (
-                "These are commanded-mm damping scales, not measured physical "
-                "travel.",
-            ),
+            ("Saved x/y/z command scales used by normalized damped correction.",),
+            ("These are commanded-mm damping scales, not measured physical travel.",),
         ),
     ),
     (
         "axis_sensitivity_px_per_cmd_mm",
         "Axis response px/cmd mm",
         _tooltip_html(
-            (
-                "Euclidean image response of each visual-Jacobian command-axis "
-                "column.",
-            ),
+            ("Euclidean image response of each command-axis column.",),
             ("This is the per-axis command-to-image response.",),
         ),
     ),
@@ -96,9 +86,7 @@ METRIC_ROWS: tuple[tuple[str, str, str], ...] = (
         "axis_scale_target_response_px",
         "Scale target px",
         _tooltip_html(
-            (
-                "Target image response used when deriving correction axis scales.",
-            ),
+            ("Target image response used when deriving correction axis scales.",),
             ("Shown for diagnosing scale clamping during calibration.",),
         ),
     ),
@@ -117,11 +105,10 @@ METRIC_ROWS: tuple[tuple[str, str, str], ...] = (
         "residual_rms_px",
         "Residual RMS px",
         _tooltip_html(
+            ("Residual is measured probe image delta minus prediction.",),
             (
-                "Residual is measured probe image delta minus visual-Jacobian "
-                "prediction.",
+                "Lower means the local linear command-to-image model is more consistent.",
             ),
-            ("Lower means the local linear command-to-image model is more consistent.",),
         ),
     ),
     (
@@ -155,9 +142,7 @@ METRIC_ROWS: tuple[tuple[str, str, str], ...] = (
         "readback_command_rms_mm",
         "Readback disagreement RMS mm",
         _tooltip_html(
-            (
-                "RMS of <tt>(post_readback - pre_readback) - commanded_delta</tt>.",
-            ),
+            ("RMS of <tt>(post_readback - pre_readback) - commanded_delta</tt>.",),
             ("Readback is diagnostic only and does not affect the fitted Jacobian.",),
         ),
     ),
@@ -165,9 +150,7 @@ METRIC_ROWS: tuple[tuple[str, str, str], ...] = (
         "readback_command_max_mm",
         "Readback disagreement max mm",
         _tooltip_html(
-            (
-                "Worst readback-vs-command disagreement among all visual probes.",
-            ),
+            ("Worst readback-vs-command disagreement among all visual probes.",),
             ("Useful for spotting BCS or mechanical reproducibility issues.",),
         ),
     ),
@@ -181,7 +164,9 @@ REPEATABILITY_ROWS: tuple[tuple[str, str, str], ...] = (
                 "Repeated probes with identical commanded-mm deltas are grouped.",
                 "The four camera/pixel components are RMS-combined after sample std.",
             ),
-            ("Lower means repeated command probes produce more consistent image motion.",),
+            (
+                "Lower means repeated command probes produce more consistent image motion.",
+            ),
         ),
     ),
     (
@@ -284,10 +269,13 @@ def _calibration_arrays(dataset: xr.Dataset) -> dict[str, np.ndarray]:
         len(PIXEL_AXES),
     )
     residual_shift = measured_shift - predicted_shift
-    residual_command = residual_shift.reshape(
-        command_delta.shape[0],
-        len(OBSERVATION_AXES),
-    ) @ pixel_to_command.T
+    residual_command = (
+        residual_shift.reshape(
+            command_delta.shape[0],
+            len(OBSERVATION_AXES),
+        )
+        @ pixel_to_command.T
+    )
     readback_disagreement = (
         np.asarray(dataset["post_readback_position_mm"].values, dtype=float)
         - np.asarray(dataset["pre_readback_position_mm"].values, dtype=float)
@@ -354,9 +342,7 @@ def _calibration_summary(dataset: xr.Dataset) -> dict[str, object]:
         residual_max_px = math.nan
 
     residual_command_norms = np.linalg.norm(residual_command, axis=1)
-    finite_command_norms = residual_command_norms[
-        np.isfinite(residual_command_norms)
-    ]
+    finite_command_norms = residual_command_norms[np.isfinite(residual_command_norms)]
     if finite_command_norms.size:
         residual_rms_cmd_mm = float(
             np.sqrt(np.mean(finite_command_norms * finite_command_norms))
@@ -386,9 +372,7 @@ def _calibration_summary(dataset: xr.Dataset) -> dict[str, object]:
     measurement_warning_lines = _measurement_warning_lines(dataset)
     if measurement_warning_lines:
         warning_lines = [
-            line
-            for line in warning_lines
-            if line != MEASUREMENT_WARNING_SUMMARY
+            line for line in warning_lines if line != MEASUREMENT_WARNING_SUMMARY
         ]
         warning_lines.extend(measurement_warning_lines)
     warnings = tuple(dict.fromkeys(warning_lines))
@@ -434,7 +418,9 @@ def _measurement_warning_lines(dataset: xr.Dataset) -> tuple[str, ...]:
         return ()
 
     command_delta = np.asarray(dataset["probe_command_delta_mm"].values, dtype=float)
-    warning_values = np.asarray(dataset["probe_registration_warnings"].values, dtype=str)
+    warning_values = np.asarray(
+        dataset["probe_registration_warnings"].values, dtype=str
+    )
     if warning_values.shape != (command_delta.shape[0], len(CAMERAS)):
         return ()
 
@@ -490,14 +476,14 @@ class CalibrationPanel(QtWidgets.QWidget):
         content_layout.addLayout(right_column, stretch=1)
         calibration_layout.addLayout(content_layout)
 
-        warnings_group = QtWidgets.QGroupBox("Visual-Jacobian Warnings")
+        warnings_group = QtWidgets.QGroupBox("Warnings")
         warnings_layout = QtWidgets.QVBoxLayout(warnings_group)
         self.calibration_warnings_text = QtWidgets.QPlainTextEdit()
         self.calibration_warnings_text.setReadOnly(True)
         self.calibration_warnings_text.setMaximumHeight(90)
         warnings_layout.addWidget(self.calibration_warnings_text)
 
-        metrics_group = QtWidgets.QGroupBox("Visual-Jacobian Metrics")
+        metrics_group = QtWidgets.QGroupBox("Metrics")
         metrics_layout = QtWidgets.QFormLayout(metrics_group)
         self.metric_labels: dict[str, QtWidgets.QLabel] = {}
         for key, label, tooltip in METRIC_ROWS:
@@ -584,13 +570,11 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.correct_sample_button.setEnabled(False)
         self.new_calibration_button.setEnabled(True)
         self.new_calibration_button.setText("New calibration")
-        self.calibration_status_label.setText("No visual-Jacobian calibration loaded.")
+        self.calibration_status_label.setText("No calibration loaded.")
         self.calibration_progress_bar.setVisible(False)
         self.calibration_progress_bar.setRange(0, 1)
         self.calibration_progress_bar.setValue(0)
-        self.calibration_warnings_text.setPlainText(
-            "No visual-Jacobian calibration loaded."
-        )
+        self.calibration_warnings_text.setPlainText("No calibration loaded.")
         for label in self.metric_labels.values():
             label.setText("n/a")
         for label in self.repeatability_labels.values():
@@ -607,9 +591,7 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.correct_sample_button.setEnabled(False)
         self.new_calibration_button.setEnabled(False)
         self.new_calibration_button.setText("New calibration")
-        self.calibration_status_label.setText(
-            "New visual-Jacobian calibration in progress..."
-        )
+        self.calibration_status_label.setText("New calibration in progress...")
         self.calibration_progress_bar.setVisible(True)
         if total_steps is None or total_steps < 1:
             self.calibration_progress_bar.setRange(0, 0)
@@ -634,11 +616,9 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.calibration_progress_bar.setVisible(True)
         self.calibration_progress_bar.setRange(0, total_steps)
         self.calibration_progress_bar.setValue(completed)
-        self.calibration_progress_bar.setFormat(
-            f"{completed} / {total_steps} probes"
-        )
+        self.calibration_progress_bar.setFormat(f"{completed} / {total_steps} probes")
         self.calibration_status_label.setText(
-            "New visual-Jacobian calibration in progress. "
+            "New calibration in progress. "
             f"Command delta ({_format_number(dx)}, {_format_number(dy)}, "
             f"{_format_number(dz)}) mm. "
             f"Elapsed {_format_duration(elapsed_s)}, ETA {_format_duration(eta_s)}."
@@ -657,11 +637,9 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.calibration_progress_bar.setVisible(True)
         self.calibration_progress_bar.setRange(0, total)
         self.calibration_progress_bar.setValue(completed)
-        self.calibration_progress_bar.setFormat(
-            f"{completed} / {total} registrations"
-        )
+        self.calibration_progress_bar.setFormat(f"{completed} / {total} registrations")
         self.calibration_status_label.setText(
-            "Processing visual-Jacobian probes. "
+            "Processing probes. "
             f"Elapsed {_format_duration(elapsed_s)}, ETA {_format_duration(eta_s)}."
         )
 
@@ -679,16 +657,11 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.new_calibration_button.setText("Clear calibration")
         self.calibration_progress_bar.setVisible(False)
         self.calibration_status_label.setText(
-            "Loaded visual-Jacobian calibration: "
-            f"{display_name} ({summary['probe_count']} probes)"
+            f"Loaded calibration: {display_name} ({summary['probe_count']} probes)"
         )
 
         warnings = summary["warnings"]
-        warnings_text = (
-            "\n".join(warnings)
-            if warnings
-            else "No visual-Jacobian calibration warnings."
-        )
+        warnings_text = "\n".join(warnings) if warnings else "No calibration warnings."
         self.calibration_warnings_text.setPlainText(warnings_text)
 
         for key, _, _ in METRIC_ROWS:
@@ -745,8 +718,7 @@ class CalibrationPanel(QtWidgets.QWidget):
         summary_lines: list[str] = []
         if move_delta.size:
             summary_lines.append(
-                "Applied total: "
-                f"{_format_axis_triplet_um(np.sum(move_delta, axis=0))}."
+                f"Applied total: {_format_axis_triplet_um(np.sum(move_delta, axis=0))}."
             )
         else:
             summary_lines.append("No correction moves were applied.")
@@ -766,9 +738,7 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.correction_steps_group.setVisible(True)
 
     def show_saved_calibration(self, display_name: str) -> None:
-        self.calibration_status_label.setText(
-            f"Saved visual-Jacobian calibration: {display_name}"
-        )
+        self.calibration_status_label.setText(f"Saved calibration: {display_name}")
 
     def show_correction_in_progress(self) -> None:
         self.load_calibration_button.setEnabled(False)
@@ -784,7 +754,9 @@ class CalibrationPanel(QtWidgets.QWidget):
 
     def show_correction_result(self, result: xr.Dataset) -> None:
         converged = bool(result.attrs.get("correction_converged", False))
-        moves = int(result.attrs.get("correction_iterations", result.sizes.get("move", 0)))
+        moves = int(
+            result.attrs.get("correction_iterations", result.sizes.get("move", 0))
+        )
         residual = math.nan
         if "iteration_weighted_residual_px" in result:
             residual_values = np.asarray(
@@ -817,7 +789,7 @@ class CalibrationPanel(QtWidgets.QWidget):
         summary = _calibration_summary(calibration)
         arrays = _calibration_arrays(calibration)
         dialog = QtWidgets.QDialog(self)
-        dialog.setWindowTitle("Visual-Jacobian Calibration Details")
+        dialog.setWindowTitle("Calibration Details")
         layout = QtWidgets.QVBoxLayout(dialog)
 
         tabs = QtWidgets.QTabWidget()
