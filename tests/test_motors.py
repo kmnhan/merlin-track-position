@@ -43,8 +43,10 @@ class FakeBCSServer:
             {"success": True, "not_found": [], "timed_out": []},
             motors,
         )
-        if not response.get("success", True) or response.get("not_found") or response.get(
-            "timed_out"
+        if (
+            not response.get("success", True)
+            or response.get("not_found")
+            or response.get("timed_out")
         ):
             return response
 
@@ -70,7 +72,7 @@ class FakeBCSServer:
                     "status": self._status,
                 }
                 for motor in motors
-            ]
+            ],
         }
 
     def _ensure_positions(self, motors):
@@ -133,7 +135,9 @@ class MoveMotorsAndWaitTests(unittest.TestCase):
                 self.port = port
 
         created = []
-        with patch("merlin_track_position.instruments.motors.BCSz.BCSServer", FakeServer):
+        with patch(
+            "merlin_track_position.instruments.motors.BCSz.BCSServer", FakeServer
+        ):
             with _bcs_server_context() as server:
                 self.assertEqual(server.addr, constants.BCS_SERVER_HOST)
                 self.assertEqual(server.port, constants.BCS_SERVER_PORT)
@@ -786,8 +790,9 @@ class DevelopmentModeMotorTests(unittest.TestCase):
                 "merlin_track_position.instruments.motors._bcs_server_context",
                 side_effect=AssertionError("BCS context should not be opened"),
             ),
-            patch("merlin_track_position.instruments.simulated_hardware.time.sleep")
-            as sleep,
+            patch(
+                "merlin_track_position.instruments.simulated_hardware.time.sleep"
+            ) as sleep,
         ):
             positions = move_motors_and_wait(("x", "y"), (0.03, -0.015))
             saved_positions = get_positions(("x", "y"))

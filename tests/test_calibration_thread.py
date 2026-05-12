@@ -14,7 +14,9 @@ from merlin_track_position.instruments.cameras import (
 )
 from merlin_track_position.interface.calibration_thread import CalibrationThread
 from merlin_track_position.interface.correction_thread import CorrectionThread
-from merlin_track_position.tracking.sample_calibration import build_sample_calibration_dataset
+from merlin_track_position.tracking.sample_calibration import (
+    build_sample_calibration_dataset,
+)
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -71,7 +73,9 @@ class CalibrationThreadTests(unittest.TestCase):
         thread.sigCalibrationProcessingStep.connect(
             lambda completed, total: processing_steps.append((completed, total))
         )
-        thread.sigCalibrationReady.connect(lambda calibration: ready.append(calibration))
+        thread.sigCalibrationReady.connect(
+            lambda calibration: ready.append(calibration)
+        )
         thread.sigCalibrationFailed.connect(lambda message: failed.append(message))
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -126,7 +130,9 @@ class CalibrationThreadTests(unittest.TestCase):
         thread = CalibrationThread()
         ready = []
         failed = []
-        thread.sigCalibrationReady.connect(lambda calibration: ready.append(calibration))
+        thread.sigCalibrationReady.connect(
+            lambda calibration: ready.append(calibration)
+        )
         thread.sigCalibrationFailed.connect(lambda message: failed.append(message))
         with tempfile.TemporaryDirectory() as tmpdir:
             thread.configure(

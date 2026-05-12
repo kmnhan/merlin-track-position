@@ -181,12 +181,9 @@ class SimulatedHardware:
             order=3,
             mode="nearest",
         )
-        return (
-            np.asarray(shifted, dtype=np.float64)[
-                : constants.IMAGE_HEIGHT_CAM0, : constants.IMAGE_WIDTH_CAM0
-            ]
-            .copy()
-        )
+        return np.asarray(shifted, dtype=np.float64)[
+            : constants.IMAGE_HEIGHT_CAM0, : constants.IMAGE_WIDTH_CAM0
+        ].copy()
 
     def get_basler_image(self) -> npt.NDArray[np.float64]:
         x_mm, y_mm, z_mm = self.get_positions(("x", "y", "z"))
@@ -201,12 +198,9 @@ class SimulatedHardware:
             order=3,
             mode="nearest",
         )
-        return (
-            np.asarray(shifted, dtype=np.float64)[
-                : constants.IMAGE_HEIGHT_CAM1, : constants.IMAGE_WIDTH_CAM1
-            ]
-            .copy()
-        )
+        return np.asarray(shifted, dtype=np.float64)[
+            : constants.IMAGE_HEIGHT_CAM1, : constants.IMAGE_WIDTH_CAM1
+        ].copy()
 
     def _position_for_alias(self, alias: str) -> float:
         if alias not in constants.MOTOR_NAMES:

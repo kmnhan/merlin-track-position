@@ -29,9 +29,8 @@ class _ImageContentKey:
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, _ImageContentKey):
             return NotImplemented
-        return (
-            self.image.shape == other.image.shape
-            and np.array_equal(self.image, other.image)
+        return self.image.shape == other.image.shape and np.array_equal(
+            self.image, other.image
         )
 
 

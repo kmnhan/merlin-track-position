@@ -69,9 +69,7 @@ def run_calibration(
     if camera_pair is None:
         camera_pair = default_camera_pair()
 
-    x0, y0, z0, polar, tilt, cam = get_positions(
-        ("x", "y", "z", "p", "t", "cam")
-    )
+    x0, y0, z0, polar, tilt, cam = get_positions(("x", "y", "z", "p", "t", "cam"))
     commanded_position = np.asarray([x0, y0, z0], dtype=np.float64)
 
     if not np.isclose(cam, 5.0):

@@ -371,10 +371,9 @@ def do_correction(
             decreased,
         )
         jacobian_refined = False
-        measured_delta_px = (
-            np.asarray(after_measurement["shift_px"].values, dtype=np.float64)
-            - np.asarray(measurement["shift_px"].values, dtype=np.float64)
-        )
+        measured_delta_px = np.asarray(
+            after_measurement["shift_px"].values, dtype=np.float64
+        ) - np.asarray(measurement["shift_px"].values, dtype=np.float64)
         if decreased:
             try:
                 logger.info("Attempting Jacobian refinement from accepted move.")
@@ -719,8 +718,7 @@ def save_correction_history_dataset_deferred(
             flushed=False,
             pending=True,
             message=(
-                "queued correction history write because target is unavailable: "
-                f"{exc}"
+                f"queued correction history write because target is unavailable: {exc}"
             ),
         )
 
@@ -788,9 +786,7 @@ def load_latest_correction_history_dataset(
     history_path = correction_history_path(calibration_path)
     target_run_id = _latest_correction_history_run_id(history_path)
     pending = _latest_pending_correction_history_entry(history_path)
-    pending_run_id = (
-        int(pending.metadata["run_id"]) if pending is not None else None
-    )
+    pending_run_id = int(pending.metadata["run_id"]) if pending is not None else None
 
     if target_run_id is None and pending_run_id is None:
         return None

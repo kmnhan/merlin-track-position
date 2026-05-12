@@ -74,8 +74,7 @@ timestamp_utc = np.full(N_SAMPLES, "", dtype=object)
 elapsed_s = np.full(N_SAMPLES, np.nan)
 
 print(
-    f"Recording {N_SAMPLES} shift samples every {INTERVAL_SECONDS} s -> "
-    f"{OUTPUT_PATH}"
+    f"Recording {N_SAMPLES} shift samples every {INTERVAL_SECONDS} s -> {OUTPUT_PATH}"
 )
 
 for sample_index in range(N_SAMPLES):

@@ -40,9 +40,7 @@ def _get_motor_info(
     bcs_motor_names = _bcs_motor_names(aliases)
     keys = tuple(keys)
     try:
-        info_dict = bcs_server.get_motor(
-            motors=list(bcs_motor_names)
-        )
+        info_dict = bcs_server.get_motor(motors=list(bcs_motor_names))
     except BCSz.zmq.Again as exc:
         raise TimeoutError(
             "Timed out waiting for BCS GetMotor response: "
@@ -135,8 +133,7 @@ def _wait_until_move_complete(
             return positions
         if elapsed_s >= timeout_s:
             position_errors = tuple(
-                position - goal
-                for position, goal in zip(positions, goals, strict=True)
+                position - goal for position, goal in zip(positions, goals, strict=True)
             )
             raise TimeoutError(
                 "Timed out waiting for motor move completion: "
@@ -396,7 +393,9 @@ def _validated_motor_field(motor: Mapping, key: str) -> float | int:
         try:
             position = float(value)
         except (TypeError, ValueError) as exc:
-            raise RuntimeError("BCS GetMotor returned malformed position field") from exc
+            raise RuntimeError(
+                "BCS GetMotor returned malformed position field"
+            ) from exc
         if not np.isfinite(position):
             raise RuntimeError("BCS GetMotor returned malformed position field")
         return position

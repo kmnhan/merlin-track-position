@@ -67,10 +67,7 @@ def measured_from_jacobian(command_delta, jacobian):
 
 
 def empty_capture_stacks(probe_count, shape=(8, 9)):
-    return [
-        np.zeros((1, *shape), dtype=np.float32)
-        for _ in range(probe_count)
-    ]
+    return [np.zeros((1, *shape), dtype=np.float32) for _ in range(probe_count)]
 
 
 def shift_dataset(values):
@@ -239,12 +236,11 @@ class VisualCalibrationTests(unittest.TestCase):
         pre = np.zeros_like(command_delta)
         post = pre + command_delta
         reference_cam0 = np.arange(8 * 9, dtype=np.uint16).reshape(8, 9)
-        reference_cam1 = (
-            np.arange(8 * 9, dtype=np.uint16).reshape(8, 9) + np.uint16(100)
+        reference_cam1 = np.arange(8 * 9, dtype=np.uint16).reshape(8, 9) + np.uint16(
+            100
         )
         capture_stacks = [
-            np.zeros((1, 8, 9), dtype=np.uint16)
-            for _ in range(len(command_delta))
+            np.zeros((1, 8, 9), dtype=np.uint16) for _ in range(len(command_delta))
         ]
         with patch(
             "merlin_track_position.tracking.calibration_core.estimate_shift",
@@ -371,29 +367,33 @@ class VisualCalibrationTests(unittest.TestCase):
             "residual_rms_px",
             "residual_max_px",
         )
-        dataset = calibration_dataset().assign(
-            {
-                "axis_sensitivity_px_per_cmd_mm": (
-                    ("command_axis",),
-                    np.ones(len(COMMAND_AXES)),
-                ),
-                "probe_predicted_delta_px": (
-                    ("probe", "camera", "pixel_axis"),
-                    np.zeros(
-                        (
-                            calibration_dataset().sizes["probe"],
-                            len(CAMERAS),
-                            len(PIXEL_AXES),
-                        )
+        dataset = (
+            calibration_dataset()
+            .assign(
+                {
+                    "axis_sensitivity_px_per_cmd_mm": (
+                        ("command_axis",),
+                        np.ones(len(COMMAND_AXES)),
                     ),
-                ),
-            }
-        ).assign_attrs(
-            {
-                "condition_number": 1.0,
-                "residual_rms_px": 0.0,
-                "residual_max_px": 0.0,
-            }
+                    "probe_predicted_delta_px": (
+                        ("probe", "camera", "pixel_axis"),
+                        np.zeros(
+                            (
+                                calibration_dataset().sizes["probe"],
+                                len(CAMERAS),
+                                len(PIXEL_AXES),
+                            )
+                        ),
+                    ),
+                }
+            )
+            .assign_attrs(
+                {
+                    "condition_number": 1.0,
+                    "residual_rms_px": 0.0,
+                    "residual_max_px": 0.0,
+                }
+            )
         )
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -763,8 +763,9 @@ class CorrectionTests(unittest.TestCase):
             calibration = calibration_dataset()
             offset_mm = np.array([0.0, 0.020, 0.0], dtype=float)
             p0 = (
-                calibration["visual_jacobian_px_per_cmd_mm"]
-                .values.reshape(len(CAMERAS) * len(PIXEL_AXES), len(COMMAND_AXES))
+                calibration["visual_jacobian_px_per_cmd_mm"].values.reshape(
+                    len(CAMERAS) * len(PIXEL_AXES), len(COMMAND_AXES)
+                )
                 @ offset_mm
             ).reshape(len(CAMERAS), len(PIXEL_AXES))
             p1 = np.zeros((len(CAMERAS), len(PIXEL_AXES)), dtype=float)
@@ -812,8 +813,9 @@ class CorrectionTests(unittest.TestCase):
             calibration = calibration_dataset()
             offset_mm = np.array([0.020, 0.0, 0.0], dtype=float)
             p0 = (
-                calibration["visual_jacobian_px_per_cmd_mm"]
-                .values.reshape(len(CAMERAS) * len(PIXEL_AXES), len(COMMAND_AXES))
+                calibration["visual_jacobian_px_per_cmd_mm"].values.reshape(
+                    len(CAMERAS) * len(PIXEL_AXES), len(COMMAND_AXES)
+                )
                 @ offset_mm
             ).reshape(len(CAMERAS), len(PIXEL_AXES))
             p1 = np.zeros((len(CAMERAS), len(PIXEL_AXES)), dtype=float)

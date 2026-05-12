@@ -1008,7 +1008,9 @@ class MainWindow(_MainWindowGUI):
         eta_s = (
             (elapsed_s / completed) * remaining
             if completed > 0 and remaining > 0
-            else 0.0 if remaining == 0 else None
+            else 0.0
+            if remaining == 0
+            else None
         )
         self.calibration_panel.show_calibration_processing(
             completed=completed,

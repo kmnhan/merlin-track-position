@@ -61,9 +61,7 @@ def estimate_shift(
             f"reference image must be 2D, got shape {reference_image.shape!r}"
         )
     if current_image.ndim != 2:
-        raise ValueError(
-            f"current image must be 2D, got shape {current_image.shape!r}"
-        )
+        raise ValueError(f"current image must be 2D, got shape {current_image.shape!r}")
     if reference_image.size == 0 or current_image.size == 0:
         raise ValueError("images must not be empty")
     if not np.isfinite(reference_image).all() or not np.isfinite(current_image).all():
@@ -105,14 +103,12 @@ def estimate_shift(
         current_norm = normalize_intensity(
             current_image, clip_percentiles=clip_percentiles
         )
-        shift_px, registration_error, _, skimage_warnings = (
-            _estimate_translation(
-                reference_norm,
-                current_norm,
-                use_window=use_window,
-                upsample_factor=upsample_factor,
-                normalization=normalization,
-            )
+        shift_px, registration_error, _, skimage_warnings = _estimate_translation(
+            reference_norm,
+            current_norm,
+            use_window=use_window,
+            upsample_factor=upsample_factor,
+            normalization=normalization,
         )
         diagnostic_warnings.extend(
             f"skimage registration warning: {message}" for message in skimage_warnings

@@ -95,10 +95,7 @@ def hdf5_image_encoding(dataset: xr.Dataset) -> dict[str, dict[str, Any]]:
     encoding: dict[str, dict[str, Any]] = {}
     for name, variable in dataset.data_vars.items():
         dims = set(variable.dims)
-        if (
-            {"y_cam0", "x_cam0"}.issubset(dims)
-            or {"y_cam1", "x_cam1"}.issubset(dims)
-        ):
+        if {"y_cam0", "x_cam0"}.issubset(dims) or {"y_cam1", "x_cam1"}.issubset(dims):
             encoding[name] = {
                 "compression": HDF5_IMAGE_COMPRESSION,
                 "compression_opts": HDF5_IMAGE_COMPRESSION_LEVEL,

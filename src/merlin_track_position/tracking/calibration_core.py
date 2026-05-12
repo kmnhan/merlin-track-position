@@ -222,8 +222,7 @@ def fit_visual_jacobian_calibration(
     calibration_rank = int(np.count_nonzero(singular_values > rank_tolerance))
     if calibration_rank < len(COMMAND_AXES):
         raise ValueError(
-            "fitted visual Jacobian must have rank 3; "
-            f"got rank {calibration_rank}"
+            f"fitted visual Jacobian must have rank 3; got rank {calibration_rank}"
         )
 
     condition_number = float(np.linalg.cond(jacobian_observation))
@@ -240,9 +239,7 @@ def fit_visual_jacobian_calibration(
         )
 
     axis_scale, *_ = derive_axis_scale_from_jacobian(visual_jacobian, command_delta)
-    warnings = list(
-        format_probe_warning_lines(measurement_warnings, command_delta)
-    )
+    warnings = list(format_probe_warning_lines(measurement_warnings, command_delta))
     attrs: dict[str, Any] = {
         "capture_count": capture_count,
         "min_shift_px": min_shift_px,
@@ -355,7 +352,9 @@ def validate_visual_calibration_dataset(dataset: xr.Dataset) -> None:
     command_delta = np.asarray(dataset["probe_command_delta_mm"].values, dtype=float)
     measured_delta = np.asarray(dataset["probe_measured_delta_px"].values, dtype=float)
     pre_commanded = np.asarray(dataset["pre_commanded_position_mm"].values, dtype=float)
-    post_commanded = np.asarray(dataset["post_commanded_position_mm"].values, dtype=float)
+    post_commanded = np.asarray(
+        dataset["post_commanded_position_mm"].values, dtype=float
+    )
     pre_readback = np.asarray(dataset["pre_readback_position_mm"].values, dtype=float)
     post_readback = np.asarray(dataset["post_readback_position_mm"].values, dtype=float)
 
@@ -365,7 +364,9 @@ def validate_visual_calibration_dataset(dataset: xr.Dataset) -> None:
             "(camera, pixel_axis, command_axis)"
         )
     if not np.isfinite(jacobian).all():
-        raise ValueError("visual_jacobian_px_per_cmd_mm must contain only finite values")
+        raise ValueError(
+            "visual_jacobian_px_per_cmd_mm must contain only finite values"
+        )
     jacobian_observation = jacobian.reshape(
         len(OBSERVATION_AXES),
         len(COMMAND_AXES),
@@ -864,7 +865,9 @@ def solve_damped_command_correction(
 ) -> np.ndarray:
     """Solve the damped normalized-command correction ``Delta a``."""
 
-    jacobian_observation = _jacobian_to_observation(_as_visual_jacobian(visual_jacobian))
+    jacobian_observation = _jacobian_to_observation(
+        _as_visual_jacobian(visual_jacobian)
+    )
     observation = _shift_to_observation(_shift_values(shift))
     axis_scale = np.asarray(axis_scale_cmd_mm, dtype=np.float64)
     if axis_scale.shape != (len(COMMAND_AXES),):
@@ -887,9 +890,7 @@ def solve_damped_command_correction(
         not np.isfinite(min_axis_predicted_shift_px)
         or min_axis_predicted_shift_px < 0.0
     ):
-        raise ValueError(
-            "min_axis_predicted_shift_px must be finite and non-negative"
-        )
+        raise ValueError("min_axis_predicted_shift_px must be finite and non-negative")
 
     scale_matrix = np.diag(axis_scale)
     normalized_jacobian = jacobian_observation @ scale_matrix
@@ -1026,18 +1027,20 @@ def _estimate_probe_capture_shifts(
                 )
 
     completed = 0
-    for probe_index, camera_index, capture_index, shift_px, capture_warnings in (
-        _iter_indexed_capture_shift_results(
-            tasks,
-            capture_count,
-            n_jobs=n_jobs,
-            **shift_kwargs,
-        )
+    for (
+        probe_index,
+        camera_index,
+        capture_index,
+        shift_px,
+        capture_warnings,
+    ) in _iter_indexed_capture_shift_results(
+        tasks,
+        capture_count,
+        n_jobs=n_jobs,
+        **shift_kwargs,
     ):
         shift_array[probe_index, camera_index, capture_index, :] = shift_px
-        warnings_by_capture[probe_index][camera_index][capture_index] = (
-            capture_warnings
-        )
+        warnings_by_capture[probe_index][camera_index][capture_index] = capture_warnings
         completed += 1
         if progress_callback is not None:
             progress_callback(completed, total)
@@ -1145,9 +1148,7 @@ def _estimate_capture_shift(
         shift = estimate_shift(reference, current, **shift_kwargs)
         shift_px = np.asarray(shift["shift_px"].values, dtype=np.float64)
         capture_warnings = tuple(
-            line
-            for line in str(shift.attrs.get("warnings", "")).splitlines()
-            if line
+            line for line in str(shift.attrs.get("warnings", "")).splitlines() if line
         )
     except Exception as exc:
         shift_px = np.array([np.nan, np.nan], dtype=np.float64)
@@ -1230,7 +1231,9 @@ def _validate_probe_stack_lengths(*groups: Sequence[np.ndarray]) -> int:
     return int(counts[0])
 
 
-def _as_probe_command_matrix(name: str, values: Sequence[Sequence[float]]) -> np.ndarray:
+def _as_probe_command_matrix(
+    name: str, values: Sequence[Sequence[float]]
+) -> np.ndarray:
     matrix = np.asarray(values, dtype=np.float64)
     if matrix.ndim != 2 or matrix.shape[1] != len(COMMAND_AXES):
         raise ValueError(f"{name} must have shape (probe, command_axis)")
@@ -1457,7 +1460,13 @@ def derive_axis_scale_from_jacobian(
         scale_bounds[:, 0],
         scale_bounds[:, 1],
     )
-    return axis_scale, axis_sensitivity, axis_scale_unclamped, scale_bounds, scale_target
+    return (
+        axis_scale,
+        axis_sensitivity,
+        axis_scale_unclamped,
+        scale_bounds,
+        scale_target,
+    )
 
 
 def _axis_scale_bounds_array() -> np.ndarray:
@@ -1520,7 +1529,9 @@ def _as_visual_jacobian(values: np.ndarray) -> np.ndarray:
             "(camera, pixel_axis, command_axis)"
         )
     if not np.isfinite(jacobian).all():
-        raise ValueError("visual_jacobian_px_per_cmd_mm must contain only finite values")
+        raise ValueError(
+            "visual_jacobian_px_per_cmd_mm must contain only finite values"
+        )
     return jacobian
 
 
