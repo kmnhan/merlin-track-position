@@ -91,6 +91,7 @@ MOTOR_SERVER_PORT: int = 6554
 # These are default settings for BCS API server, probably shouldn't need to be changed.
 BCS_SERVER_HOST: str = "localhost"
 BCS_SERVER_PORT: int = 5577
+BCS_REQUEST_TIMEOUT_MS: int = 10_000
 
 # Flag to indicate whether we're running on the acquisition PC (True) or a development
 # machine (False). This can be used to determine file paths and other

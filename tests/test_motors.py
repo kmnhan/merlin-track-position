@@ -7,6 +7,7 @@ import merlin_track_position.instruments.BCSz as BCSz
 from merlin_track_position import constants
 from merlin_track_position.constants import MOTOR_NAMES
 from merlin_track_position.instruments.motors import (
+    _bcs_server_context,
     _move_motors_and_wait,
     get_positions,
     get_temperatures,
@@ -66,6 +67,45 @@ class FakeBCSServer:
 
 
 class MoveMotorsAndWaitTests(unittest.TestCase):
+    def test_bcs_context_configures_request_timeouts(self):
+        class FakeSocket:
+            def __init__(self):
+                self.options = {}
+                self.closed = False
+
+            def setsockopt(self, option, value):
+                self.options[option] = value
+
+            def close(self):
+                self.closed = True
+
+        class FakeServer:
+            def __init__(self):
+                self._zmq_socket = FakeSocket()
+                created.append(self)
+
+            def connect(self, *, addr, port):
+                self.addr = addr
+                self.port = port
+
+        created = []
+        with patch("merlin_track_position.instruments.motors.BCSz.BCSServer", FakeServer):
+            with _bcs_server_context() as server:
+                self.assertEqual(server.addr, constants.BCS_SERVER_HOST)
+                self.assertEqual(server.port, constants.BCS_SERVER_PORT)
+                self.assertEqual(
+                    server._zmq_socket.options[BCSz.zmq.RCVTIMEO],
+                    constants.BCS_REQUEST_TIMEOUT_MS,
+                )
+                self.assertEqual(
+                    server._zmq_socket.options[BCSz.zmq.SNDTIMEO],
+                    constants.BCS_REQUEST_TIMEOUT_MS,
+                )
+                self.assertEqual(server._zmq_socket.options[BCSz.zmq.LINGER], 0)
+
+        self.assertEqual(len(created), 1)
+        self.assertTrue(created[0]._zmq_socket.closed)
+
     def test_public_helper_forwards_tolerance_and_retry_arguments(self):
         server = object()
 

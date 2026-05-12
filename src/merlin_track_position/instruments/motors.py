@@ -17,18 +17,35 @@ DEFAULT_MOVE_TIMEOUT_S = 60.0
 def _bcs_server_context():
     server = BCSz.BCSServer()
     server.connect(addr=constants.BCS_SERVER_HOST, port=constants.BCS_SERVER_PORT)
+    _configure_bcs_socket_timeouts(server)
     try:
         yield server
     finally:
         server._zmq_socket.close()
 
 
+def _configure_bcs_socket_timeouts(server: BCSz.BCSServer) -> None:
+    timeout_ms = int(constants.BCS_REQUEST_TIMEOUT_MS)
+    if timeout_ms < 0:
+        raise ValueError("BCS_REQUEST_TIMEOUT_MS must be non-negative")
+    server._zmq_socket.setsockopt(BCSz.zmq.RCVTIMEO, timeout_ms)
+    server._zmq_socket.setsockopt(BCSz.zmq.SNDTIMEO, timeout_ms)
+    server._zmq_socket.setsockopt(BCSz.zmq.LINGER, 0)
+
+
 def _get_motor_info(
     bcs_server: BCSz.BCSServer, motor_aliases: Iterable[str], keys: Iterable[str]
 ) -> tuple[tuple[float, ...], ...]:
-    info_dict = bcs_server.get_motor(
-        motors=[constants.MOTOR_NAMES[m] for m in motor_aliases]
-    )
+    aliases = tuple(motor_aliases)
+    try:
+        info_dict = bcs_server.get_motor(
+            motors=[constants.MOTOR_NAMES[m] for m in aliases]
+        )
+    except BCSz.zmq.Again as exc:
+        raise TimeoutError(
+            "Timed out waiting for BCS GetMotor response: "
+            f"motor_aliases={aliases}, timeout_ms={constants.BCS_REQUEST_TIMEOUT_MS}"
+        ) from exc
     return tuple(tuple(m[k] for m in info_dict["data"]) for k in keys)
 
 
