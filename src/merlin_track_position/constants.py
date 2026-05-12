@@ -36,10 +36,10 @@ DEFAULT_CAPTURE_COUNT: int = 3
 
 
 # Default number of points along each axis for the calibration grid.
-DEFAULT_CALIBRATION_N: int = 5
+DEFAULT_CALIBRATION_N: int = 3
 
 # Default step size in microns for the calibration grid.
-DEFAULT_CALIBRATION_STEP_UM: float = 10.0
+DEFAULT_CALIBRATION_STEP_UM: float = 60.0
 
 # Image size for initial crop from each camera array.
 IMAGE_WIDTH_CAM0: int = 704
