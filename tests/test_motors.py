@@ -1,7 +1,7 @@
 import contextlib
 import threading
 import unittest
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 import merlin_track_position.instruments.BCSz as BCSz
 from merlin_track_position import constants
@@ -22,28 +22,48 @@ class FakeBCSServer:
         final_positions_by_move,
         initial_positions=(),
         status=BCSz.MotorStatus.MOVE_COMPLETE.value,
+        move_responses=(),
+        get_motor_responses=(),
     ):
         self._final_positions_by_move = [
             tuple(positions) for positions in final_positions_by_move
         ]
         self._initial_positions = tuple(initial_positions)
         self._status = int(status)
+        self._move_responses = list(move_responses)
+        self._get_motor_responses = list(get_motor_responses)
         self._positions_by_motor = {}
         self.move_calls = []
 
     def move_motor(self, *, motors, goals):
         self._ensure_positions(motors)
         self.move_calls.append((tuple(motors), tuple(goals)))
+        response = self._next_response(
+            self._move_responses,
+            {"success": True, "not_found": [], "timed_out": []},
+            motors,
+        )
+        if not response.get("success", True) or response.get("not_found") or response.get(
+            "timed_out"
+        ):
+            return response
+
         move_index = min(
             len(self.move_calls) - 1, len(self._final_positions_by_move) - 1
         )
         final_positions = self._final_positions_by_move[move_index]
         for motor, position in zip(motors, final_positions, strict=True):
             self._positions_by_motor[motor] = position
+        return response
 
     def get_motor(self, *, motors):
+        if self._get_motor_responses:
+            return self._next_response(self._get_motor_responses, {}, motors)
+
         self._ensure_positions(motors)
         return {
+            "success": True,
+            "not_found": [],
             "data": [
                 {
                     "position": self._positions_by_motor[motor],
@@ -64,6 +84,30 @@ class FakeBCSServer:
                 self._positions_by_motor[motor] = position
         for motor in motors:
             self._positions_by_motor.setdefault(motor, 0.0)
+
+    def _next_response(self, responses, default, motors):
+        if not responses:
+            return default
+
+        response = responses.pop(0)
+        if callable(response):
+            return response(motors)
+        return response
+
+
+def _get_motor_response(positions, status=BCSz.MotorStatus.MOVE_COMPLETE.value):
+    if isinstance(status, tuple):
+        statuses = status
+    else:
+        statuses = (status,) * len(positions)
+    return {
+        "success": True,
+        "not_found": [],
+        "data": [
+            {"position": position, "status": motor_status}
+            for position, motor_status in zip(positions, statuses, strict=True)
+        ],
+    }
 
 
 class MoveMotorsAndWaitTests(unittest.TestCase):
@@ -150,6 +194,262 @@ class MoveMotorsAndWaitTests(unittest.TestCase):
         self.assertEqual(positions, (9.5, 2.5))
         self.assertEqual(len(server.move_calls), 1)
 
+    def test_motor_timing_matches_bcs_example(self):
+        server = FakeBCSServer(
+            [(1.0,)],
+            get_motor_responses=[
+                _get_motor_response((0.0,)),
+                _get_motor_response((0.5,), status=0),
+                _get_motor_response((1.0,)),
+                _get_motor_response((1.0,)),
+                _get_motor_response((1.0,)),
+            ],
+        )
+
+        with (
+            patch("merlin_track_position.instruments.motors.time.sleep") as sleep,
+            patch(
+                "merlin_track_position.instruments.motors.time.monotonic",
+                side_effect=[0.0, 0.1, 0.2, 0.3],
+            ),
+        ):
+            positions = _move_motors_and_wait(
+                server,
+                ("x",),
+                (1.0,),
+                backlash_correction={},
+            )
+
+        self.assertEqual(positions, (1.0,))
+        self.assertEqual(sleep.call_args_list[:2], [call(0.25), call(0.25)])
+        self.assertTrue(all(args.args[0] == 0.25 for args in sleep.call_args_list))
+
+    def test_move_motor_not_found_response_raises_with_context(self):
+        server = FakeBCSServer(
+            [(1.0,)],
+            initial_positions=(0.0,),
+            move_responses=[
+                {
+                    "success": True,
+                    "not_found": [MOTOR_NAMES["x"]],
+                    "timed_out": [],
+                    "error description": "missing motor",
+                }
+            ],
+        )
+
+        with (
+            patch("merlin_track_position.instruments.motors.time.sleep"),
+            self.assertRaisesRegex(
+                RuntimeError,
+                r"MoveMotor reported not_found.*Sample X.*goals=\(1\.0,\).*missing motor",
+            ),
+        ):
+            _move_motors_and_wait(
+                server,
+                ("x",),
+                (1.0,),
+                backlash_correction={},
+            )
+
+        self.assertEqual(len(server.move_calls), 1)
+
+    def test_move_motor_timed_out_response_raises_with_context(self):
+        server = FakeBCSServer(
+            [(1.0,)],
+            initial_positions=(0.0,),
+            move_responses=[
+                {
+                    "success": True,
+                    "not_found": [],
+                    "timed_out": [MOTOR_NAMES["x"]],
+                    "error_description": "queue timed out",
+                }
+            ],
+        )
+
+        with (
+            patch("merlin_track_position.instruments.motors.time.sleep"),
+            self.assertRaisesRegex(
+                RuntimeError,
+                r"MoveMotor reported timed_out.*Sample X.*goals=\(1\.0,\).*queue timed out",
+            ),
+        ):
+            _move_motors_and_wait(
+                server,
+                ("x",),
+                (1.0,),
+                backlash_correction={},
+            )
+
+        self.assertEqual(len(server.move_calls), 1)
+
+    def test_move_motor_unsuccessful_response_raises_with_error_text(self):
+        server = FakeBCSServer(
+            [(1.0,)],
+            initial_positions=(0.0,),
+            move_responses=[
+                {
+                    "success": False,
+                    "not_found": [],
+                    "timed_out": [],
+                    "error description": "queue unavailable",
+                }
+            ],
+        )
+
+        with (
+            patch("merlin_track_position.instruments.motors.time.sleep"),
+            self.assertRaisesRegex(
+                RuntimeError,
+                r"MoveMotor failed: queue unavailable.*Sample X.*goals=\(1\.0,\)",
+            ),
+        ):
+            _move_motors_and_wait(
+                server,
+                ("x",),
+                (1.0,),
+                backlash_correction={},
+            )
+
+        self.assertEqual(len(server.move_calls), 1)
+
+    def test_get_motor_missing_data_response_raises(self):
+        server = FakeBCSServer(
+            [(1.0,)],
+            get_motor_responses=[{"success": True, "not_found": []}],
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "GetMotor.*missing data"):
+            _move_motors_and_wait(
+                server,
+                ("x",),
+                (1.0,),
+                backlash_correction={},
+            )
+
+        self.assertEqual(len(server.move_calls), 0)
+
+    def test_get_motor_short_data_response_raises(self):
+        server = FakeBCSServer(
+            [(1.0,)],
+            get_motor_responses=[{"success": True, "not_found": [], "data": []}],
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "expected 1 data rows, got 0"):
+            _move_motors_and_wait(
+                server,
+                ("x",),
+                (1.0,),
+                backlash_correction={},
+            )
+
+        self.assertEqual(len(server.move_calls), 0)
+
+    def test_get_motor_missing_key_response_raises(self):
+        server = FakeBCSServer(
+            [(1.0,)],
+            get_motor_responses=[
+                {
+                    "success": True,
+                    "not_found": [],
+                    "data": [{"status": BCSz.MotorStatus.MOVE_COMPLETE.value}],
+                }
+            ],
+        )
+
+        with self.assertRaisesRegex(RuntimeError, r"missing key 'position'"):
+            _move_motors_and_wait(
+                server,
+                ("x",),
+                (1.0,),
+                backlash_correction={},
+            )
+
+        self.assertEqual(len(server.move_calls), 0)
+
+    def test_get_motor_not_found_response_raises(self):
+        server = FakeBCSServer(
+            [(1.0,)],
+            get_motor_responses=[
+                {
+                    "success": True,
+                    "not_found": [MOTOR_NAMES["x"]],
+                    "data": [],
+                    "error description": "unknown motor",
+                }
+            ],
+        )
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            r"GetMotor reported not_found.*Sample X.*unknown motor",
+        ):
+            _move_motors_and_wait(
+                server,
+                ("x",),
+                (1.0,),
+                backlash_correction={},
+            )
+
+        self.assertEqual(len(server.move_calls), 0)
+
+    def test_get_motor_unsuccessful_response_raises_with_error_text(self):
+        server = FakeBCSServer(
+            [(1.0,)],
+            get_motor_responses=[
+                {
+                    "success": False,
+                    "not_found": [],
+                    "data": [],
+                    "error_description": "backend unavailable",
+                }
+            ],
+        )
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            r"GetMotor failed: backend unavailable.*Sample X",
+        ):
+            _move_motors_and_wait(
+                server,
+                ("x",),
+                (1.0,),
+                backlash_correction={},
+            )
+
+        self.assertEqual(len(server.move_calls), 0)
+
+    def test_get_motor_malformed_status_response_raises(self):
+        server = FakeBCSServer(
+            [(1.0,)],
+            get_motor_responses=[
+                _get_motor_response((0.0,)),
+                {
+                    "success": True,
+                    "not_found": [],
+                    "data": [{"position": 1.0, "status": "bad"}],
+                },
+            ],
+        )
+
+        with (
+            patch("merlin_track_position.instruments.motors.time.sleep"),
+            patch(
+                "merlin_track_position.instruments.motors.time.monotonic",
+                return_value=0.0,
+            ),
+            self.assertRaisesRegex(RuntimeError, "malformed status field"),
+        ):
+            _move_motors_and_wait(
+                server,
+                ("x",),
+                (1.0,),
+                backlash_correction={},
+            )
+
+        self.assertEqual(len(server.move_calls), 1)
+
     def test_stale_status_accepts_position_readback_after_delay(self):
         server = FakeBCSServer(
             [(10.0005, 1.9995)],
@@ -225,8 +525,9 @@ class MoveMotorsAndWaitTests(unittest.TestCase):
         self.assertEqual(len(server.move_calls), 1)
 
     def test_stale_status_outside_readback_deadband_times_out(self):
+        outside_x_deadband = 10.0 + constants.MOTOR_STALE_READBACK_DEADBAND["x"] + 0.001
         server = FakeBCSServer(
-            [(10.002, 2.0)],
+            [(outside_x_deadband, 2.0)],
             status=0,
         )
 

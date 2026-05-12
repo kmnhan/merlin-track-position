@@ -27,9 +27,9 @@ MOTOR_BACKLASH_CORRECTION: dict[str, float] = {
 # Stale-status readback fallback for motor moves. Values are keyed by motor alias
 # and are in each motor's command units. For x/y/z this is mm.
 MOTOR_STALE_READBACK_DEADBAND: dict[str, float] = {
-    "x": 0.005,
-    "y": 0.02,
-    "z": 0.005,
+    "x": 0.01,
+    "y": 0.1,
+    "z": 0.01,
     "p": 0.05,
     "t": 0.05,
     "cam": 0.001,

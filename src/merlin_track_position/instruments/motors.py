@@ -37,16 +37,33 @@ def _get_motor_info(
     bcs_server: BCSz.BCSServer, motor_aliases: Iterable[str], keys: Iterable[str]
 ) -> tuple[tuple[float, ...], ...]:
     aliases = tuple(motor_aliases)
+    bcs_motor_names = _bcs_motor_names(aliases)
+    keys = tuple(keys)
     try:
         info_dict = bcs_server.get_motor(
-            motors=[constants.MOTOR_NAMES[m] for m in aliases]
+            motors=list(bcs_motor_names)
         )
     except BCSz.zmq.Again as exc:
         raise TimeoutError(
             "Timed out waiting for BCS GetMotor response: "
             f"motor_aliases={aliases}, timeout_ms={constants.BCS_REQUEST_TIMEOUT_MS}"
         ) from exc
-    return tuple(tuple(m[k] for m in info_dict["data"]) for k in keys)
+    info_dict = _validate_bcs_common_response(
+        "GetMotor",
+        info_dict,
+        motor_aliases=aliases,
+        bcs_motor_names=bcs_motor_names,
+    )
+    motor_data = _validated_get_motor_data(
+        info_dict,
+        aliases,
+        bcs_motor_names,
+        keys,
+    )
+    return tuple(
+        tuple(_validated_motor_field(motor, key) for motor in motor_data)
+        for key in keys
+    )
 
 
 def _get_positions(
@@ -86,7 +103,7 @@ def _wait_until_move_complete(
         if all(
             BCSz.MotorStatus(s).is_set(BCSz.MotorStatus.MOVE_COMPLETE) for s in status
         ):
-            time.sleep(0.2)
+            time.sleep(0.25)
 
             # Get the final positions one more time just to be extra careful
             positions, _ = _get_motor_info(
@@ -141,7 +158,7 @@ def _wait_until_move_complete(
                 elapsed_s,
             )
             next_log_elapsed_s = elapsed_s + 5.0
-        time.sleep(0.2)  # don't hit the api server constantly
+        time.sleep(0.25)  # don't hit the api server constantly
 
 
 def _move_motors_and_wait(
@@ -200,11 +217,12 @@ def _move_motors_and_wait(
             pre_goals,
             _items_at(goals, pre_indices),
         )
-        bcs_server.move_motor(
-            motors=[constants.MOTOR_NAMES[alias] for alias in pre_aliases],
-            goals=list(pre_goals),
+        _move_motor(
+            bcs_server,
+            pre_aliases,
+            pre_goals,
         )
-        time.sleep(0.2)
+        time.sleep(0.25)
         _wait_until_move_complete(
             bcs_server,
             pre_aliases,
@@ -212,12 +230,13 @@ def _move_motors_and_wait(
             timeout_s=move_timeout_s,
         )
 
-    bcs_server.move_motor(
-        motors=[constants.MOTOR_NAMES[alias] for alias in motor_aliases],
-        goals=list(goals),
+    _move_motor(
+        bcs_server,
+        motor_aliases,
+        goals,
     )
     # wait just a bit to let the move begin.
-    time.sleep(0.2)
+    time.sleep(0.25)
     _wait_until_move_complete(
         bcs_server,
         motor_aliases,
@@ -239,6 +258,189 @@ def _validate_move_timeout(timeout_s: float) -> float:
     if not np.isfinite(timeout) or timeout < 0.0:
         raise ValueError("move_timeout_s must be finite and non-negative")
     return timeout
+
+
+def _move_motor(
+    bcs_server: BCSz.BCSServer,
+    motor_aliases: Iterable[str],
+    goals: Iterable[float],
+) -> None:
+    aliases = tuple(motor_aliases)
+    goals = tuple(float(goal) for goal in goals)
+    bcs_motor_names = _bcs_motor_names(aliases)
+    try:
+        response = bcs_server.move_motor(
+            motors=list(bcs_motor_names),
+            goals=list(goals),
+        )
+    except BCSz.zmq.Again as exc:
+        raise TimeoutError(
+            "Timed out waiting for BCS MoveMotor response: "
+            f"motor_aliases={aliases}, bcs_motor_names={bcs_motor_names}, "
+            f"goals={goals}, timeout_ms={constants.BCS_REQUEST_TIMEOUT_MS}"
+        ) from exc
+    response = _validate_bcs_common_response(
+        "MoveMotor",
+        response,
+        motor_aliases=aliases,
+        bcs_motor_names=bcs_motor_names,
+        goals=goals,
+    )
+    timed_out = _response_field(response, "timed_out", "timed out")
+    if _has_response_value(timed_out):
+        raise RuntimeError(
+            "BCS MoveMotor reported timed_out: "
+            f"timed_out={timed_out!r}; "
+            f"{_bcs_response_context(aliases, bcs_motor_names, goals, response)}"
+        )
+
+
+def _bcs_motor_names(motor_aliases: Iterable[str]) -> tuple[str, ...]:
+    return tuple(constants.MOTOR_NAMES[alias] for alias in motor_aliases)
+
+
+def _validate_bcs_common_response(
+    command_name: str,
+    response: object,
+    *,
+    motor_aliases: tuple[str, ...],
+    bcs_motor_names: tuple[str, ...],
+    goals: tuple[float, ...] | None = None,
+) -> Mapping:
+    if not isinstance(response, Mapping):
+        raise RuntimeError(
+            f"BCS {command_name} returned malformed response: "
+            f"expected mapping, got {type(response).__name__}; "
+            f"{_bcs_response_context(motor_aliases, bcs_motor_names, goals, None)}"
+        )
+
+    if not bool(response.get("success", True)):
+        raise RuntimeError(
+            f"BCS {command_name} failed: "
+            f"{_bcs_error_description(response)}; "
+            f"{_bcs_response_context(motor_aliases, bcs_motor_names, goals, response)}"
+        )
+
+    not_found = _response_field(response, "not_found", "not found")
+    if _has_response_value(not_found):
+        raise RuntimeError(
+            f"BCS {command_name} reported not_found: "
+            f"not_found={not_found!r}; "
+            f"{_bcs_response_context(motor_aliases, bcs_motor_names, goals, response)}"
+        )
+
+    return response
+
+
+def _validated_get_motor_data(
+    response: Mapping,
+    motor_aliases: tuple[str, ...],
+    bcs_motor_names: tuple[str, ...],
+    keys: tuple[str, ...],
+) -> tuple[Mapping, ...]:
+    if "data" not in response:
+        raise RuntimeError(
+            "BCS GetMotor returned malformed response: missing data; "
+            f"{_bcs_response_context(motor_aliases, bcs_motor_names, None, response)}"
+        )
+
+    data = response["data"]
+    if not isinstance(data, list | tuple):
+        raise RuntimeError(
+            "BCS GetMotor returned malformed response: data must be a sequence; "
+            f"{_bcs_response_context(motor_aliases, bcs_motor_names, None, response)}"
+        )
+    if len(data) != len(motor_aliases):
+        raise RuntimeError(
+            "BCS GetMotor returned malformed response: "
+            f"expected {len(motor_aliases)} data rows, got {len(data)}; "
+            f"{_bcs_response_context(motor_aliases, bcs_motor_names, None, response)}"
+        )
+
+    motor_data = tuple(data)
+    for index, motor in enumerate(motor_data):
+        if not isinstance(motor, Mapping):
+            raise RuntimeError(
+                "BCS GetMotor returned malformed response: "
+                f"data row {index} must be a mapping; "
+                f"{_bcs_response_context(motor_aliases, bcs_motor_names, None, response)}"
+            )
+        for key in keys:
+            if key not in motor:
+                raise RuntimeError(
+                    "BCS GetMotor returned malformed response: "
+                    f"data row {index} missing key {key!r}; "
+                    f"{_bcs_response_context(motor_aliases, bcs_motor_names, None, response)}"
+                )
+    return motor_data
+
+
+def _validated_motor_field(motor: Mapping, key: str) -> float | int:
+    value = motor[key]
+    if key == "status":
+        if isinstance(value, bool):
+            raise RuntimeError("BCS GetMotor returned malformed status field")
+        try:
+            status = int(value)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("BCS GetMotor returned malformed status field") from exc
+        if status != value:
+            raise RuntimeError("BCS GetMotor returned malformed status field")
+        try:
+            BCSz.MotorStatus(status)
+        except ValueError as exc:
+            raise RuntimeError("BCS GetMotor returned malformed status field") from exc
+        return status
+
+    if key == "position":
+        try:
+            position = float(value)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("BCS GetMotor returned malformed position field") from exc
+        if not np.isfinite(position):
+            raise RuntimeError("BCS GetMotor returned malformed position field")
+        return position
+
+    return value
+
+
+def _response_field(response: Mapping, *keys: str) -> object:
+    for key in keys:
+        if key in response:
+            return response[key]
+    return None
+
+
+def _has_response_value(value: object) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, (str, bytes, list, tuple, set, dict)):
+        return len(value) > 0
+    return bool(value)
+
+
+def _bcs_error_description(response: Mapping) -> str:
+    description = _response_field(response, "error_description", "error description")
+    if description:
+        return str(description)
+    return "no BCS error description"
+
+
+def _bcs_response_context(
+    motor_aliases: tuple[str, ...],
+    bcs_motor_names: tuple[str, ...],
+    goals: tuple[float, ...] | None,
+    response: Mapping | None,
+) -> str:
+    parts = [
+        f"motor_aliases={motor_aliases}",
+        f"bcs_motor_names={bcs_motor_names}",
+    ]
+    if goals is not None:
+        parts.append(f"goals={goals}")
+    if response is not None:
+        parts.append(f"error={_bcs_error_description(response)!r}")
+    return ", ".join(parts)
 
 
 def _stale_readback_deadbands(motor_aliases: Iterable[str]) -> tuple[float, ...]:
