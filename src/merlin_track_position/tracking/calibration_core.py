@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Sequence
@@ -10,6 +9,7 @@ from typing import Any, Sequence
 import numpy as np
 import xarray as xr
 
+from merlin_track_position import constants
 from merlin_track_position.tracking.shift import estimate_shift
 
 CAMERAS = ("cam0", "cam1")
@@ -353,7 +353,7 @@ def _estimate_calibration_capture_shifts(
 
 def _resolve_n_jobs(n_jobs: int | None) -> int:
     if n_jobs is None:
-        return min(4, os.cpu_count() or 1)
+        n_jobs = constants.CALIBRATION_FIT_N_JOBS
     n_jobs = int(n_jobs)
     if n_jobs < 1:
         raise ValueError("n_jobs must be >= 1")

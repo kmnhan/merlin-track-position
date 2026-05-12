@@ -17,6 +17,7 @@ from merlin_track_position.tracking.calibration_core import (
     CAMERAS,
     PIXEL_AXES,
     STAGE_AXES,
+    _resolve_n_jobs,
     estimate_stage_offset,
     fit_calibration_from_images,
     get_correction,
@@ -532,6 +533,15 @@ class CalibrationTests(unittest.TestCase):
         self.assertEqual(progress[-1], (expected_total, expected_total))
         self.assertEqual([completed for completed, _ in progress], list(range(expected_total + 1)))
         self.assertTrue(all(total == expected_total for _, total in progress))
+
+    def test_fit_calibration_default_worker_count_comes_from_constants(self):
+        self.assertEqual(_resolve_n_jobs(None), constants.CALIBRATION_FIT_N_JOBS)
+        with patch.object(constants, "CALIBRATION_FIT_N_JOBS", 3):
+            self.assertEqual(_resolve_n_jobs(None), 3)
+
+        self.assertEqual(_resolve_n_jobs(2), 2)
+        with self.assertRaisesRegex(ValueError, "n_jobs"):
+            _resolve_n_jobs(0)
 
     def test_h5_roundtrip_preserves_stereo_schema(self):
         stage_to_pixel = stereo_stage_to_pixel()
