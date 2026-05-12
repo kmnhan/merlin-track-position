@@ -300,6 +300,11 @@ mu = DEFAULT_CORRECTION_DAMPING_MU = 1.0
 max |Delta q_j| = DEFAULT_CORRECTION_MAX_NORMALIZED_STEP = 0.5
 min per-axis predicted response =
     DEFAULT_CORRECTION_MIN_AXIS_PREDICTED_SHIFT_PX = 0.15 px
+min total predicted response =
+    DEFAULT_CORRECTION_MIN_TOTAL_PREDICTED_SHIFT_PX = 0.30 px
+min feedback alpha = DEFAULT_CORRECTION_MIN_FEEDBACK_ALPHA = 0.25
+min feedback parallel response =
+    DEFAULT_CORRECTION_MIN_FEEDBACK_PARALLEL_SHIFT_PX = 0.15 px
 min command norm = DEFAULT_CORRECTION_MIN_COMMAND_NORM_MM = 1e-9 mm
 max_moves = DEFAULT_CORRECTION_MAX_MOVES = 12
 ```
@@ -327,6 +332,79 @@ offset is at or below the configured correction deadband. If the remaining
 command vector is effectively zero, correction stops before issuing another
 motor command and reports non-convergence with a warning.
 
+### Image-Response Observability
+
+The predicted image response for a proposed correction is
+
+$$
+\widehat{\Delta \mathbf p}
+=
+J\Delta\mathbf a.
+$$
+
+Before motion, the controller computes the weighted response magnitude
+
+$$
+r_{\mathrm{pred}}
+=
+\sqrt{\widehat{\Delta \mathbf p}^{\mathsf T}
+W\widehat{\Delta \mathbf p}}.
+$$
+
+If \(r_{\mathrm{pred}}\) is below
+`DEFAULT_CORRECTION_MIN_TOTAL_PREDICTED_SHIFT_PX`, the move is not observable
+enough to provide useful feedback. Correction stops before issuing the motor
+command, rather than treating a below-noise image change as evidence about the
+motor direction or Jacobian.
+
+After a commanded move and one post-move image capture, the measured image
+change is
+
+$$
+\Delta \mathbf p_{\mathrm{meas}}
+=
+\mathbf p_{k+1} - \mathbf p_k.
+$$
+
+The scalar innovation gain is the weighted least-squares coefficient
+
+$$
+\alpha
+=
+\frac{
+\widehat{\Delta \mathbf p}^{\mathsf T}
+W\Delta \mathbf p_{\mathrm{meas}}
+}{
+\widehat{\Delta \mathbf p}^{\mathsf T}
+W\widehat{\Delta \mathbf p}
+}.
+$$
+
+The parallel measured response, in pixels, is
+
+$$
+r_{\parallel}
+=
+\frac{
+\widehat{\Delta \mathbf p}^{\mathsf T}
+W\Delta \mathbf p_{\mathrm{meas}}
+}{
+r_{\mathrm{pred}}
+}.
+$$
+
+Post-move feedback is accepted only when
+
+```text
+r_pred >= DEFAULT_CORRECTION_MIN_TOTAL_PREDICTED_SHIFT_PX
+alpha >= DEFAULT_CORRECTION_MIN_FEEDBACK_ALPHA
+r_parallel >= DEFAULT_CORRECTION_MIN_FEEDBACK_PARALLEL_SHIFT_PX
+```
+
+Invalid feedback is recorded in the correction history, but it is not used for
+Jacobian refinement and it does not cause the loop to keep stacking additional
+correction moves on top of an unobservable or anti-aligned image response.
+
 The absolute BCS-mm target sent to the motors is
 
 $$
@@ -353,16 +431,20 @@ The closed-loop correction algorithm proceeds as follows:
 6. compute the damped normalized command correction;
 7. apply the normalized-step cap and suppress low-impact axis components;
 8. stop before motion if the remaining command vector is below the minimum
-   command norm;
+   command norm or the predicted total image response is below the observable
+   feedback threshold;
 9. send absolute BCS-mm targets only for axes with nonzero correction components;
-10. re-image and compute the new residual;
-11. if the residual decreased, refit the visual Jacobian from the calibration
-   probes plus accepted correction observations and save the refined
-   calibration dataset to disk;
-12. if the residual increased or stayed flat, skip the Jacobian update, halve
-    the gain down to `DEFAULT_CORRECTION_MIN_GAIN`, double `mu`, and continue
-    from the newly measured image state;
-13. save the correction result into the sibling correction-history file.
+10. re-image once and compute the new residual plus feedback innovation
+    diagnostics;
+11. if feedback is valid and the residual decreased, refit the visual Jacobian
+    from the calibration probes plus accepted correction observations and save
+    the refined calibration dataset to disk;
+12. if feedback is valid but the residual increased or stayed flat, skip the
+    Jacobian update, halve the gain down to `DEFAULT_CORRECTION_MIN_GAIN`,
+    double `mu`, and continue from the newly measured image state;
+13. if feedback is invalid, record the move diagnostics and stop unless the
+    new residual is already within tolerance;
+14. save the correction result into the sibling correction-history file.
 
 No rollback is performed after a residual-increasing move. The image
 measurement acquired after that move defines the next closed-loop state.
@@ -423,9 +505,10 @@ has approximately $(0.005/0.5)^2 = 10^{-4}$ the Jacobian leverage of a 0.5 mm
 calibration probe, preventing a single small move from dominating a Jacobian
 column.
 
-Refinement is only attempted when the weighted image residual decreased. If the
-refit is rank-deficient, poorly conditioned, or otherwise invalid, it is skipped
-and the warning is recorded. Accepted refinements update
+Refinement is only attempted when the post-move feedback is valid and the
+weighted image residual decreased. If the refit is rank-deficient, poorly
+conditioned, or otherwise invalid, it is skipped and the warning is recorded.
+Accepted refinements update
 `visual_jacobian_px_per_cmd_mm`, increment `jacobian_refinement_count`, mark
 `jacobian_refined = "true"`, validate the dataset, and save it back to the
 calibration file path.
@@ -474,6 +557,11 @@ move_pre_weighted_residual_px(move)
 move_post_weighted_residual_px(move)
 move_predicted_delta_px(move, camera, pixel_axis)
 move_measured_delta_px(move, camera, pixel_axis)
+move_predicted_weighted_response_px(move)
+move_measured_weighted_response_px(move)
+move_feedback_alpha(move)
+move_feedback_parallel_px(move)
+move_feedback_valid(move)
 move_visual_jacobian_before_px_per_cmd_mm(move, camera, pixel_axis, command_axis)
 move_visual_jacobian_after_px_per_cmd_mm(move, camera, pixel_axis, command_axis)
 move_gain(move)

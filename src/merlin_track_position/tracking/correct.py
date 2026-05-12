@@ -4,7 +4,7 @@ import logging
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import h5py
 import numpy as np
@@ -57,6 +57,13 @@ ROI_ATTR_KEYS: dict[str, tuple[str, str, str, str]] = {
 }
 
 
+class CorrectionFeedback(NamedTuple):
+    predicted_weighted_response_px: float
+    measured_weighted_response_px: float
+    alpha: float
+    parallel_px: float
+
+
 def do_correction(
     calibration: xr.Dataset | str | Path,
     camera_pair: CameraPairPlugin | None = None,
@@ -73,6 +80,13 @@ def do_correction(
     ),
     min_axis_predicted_shift_px: float = (
         constants.DEFAULT_CORRECTION_MIN_AXIS_PREDICTED_SHIFT_PX
+    ),
+    min_total_predicted_shift_px: float = (
+        constants.DEFAULT_CORRECTION_MIN_TOTAL_PREDICTED_SHIFT_PX
+    ),
+    min_feedback_alpha: float = constants.DEFAULT_CORRECTION_MIN_FEEDBACK_ALPHA,
+    min_feedback_parallel_shift_px: float = (
+        constants.DEFAULT_CORRECTION_MIN_FEEDBACK_PARALLEL_SHIFT_PX
     ),
     min_command_norm_mm: float = constants.DEFAULT_CORRECTION_MIN_COMMAND_NORM_MM,
     max_moves: int = constants.DEFAULT_CORRECTION_MAX_MOVES,
@@ -100,6 +114,9 @@ def do_correction(
     current_gain = float(gain)
     min_gain = float(min_gain)
     current_mu = float(damping_mu)
+    min_total_predicted_shift_px = float(min_total_predicted_shift_px)
+    min_feedback_alpha = float(min_feedback_alpha)
+    min_feedback_parallel_shift_px = float(min_feedback_parallel_shift_px)
     min_command_norm_mm = float(min_command_norm_mm)
     max_moves = int(max_moves)
     if not np.isfinite(pixel_tolerance_px) or pixel_tolerance_px < 0.0:
@@ -112,18 +129,39 @@ def do_correction(
         current_gain = min_gain
     if not np.isfinite(current_mu) or current_mu < 0.0:
         raise ValueError("damping_mu must be finite and non-negative")
+    if (
+        not np.isfinite(min_total_predicted_shift_px)
+        or min_total_predicted_shift_px < 0.0
+    ):
+        raise ValueError(
+            "min_total_predicted_shift_px must be finite and non-negative"
+        )
+    if not np.isfinite(min_feedback_alpha) or min_feedback_alpha < 0.0:
+        raise ValueError("min_feedback_alpha must be finite and non-negative")
+    if (
+        not np.isfinite(min_feedback_parallel_shift_px)
+        or min_feedback_parallel_shift_px < 0.0
+    ):
+        raise ValueError(
+            "min_feedback_parallel_shift_px must be finite and non-negative"
+        )
     if not np.isfinite(min_command_norm_mm) or min_command_norm_mm < 0.0:
         raise ValueError("min_command_norm_mm must be finite and non-negative")
     if max_moves < 0:
         raise ValueError("max_moves must be >= 0")
     logger.info(
         "Correction parameters: capture_count=%d, pixel_tolerance_px=%g, "
-        "gain=%g, min_gain=%g, damping_mu=%g, max_moves=%d",
+        "gain=%g, min_gain=%g, damping_mu=%g, "
+        "min_total_predicted_shift_px=%g, min_feedback_alpha=%g, "
+        "min_feedback_parallel_shift_px=%g, max_moves=%d",
         capture_count,
         pixel_tolerance_px,
         current_gain,
         min_gain,
         current_mu,
+        min_total_predicted_shift_px,
+        min_feedback_alpha,
+        min_feedback_parallel_shift_px,
         max_moves,
     )
 
@@ -170,6 +208,11 @@ def do_correction(
     move_post_weighted_residuals: list[float] = []
     move_predicted_delta_px: list[np.ndarray] = []
     move_measured_delta_px: list[np.ndarray] = []
+    move_predicted_weighted_response_px: list[float] = []
+    move_measured_weighted_response_px: list[float] = []
+    move_feedback_alpha: list[float] = []
+    move_feedback_parallel_px: list[float] = []
+    move_feedback_valid: list[bool] = []
     move_jacobian_before: list[np.ndarray] = []
     move_jacobian_after: list[np.ndarray] = []
     move_max_normalized_component: list[float] = []
@@ -216,6 +259,13 @@ def do_correction(
             move_post_weighted_residuals=move_post_weighted_residuals,
             move_predicted_delta_px=move_predicted_delta_px,
             move_measured_delta_px=move_measured_delta_px,
+            move_predicted_weighted_response_px=(
+                move_predicted_weighted_response_px
+            ),
+            move_measured_weighted_response_px=move_measured_weighted_response_px,
+            move_feedback_alpha=move_feedback_alpha,
+            move_feedback_parallel_px=move_feedback_parallel_px,
+            move_feedback_valid=move_feedback_valid,
             move_jacobian_before=move_jacobian_before,
             move_jacobian_after=move_jacobian_after,
             move_max_normalized_component=move_max_normalized_component,
@@ -236,6 +286,9 @@ def do_correction(
             current_mu=current_mu,
             max_normalized_step=max_normalized_step,
             min_axis_predicted_shift_px=min_axis_predicted_shift_px,
+            min_total_predicted_shift_px=min_total_predicted_shift_px,
+            min_feedback_alpha=min_feedback_alpha,
+            min_feedback_parallel_shift_px=min_feedback_parallel_shift_px,
             min_command_norm_mm=min_command_norm_mm,
             max_moves=max_moves,
             initial_commanded_position_mm=initial_commanded_position_mm,
@@ -328,6 +381,25 @@ def do_correction(
             jacobian_before.reshape(len(CAMERAS) * len(PIXEL_AXES), len(COMMAND_AXES))
             @ correction_cmd_mm
         ).reshape(len(CAMERAS), len(PIXEL_AXES))
+        predicted_weighted_response_px = _weighted_shift_norm(
+            predicted_delta_px,
+            weights=weights,
+        )
+        if predicted_weighted_response_px < min_total_predicted_shift_px:
+            warnings.append(
+                _below_observable_feedback_warning(
+                    predicted_weighted_response_px=predicted_weighted_response_px,
+                    min_total_predicted_shift_px=min_total_predicted_shift_px,
+                )
+            )
+            logger.info(
+                "Stopping correction before move because predicted response "
+                "%.6g px is below observable feedback threshold %.6g px.",
+                predicted_weighted_response_px,
+                min_total_predicted_shift_px,
+            )
+            break
+
         normalized_component = correction_cmd_mm / axis_scale
         requested_position_mm = commanded_position_mm + correction_cmd_mm
         active_axes = tuple(COMMAND_AXES[index] for index in active_indices)
@@ -377,7 +449,31 @@ def do_correction(
         measured_delta_px = np.asarray(
             after_measurement["shift_px"].values, dtype=np.float64
         ) - np.asarray(measurement["shift_px"].values, dtype=np.float64)
-        if decreased:
+        feedback = _correction_feedback_metrics(
+            predicted_delta_px,
+            measured_delta_px,
+            weights=weights,
+        )
+        feedback_valid = _correction_feedback_is_valid(
+            feedback,
+            min_total_predicted_shift_px=min_total_predicted_shift_px,
+            min_feedback_alpha=min_feedback_alpha,
+            min_feedback_parallel_shift_px=min_feedback_parallel_shift_px,
+        )
+        stop_after_invalid_feedback = not feedback_valid and after_residual > (
+            pixel_tolerance_px
+        )
+        logger.info(
+            "Post-move feedback metrics: predicted_response=%.6g px, "
+            "measured_response=%.6g px, alpha=%.6g, parallel=%.6g px, "
+            "valid=%s",
+            feedback.predicted_weighted_response_px,
+            feedback.measured_weighted_response_px,
+            feedback.alpha,
+            feedback.parallel_px,
+            feedback_valid,
+        )
+        if feedback_valid and decreased:
             try:
                 logger.info("Attempting Jacobian refinement from accepted move.")
                 refinement_delta, refinement_measured = (
@@ -407,7 +503,7 @@ def do_correction(
                 )
                 jacobian_refined = True
                 logger.info("Jacobian refinement accepted and saved.")
-        else:
+        elif feedback_valid:
             current_gain = max(min_gain, 0.5 * current_gain)
             current_mu = 2.0 * current_mu if current_mu > 0.0 else 1e-12
             logger.info(
@@ -416,6 +512,15 @@ def do_correction(
                 current_gain,
                 current_mu,
             )
+        elif stop_after_invalid_feedback:
+            warnings.append(
+                _invalid_feedback_warning(
+                    feedback,
+                    min_feedback_alpha=min_feedback_alpha,
+                    min_feedback_parallel_shift_px=min_feedback_parallel_shift_px,
+                )
+            )
+            logger.info("Stopping correction after invalid image feedback.")
 
         move_command_delta_mm.append(correction_cmd_mm)
         move_requested_position_mm.append(requested_position_mm.copy())
@@ -426,6 +531,15 @@ def do_correction(
         move_post_weighted_residuals.append(float(after_residual))
         move_predicted_delta_px.append(predicted_delta_px)
         move_measured_delta_px.append(measured_delta_px)
+        move_predicted_weighted_response_px.append(
+            feedback.predicted_weighted_response_px
+        )
+        move_measured_weighted_response_px.append(
+            feedback.measured_weighted_response_px
+        )
+        move_feedback_alpha.append(feedback.alpha)
+        move_feedback_parallel_px.append(feedback.parallel_px)
+        move_feedback_valid.append(feedback_valid)
         move_jacobian_before.append(jacobian_before)
         move_jacobian_after.append(jacobian.copy())
         move_max_normalized_component.append(
@@ -456,6 +570,8 @@ def do_correction(
             converged,
         )
         save_progress(completed=False)
+        if stop_after_invalid_feedback:
+            break
 
     if not converged:
         warnings.append(
@@ -842,7 +958,11 @@ def _netcdf_safe_correction_result(result: xr.Dataset) -> xr.Dataset:
 
 def _restore_netcdf_safe_correction_result(result: xr.Dataset) -> xr.Dataset:
     restored = result.copy(deep=True)
-    for name in ("move_active_axis_mask", "move_jacobian_refined"):
+    for name in (
+        "move_active_axis_mask",
+        "move_jacobian_refined",
+        "move_feedback_valid",
+    ):
         if name in restored:
             restored[name] = restored[name].astype(bool)
     for key in (
@@ -981,6 +1101,115 @@ def _discard_pending_correction_history_run(
             discard_spool_entry(entry)
 
 
+def _correction_feedback_metrics(
+    predicted_delta_px: np.ndarray,
+    measured_delta_px: np.ndarray,
+    *,
+    weights: Sequence[float] | np.ndarray | None,
+) -> CorrectionFeedback:
+    predicted = _shift_to_observation_vector(predicted_delta_px)
+    measured = _shift_to_observation_vector(measured_delta_px)
+    weight_values = _observation_weight_values(weights)
+    weighted_predicted = weight_values * predicted
+    weighted_measured = weight_values * measured
+    predicted_energy = float(predicted @ weighted_predicted)
+    measured_energy = float(measured @ weighted_measured)
+    predicted_response = float(np.sqrt(max(predicted_energy, 0.0)))
+    measured_response = float(np.sqrt(max(measured_energy, 0.0)))
+    projected_energy = float(predicted @ weighted_measured)
+    if predicted_energy > 0.0 and predicted_response > 0.0:
+        alpha = projected_energy / predicted_energy
+        parallel_px = projected_energy / predicted_response
+    else:
+        alpha = np.nan
+        parallel_px = np.nan
+    return CorrectionFeedback(
+        predicted_weighted_response_px=predicted_response,
+        measured_weighted_response_px=measured_response,
+        alpha=float(alpha),
+        parallel_px=float(parallel_px),
+    )
+
+
+def _correction_feedback_is_valid(
+    feedback: CorrectionFeedback,
+    *,
+    min_total_predicted_shift_px: float,
+    min_feedback_alpha: float,
+    min_feedback_parallel_shift_px: float,
+) -> bool:
+    return bool(
+        feedback.predicted_weighted_response_px >= min_total_predicted_shift_px
+        and np.isfinite(feedback.alpha)
+        and feedback.alpha >= min_feedback_alpha
+        and np.isfinite(feedback.parallel_px)
+        and feedback.parallel_px >= min_feedback_parallel_shift_px
+    )
+
+
+def _weighted_shift_norm(
+    shift_px: np.ndarray,
+    *,
+    weights: Sequence[float] | np.ndarray | None,
+) -> float:
+    values = _shift_to_observation_vector(shift_px)
+    weight_values = _observation_weight_values(weights)
+    return float(np.sqrt(max(float(values @ (weight_values * values)), 0.0)))
+
+
+def _shift_to_observation_vector(values: np.ndarray) -> np.ndarray:
+    array = np.asarray(values, dtype=np.float64)
+    if array.shape != (len(CAMERAS), len(PIXEL_AXES)):
+        raise ValueError("shift array must have shape (camera, pixel_axis)")
+    if not np.isfinite(array).all():
+        raise ValueError("shift array must contain only finite values")
+    return array.reshape(-1)
+
+
+def _observation_weight_values(
+    weights: Sequence[float] | np.ndarray | None,
+) -> np.ndarray:
+    if weights is None:
+        return np.ones(len(CAMERAS) * len(PIXEL_AXES), dtype=np.float64)
+    values = np.asarray(weights, dtype=np.float64)
+    if values.shape == (len(CAMERAS), len(PIXEL_AXES)):
+        values = values.reshape(-1)
+    if values.shape != (len(CAMERAS) * len(PIXEL_AXES),):
+        raise ValueError("weights must have four observation values")
+    if not np.isfinite(values).all() or np.any(values < 0.0):
+        raise ValueError("weights must contain finite non-negative values")
+    if not np.any(values > 0.0):
+        raise ValueError("weights must include at least one positive value")
+    return values
+
+
+def _below_observable_feedback_warning(
+    *,
+    predicted_weighted_response_px: float,
+    min_total_predicted_shift_px: float,
+) -> str:
+    return (
+        "predicted correction response is below the observable feedback "
+        f"threshold: predicted={predicted_weighted_response_px:.4g} px, "
+        f"threshold={min_total_predicted_shift_px:.4g} px; stopping before "
+        "another move"
+    )
+
+
+def _invalid_feedback_warning(
+    feedback: CorrectionFeedback,
+    *,
+    min_feedback_alpha: float,
+    min_feedback_parallel_shift_px: float,
+) -> str:
+    return (
+        "post-move image response below effective feedback threshold: "
+        f"alpha={feedback.alpha:.4g} < {min_feedback_alpha:.4g} or "
+        f"parallel={feedback.parallel_px:.4g} px < "
+        f"{min_feedback_parallel_shift_px:.4g} px; stopping before another move"
+    )
+
+
 def _reported_next_correction(
     *,
     converged: bool,
@@ -1033,6 +1262,11 @@ def _build_correction_result(
     move_post_weighted_residuals: Sequence[float],
     move_predicted_delta_px: Sequence[np.ndarray],
     move_measured_delta_px: Sequence[np.ndarray],
+    move_predicted_weighted_response_px: Sequence[float],
+    move_measured_weighted_response_px: Sequence[float],
+    move_feedback_alpha: Sequence[float],
+    move_feedback_parallel_px: Sequence[float],
+    move_feedback_valid: Sequence[bool],
     move_jacobian_before: Sequence[np.ndarray],
     move_jacobian_after: Sequence[np.ndarray],
     move_max_normalized_component: Sequence[float],
@@ -1053,6 +1287,9 @@ def _build_correction_result(
     current_mu: float,
     max_normalized_step: float | None,
     min_axis_predicted_shift_px: float,
+    min_total_predicted_shift_px: float,
+    min_feedback_alpha: float,
+    min_feedback_parallel_shift_px: float,
     min_command_norm_mm: float,
     max_moves: int,
     initial_commanded_position_mm: np.ndarray,
@@ -1136,6 +1373,29 @@ def _build_correction_result(
                 _stack_shift_or_empty(move_measured_delta_px),
                 {"units": "px"},
             ),
+            "move_predicted_weighted_response_px": (
+                ("move",),
+                np.asarray(move_predicted_weighted_response_px, dtype=np.float64),
+                {"units": "px"},
+            ),
+            "move_measured_weighted_response_px": (
+                ("move",),
+                np.asarray(move_measured_weighted_response_px, dtype=np.float64),
+                {"units": "px"},
+            ),
+            "move_feedback_alpha": (
+                ("move",),
+                np.asarray(move_feedback_alpha, dtype=np.float64),
+            ),
+            "move_feedback_parallel_px": (
+                ("move",),
+                np.asarray(move_feedback_parallel_px, dtype=np.float64),
+                {"units": "px"},
+            ),
+            "move_feedback_valid": (
+                ("move",),
+                np.asarray(move_feedback_valid, dtype=bool),
+            ),
             "move_visual_jacobian_before_px_per_cmd_mm": (
                 ("move", "camera", "pixel_axis", "command_axis"),
                 _stack_jacobian_or_empty(move_jacobian_before),
@@ -1193,6 +1453,13 @@ def _build_correction_result(
             "correction_max_normalized_step": max_normalized_attr,
             "correction_min_axis_predicted_shift_px": float(
                 min_axis_predicted_shift_px
+            ),
+            "correction_min_total_predicted_shift_px": float(
+                min_total_predicted_shift_px
+            ),
+            "correction_min_feedback_alpha": float(min_feedback_alpha),
+            "correction_min_feedback_parallel_shift_px": float(
+                min_feedback_parallel_shift_px
             ),
             "correction_min_command_norm_mm": float(min_command_norm_mm),
             "max_correction_moves": int(max_moves),
