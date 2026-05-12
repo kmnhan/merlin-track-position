@@ -154,7 +154,7 @@ def _roi_geometries_from_calibration_metadata(
     return geometries
 
 
-def _add_roi_scale_handles(roi: pg.RectROI) -> None:
+def _add_roi_scale_handles(roi: pg.ROI) -> None:
     if len(roi.getHandles()) == len(ROI_SCALE_HANDLES):
         return
 
@@ -163,7 +163,7 @@ def _add_roi_scale_handles(roi: pg.RectROI) -> None:
         roi.addScaleHandle(position, center)
 
 
-def _remove_roi_scale_handles(roi: pg.RectROI) -> None:
+def _remove_roi_scale_handles(roi: pg.ROI) -> None:
     for handle in list(roi.getHandles()):
         roi.removeHandle(handle)
 
@@ -317,7 +317,7 @@ class _MainWindowGUI(QtWidgets.QMainWindow):
         image_layout.addWidget(self.image_graphics_layout)
         self.image_plots: dict[str, pg.PlotItem] = {}
         self.image_items: dict[str, pg.ImageItem] = {}
-        self.image_rois: dict[str, pg.RectROI] = {}
+        self.image_rois: dict[str, pg.ROI] = {}
         for row, (camera, (image_width, image_height)) in enumerate(
             CAMERA_IMAGE_SIZES.items()
         ):
@@ -340,10 +340,9 @@ class _MainWindowGUI(QtWidgets.QMainWindow):
             )
 
             roi_geometry = _default_roi_geometry(image_width, image_height)
-            image_roi = pg.RectROI(
+            image_roi = pg.ROI(
                 roi_geometry[:2],
                 roi_geometry[2:],
-                sideScalers=False,
                 maxBounds=QtCore.QRectF(0.0, 0.0, image_width, image_height),
                 pen=pg.mkPen("#008c99", width=2),
                 hoverPen=pg.mkPen("#00c2d1", width=2),
