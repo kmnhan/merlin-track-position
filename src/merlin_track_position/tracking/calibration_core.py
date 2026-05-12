@@ -620,6 +620,12 @@ def solve_damped_command_correction(
     *,
     gain: float = constants.DEFAULT_CORRECTION_GAIN,
     damping_mu: float = constants.DEFAULT_CORRECTION_DAMPING_MU,
+    max_normalized_step: float | None = (
+        constants.DEFAULT_CORRECTION_MAX_NORMALIZED_STEP
+    ),
+    min_axis_predicted_shift_px: float = (
+        constants.DEFAULT_CORRECTION_MIN_AXIS_PREDICTED_SHIFT_PX
+    ),
     weights: Sequence[float] | np.ndarray | None = None,
 ) -> np.ndarray:
     """Solve the damped normalized-command correction ``Delta a``."""
@@ -638,6 +644,18 @@ def solve_damped_command_correction(
         raise ValueError("gain must be finite and positive")
     if not np.isfinite(damping_mu) or damping_mu < 0.0:
         raise ValueError("damping_mu must be finite and non-negative")
+    if max_normalized_step is not None:
+        max_normalized_step = float(max_normalized_step)
+        if np.isnan(max_normalized_step) or max_normalized_step <= 0.0:
+            raise ValueError("max_normalized_step must be positive or None")
+    min_axis_predicted_shift_px = float(min_axis_predicted_shift_px)
+    if (
+        not np.isfinite(min_axis_predicted_shift_px)
+        or min_axis_predicted_shift_px < 0.0
+    ):
+        raise ValueError(
+            "min_axis_predicted_shift_px must be finite and non-negative"
+        )
 
     scale_matrix = np.diag(axis_scale)
     normalized_jacobian = jacobian_observation @ scale_matrix
@@ -648,7 +666,20 @@ def solve_damped_command_correction(
     )
     rhs = normalized_jacobian.T @ weight_matrix @ observation
     delta_q = -gain * np.linalg.solve(lhs, rhs)
+    if max_normalized_step is not None and np.isfinite(max_normalized_step):
+        max_component = float(np.max(np.abs(delta_q)))
+        if max_component > max_normalized_step:
+            delta_q *= max_normalized_step / max_component
+
     correction_cmd_mm = scale_matrix @ delta_q
+    if min_axis_predicted_shift_px > 0.0:
+        axis_sensitivity = np.sqrt(
+            np.diag(jacobian_observation.T @ weight_matrix @ jacobian_observation)
+        )
+        predicted_axis_shift_px = np.abs(correction_cmd_mm) * axis_sensitivity
+        correction_cmd_mm = correction_cmd_mm.copy()
+        correction_cmd_mm[predicted_axis_shift_px < min_axis_predicted_shift_px] = 0.0
+
     if correction_cmd_mm.shape != (len(COMMAND_AXES),):
         raise ValueError("computed correction has unexpected shape")
     if not np.isfinite(correction_cmd_mm).all():

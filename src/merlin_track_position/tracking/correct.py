@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import h5py
 import numpy as np
 import xarray as xr
 
@@ -20,6 +22,7 @@ from merlin_track_position.instruments.motors import get_positions, move_motors_
 from merlin_track_position.tracking.calibration_core import (
     CAMERAS,
     COMMAND_AXES,
+    PIXEL_AXES,
     assign_refined_visual_jacobian,
     broyden_update_jacobian,
     estimate_command_offset,
@@ -53,6 +56,13 @@ def do_correction(
     gain: float = constants.DEFAULT_CORRECTION_GAIN,
     min_gain: float = constants.DEFAULT_CORRECTION_MIN_GAIN,
     damping_mu: float = constants.DEFAULT_CORRECTION_DAMPING_MU,
+    max_normalized_step: float | None = (
+        constants.DEFAULT_CORRECTION_MAX_NORMALIZED_STEP
+    ),
+    min_axis_predicted_shift_px: float = (
+        constants.DEFAULT_CORRECTION_MIN_AXIS_PREDICTED_SHIFT_PX
+    ),
+    min_command_norm_mm: float = constants.DEFAULT_CORRECTION_MIN_COMMAND_NORM_MM,
     max_moves: int = constants.DEFAULT_CORRECTION_MAX_MOVES,
     broyden_update_blend: float = constants.DEFAULT_BROYDEN_UPDATE_BLEND,
     weights: Sequence[float] | np.ndarray | None = None,
@@ -77,6 +87,7 @@ def do_correction(
     current_gain = float(gain)
     min_gain = float(min_gain)
     current_mu = float(damping_mu)
+    min_command_norm_mm = float(min_command_norm_mm)
     max_moves = int(max_moves)
     if not np.isfinite(pixel_tolerance_px) or pixel_tolerance_px < 0.0:
         raise ValueError("pixel_tolerance_px must be finite and non-negative")
@@ -88,6 +99,8 @@ def do_correction(
         current_gain = min_gain
     if not np.isfinite(current_mu) or current_mu < 0.0:
         raise ValueError("damping_mu must be finite and non-negative")
+    if not np.isfinite(min_command_norm_mm) or min_command_norm_mm < 0.0:
+        raise ValueError("min_command_norm_mm must be finite and non-negative")
     if max_moves < 0:
         raise ValueError("max_moves must be >= 0")
 
@@ -104,6 +117,10 @@ def do_correction(
     )
     if commanded_position_mm.shape != (len(COMMAND_AXES),):
         raise ValueError("initial command position readback must have x/y/z values")
+    initial_commanded_position_mm = commanded_position_mm.copy()
+    correction_log_path = correction_history_path(resolved_path)
+    correction_run_id = _next_correction_history_run_id(correction_log_path)
+    correction_started_at_utc = datetime.now(UTC).isoformat()
 
     measurement = _capture_measurement(
         calibration,
@@ -122,6 +139,14 @@ def do_correction(
     move_final_readback_position_mm: list[np.ndarray] = []
     move_gain: list[float] = []
     move_damping_mu: list[float] = []
+    move_pre_weighted_residuals: list[float] = []
+    move_post_weighted_residuals: list[float] = []
+    move_predicted_delta_px: list[np.ndarray] = []
+    move_measured_delta_px: list[np.ndarray] = []
+    move_jacobian_before: list[np.ndarray] = []
+    move_jacobian_after: list[np.ndarray] = []
+    move_max_normalized_component: list[float] = []
+    move_active_axis_mask: list[np.ndarray] = []
     move_jacobian_updated: list[bool] = []
     warnings: list[str] = [
         line.strip()
@@ -131,27 +156,121 @@ def do_correction(
 
     move_count = 0
     converged = residual <= pixel_tolerance_px
+
+    def build_result(completed: bool) -> xr.Dataset:
+        return _build_correction_result(
+            measurement=measurement,
+            jacobian=jacobian,
+            axis_scale=axis_scale,
+            estimated_offset=estimate_command_offset(
+                jacobian,
+                measurement,
+                weights=weights,
+            ),
+            next_correction=_reported_next_correction(
+                converged=converged,
+                jacobian=jacobian,
+                measurement=measurement,
+                axis_scale=axis_scale,
+                gain=current_gain,
+                damping_mu=current_mu,
+                max_normalized_step=max_normalized_step,
+                min_axis_predicted_shift_px=min_axis_predicted_shift_px,
+                weights=weights,
+            ),
+            iteration_shift_px=iteration_shift_px,
+            iteration_weighted_residuals=iteration_weighted_residuals,
+            move_command_delta_mm=move_command_delta_mm,
+            move_requested_position_mm=move_requested_position_mm,
+            move_final_readback_position_mm=move_final_readback_position_mm,
+            move_gain=move_gain,
+            move_damping_mu=move_damping_mu,
+            move_pre_weighted_residuals=move_pre_weighted_residuals,
+            move_post_weighted_residuals=move_post_weighted_residuals,
+            move_predicted_delta_px=move_predicted_delta_px,
+            move_measured_delta_px=move_measured_delta_px,
+            move_jacobian_before=move_jacobian_before,
+            move_jacobian_after=move_jacobian_after,
+            move_max_normalized_component=move_max_normalized_component,
+            move_active_axis_mask=move_active_axis_mask,
+            move_jacobian_updated=move_jacobian_updated,
+            calibration_path=resolved_path,
+            correction_history_path=correction_log_path,
+            correction_run_id=correction_run_id,
+            correction_started_at_utc=correction_started_at_utc,
+            correction_history_completed=completed,
+            converged=converged,
+            move_count=move_count,
+            pixel_tolerance_px=pixel_tolerance_px,
+            gain=gain,
+            min_gain=min_gain,
+            damping_mu=damping_mu,
+            current_gain=current_gain,
+            current_mu=current_mu,
+            max_normalized_step=max_normalized_step,
+            min_axis_predicted_shift_px=min_axis_predicted_shift_px,
+            min_command_norm_mm=min_command_norm_mm,
+            max_moves=max_moves,
+            initial_commanded_position_mm=initial_commanded_position_mm,
+            commanded_position_mm=commanded_position_mm,
+            warnings=warnings,
+        )
+
+    def save_progress(completed: bool) -> xr.Dataset:
+        progress = build_result(completed)
+        save_correction_history_dataset(
+            progress,
+            correction_log_path,
+            run_id=correction_run_id,
+        )
+        return progress
+
     while not converged and move_count < max_moves:
         gain_used = float(current_gain)
         mu_used = float(current_mu)
+        jacobian_before = jacobian.copy()
         correction_cmd_mm = solve_damped_command_correction(
             jacobian,
             measurement,
             axis_scale,
             gain=gain_used,
             damping_mu=mu_used,
+            max_normalized_step=max_normalized_step,
+            min_axis_predicted_shift_px=min_axis_predicted_shift_px,
             weights=weights,
         )
+        correction_cmd_mm = _zero_deadband_axis_corrections(correction_cmd_mm)
+        correction_norm_mm = float(np.linalg.norm(correction_cmd_mm))
+        active_indices = _active_correction_indices(correction_cmd_mm)
+        if correction_norm_mm <= min_command_norm_mm or not active_indices:
+            warnings.append(
+                "computed correction step is below the minimum command norm "
+                f"{min_command_norm_mm:.4g} mm; stopping before another move"
+            )
+            break
+
+        predicted_delta_px = (
+            jacobian_before.reshape(len(CAMERAS) * len(PIXEL_AXES), len(COMMAND_AXES))
+            @ correction_cmd_mm
+        ).reshape(len(CAMERAS), len(PIXEL_AXES))
+        normalized_component = correction_cmd_mm / axis_scale
         requested_position_mm = commanded_position_mm + correction_cmd_mm
+        active_axes = tuple(COMMAND_AXES[index] for index in active_indices)
+        active_requested_position_mm = tuple(
+            float(requested_position_mm[index]) for index in active_indices
+        )
+        move_motors_and_wait(
+            active_axes,
+            active_requested_position_mm,
+            tolerance=_active_move_tolerance(move_tolerance_mm, active_indices),
+            max_retries=max_retries,
+        )
         final_readback_mm = np.asarray(
-            move_motors_and_wait(
-                COMMAND_AXES,
-                tuple(float(value) for value in requested_position_mm),
-                tolerance=move_tolerance_mm,
-                max_retries=max_retries,
-            ),
+            get_positions(COMMAND_AXES),
             dtype=np.float64,
         )
+        if final_readback_mm.shape != (len(COMMAND_AXES),):
+            raise ValueError("final command position readback must have x/y/z values")
         commanded_position_mm = requested_position_mm
 
         after_measurement = _capture_measurement(
@@ -165,11 +284,11 @@ def do_correction(
         after_residual = weighted_pixel_residual(after_measurement, weights=weights)
         decreased = bool(after_residual < residual)
         jacobian_updated = False
+        measured_delta_px = (
+            np.asarray(after_measurement["shift_px"].values, dtype=np.float64)
+            - np.asarray(measurement["shift_px"].values, dtype=np.float64)
+        )
         if decreased:
-            measured_delta_px = (
-                np.asarray(after_measurement["shift_px"].values, dtype=np.float64)
-                - np.asarray(measurement["shift_px"].values, dtype=np.float64)
-            )
             try:
                 candidate_jacobian = broyden_update_jacobian(
                     jacobian,
@@ -196,6 +315,18 @@ def do_correction(
         move_final_readback_position_mm.append(final_readback_mm)
         move_gain.append(gain_used)
         move_damping_mu.append(mu_used)
+        move_pre_weighted_residuals.append(float(residual))
+        move_post_weighted_residuals.append(float(after_residual))
+        move_predicted_delta_px.append(predicted_delta_px)
+        move_measured_delta_px.append(measured_delta_px)
+        move_jacobian_before.append(jacobian_before)
+        move_jacobian_after.append(jacobian.copy())
+        move_max_normalized_component.append(
+            float(np.max(np.abs(normalized_component)))
+        )
+        active_axis_mask = np.zeros(len(COMMAND_AXES), dtype=bool)
+        active_axis_mask[list(active_indices)] = True
+        move_active_axis_mask.append(active_axis_mask)
         move_jacobian_updated.append(jacobian_updated)
 
         measurement = after_measurement
@@ -211,6 +342,7 @@ def do_correction(
         )
         move_count += 1
         converged = residual <= pixel_tolerance_px
+        save_progress(completed=False)
 
     if not converged:
         warnings.append(
@@ -219,19 +351,179 @@ def do_correction(
             f"{pixel_tolerance_px:.4g} px"
         )
 
-    estimated_offset = estimate_command_offset(jacobian, measurement, weights=weights)
-    if converged:
-        next_correction = np.zeros(len(COMMAND_AXES), dtype=np.float64)
-    else:
-        next_correction = solve_damped_command_correction(
-            jacobian,
-            measurement,
-            axis_scale,
-            gain=current_gain,
-            damping_mu=current_mu,
-            weights=weights,
+    return save_progress(completed=True)
+
+
+def _resolve_calibration_and_path(
+    calibration: xr.Dataset | str | Path,
+    calibration_path: str | Path | None,
+) -> tuple[xr.Dataset, Path]:
+    if isinstance(calibration, xr.Dataset):
+        path_value = (
+            calibration_path
+            if calibration_path is not None
+            else calibration.attrs.get("calibration_path")
+        )
+        if path_value is None or not str(path_value).strip():
+            raise ValueError(
+                "correction requires a calibration file path so refined "
+                "Jacobians can be persisted"
+            )
+        path = Path(path_value)
+        if not path.exists():
+            raise ValueError(f"calibration file does not exist: {path}")
+        loaded = calibration.load()
+        loaded.attrs["calibration_path"] = str(path)
+        return loaded, path
+
+    path = Path(calibration if calibration_path is None else calibration_path)
+    if not path.exists():
+        raise ValueError(f"calibration file does not exist: {path}")
+    return load_calibration_dataset(path), path
+
+
+def correction_history_path(calibration_path: str | Path) -> Path:
+    """Return the sibling correction-history path for a calibration file."""
+
+    path = Path(calibration_path)
+    suffix = path.suffix if path.suffix else ".h5"
+    return path.with_name(f"{path.stem}_corrections{suffix}")
+
+
+def save_correction_history_dataset(
+    result: xr.Dataset,
+    path: str | Path,
+    *,
+    run_id: int,
+) -> Path:
+    """Persist one correction run into the correction-history HDF5 file."""
+
+    output_path = Path(path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    group_name = _correction_history_group_name(run_id)
+    saved = _netcdf_safe_correction_result(result.load().copy(deep=True))
+
+    with h5py.File(output_path, "a") as history_file:
+        if group_name in history_file:
+            del history_file[group_name]
+        history_file.attrs["format"] = "merlin_track_position_correction_history"
+        history_file.attrs["latest_run_group"] = group_name
+        history_file.attrs["latest_run_id"] = int(run_id)
+        history_file.attrs["calibration_path"] = str(
+            saved.attrs.get("calibration_path", "")
         )
 
+    saved.to_netcdf(
+        output_path,
+        engine="h5netcdf",
+        mode="a",
+        group=group_name,
+    )
+    return output_path
+
+
+def _netcdf_safe_correction_result(result: xr.Dataset) -> xr.Dataset:
+    saved = result.copy(deep=True)
+    for name in saved.data_vars:
+        if saved[name].dtype == bool:
+            saved[name] = saved[name].astype(np.int8)
+            saved[name].attrs["flag_values"] = np.asarray([0, 1], dtype=np.int8)
+            saved[name].attrs["flag_meanings"] = "false true"
+    for key, value in tuple(saved.attrs.items()):
+        if isinstance(value, (bool, np.bool_)):
+            saved.attrs[key] = int(value)
+    return saved
+
+
+def _next_correction_history_run_id(path: Path) -> int:
+    if not path.exists():
+        return 0
+    with h5py.File(path, "r") as history_file:
+        run_ids = [
+            int(name.removeprefix("run_"))
+            for name in history_file.keys()
+            if name.startswith("run_") and name.removeprefix("run_").isdigit()
+        ]
+    return max(run_ids, default=-1) + 1
+
+
+def _correction_history_group_name(run_id: int) -> str:
+    run_id = int(run_id)
+    if run_id < 0:
+        raise ValueError("run_id must be non-negative")
+    return f"run_{run_id:06d}"
+
+
+def _reported_next_correction(
+    *,
+    converged: bool,
+    jacobian: np.ndarray,
+    measurement: xr.Dataset,
+    axis_scale: np.ndarray,
+    gain: float,
+    damping_mu: float,
+    max_normalized_step: float | None,
+    min_axis_predicted_shift_px: float,
+    weights: Sequence[float] | np.ndarray | None,
+) -> np.ndarray:
+    if converged:
+        return np.zeros(len(COMMAND_AXES), dtype=np.float64)
+    return solve_damped_command_correction(
+        jacobian,
+        measurement,
+        axis_scale,
+        gain=gain,
+        damping_mu=damping_mu,
+        max_normalized_step=max_normalized_step,
+        min_axis_predicted_shift_px=min_axis_predicted_shift_px,
+        weights=weights,
+    )
+
+
+def _build_correction_result(
+    *,
+    measurement: xr.Dataset,
+    jacobian: np.ndarray,
+    axis_scale: np.ndarray,
+    estimated_offset: np.ndarray,
+    next_correction: np.ndarray,
+    iteration_shift_px: Sequence[np.ndarray],
+    iteration_weighted_residuals: Sequence[float],
+    move_command_delta_mm: Sequence[np.ndarray],
+    move_requested_position_mm: Sequence[np.ndarray],
+    move_final_readback_position_mm: Sequence[np.ndarray],
+    move_gain: Sequence[float],
+    move_damping_mu: Sequence[float],
+    move_pre_weighted_residuals: Sequence[float],
+    move_post_weighted_residuals: Sequence[float],
+    move_predicted_delta_px: Sequence[np.ndarray],
+    move_measured_delta_px: Sequence[np.ndarray],
+    move_jacobian_before: Sequence[np.ndarray],
+    move_jacobian_after: Sequence[np.ndarray],
+    move_max_normalized_component: Sequence[float],
+    move_active_axis_mask: Sequence[np.ndarray],
+    move_jacobian_updated: Sequence[bool],
+    calibration_path: Path,
+    correction_history_path: Path,
+    correction_run_id: int,
+    correction_started_at_utc: str,
+    correction_history_completed: bool,
+    converged: bool,
+    move_count: int,
+    pixel_tolerance_px: float,
+    gain: float,
+    min_gain: float,
+    damping_mu: float,
+    current_gain: float,
+    current_mu: float,
+    max_normalized_step: float | None,
+    min_axis_predicted_shift_px: float,
+    min_command_norm_mm: float,
+    max_moves: int,
+    initial_commanded_position_mm: np.ndarray,
+    commanded_position_mm: np.ndarray,
+    warnings: Sequence[str],
+) -> xr.Dataset:
     result = measurement.assign(
         {
             "estimated_command_offset_mm": (
@@ -242,6 +534,21 @@ def do_correction(
             "correction_cmd_mm": (
                 ("command_axis",),
                 next_correction,
+                {"units": "commanded-mm"},
+            ),
+            "axis_scale_cmd_mm": (
+                ("command_axis",),
+                axis_scale,
+                {"units": "commanded-mm"},
+            ),
+            "initial_commanded_position_mm": (
+                ("command_axis",),
+                initial_commanded_position_mm,
+                {"units": "commanded-mm"},
+            ),
+            "final_commanded_position_mm": (
+                ("command_axis",),
+                commanded_position_mm,
                 {"units": "commanded-mm"},
             ),
             "visual_jacobian_px_per_cmd_mm": (
@@ -274,6 +581,36 @@ def do_correction(
                 _stack_or_empty(move_final_readback_position_mm),
                 {"units": "readback-mm"},
             ),
+            "move_pre_weighted_residual_px": (
+                ("move",),
+                np.asarray(move_pre_weighted_residuals, dtype=np.float64),
+                {"units": "px"},
+            ),
+            "move_post_weighted_residual_px": (
+                ("move",),
+                np.asarray(move_post_weighted_residuals, dtype=np.float64),
+                {"units": "px"},
+            ),
+            "move_predicted_delta_px": (
+                ("move", "camera", "pixel_axis"),
+                _stack_shift_or_empty(move_predicted_delta_px),
+                {"units": "px"},
+            ),
+            "move_measured_delta_px": (
+                ("move", "camera", "pixel_axis"),
+                _stack_shift_or_empty(move_measured_delta_px),
+                {"units": "px"},
+            ),
+            "move_visual_jacobian_before_px_per_cmd_mm": (
+                ("move", "camera", "pixel_axis", "command_axis"),
+                _stack_jacobian_or_empty(move_jacobian_before),
+                {"units": "px/commanded-mm"},
+            ),
+            "move_visual_jacobian_after_px_per_cmd_mm": (
+                ("move", "camera", "pixel_axis", "command_axis"),
+                _stack_jacobian_or_empty(move_jacobian_after),
+                {"units": "px/commanded-mm"},
+            ),
             "move_gain": (
                 ("move",),
                 np.asarray(move_gain, dtype=np.float64),
@@ -281,6 +618,14 @@ def do_correction(
             "move_damping_mu": (
                 ("move",),
                 np.asarray(move_damping_mu, dtype=np.float64),
+            ),
+            "move_max_normalized_component": (
+                ("move",),
+                np.asarray(move_max_normalized_component, dtype=np.float64),
+            ),
+            "move_active_axis_mask": (
+                ("move", "command_axis"),
+                _stack_bool_or_empty(move_active_axis_mask),
             ),
             "move_jacobian_updated": (
                 ("move",),
@@ -292,9 +637,16 @@ def do_correction(
         iteration=np.arange(len(iteration_weighted_residuals), dtype=np.int64),
         move=np.arange(move_count, dtype=np.int64),
     )
+    max_normalized_attr = (
+        float(max_normalized_step) if max_normalized_step is not None else np.inf
+    )
     return result.assign_attrs(
         {
-            "calibration_path": str(resolved_path),
+            "calibration_path": str(calibration_path),
+            "correction_history_path": str(correction_history_path),
+            "correction_history_run_id": int(correction_run_id),
+            "correction_history_completed": bool(correction_history_completed),
+            "correction_started_at_utc": correction_started_at_utc,
             "correction_converged": bool(converged),
             "correction_iterations": int(move_count),
             "pixel_tolerance_px": float(pixel_tolerance_px),
@@ -303,39 +655,16 @@ def do_correction(
             "correction_damping_mu": float(damping_mu),
             "correction_final_gain": float(current_gain),
             "correction_final_damping_mu": float(current_mu),
+            "correction_max_normalized_step": max_normalized_attr,
+            "correction_min_axis_predicted_shift_px": float(
+                min_axis_predicted_shift_px
+            ),
+            "correction_min_command_norm_mm": float(min_command_norm_mm),
             "max_correction_moves": int(max_moves),
             "correction_applied": move_count > 0,
             "warnings": "\n".join(tuple(dict.fromkeys(warnings))),
         }
     )
-
-
-def _resolve_calibration_and_path(
-    calibration: xr.Dataset | str | Path,
-    calibration_path: str | Path | None,
-) -> tuple[xr.Dataset, Path]:
-    if isinstance(calibration, xr.Dataset):
-        path_value = (
-            calibration_path
-            if calibration_path is not None
-            else calibration.attrs.get("calibration_path")
-        )
-        if path_value is None or not str(path_value).strip():
-            raise ValueError(
-                "correction requires a calibration file path so refined "
-                "Jacobians can be persisted"
-            )
-        path = Path(path_value)
-        if not path.exists():
-            raise ValueError(f"calibration file does not exist: {path}")
-        loaded = calibration.load()
-        loaded.attrs["calibration_path"] = str(path)
-        return loaded, path
-
-    path = Path(calibration if calibration_path is None else calibration_path)
-    if not path.exists():
-        raise ValueError(f"calibration file does not exist: {path}")
-    return load_calibration_dataset(path), path
 
 
 def _capture_measurement(
@@ -372,6 +701,58 @@ def _stack_or_empty(rows: Sequence[np.ndarray]) -> np.ndarray:
     if not rows:
         return np.empty((0, len(COMMAND_AXES)), dtype=np.float64)
     return np.stack(rows, axis=0).astype(np.float64, copy=False)
+
+
+def _stack_bool_or_empty(rows: Sequence[np.ndarray]) -> np.ndarray:
+    if not rows:
+        return np.empty((0, len(COMMAND_AXES)), dtype=bool)
+    return np.stack(rows, axis=0).astype(bool, copy=False)
+
+
+def _stack_shift_or_empty(rows: Sequence[np.ndarray]) -> np.ndarray:
+    if not rows:
+        return np.empty((0, len(CAMERAS), len(PIXEL_AXES)), dtype=np.float64)
+    return np.stack(rows, axis=0).astype(np.float64, copy=False)
+
+
+def _stack_jacobian_or_empty(rows: Sequence[np.ndarray]) -> np.ndarray:
+    if not rows:
+        return np.empty(
+            (0, len(CAMERAS), len(PIXEL_AXES), len(COMMAND_AXES)),
+            dtype=np.float64,
+        )
+    return np.stack(rows, axis=0).astype(np.float64, copy=False)
+
+
+def _zero_deadband_axis_corrections(correction_cmd_mm: np.ndarray) -> np.ndarray:
+    correction = np.asarray(correction_cmd_mm, dtype=np.float64).copy()
+    for index, axis in enumerate(COMMAND_AXES):
+        deadband = float(constants.MOTOR_MOVE_DEADBAND.get(axis, 0.0))
+        if not np.isfinite(deadband) or deadband < 0.0:
+            raise ValueError("move deadbands must be finite and non-negative")
+        if abs(correction[index]) <= deadband:
+            correction[index] = 0.0
+    return correction
+
+
+def _active_correction_indices(correction_cmd_mm: np.ndarray) -> tuple[int, ...]:
+    return tuple(
+        index
+        for index, value in enumerate(np.asarray(correction_cmd_mm, dtype=np.float64))
+        if value != 0.0
+    )
+
+
+def _active_move_tolerance(
+    tolerance: float | Iterable[float] | None,
+    active_indices: Sequence[int],
+) -> float | tuple[float, ...] | None:
+    if tolerance is None or np.isscalar(tolerance):
+        return tolerance
+    values = tuple(float(value) for value in tolerance)
+    if len(values) != len(COMMAND_AXES):
+        raise ValueError("move_tolerance_mm must be scalar or have x/y/z values")
+    return tuple(values[index] for index in active_indices)
 
 
 def _crop_current_stack_if_needed(

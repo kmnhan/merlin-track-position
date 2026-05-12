@@ -290,8 +290,35 @@ The current defaults are:
 lambda = DEFAULT_CORRECTION_GAIN = 0.3
 lambda_min = DEFAULT_CORRECTION_MIN_GAIN = 0.05
 mu = DEFAULT_CORRECTION_DAMPING_MU = 1e-2
-max_moves = DEFAULT_CORRECTION_MAX_MOVES = 8
+max |Delta q_j| = DEFAULT_CORRECTION_MAX_NORMALIZED_STEP = 0.5
+min per-axis predicted response =
+    DEFAULT_CORRECTION_MIN_AXIS_PREDICTED_SHIFT_PX = 0.25 px
+min command norm = DEFAULT_CORRECTION_MIN_COMMAND_NORM_MM = 1e-9 mm
+max_moves = DEFAULT_CORRECTION_MAX_MOVES = 12
 ```
+
+Before a motor command is sent, the implementation applies two guards to the
+least-squares proposal. First, it clips the largest normalized component by
+scaling the whole vector if
+
+$$
+\max_j |\Delta q_j|
+>
+\texttt{DEFAULT\_CORRECTION\_MAX\_NORMALIZED\_STEP}.
+$$
+
+Second, it suppresses nuisance axis components whose predicted image effect is
+below the configured threshold:
+
+$$
+|\Delta a_j|\sqrt{J_{:,j}^\mathsf T WJ_{:,j}}
+<
+\texttt{DEFAULT\_CORRECTION\_MIN\_AXIS\_PREDICTED\_SHIFT\_PX}.
+$$
+
+Components at or below the configured motor move deadband are also set to zero.
+If the remaining command vector is effectively zero, the loop stops before
+sending another motor move and reports non-convergence with a warning.
 
 The absolute BCS-mm target sent to the motors is
 
@@ -318,13 +345,17 @@ The implemented correction loop is:
    $\rho_k = \sqrt{\mathbf p_k^\mathsf T W \mathbf p_k}$;
 5. stop immediately if $\rho_k$ is at or below the pixel tolerance;
 6. compute the damped normalized command correction;
-7. send the absolute BCS-mm target for `x`, `y`, and `z`;
-8. re-image and compute the new residual;
-9. if the residual decreased, apply a guarded blended Broyden update and save
+7. apply the normalized-step cap and suppress low-impact axis components;
+8. stop before motion if the remaining command vector is below the minimum
+   command norm;
+9. send absolute BCS-mm targets only for axes with nonzero correction components;
+10. re-image and compute the new residual;
+11. if the residual decreased, apply a guarded blended Broyden update and save
    the refined calibration dataset to disk;
-10. if the residual increased or stayed flat, skip the Jacobian update, halve
+12. if the residual increased or stayed flat, skip the Jacobian update, halve
     the gain down to `DEFAULT_CORRECTION_MIN_GAIN`, double `mu`, and continue
-    from the newly measured image state.
+    from the newly measured image state;
+13. save the current correction result into the sibling correction-history file.
 
 The code does not roll back the motor position after a bad move. The camera
 measurement after that move becomes the next state.
@@ -428,14 +459,27 @@ iteration_weighted_residual_px(iteration)
 move_command_delta_mm(move, command_axis)
 move_requested_position_mm(move, command_axis)
 move_final_readback_position_mm(move, command_axis)
+move_pre_weighted_residual_px(move)
+move_post_weighted_residual_px(move)
+move_predicted_delta_px(move, camera, pixel_axis)
+move_measured_delta_px(move, camera, pixel_axis)
+move_visual_jacobian_before_px_per_cmd_mm(move, camera, pixel_axis, command_axis)
+move_visual_jacobian_after_px_per_cmd_mm(move, camera, pixel_axis, command_axis)
 move_gain(move)
 move_damping_mu(move)
+move_max_normalized_component(move)
+move_active_axis_mask(move, command_axis)
 move_jacobian_updated(move)
 ```
 
-The correction result omits redundant per-move state. Residual decrease can be
-recovered from consecutive `iteration_weighted_residual_px` values, and the
-final gain/damping are stored as summary attributes.
+The correction result keeps per-move diagnostic state because that dataset is
+also used as the on-disk correction log. For a calibration file such as
+`calibration.h5`, corrections are saved next to it in
+`calibration_corrections.h5`. Each correction run is written to an HDF5 group
+named `run_000000`, `run_000001`, and so on. During an active correction, the
+current run group is rewritten after every completed motor move, so the file
+contains the latest available residual trace, move commands, measured image
+response, and Jacobian before/after any accepted Broyden update.
 
 At result assembly, the reported command offset is computed from the current
 image residual as
