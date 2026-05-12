@@ -839,6 +839,51 @@ class CorrectionTests(unittest.TestCase):
             [[True, False, False]],
         )
 
+    def test_correction_move_disables_motor_backlash_prepositioning(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self.save_calibration(tmpdir)
+            calibration = calibration_dataset()
+            offset_mm = np.array([0.020, 0.0, 0.0], dtype=float)
+            p0 = (
+                calibration["visual_jacobian_px_per_cmd_mm"].values.reshape(
+                    len(CAMERAS) * len(PIXEL_AXES), len(COMMAND_AXES)
+                )
+                @ offset_mm
+            ).reshape(len(CAMERAS), len(PIXEL_AXES))
+            p1 = np.zeros((len(CAMERAS), len(PIXEL_AXES)), dtype=float)
+            expected_delta = solve_damped_command_correction(
+                calibration["visual_jacobian_px_per_cmd_mm"].values,
+                shift_dataset(p0),
+                calibration["axis_scale_cmd_mm"].values,
+                gain=0.3,
+                damping_mu=constants.DEFAULT_CORRECTION_DAMPING_MU,
+            )
+            self.assertLess(
+                abs(expected_delta[0]),
+                constants.MOTOR_BACKLASH_CORRECTION["x"],
+            )
+            hardware_patches = self.patch_hardware(
+                [shift_dataset(p0), shift_dataset(p1)],
+                positions=(0.5, 0.0, 0.0),
+            )
+            with (
+                hardware_patches[0],
+                hardware_patches[1],
+                hardware_patches[2],
+                patch(
+                    "merlin_track_position.tracking.correct.move_motors_and_wait",
+                    return_value=(0.5 + expected_delta[0],),
+                ) as move,
+            ):
+                do_correction(path, capture_count=1, max_moves=1)
+
+        self.assertEqual(move.call_args.args[0], ("x",))
+        np.testing.assert_allclose(
+            np.asarray(move.call_args.args[1], dtype=float),
+            np.asarray([0.5 + expected_delta[0]], dtype=float),
+        )
+        self.assertEqual(move.call_args.kwargs["backlash_correction"], {})
+
     def test_residual_improvement_refines_jacobian_and_updates_file(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = self.save_calibration(tmpdir)

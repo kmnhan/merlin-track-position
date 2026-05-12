@@ -24,6 +24,7 @@ class FakeBCSServer:
         status=BCSz.MotorStatus.MOVE_COMPLETE.value,
         move_responses=(),
         get_motor_responses=(),
+        goal_latched_by_move=(),
     ):
         self._final_positions_by_move = [
             tuple(positions) for positions in final_positions_by_move
@@ -32,7 +33,10 @@ class FakeBCSServer:
         self._status = int(status)
         self._move_responses = list(move_responses)
         self._get_motor_responses = list(get_motor_responses)
+        self._goal_latched_by_move = list(goal_latched_by_move)
         self._positions_by_motor = {}
+        self._goals_by_motor = {}
+        self._times_by_motor = {}
         self.move_calls = []
 
     def move_motor(self, *, motors, goals):
@@ -53,9 +57,17 @@ class FakeBCSServer:
         move_index = min(
             len(self.move_calls) - 1, len(self._final_positions_by_move) - 1
         )
+        latch_goal = (
+            self._goal_latched_by_move[move_index]
+            if move_index < len(self._goal_latched_by_move)
+            else True
+        )
         final_positions = self._final_positions_by_move[move_index]
-        for motor, position in zip(motors, final_positions, strict=True):
+        for motor, goal, position in zip(motors, goals, final_positions, strict=True):
+            if latch_goal:
+                self._goals_by_motor[motor] = float(goal)
             self._positions_by_motor[motor] = position
+            self._times_by_motor[motor] = len(self.move_calls)
         return response
 
     def get_motor(self, *, motors):
@@ -69,7 +81,9 @@ class FakeBCSServer:
             "data": [
                 {
                     "position": self._positions_by_motor[motor],
+                    "goal": self._goals_by_motor[motor],
                     "status": self._status,
+                    "time": self._times_by_motor[motor],
                 }
                 for motor in motors
             ],
@@ -79,6 +93,8 @@ class FakeBCSServer:
         if self._positions_by_motor:
             for motor in motors:
                 self._positions_by_motor.setdefault(motor, 0.0)
+                self._goals_by_motor.setdefault(motor, self._positions_by_motor[motor])
+                self._times_by_motor.setdefault(motor, 0)
             return
 
         if self._initial_positions:
@@ -86,6 +102,8 @@ class FakeBCSServer:
                 self._positions_by_motor[motor] = position
         for motor in motors:
             self._positions_by_motor.setdefault(motor, 0.0)
+            self._goals_by_motor.setdefault(motor, self._positions_by_motor[motor])
+            self._times_by_motor.setdefault(motor, 0)
 
     def _next_response(self, responses, default, motors):
         if not responses:
@@ -97,17 +115,37 @@ class FakeBCSServer:
         return response
 
 
-def _get_motor_response(positions, status=BCSz.MotorStatus.MOVE_COMPLETE.value):
+def _get_motor_response(
+    positions,
+    status=BCSz.MotorStatus.MOVE_COMPLETE.value,
+    goals=None,
+    times=None,
+):
     if isinstance(status, tuple):
         statuses = status
     else:
         statuses = (status,) * len(positions)
+    if goals is None:
+        goals = positions
+    if times is None:
+        times = (0,) * len(positions)
     return {
         "success": True,
         "not_found": [],
         "data": [
-            {"position": position, "status": motor_status}
-            for position, motor_status in zip(positions, statuses, strict=True)
+            {
+                "position": position,
+                "goal": goal,
+                "status": motor_status,
+                "time": readback_time,
+            }
+            for position, goal, motor_status, readback_time in zip(
+                positions,
+                goals,
+                statuses,
+                times,
+                strict=True,
+            )
         ],
     }
 
@@ -432,7 +470,9 @@ class MoveMotorsAndWaitTests(unittest.TestCase):
                 {
                     "success": True,
                     "not_found": [],
-                    "data": [{"position": 1.0, "status": "bad"}],
+                    "data": [
+                        {"position": 1.0, "goal": 1.0, "status": "bad", "time": 0}
+                    ],
                 },
             ],
         )
@@ -503,6 +543,30 @@ class MoveMotorsAndWaitTests(unittest.TestCase):
             )
 
         self.assertEqual(positions, (10.0005, 2.004))
+        self.assertEqual(len(server.move_calls), 1)
+
+    def test_raw_move_complete_accepts_position_readback_without_stale_delay(self):
+        server = FakeBCSServer(
+            [(10.0005,)],
+            status=BCSz.MotorStatus.RAW_MOVE_COMPLETE.value,
+        )
+
+        with (
+            patch("merlin_track_position.instruments.motors.time.sleep"),
+            patch(
+                "merlin_track_position.instruments.motors.time.monotonic",
+                side_effect=[0.0, 0.0],
+            ),
+        ):
+            positions = _move_motors_and_wait(
+                server,
+                ("x",),
+                (10.0,),
+                max_retries=3,
+                backlash_correction={},
+            )
+
+        self.assertEqual(positions, (10.0005,))
         self.assertEqual(len(server.move_calls), 1)
 
     def test_stale_status_does_not_accept_position_readback_before_delay(self):
@@ -621,6 +685,82 @@ class MoveMotorsAndWaitTests(unittest.TestCase):
         self.assertAlmostEqual(server.move_calls[0][1][0], 0.005)
         self.assertEqual(server.move_calls[1][0], (MOTOR_NAMES["x"], MOTOR_NAMES["y"]))
         self.assertEqual(server.move_calls[1][1], (0.02, 2.0))
+
+    def test_backlash_preposition_is_retried_when_raw_complete_without_motion(self):
+        server = FakeBCSServer(
+            [
+                (0.5,),
+                (0.395,),
+                (0.495,),
+            ],
+            initial_positions=(0.5,),
+            status=BCSz.MotorStatus.RAW_MOVE_COMPLETE.value,
+        )
+
+        with (
+            patch("merlin_track_position.instruments.motors.time.sleep"),
+            patch(
+                "merlin_track_position.instruments.motors.time.monotonic",
+                side_effect=[
+                    0.0,
+                    constants.MOTOR_STALE_READBACK_DELAY_S,
+                    constants.MOTOR_STALE_READBACK_DELAY_S,
+                    constants.MOTOR_STALE_READBACK_DELAY_S,
+                    constants.MOTOR_STALE_READBACK_DELAY_S,
+                    constants.MOTOR_STALE_READBACK_DELAY_S,
+                ],
+            ),
+        ):
+            positions = _move_motors_and_wait(
+                server,
+                ("x",),
+                (0.495,),
+                max_retries=1,
+                backlash_correction={"x": 0.1},
+            )
+
+        self.assertEqual(positions, (0.495,))
+        self.assertEqual(
+            server.move_calls,
+            [
+                ((MOTOR_NAMES["x"],), (0.395,)),
+                ((MOTOR_NAMES["x"],), (0.395,)),
+                ((MOTOR_NAMES["x"],), (0.495,)),
+            ],
+        )
+
+    def test_raw_complete_without_goal_latch_reports_goal_did_not_latch(self):
+        server = FakeBCSServer(
+            [
+                (0.5,),
+            ],
+            initial_positions=(0.5,),
+            status=BCSz.MotorStatus.RAW_MOVE_COMPLETE.value,
+            goal_latched_by_move=[False],
+        )
+
+        with (
+            patch("merlin_track_position.instruments.motors.time.sleep"),
+            patch(
+                "merlin_track_position.instruments.motors.time.monotonic",
+                side_effect=[0.0, constants.MOTOR_STALE_READBACK_DELAY_S],
+            ),
+            self.assertRaisesRegex(TimeoutError, "goal_did_not_latch"),
+        ):
+            _move_motors_and_wait(
+                server,
+                ("x",),
+                (0.395,),
+                max_retries=0,
+                backlash_correction={},
+            )
+
+        self.assertEqual(
+            server.move_calls,
+            [
+                ((MOTOR_NAMES["x"],), (0.395,)),
+            ],
+        )
 
     def test_requested_axes_are_sent_even_when_already_close(self):
         server = FakeBCSServer(

@@ -343,6 +343,9 @@ def do_correction(
             active_axes,
             active_requested_position_mm,
             max_retries=max_retries,
+            # Correction moves are already closed-loop and can be micron-scale.
+            # Do not expand a small correction into a large backlash pre-position.
+            backlash_correction={},
         )
         logger.info("Correction motor move returned; reading final x/y/z positions.")
         final_readback_mm = np.asarray(

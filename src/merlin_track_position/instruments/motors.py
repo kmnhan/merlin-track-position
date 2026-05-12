@@ -13,6 +13,10 @@ logger = logging.getLogger("merlin_track_position.instruments.motors")
 DEFAULT_MOVE_TIMEOUT_S = 60.0
 
 
+class _MotorMoveDidNotStartError(TimeoutError):
+    pass
+
+
 @contextlib.contextmanager
 def _bcs_server_context():
     server = BCSz.BCSServer()
@@ -35,7 +39,7 @@ def _configure_bcs_socket_timeouts(server: BCSz.BCSServer) -> None:
 
 def _get_motor_info(
     bcs_server: BCSz.BCSServer, motor_aliases: Iterable[str], keys: Iterable[str]
-) -> tuple[tuple[float, ...], ...]:
+) -> tuple[tuple[object, ...], ...]:
     aliases = tuple(motor_aliases)
     bcs_motor_names = _bcs_motor_names(aliases)
     keys = tuple(keys)
@@ -67,7 +71,10 @@ def _get_motor_info(
 def _get_positions(
     bcs_server: BCSz.BCSServer, motor_aliases: Iterable[str]
 ) -> tuple[float, ...]:
-    return _get_motor_info(bcs_server, motor_aliases, ("position",))[0]
+    return tuple(
+        float(position)
+        for position in _get_motor_info(bcs_server, motor_aliases, ("position",))[0]
+    )
 
 
 def _wait_until_move_complete(
@@ -76,9 +83,12 @@ def _wait_until_move_complete(
     goals: Iterable[float],
     *,
     timeout_s: float = DEFAULT_MOVE_TIMEOUT_S,
+    start_positions: Iterable[float] | None = None,
 ) -> tuple[float, ...]:
     motor_aliases = tuple(motor_aliases)
     goals = tuple(float(goal) for goal in goals)
+    if start_positions is not None:
+        start_positions = tuple(float(position) for position in start_positions)
     timeout_s = _validate_move_timeout(timeout_s)
     stale_readback_deadbands = _stale_readback_deadbands(motor_aliases)
     stale_readback_delay_s = _stale_readback_delay_s()
@@ -94,19 +104,25 @@ def _wait_until_move_complete(
         timeout_s,
     )
     while True:
-        positions, status = _get_motor_info(
-            bcs_server, motor_aliases, ("position", "status")
+        positions, status, goal_readbacks, readback_times = _get_motor_info(
+            bcs_server,
+            motor_aliases,
+            ("position", "status", "goal", "time"),
         )
+        positions = tuple(float(position) for position in positions)
+        status = tuple(int(motor_status) for motor_status in status)
+        goal_readbacks = tuple(float(goal) for goal in goal_readbacks)
         elapsed_s = time.monotonic() - started_at
-        if all(
-            BCSz.MotorStatus(s).is_set(BCSz.MotorStatus.MOVE_COMPLETE) for s in status
-        ):
+        goal_latched = _positions_within_deadband(
+            goal_readbacks,
+            goals,
+            stale_readback_deadbands,
+        )
+        if _motor_statuses_all_set(status, BCSz.MotorStatus.MOVE_COMPLETE):
             time.sleep(0.25)
 
             # Get the final positions one more time just to be extra careful
-            positions, _ = _get_motor_info(
-                bcs_server, motor_aliases, ("position", "status")
-            )
+            positions = _get_positions(bcs_server, motor_aliases)
             logger.info(
                 "Motor move complete: motor_aliases=%s, positions=%s, elapsed_s=%.1f",
                 motor_aliases,
@@ -114,6 +130,53 @@ def _wait_until_move_complete(
                 time.monotonic() - started_at,
             )
             return positions
+        if _motor_statuses_all_set(
+            status,
+            BCSz.MotorStatus.RAW_MOVE_COMPLETE,
+        ) and _positions_within_deadband(
+            positions,
+            goals,
+            stale_readback_deadbands,
+        ):
+            logger.info(
+                "Motor move accepted by raw-complete position readback: "
+                "motor_aliases=%s, positions=%s, goals=%s, "
+                "goal_readbacks=%s, readback_times=%s, "
+                "stale_readback_deadbands=%s, status=%s, elapsed_s=%.1f",
+                motor_aliases,
+                positions,
+                goals,
+                goal_readbacks,
+                readback_times,
+                stale_readback_deadbands,
+                status,
+                elapsed_s,
+            )
+            return positions
+        if (
+            start_positions is not None
+            and elapsed_s >= stale_readback_delay_s
+            and _motor_statuses_all_set(status, BCSz.MotorStatus.RAW_MOVE_COMPLETE)
+            and _positions_within_deadband(
+                positions,
+                start_positions,
+                stale_readback_deadbands,
+            )
+        ):
+            stall_reason = (
+                "latched_but_position_did_not_move"
+                if goal_latched
+                else "goal_did_not_latch"
+            )
+            raise _MotorMoveDidNotStartError(
+                "Motor move did not start: "
+                f"reason={stall_reason}, "
+                f"motor_aliases={motor_aliases}, goals={goals}, "
+                f"goal_readbacks={goal_readbacks}, start_positions={start_positions}, "
+                f"positions={positions}, readback_times={readback_times}, "
+                f"stale_readback_deadbands={stale_readback_deadbands}, "
+                f"status={status}, elapsed_s={elapsed_s:.1f}"
+            )
         if elapsed_s >= stale_readback_delay_s and _positions_within_deadband(
             positions,
             goals,
@@ -122,10 +185,13 @@ def _wait_until_move_complete(
             logger.info(
                 "Motor move accepted by stale-status position readback: "
                 "motor_aliases=%s, positions=%s, goals=%s, "
+                "goal_readbacks=%s, readback_times=%s, "
                 "stale_readback_deadbands=%s, status=%s, elapsed_s=%.1f",
                 motor_aliases,
                 positions,
                 goals,
+                goal_readbacks,
+                readback_times,
                 stale_readback_deadbands,
                 status,
                 elapsed_s,
@@ -138,18 +204,23 @@ def _wait_until_move_complete(
             raise TimeoutError(
                 "Timed out waiting for motor move completion: "
                 f"motor_aliases={motor_aliases}, goals={goals}, "
-                f"positions={positions}, position_errors={position_errors}, "
+                f"goal_readbacks={goal_readbacks}, positions={positions}, "
+                f"position_errors={position_errors}, readback_times={readback_times}, "
                 f"stale_readback_deadbands={stale_readback_deadbands}, "
                 f"status={status}, elapsed_s={elapsed_s:.1f}"
             )
         if elapsed_s >= next_log_elapsed_s:
             logger.info(
                 "Still waiting for motor move completion: motor_aliases=%s, "
-                "positions=%s, goals=%s, stale_readback_deadbands=%s, "
-                "status=%s, elapsed_s=%.1f",
+                "positions=%s, goals=%s, goal_readbacks=%s, readback_times=%s, "
+                "goal_latched=%s, stale_readback_deadbands=%s, status=%s, "
+                "elapsed_s=%.1f",
                 motor_aliases,
                 positions,
                 goals,
+                goal_readbacks,
+                readback_times,
+                goal_latched,
                 stale_readback_deadbands,
                 status,
                 elapsed_s,
@@ -214,31 +285,25 @@ def _move_motors_and_wait(
             pre_goals,
             _items_at(goals, pre_indices),
         )
-        _move_motor(
+        _move_motor_phase_and_wait(
             bcs_server,
             pre_aliases,
             pre_goals,
-        )
-        time.sleep(0.25)
-        _wait_until_move_complete(
-            bcs_server,
-            pre_aliases,
-            pre_goals,
+            phase="backlash_preposition",
+            max_retries=max_retries,
             timeout_s=move_timeout_s,
+            start_positions=_items_at(current_positions, pre_indices),
         )
+        current_positions = _get_positions(bcs_server, motor_aliases)
 
-    _move_motor(
+    _move_motor_phase_and_wait(
         bcs_server,
         motor_aliases,
         goals,
-    )
-    # wait just a bit to let the move begin.
-    time.sleep(0.25)
-    _wait_until_move_complete(
-        bcs_server,
-        motor_aliases,
-        goals,
+        phase="final",
+        max_retries=max_retries,
         timeout_s=move_timeout_s,
+        start_positions=current_positions,
     )
     final_positions = _get_positions(bcs_server, motor_aliases)
     logger.debug(
@@ -290,6 +355,72 @@ def _move_motor(
             f"timed_out={timed_out!r}; "
             f"{_bcs_response_context(aliases, bcs_motor_names, goals, response)}"
         )
+
+
+def _move_motor_phase_and_wait(
+    bcs_server: BCSz.BCSServer,
+    motor_aliases: Iterable[str],
+    goals: Iterable[float],
+    *,
+    phase: str,
+    max_retries: int,
+    timeout_s: float,
+    start_positions: Iterable[float] | None = None,
+) -> tuple[float, ...]:
+    aliases = tuple(motor_aliases)
+    goals = tuple(float(goal) for goal in goals)
+    if start_positions is not None:
+        start_positions = tuple(float(position) for position in start_positions)
+
+    for attempt_index in range(max_retries + 1):
+        if start_positions is None or attempt_index > 0:
+            start_positions = _get_positions(bcs_server, aliases)
+        logger.info(
+            "Starting motor move phase: phase=%s, attempt=%d/%d, "
+            "motor_aliases=%s, goals=%s, start_positions=%s",
+            phase,
+            attempt_index + 1,
+            max_retries + 1,
+            aliases,
+            goals,
+            start_positions,
+        )
+        _move_motor(
+            bcs_server,
+            aliases,
+            goals,
+        )
+        # wait just a bit to let the move begin.
+        time.sleep(0.25)
+        try:
+            return _wait_until_move_complete(
+                bcs_server,
+                aliases,
+                goals,
+                timeout_s=timeout_s,
+                start_positions=start_positions,
+            )
+        except _MotorMoveDidNotStartError as exc:
+            if attempt_index >= max_retries:
+                raise TimeoutError(
+                    "Motor move did not start after retries: "
+                    f"phase={phase}, attempts={max_retries + 1}, "
+                    f"motor_aliases={aliases}, goals={goals}, "
+                    f"start_positions={start_positions}, last_error={exc}"
+                ) from exc
+            logger.warning(
+                "Motor move did not start; retrying: phase=%s, attempt=%d/%d, "
+                "motor_aliases=%s, goals=%s, start_positions=%s, error=%s",
+                phase,
+                attempt_index + 1,
+                max_retries + 1,
+                aliases,
+                goals,
+                start_positions,
+                exc,
+            )
+
+    raise AssertionError("unreachable move retry loop exit")
 
 
 def _bcs_motor_names(motor_aliases: Iterable[str]) -> tuple[str, ...]:
@@ -372,7 +503,7 @@ def _validated_get_motor_data(
     return motor_data
 
 
-def _validated_motor_field(motor: Mapping, key: str) -> float | int:
+def _validated_motor_field(motor: Mapping, key: str) -> object:
     value = motor[key]
     if key == "status":
         if isinstance(value, bool):
@@ -389,15 +520,15 @@ def _validated_motor_field(motor: Mapping, key: str) -> float | int:
             raise RuntimeError("BCS GetMotor returned malformed status field") from exc
         return status
 
-    if key == "position":
+    if key in {"position", "goal"}:
         try:
             position = float(value)
         except (TypeError, ValueError) as exc:
             raise RuntimeError(
-                "BCS GetMotor returned malformed position field"
+                f"BCS GetMotor returned malformed {key} field"
             ) from exc
         if not np.isfinite(position):
-            raise RuntimeError("BCS GetMotor returned malformed position field")
+            raise RuntimeError(f"BCS GetMotor returned malformed {key} field")
         return position
 
     return value
@@ -489,6 +620,13 @@ def _positions_within_deadband(
     )
 
 
+def _motor_statuses_all_set(
+    statuses: Iterable[int],
+    flag: BCSz.MotorStatus,
+) -> bool:
+    return all(BCSz.MotorStatus(status).is_set(flag) for status in statuses)
+
+
 def _items_at(values: Iterable, indices: Iterable[int]) -> tuple:
     values_tuple = tuple(values)
     return tuple(values_tuple[index] for index in indices)
@@ -570,8 +708,9 @@ def move_motors_and_wait(
     goals
         Iterable of goal positions corresponding to motor_aliases, e.g. (1.0, 2.0).
     max_retries
-        Retained for API compatibility; motor completion is controlled by controller
-        status, stale-status readback fallback, and ``move_timeout_s``.
+        Number of times to reissue a move phase when the controller reports raw
+        completion but readback remains at the pre-move position outside the
+        goal deadband.
     move_timeout_s
         Maximum time to wait for each move phase to either report complete or, after
         the stale-readback delay, reach its requested readback position. Default is
