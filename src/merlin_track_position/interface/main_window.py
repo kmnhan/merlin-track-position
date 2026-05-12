@@ -71,6 +71,19 @@ ROI_METADATA_KEYS: dict[str, tuple[str, str, str, str]] = {
     )
     for camera in CAMERA_IMAGE_SIZES
 }
+ROI_SCALE_HANDLES: tuple[
+    tuple[tuple[float, float], tuple[float, float]],
+    ...,
+] = (
+    ((1.0, 1.0), (0.0, 0.0)),
+    ((1.0, 0.5), (0.0, 0.5)),
+    ((0.5, 1.0), (0.5, 0.0)),
+    ((0.0, 0.0), (1.0, 1.0)),
+    ((1.0, 0.0), (0.0, 1.0)),
+    ((0.0, 1.0), (1.0, 0.0)),
+    ((0.5, 0.0), (0.5, 1.0)),
+    ((0.0, 0.5), (1.0, 0.5)),
+)
 
 
 def _default_roi_geometry(
@@ -139,6 +152,20 @@ def _roi_geometries_from_calibration_metadata(
             image_height,
         )
     return geometries
+
+
+def _add_roi_scale_handles(roi: pg.RectROI) -> None:
+    if len(roi.getHandles()) == len(ROI_SCALE_HANDLES):
+        return
+
+    _remove_roi_scale_handles(roi)
+    for position, center in ROI_SCALE_HANDLES:
+        roi.addScaleHandle(position, center)
+
+
+def _remove_roi_scale_handles(roi: pg.RectROI) -> None:
+    for handle in list(roi.getHandles()):
+        roi.removeHandle(handle)
 
 
 class CalibrationStartDialog(QtWidgets.QDialog):
@@ -316,16 +343,12 @@ class _MainWindowGUI(QtWidgets.QMainWindow):
             image_roi = pg.RectROI(
                 roi_geometry[:2],
                 roi_geometry[2:],
-                sideScalers=True,
+                sideScalers=False,
                 maxBounds=QtCore.QRectF(0.0, 0.0, image_width, image_height),
                 pen=pg.mkPen("#008c99", width=2),
                 hoverPen=pg.mkPen("#00c2d1", width=2),
             )
-            image_roi.addScaleHandle((0.0, 0.0), (1.0, 1.0))
-            image_roi.addScaleHandle((1.0, 0.0), (0.0, 1.0))
-            image_roi.addScaleHandle((0.0, 1.0), (1.0, 0.0))
-            image_roi.addScaleHandle((0.5, 0.0), (0.5, 1.0))
-            image_roi.addScaleHandle((0.0, 0.5), (1.0, 0.5))
+            _add_roi_scale_handles(image_roi)
             image_roi.setZValue(10)
             image_plot.addItem(image_roi)
 
@@ -462,9 +485,22 @@ class MainWindow(_MainWindowGUI):
         enabled = bool(enabled)
         self._roi_editing_enabled = enabled
         for roi in self.image_rois.values():
-            roi.translatable = enabled
-            for handle in roi.getHandles():
-                handle.setVisible(enabled)
+            was_blocked = roi.blockSignals(True)
+            try:
+                roi.setSelected(False)
+                roi.translatable = enabled
+                roi.rotatable = enabled
+                roi.resizable = enabled
+                if enabled:
+                    _add_roi_scale_handles(roi)
+                else:
+                    _remove_roi_scale_handles(roi)
+                for handle in roi.getHandles():
+                    handle.setEnabled(enabled)
+                    handle.setVisible(enabled)
+            finally:
+                roi.blockSignals(was_blocked)
+            roi.update()
 
     def _on_roi_region_change_finished(self, camera: str) -> None:
         if self._calibration is not None or not self._roi_editing_enabled:

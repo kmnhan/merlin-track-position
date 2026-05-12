@@ -158,10 +158,13 @@ def patched_main_window_runtime(settings=None):
 
 def roi_handles_visible(window):
     return all(
-        handle.isVisible()
-        for roi in window.image_rois.values()
-        for handle in roi.getHandles()
+        handles and all(handle.isVisible() for handle in handles)
+        for handles in (roi.getHandles() for roi in window.image_rois.values())
     )
+
+
+def roi_handle_count(window):
+    return sum(len(roi.getHandles()) for roi in window.image_rois.values())
 
 
 def roi_editing_enabled(window):
@@ -409,6 +412,29 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                 window._on_roi_region_change_finished("cam0")
 
                 self.assertEqual(settings.set_calls, [])
+            finally:
+                window.close()
+
+    def test_locked_roi_handles_stay_hidden_if_roi_is_selected_again(self):
+        get_qapp()
+        with patched_main_window_runtime():
+            window = MainWindow()
+            try:
+                self.assertEqual(roi_handle_count(window), 16)
+
+                window._set_roi_editing_enabled(False)
+                for roi in window.image_rois.values():
+                    roi.setSelected(True)
+
+                self.assertEqual(roi_handle_count(window), 0)
+                self.assertFalse(roi_handles_visible(window))
+                self.assertFalse(roi_editing_enabled(window))
+
+                window._set_roi_editing_enabled(True)
+
+                self.assertEqual(roi_handle_count(window), 16)
+                self.assertTrue(roi_handles_visible(window))
+                self.assertTrue(roi_editing_enabled(window))
             finally:
                 window.close()
 
