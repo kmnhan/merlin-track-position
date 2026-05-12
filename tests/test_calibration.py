@@ -100,6 +100,17 @@ def x_shift(value: float) -> np.ndarray:
     return np.array([[float(value), 0.0], [0.0, 0.0]], dtype=float)
 
 
+def assert_hdf5_image_dataset_compressed(
+    test_case: unittest.TestCase,
+    dataset: h5py.Dataset,
+    expected_dtype,
+) -> None:
+    test_case.assertEqual(dataset.dtype, np.dtype(expected_dtype))
+    test_case.assertEqual(dataset.compression, "gzip")
+    test_case.assertEqual(dataset.compression_opts, 4)
+    test_case.assertTrue(dataset.shuffle)
+
+
 def calibration_dataset(jacobian=None):
     if jacobian is None:
         jacobian = visual_jacobian()
@@ -205,6 +216,65 @@ class VisualCalibrationTests(unittest.TestCase):
             calibration["visual_jacobian_px_per_cmd_mm"].values,
             expected,
             atol=1e-10,
+        )
+
+    def test_fitted_visual_calibration_preserves_reference_image_dtype(self):
+        command_delta = probe_deltas()
+        expected = visual_jacobian()
+        measured = measured_from_jacobian(command_delta, expected)
+        shift_values = iter(
+            measured[probe_index, camera_index]
+            for probe_index in range(command_delta.shape[0])
+            for camera_index in range(len(CAMERAS))
+        )
+
+        def fake_estimate_shift(reference, current, **kwargs):
+            del reference, current, kwargs
+            return xr.Dataset(
+                {"shift_px": (("pixel_axis",), next(shift_values))},
+                coords={"pixel_axis": list(PIXEL_AXES)},
+                attrs={"warnings": ""},
+            )
+
+        pre = np.zeros_like(command_delta)
+        post = pre + command_delta
+        reference_cam0 = np.arange(8 * 9, dtype=np.uint16).reshape(8, 9)
+        reference_cam1 = (
+            np.arange(8 * 9, dtype=np.uint16).reshape(8, 9) + np.uint16(100)
+        )
+        capture_stacks = [
+            np.zeros((1, 8, 9), dtype=np.uint16)
+            for _ in range(len(command_delta))
+        ]
+        with patch(
+            "merlin_track_position.tracking.calibration_core.estimate_shift",
+            side_effect=fake_estimate_shift,
+        ):
+            calibration = fit_visual_jacobian_calibration(
+                reference_cam0=reference_cam0,
+                reference_cam1=reference_cam1,
+                before_images_cam0=capture_stacks,
+                after_images_cam0=capture_stacks,
+                before_images_cam1=capture_stacks,
+                after_images_cam1=capture_stacks,
+                command_delta_mm=command_delta,
+                pre_commanded_position_mm=pre,
+                post_commanded_position_mm=post,
+                pre_readback_position_mm=pre,
+                post_readback_position_mm=post,
+                min_shift_px=0.0,
+                n_jobs=1,
+            )
+
+        self.assertEqual(calibration["reference_cam0"].dtype, np.dtype(np.uint16))
+        self.assertEqual(calibration["reference_cam1"].dtype, np.dtype(np.uint16))
+        np.testing.assert_array_equal(
+            calibration["reference_cam0"].values,
+            reference_cam0,
+        )
+        np.testing.assert_array_equal(
+            calibration["reference_cam1"].values,
+            reference_cam1,
         )
 
     def test_axis_scale_is_derived_from_jacobian_and_clamped(self):
@@ -339,6 +409,69 @@ class VisualCalibrationTests(unittest.TestCase):
         for name in redundant_attrs:
             self.assertNotIn(name, raw_dataset.attrs)
         self.assertEqual(loaded.attrs["calibration_path"], str(path))
+
+    def test_saved_calibration_compresses_reference_images_and_preserves_dtype(self):
+        dataset = calibration_dataset()
+        reference_cam0 = np.arange(4 * 5, dtype=np.uint16).reshape(4, 5)
+        reference_cam1 = np.arange(6 * 7, dtype=np.uint16).reshape(6, 7)
+        dataset["reference_cam0"] = (("y_cam0", "x_cam0"), reference_cam0)
+        dataset["reference_cam1"] = (("y_cam1", "x_cam1"), reference_cam1)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "calibration.h5"
+            save_calibration_dataset(dataset, path)
+            with h5py.File(path, "r") as saved_file:
+                assert_hdf5_image_dataset_compressed(
+                    self,
+                    saved_file["reference_cam0"],
+                    np.uint16,
+                )
+                assert_hdf5_image_dataset_compressed(
+                    self,
+                    saved_file["reference_cam1"],
+                    np.uint16,
+                )
+                self.assertIsNone(saved_file["probe_command_delta_mm"].compression)
+            loaded = load_calibration_dataset(path)
+
+        self.assertEqual(loaded["reference_cam0"].dtype, np.dtype(np.uint16))
+        self.assertEqual(loaded["reference_cam1"].dtype, np.dtype(np.uint16))
+        np.testing.assert_array_equal(loaded["reference_cam0"].values, reference_cam0)
+        np.testing.assert_array_equal(loaded["reference_cam1"].values, reference_cam1)
+
+    def test_spooled_calibration_write_compresses_reference_images(self):
+        dataset = calibration_dataset()
+        dataset["reference_cam0"] = (
+            ("y_cam0", "x_cam0"),
+            np.arange(4 * 5, dtype=np.uint16).reshape(4, 5),
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            spool_path = tmp_path / "spool"
+            path = tmp_path / "calibration.h5"
+            with (
+                patch.dict(
+                    os.environ,
+                    {"MERLIN_TRACK_POSITION_SPOOL_DIR": str(spool_path)},
+                ),
+                patch(
+                    "merlin_track_position.tracking.calibration_core."
+                    "save_calibration_dataset",
+                    side_effect=OSError("locked"),
+                ),
+            ):
+                result = save_calibration_dataset_deferred(dataset, path)
+
+            self.assertTrue(result.pending)
+            self.assertIsNotNone(result.spool_path)
+            assert result.spool_path is not None
+            with h5py.File(result.spool_path / "data.h5", "r") as saved_file:
+                assert_hdf5_image_dataset_compressed(
+                    self,
+                    saved_file["reference_cam0"],
+                    np.uint16,
+                )
 
     def test_stale_queued_calibration_write_is_not_flushed_over_changed_target(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -619,7 +752,52 @@ class CorrectionTests(unittest.TestCase):
 
         move.assert_not_called()
         self.assertFalse(result.attrs["correction_converged"])
-        self.assertIn("below the minimum command norm", result.attrs["warnings"])
+        self.assertIn(
+            "estimated command offset is within correction deadbands",
+            result.attrs["warnings"],
+        )
+
+    def test_offset_above_deadband_is_corrected_when_gained_step_is_small(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self.save_calibration(tmpdir)
+            calibration = calibration_dataset()
+            offset_mm = np.array([0.0, 0.020, 0.0], dtype=float)
+            p0 = (
+                calibration["visual_jacobian_px_per_cmd_mm"]
+                .values.reshape(len(CAMERAS) * len(PIXEL_AXES), len(COMMAND_AXES))
+                @ offset_mm
+            ).reshape(len(CAMERAS), len(PIXEL_AXES))
+            p1 = np.zeros((len(CAMERAS), len(PIXEL_AXES)), dtype=float)
+            expected_delta = solve_damped_command_correction(
+                calibration["visual_jacobian_px_per_cmd_mm"].values,
+                shift_dataset(p0),
+                calibration["axis_scale_cmd_mm"].values,
+                gain=0.3,
+                damping_mu=constants.DEFAULT_CORRECTION_DAMPING_MU,
+            )
+            self.assertLess(
+                abs(expected_delta[1]),
+                constants.CORRECTION_COMMAND_DEADBAND_MM_BY_AXIS["y"],
+            )
+            hardware_patches = self.patch_hardware(
+                [shift_dataset(p0), shift_dataset(p1)]
+            )
+            with (
+                hardware_patches[0],
+                hardware_patches[1],
+                hardware_patches[2],
+                patch(
+                    "merlin_track_position.tracking.correct.move_motors_and_wait",
+                    Mock(),
+                ) as move,
+            ):
+                do_correction(path, capture_count=1, max_moves=1)
+
+        self.assertEqual(move.call_args.args[0], ("y",))
+        np.testing.assert_allclose(
+            np.asarray(move.call_args.args[1], dtype=float),
+            np.asarray([20.0 + expected_delta[1]], dtype=float),
+        )
 
     def test_correction_command_deadband_uses_correction_specific_constants(self):
         correction = correct_module._zero_deadband_axis_corrections(
@@ -631,8 +809,14 @@ class CorrectionTests(unittest.TestCase):
     def test_zeroed_axes_are_not_sent_to_motor_move(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = self.save_calibration(tmpdir)
-            p0 = x_shift(20.0)
-            p1 = x_shift(10.0)
+            calibration = calibration_dataset()
+            offset_mm = np.array([0.020, 0.0, 0.0], dtype=float)
+            p0 = (
+                calibration["visual_jacobian_px_per_cmd_mm"]
+                .values.reshape(len(CAMERAS) * len(PIXEL_AXES), len(COMMAND_AXES))
+                @ offset_mm
+            ).reshape(len(CAMERAS), len(PIXEL_AXES))
+            p1 = np.zeros((len(CAMERAS), len(PIXEL_AXES)), dtype=float)
             hardware_patches = self.patch_hardware(
                 [shift_dataset(p0), shift_dataset(p1)]
             )
@@ -735,6 +919,50 @@ class CorrectionTests(unittest.TestCase):
         self.assertIn("move_predicted_delta_px", saved)
         self.assertIn("move_visual_jacobian_before_px_per_cmd_mm", saved)
         self.assertIn("move_visual_jacobian_after_px_per_cmd_mm", saved)
+
+    def test_correction_history_compresses_current_images_and_preserves_dtype(self):
+        result = shift_dataset(x_shift(1.0)).assign_attrs(
+            {
+                "calibration_path": "calibration.h5",
+                "correction_history_completed": True,
+            }
+        )
+        current_cam0 = np.arange(4 * 5, dtype=np.uint16).reshape(4, 5)
+        current_cam1 = np.arange(6 * 7, dtype=np.uint16).reshape(6, 7)
+        result["current_cam0"] = (("y_cam0", "x_cam0"), current_cam0)
+        result["current_cam1"] = (("y_cam1", "x_cam1"), current_cam1)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            history_path = Path(tmpdir) / "correction-history.h5"
+            correct_module.save_correction_history_dataset(
+                result,
+                history_path,
+                run_id=0,
+            )
+            with h5py.File(history_path, "r") as history_file:
+                group = history_file["run_000000"]
+                assert_hdf5_image_dataset_compressed(
+                    self,
+                    group["current_cam0"],
+                    np.uint16,
+                )
+                assert_hdf5_image_dataset_compressed(
+                    self,
+                    group["current_cam1"],
+                    np.uint16,
+                )
+                self.assertIsNone(group["shift_px"].compression)
+            with xr.open_dataset(
+                history_path,
+                engine="h5netcdf",
+                group="run_000000",
+            ) as loaded_on_disk:
+                loaded = loaded_on_disk.load()
+
+        self.assertEqual(loaded["current_cam0"].dtype, np.dtype(np.uint16))
+        self.assertEqual(loaded["current_cam1"].dtype, np.dtype(np.uint16))
+        np.testing.assert_array_equal(loaded["current_cam0"].values, current_cam0)
+        np.testing.assert_array_equal(loaded["current_cam1"].values, current_cam1)
 
     def test_locked_correction_history_is_queued_and_flushes_later(self):
         with tempfile.TemporaryDirectory() as tmpdir:

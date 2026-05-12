@@ -14,6 +14,8 @@ import xarray as xr
 
 SPOOL_ENV_VAR = "MERLIN_TRACK_POSITION_SPOOL_DIR"
 SPOOL_SCHEMA_VERSION = 1
+HDF5_IMAGE_COMPRESSION = "gzip"
+HDF5_IMAGE_COMPRESSION_LEVEL = 4
 
 
 class PersistenceResult(NamedTuple):
@@ -87,6 +89,24 @@ def fingerprint_matches(
     return target_fingerprint(path) == expected
 
 
+def hdf5_image_encoding(dataset: xr.Dataset) -> dict[str, dict[str, Any]]:
+    """Return HDF5 compression settings for image-like data variables."""
+
+    encoding: dict[str, dict[str, Any]] = {}
+    for name, variable in dataset.data_vars.items():
+        dims = set(variable.dims)
+        if (
+            {"y_cam0", "x_cam0"}.issubset(dims)
+            or {"y_cam1", "x_cam1"}.issubset(dims)
+        ):
+            encoding[name] = {
+                "compression": HDF5_IMAGE_COMPRESSION,
+                "compression_opts": HDF5_IMAGE_COMPRESSION_LEVEL,
+                "shuffle": True,
+            }
+    return encoding
+
+
 def stage_dataset(
     dataset: xr.Dataset,
     target_path: str | Path,
@@ -117,7 +137,12 @@ def stage_dataset(
         entry_metadata.update(metadata)
 
     try:
-        dataset.load().to_netcdf(tmp_dir / "data.h5", engine="h5netcdf")
+        loaded = dataset.load()
+        loaded.to_netcdf(
+            tmp_dir / "data.h5",
+            engine="h5netcdf",
+            encoding=hdf5_image_encoding(loaded),
+        )
         _write_metadata(tmp_dir, entry_metadata)
         tmp_dir.rename(final_dir)
     except Exception:

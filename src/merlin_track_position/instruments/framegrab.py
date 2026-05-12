@@ -10,7 +10,7 @@ from merlin_track_position import constants
 from merlin_track_position.instruments.simulated_hardware import simulator
 
 
-def get_framegrabber_image(timeout_ms: int = 5000) -> npt.NDArray[np.float64]:
+def get_framegrabber_image(timeout_ms: int = 5000) -> npt.NDArray:
     """Request the latest image from the FrameGrabber LabVIEW panel.
 
     Parameters
@@ -47,4 +47,4 @@ def get_framegrabber_image(timeout_ms: int = 5000) -> npt.NDArray[np.float64]:
             : constants.IMAGE_HEIGHT_CAM0, : constants.IMAGE_WIDTH_CAM0
         ]
         .copy()
-    ).astype(np.float64)
+    )

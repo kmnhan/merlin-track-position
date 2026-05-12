@@ -29,7 +29,8 @@ MOTOR_BACKLASH_CORRECTION: dict[str, float] = {
 MOTOR_STALE_READBACK_DEADBAND: float = 0.001
 MOTOR_STALE_READBACK_DELAY_S: float = 5.0
 
-# Correction command pruning thresholds. Values are in commanded mm.
+# Correction offset pruning thresholds. Values are in commanded mm and are applied
+# to estimated command offsets before sending gain-scaled correction components.
 CORRECTION_COMMAND_DEADBAND_MM_BY_AXIS: dict[str, float] = {
     "x": 0.005,
     "y": 0.01,

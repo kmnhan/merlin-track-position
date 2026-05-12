@@ -1,3 +1,4 @@
+import json
 import unittest
 from unittest.mock import patch
 
@@ -165,6 +166,52 @@ class DevelopmentModeFramegrabTests(unittest.TestCase):
         )
         self.assertEqual(image.dtype, np.float64)
 
+    def test_daq_mode_framegrabber_image_preserves_source_dtype(self):
+        raw = np.arange(4 * 5, dtype=np.uint16).reshape(4, 5)
+        topic = "framegrabber/main "
+        metadata = json.dumps(
+            {"dtype": str(raw.dtype), "shape": list(raw.shape)}
+        ).encode("utf-8")
+        message = topic.encode("utf-8") + metadata + b"\n" + raw.tobytes()
+
+        class FakeSocket:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                del exc_type, exc, traceback
+
+            def setsockopt(self, *args):
+                del args
+
+            def setsockopt_string(self, *args):
+                del args
+
+            def connect(self, address):
+                del address
+
+            def recv(self):
+                return message
+
+        class FakeContext:
+            def socket(self, socket_type):
+                del socket_type
+                return FakeSocket()
+
+        with (
+            patch.object(constants, "IS_DAQ_PC", True),
+            patch.object(constants, "IMAGE_HEIGHT_CAM0", 3),
+            patch.object(constants, "IMAGE_WIDTH_CAM0", 4),
+            patch(
+                "merlin_track_position.instruments.framegrab.zmq.Context.instance",
+                return_value=FakeContext(),
+            ),
+        ):
+            image = get_framegrabber_image()
+
+        np.testing.assert_array_equal(image, raw[:3, :4])
+        self.assertEqual(image.dtype, np.uint16)
+
     def test_basler_configuration_sets_manual_exposure_and_expected_aoi(self):
         camera = FakeBaslerCamera()
 
@@ -195,9 +242,9 @@ class DevelopmentModeFramegrabTests(unittest.TestCase):
         ):
             image = get_basler_image()
 
-        np.testing.assert_array_equal(image, raw.astype(np.float64))
+        np.testing.assert_array_equal(image, raw)
         self.assertEqual(image.shape, (2, 3))
-        self.assertEqual(image.dtype, np.float64)
+        self.assertEqual(image.dtype, np.uint16)
 
     def test_daq_mode_basler_session_reuses_open_camera_for_consecutive_images(self):
         raw0 = np.arange(6, dtype=np.uint16).reshape(2, 3)
@@ -217,8 +264,10 @@ class DevelopmentModeFramegrabTests(unittest.TestCase):
             image0 = get_basler_image()
             image1 = get_basler_image()
 
-        np.testing.assert_array_equal(image0, raw0.astype(np.float64))
-        np.testing.assert_array_equal(image1, raw1.astype(np.float64))
+        np.testing.assert_array_equal(image0, raw0)
+        np.testing.assert_array_equal(image1, raw1)
+        self.assertEqual(image0.dtype, np.uint16)
+        self.assertEqual(image1.dtype, np.uint16)
         self.assertEqual(camera.open_count, 1)
         self.assertEqual(camera.start_grabbing_count, 1)
         self.assertEqual(camera.retrieve_result_count, 2)
@@ -249,8 +298,8 @@ class DevelopmentModeFramegrabTests(unittest.TestCase):
             basler.close_basler_camera()
             image1 = get_basler_image()
 
-        np.testing.assert_array_equal(image0, raw0.astype(np.float64))
-        np.testing.assert_array_equal(image1, raw1.astype(np.float64))
+        np.testing.assert_array_equal(image0, raw0)
+        np.testing.assert_array_equal(image1, raw1)
         self.assertEqual(camera0.stop_grabbing_count, 1)
         self.assertEqual(camera0.close_count, 1)
         self.assertEqual(camera1.open_count, 1)
@@ -279,7 +328,8 @@ class DevelopmentModeFramegrabTests(unittest.TestCase):
                 get_basler_image()
             image = get_basler_image()
 
-        np.testing.assert_array_equal(image, raw.astype(np.float64))
+        np.testing.assert_array_equal(image, raw)
+        self.assertEqual(image.dtype, np.uint16)
         self.assertEqual(failing_camera.stop_grabbing_count, 1)
         self.assertEqual(failing_camera.close_count, 1)
         self.assertEqual(recovered_camera.open_count, 1)

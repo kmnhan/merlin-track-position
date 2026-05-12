@@ -18,6 +18,7 @@ from merlin_track_position.tracking.persistence import (
     PersistenceResult,
     discard_spool_entry,
     fingerprint_matches,
+    hdf5_image_encoding,
     iter_pending_entries,
     load_spooled_dataset,
     mark_spool_entry_stale,
@@ -395,6 +396,8 @@ def validate_visual_calibration_dataset(dataset: xr.Dataset) -> None:
         raise ValueError("reference_cam0 and reference_cam1 must be 2D images")
     if reference_cam0.size == 0 or reference_cam1.size == 0:
         raise ValueError("reference images must not be empty")
+    _validate_real_finite_numeric_image("reference_cam0", reference_cam0)
+    _validate_real_finite_numeric_image("reference_cam1", reference_cam1)
 
     probe_count = command_delta.shape[0] if command_delta.ndim == 2 else -1
     expected_probe_shape = (probe_count, len(COMMAND_AXES))
@@ -471,7 +474,11 @@ def save_calibration_dataset(
     tmp_path = Path(tmp_name)
     try:
         tmp_path.unlink(missing_ok=True)
-        saved.to_netcdf(tmp_path, engine="h5netcdf")
+        saved.to_netcdf(
+            tmp_path,
+            engine="h5netcdf",
+            encoding=hdf5_image_encoding(saved),
+        )
         tmp_path.replace(output_path)
     except Exception:
         tmp_path.unlink(missing_ok=True)
@@ -1161,13 +1168,12 @@ def _estimate_capture_shift(
 
 
 def _as_reference_image(name: str, image: Any) -> np.ndarray:
-    image_array = np.asarray(image, dtype=np.float64)
+    image_array = np.asarray(image)
     if image_array.ndim != 2:
         raise ValueError(f"{name} must be 2D, got {image_array.shape!r}")
     if image_array.size == 0:
         raise ValueError(f"{name} must not be empty")
-    if not np.isfinite(image_array).all():
-        raise ValueError(f"{name} must contain only finite values")
+    _validate_real_finite_numeric_image(name, image_array)
     return image_array
 
 
@@ -1206,14 +1212,9 @@ def _as_capture_arrays(
                 f"all images in {name} must have the same shape; "
                 f"image 0 has {first_shape!r}, image {index} has {image_shape!r}"
             )
-        try:
-            capture_float = np.asarray(capture_array, dtype=np.float64)
-        except (TypeError, ValueError) as exc:
-            raise ValueError(f"{name}[{index}] must be numeric") from exc
-        if not np.isfinite(capture_float).all():
-            raise ValueError(f"{name}[{index}] must contain only finite values")
-        capture_arrays.append(capture_float)
-        image_dtypes.append(image.dtype)
+        _validate_real_finite_numeric_image(f"{name}[{index}]", capture_array)
+        capture_arrays.append(capture_array)
+        image_dtypes.append(capture_array.dtype)
     return capture_arrays, image_dtypes
 
 
@@ -1258,6 +1259,18 @@ def _common_capture_count(
 
 def _mean_capture_image(capture_array: np.ndarray) -> np.ndarray:
     return np.mean(np.asarray(capture_array, dtype=np.float64), axis=0)
+
+
+def _validate_real_finite_numeric_image(name: str, image: np.ndarray) -> None:
+    dtype = image.dtype
+    if np.issubdtype(dtype, np.bool_):
+        return
+    if not np.issubdtype(dtype, np.number):
+        raise ValueError(f"{name} must be numeric")
+    if np.issubdtype(dtype, np.complexfloating):
+        raise ValueError(f"{name} must be real-valued")
+    if np.issubdtype(dtype, np.floating) and not np.isfinite(image).all():
+        raise ValueError(f"{name} must contain only finite values")
 
 
 def _representative_capture_image(

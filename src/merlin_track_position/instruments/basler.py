@@ -183,7 +183,7 @@ def get_basler_image() -> npt.NDArray:
             f"{expected_shape}; update IMAGE_HEIGHT_CAM1/IMAGE_WIDTH_CAM1 "
             "or the camera AOI configuration."
         )
-    return image.astype(np.float64)
+    return np.asarray(image).copy()
 
 
 atexit.register(close_basler_camera)

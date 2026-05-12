@@ -295,11 +295,11 @@ The default numerical parameters are:
 
 ```text
 lambda = DEFAULT_CORRECTION_GAIN = 0.3
-lambda_min = DEFAULT_CORRECTION_MIN_GAIN = 0.05
-mu = DEFAULT_CORRECTION_DAMPING_MU = 1e-2
+lambda_min = DEFAULT_CORRECTION_MIN_GAIN = 0.15
+mu = DEFAULT_CORRECTION_DAMPING_MU = 1.0
 max |Delta q_j| = DEFAULT_CORRECTION_MAX_NORMALIZED_STEP = 0.5
 min per-axis predicted response =
-    DEFAULT_CORRECTION_MIN_AXIS_PREDICTED_SHIFT_PX = 0.25 px
+    DEFAULT_CORRECTION_MIN_AXIS_PREDICTED_SHIFT_PX = 0.15 px
 min command norm = DEFAULT_CORRECTION_MIN_COMMAND_NORM_MM = 1e-9 mm
 max_moves = DEFAULT_CORRECTION_MAX_MOVES = 12
 ```
@@ -322,9 +322,10 @@ $$
 \texttt{DEFAULT\_CORRECTION\_MIN\_AXIS\_PREDICTED\_SHIFT\_PX}.
 $$
 
-Components at or below the configured correction command deadband are also set to zero.
-If the remaining command vector is effectively zero, correction stops before
-issuing another motor command and reports non-convergence with a warning.
+Components are also set to zero when the corresponding estimated command
+offset is at or below the configured correction deadband. If the remaining
+command vector is effectively zero, correction stops before issuing another
+motor command and reports non-convergence with a warning.
 
 The absolute BCS-mm target sent to the motors is
 

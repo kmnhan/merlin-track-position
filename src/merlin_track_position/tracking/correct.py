@@ -36,6 +36,7 @@ from merlin_track_position.tracking.persistence import (
     PendingEntry,
     PersistenceResult,
     discard_spool_entry,
+    hdf5_image_encoding,
     iter_pending_entries,
     load_spooled_dataset,
     normalize_target_path,
@@ -278,7 +279,12 @@ def do_correction(
         gain_used = float(current_gain)
         mu_used = float(current_mu)
         jacobian_before = jacobian.copy()
-        correction_cmd_mm = solve_damped_command_correction(
+        estimated_offset_mm = estimate_command_offset(
+            jacobian,
+            measurement,
+            weights=weights,
+        )
+        raw_correction_cmd_mm = solve_damped_command_correction(
             jacobian,
             measurement,
             axis_scale,
@@ -288,24 +294,33 @@ def do_correction(
             min_axis_predicted_shift_px=min_axis_predicted_shift_px,
             weights=weights,
         )
-        correction_cmd_mm = _zero_deadband_axis_corrections(correction_cmd_mm)
+        correction_cmd_mm = _zero_deadband_axis_corrections(
+            raw_correction_cmd_mm,
+            reference_cmd_mm=estimated_offset_mm,
+        )
         correction_norm_mm = float(np.linalg.norm(correction_cmd_mm))
         active_indices = _active_correction_indices(correction_cmd_mm)
         logger.info(
-            "Computed correction command: delta_mm=%s, norm_mm=%.6g, "
-            "active_axes=%s",
+            "Computed correction command: estimated_offset_mm=%s, raw_delta_mm=%s, "
+            "delta_mm=%s, norm_mm=%.6g, active_axes=%s",
+            estimated_offset_mm.tolist(),
+            raw_correction_cmd_mm.tolist(),
             correction_cmd_mm.tolist(),
             correction_norm_mm,
             tuple(COMMAND_AXES[index] for index in active_indices),
         )
         if correction_norm_mm <= min_command_norm_mm or not active_indices:
             warnings.append(
-                "computed correction step is below the minimum command norm "
-                f"{min_command_norm_mm:.4g} mm; stopping before another move"
+                _correction_stop_warning(
+                    raw_correction_cmd_mm=raw_correction_cmd_mm,
+                    correction_cmd_mm=correction_cmd_mm,
+                    estimated_offset_mm=estimated_offset_mm,
+                    min_command_norm_mm=min_command_norm_mm,
+                )
             )
             logger.info(
-                "Stopping correction before move because command norm is below "
-                "minimum."
+                "Stopping correction before move: %s",
+                warnings[-1],
             )
             break
 
@@ -668,6 +683,7 @@ def save_correction_history_dataset(
         engine="h5netcdf",
         mode="a",
         group=group_name,
+        encoding=hdf5_image_encoding(saved),
     )
     return output_path
 
@@ -980,6 +996,11 @@ def _reported_next_correction(
 ) -> np.ndarray:
     if converged:
         return np.zeros(len(COMMAND_AXES), dtype=np.float64)
+    estimated_offset = estimate_command_offset(
+        jacobian,
+        measurement,
+        weights=weights,
+    )
     return _zero_deadband_axis_corrections(
         solve_damped_command_correction(
             jacobian,
@@ -990,7 +1011,8 @@ def _reported_next_correction(
             max_normalized_step=max_normalized_step,
             min_axis_predicted_shift_px=min_axis_predicted_shift_px,
             weights=weights,
-        )
+        ),
+        reference_cmd_mm=estimated_offset,
     )
 
 
@@ -1250,19 +1272,78 @@ def _stack_jacobian_or_empty(rows: Sequence[np.ndarray]) -> np.ndarray:
     return np.stack(rows, axis=0).astype(np.float64, copy=False)
 
 
-def _zero_deadband_axis_corrections(correction_cmd_mm: np.ndarray) -> np.ndarray:
+def _zero_deadband_axis_corrections(
+    correction_cmd_mm: np.ndarray,
+    *,
+    reference_cmd_mm: np.ndarray | None = None,
+) -> np.ndarray:
     correction = np.asarray(correction_cmd_mm, dtype=np.float64).copy()
+    if correction.shape != (len(COMMAND_AXES),):
+        raise ValueError("correction_cmd_mm must have one value for x/y/z")
+    if reference_cmd_mm is None:
+        reference = correction
+    else:
+        reference = np.asarray(reference_cmd_mm, dtype=np.float64)
+    if reference.shape != (len(COMMAND_AXES),):
+        raise ValueError("reference_cmd_mm must have one value for x/y/z")
+    if not np.isfinite(reference).all():
+        raise ValueError("reference_cmd_mm must contain finite values")
     for index, axis in enumerate(COMMAND_AXES):
-        deadband = float(
-            constants.CORRECTION_COMMAND_DEADBAND_MM_BY_AXIS.get(axis, 0.0)
-        )
-        if not np.isfinite(deadband) or deadband < 0.0:
-            raise ValueError(
-                "correction command deadbands must be finite and non-negative"
-            )
-        if abs(correction[index]) <= deadband:
+        deadband = _correction_command_deadband(axis)
+        if abs(reference[index]) <= deadband:
             correction[index] = 0.0
     return correction
+
+
+def _correction_command_deadband(axis: str) -> float:
+    deadband = float(constants.CORRECTION_COMMAND_DEADBAND_MM_BY_AXIS.get(axis, 0.0))
+    if not np.isfinite(deadband) or deadband < 0.0:
+        raise ValueError("correction command deadbands must be finite and non-negative")
+    return deadband
+
+
+def _correction_stop_warning(
+    *,
+    raw_correction_cmd_mm: np.ndarray,
+    correction_cmd_mm: np.ndarray,
+    estimated_offset_mm: np.ndarray,
+    min_command_norm_mm: float,
+) -> str:
+    raw_norm_mm = float(np.linalg.norm(raw_correction_cmd_mm))
+    if raw_norm_mm <= min_command_norm_mm:
+        return (
+            "computed correction step is below the minimum command norm "
+            f"{min_command_norm_mm:.4g} mm; stopping before another move"
+        )
+    if not _active_correction_indices(
+        correction_cmd_mm
+    ) and _estimated_offset_within_deadbands(estimated_offset_mm):
+        deadband_text = ", ".join(
+            f"{axis}={1000.0 * _correction_command_deadband(axis):.4g} um"
+            for axis in COMMAND_AXES
+        )
+        offset_text = ", ".join(
+            f"{axis}={1000.0 * value:.4g} um"
+            for axis, value in zip(COMMAND_AXES, estimated_offset_mm, strict=True)
+        )
+        return (
+            "estimated command offset is within correction deadbands "
+            f"({deadband_text}); offset=({offset_text}); stopping before another move"
+        )
+    return (
+        "computed correction step has no active axes after pruning; "
+        "stopping before another move"
+    )
+
+
+def _estimated_offset_within_deadbands(estimated_offset_mm: np.ndarray) -> bool:
+    offset = np.asarray(estimated_offset_mm, dtype=np.float64)
+    if offset.shape != (len(COMMAND_AXES),):
+        raise ValueError("estimated_offset_mm must have one value for x/y/z")
+    return all(
+        abs(offset[index]) <= _correction_command_deadband(axis)
+        for index, axis in enumerate(COMMAND_AXES)
+    )
 
 
 def _active_correction_indices(correction_cmd_mm: np.ndarray) -> tuple[int, ...]:
