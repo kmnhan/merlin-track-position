@@ -7,7 +7,7 @@ import xarray as xr
 
 from merlin_track_position.instruments.cameras import (
     CameraPairPlugin,
-    capture_image_stack,
+    capture_image_and_display_stacks,
     default_camera_pair,
     normalize_capture_count,
 )
@@ -118,17 +118,22 @@ def run_calibration(
 
     def _update_step(idx, dx, dy, dz):
         actual_grid_um[idx, :] = [dx, dy, dz]
-        image_cam0, image_cam1 = capture_image_stack(camera_pair, capture_count)
+        image_stacks, display_stacks = capture_image_and_display_stacks(
+            camera_pair,
+            capture_count,
+        )
+        image_cam0, image_cam1 = image_stacks
         images_cam0.append(image_cam0)
         images_cam1.append(image_cam1)
         if step_callback is not None:
+            display_cam0, display_cam1 = display_stacks
             step_callback(
                 idx,
                 dx,
                 dy,
                 dz,
-                _representative_image(image_cam0),
-                _representative_image(image_cam1),
+                _representative_image(display_cam0),
+                _representative_image(display_cam1),
             )
 
     _update_step(0, 0.0, 0.0, 0.0)

@@ -53,6 +53,7 @@ class CameraPlugin(ABC):
             fresh_frame_poll_interval_s,
         )
         self._last_frame_key: Any = _NO_FRAME
+        self._last_image: npt.NDArray | None = None
         self._capture_serial = 0
 
     def capture(self) -> npt.NDArray:
@@ -63,6 +64,7 @@ class CameraPlugin(ABC):
             frame_key = self._frame_key(image)
             if self._last_frame_key is _NO_FRAME or frame_key != self._last_frame_key:
                 self._last_frame_key = frame_key
+                self._last_image = image.copy()
                 return image
             if time.monotonic() >= deadline:
                 raise TimeoutError(
@@ -84,6 +86,12 @@ class CameraPlugin(ABC):
     def cropped(self, roi_geometry: RoiGeometry) -> "CameraPlugin":
         """Return a camera plugin that crops this camera's captured images."""
         return CroppedCameraPlugin(self, roi_geometry)
+
+    def display_image(self) -> npt.NDArray:
+        """Return the image that should be displayed for the last capture."""
+        if self._last_image is None:
+            raise RuntimeError(f"{self.name} has not captured an image yet")
+        return self._last_image.copy()
 
 
 class FramegrabberCameraPlugin(CameraPlugin):
@@ -179,6 +187,9 @@ class CroppedCameraPlugin(CameraPlugin):
     def _capture_once(self) -> npt.NDArray:
         return crop_image_to_roi(self._camera.capture(), self._roi_geometry)
 
+    def display_image(self) -> npt.NDArray:
+        return self._camera.display_image()
+
 
 class CameraPairPlugin:
     """The two camera plugins used together by calibration and correction."""
@@ -228,6 +239,15 @@ def capture_image_stack(
     capture_count: int,
 ) -> tuple[npt.NDArray, ...]:
     """Capture image stacks from camera plugins."""
+    image_stacks, _ = capture_image_and_display_stacks(cameras, capture_count)
+    return image_stacks
+
+
+def capture_image_and_display_stacks(
+    cameras: CameraPairPlugin | Sequence[CameraPlugin],
+    capture_count: int,
+) -> tuple[tuple[npt.NDArray, ...], tuple[npt.NDArray, ...]]:
+    """Capture processing-image stacks and their corresponding display stacks."""
 
     capture_count = normalize_capture_count(capture_count)
     camera_plugins = _camera_plugins_tuple(cameras)
@@ -235,11 +255,16 @@ def capture_image_stack(
         raise ValueError("at least one camera plugin is required")
 
     image_stacks: list[list[npt.NDArray]] = [[] for _ in camera_plugins]
+    display_stacks: list[list[npt.NDArray]] = [[] for _ in camera_plugins]
     for _ in range(capture_count):
         for camera_index, camera in enumerate(camera_plugins):
             image_stacks[camera_index].append(np.asarray(camera.capture()))
+            display_stacks[camera_index].append(np.asarray(camera.display_image()))
 
-    return tuple(np.stack(images, axis=0) for images in image_stacks)
+    return (
+        tuple(np.stack(images, axis=0) for images in image_stacks),
+        tuple(np.stack(images, axis=0) for images in display_stacks),
+    )
 
 
 def _camera_plugins_tuple(

@@ -648,8 +648,14 @@ class MainWindowGUISmokeTests(unittest.TestCase):
                     crop_image_to_roi(fresh_cam1, roi_cam1),
                 )
 
-                representative_cam0 = np.full((4, 5), 12.0)
-                representative_cam1 = np.full((6, 7), 34.0)
+                representative_cam0 = np.full(
+                    (IMAGE_HEIGHT_CAM0, IMAGE_WIDTH_CAM0),
+                    12.0,
+                )
+                representative_cam1 = np.full(
+                    (IMAGE_HEIGHT_CAM1, IMAGE_WIDTH_CAM1),
+                    34.0,
+                )
                 window._on_calibration_step(
                     0,
                     1.0,

@@ -230,6 +230,69 @@ class CalibrationTests(unittest.TestCase):
             np.full((2, 3), 103.0, dtype=np.float32),
         )
 
+    def test_run_calibration_reports_full_display_images_from_cropped_pair(self):
+        captured_kwargs = {}
+        callback_steps = []
+        generator_calls = 0
+
+        def fake_pair_source():
+            nonlocal generator_calls
+            generator_calls += 1
+            return (
+                np.full((4, 5), generator_calls, dtype=np.float32),
+                np.full((6, 7), generator_calls + 100.0, dtype=np.float32),
+            )
+
+        def fake_move_motors_and_wait(motor_aliases, goals, **kwargs):
+            del motor_aliases, kwargs
+            return tuple(float(goal) for goal in goals)
+
+        def fake_fit_calibration_from_images(**kwargs):
+            captured_kwargs.update(kwargs)
+            return xr.Dataset()
+
+        def step_callback(idx, dx, dy, dz, image_cam0, image_cam1):
+            callback_steps.append((idx, dx, dy, dz, image_cam0, image_cam1))
+
+        camera_pair = camera_pair_from_pair_source(fake_pair_source).cropped(
+            (1.0, 1.0, 3.0, 2.0),
+            (2.0, 3.0, 2.0, 2.0),
+        )
+        with (
+            patch(
+                "merlin_track_position.tracking.calibrate.get_positions",
+                return_value=(1.2, 2.3, 3.4, 4.5, 6.7, 5.0),
+            ),
+            patch(
+                "merlin_track_position.tracking.calibrate.move_motors_and_wait",
+                side_effect=fake_move_motors_and_wait,
+            ),
+            patch(
+                "merlin_track_position.tracking.calibrate.fit_calibration_from_images",
+                side_effect=fake_fit_calibration_from_images,
+            ),
+            patch("merlin_track_position.tracking.calibrate.time.sleep"),
+        ):
+            run_calibration(
+                2,
+                10.0,
+                camera_pair,
+                origin_stability_um=ORIGIN_STABILITY_UM,
+                capture_count=1,
+                step_callback=step_callback,
+            )
+
+        self.assertEqual(captured_kwargs["images_cam0"][0].shape, (1, 2, 3))
+        self.assertEqual(captured_kwargs["images_cam1"][0].shape, (1, 2, 2))
+        np.testing.assert_array_equal(
+            callback_steps[0][4],
+            np.full((4, 5), 1.0, dtype=np.float32),
+        )
+        np.testing.assert_array_equal(
+            callback_steps[0][5],
+            np.full((6, 7), 101.0, dtype=np.float32),
+        )
+
     def test_fit_calibration_from_stereo_numpy_arrays(self):
         stage_to_pixel = stereo_stage_to_pixel()
         stage = calibration_stage()

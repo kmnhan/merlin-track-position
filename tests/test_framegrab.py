@@ -9,6 +9,7 @@ from merlin_track_position.instruments.basler import get_basler_image
 from merlin_track_position.instruments.cameras import (
     CallableCameraPlugin,
     CameraPairPlugin,
+    capture_image_and_display_stacks,
     capture_image_stack,
     crop_image_to_roi,
     default_camera_pair,
@@ -395,6 +396,24 @@ class DevelopmentModeFramegrabTests(unittest.TestCase):
             stack_cam1,
             np.stack([image_cam1_a[3:5, 2:4], image_cam1_b[3:5, 2:4]]),
         )
+
+    def test_cropped_camera_pair_keeps_full_display_images(self):
+        full_cam0 = np.arange(4 * 5).reshape(4, 5)
+        full_cam1 = np.arange(6 * 7).reshape(6, 7)
+        camera_pair = CameraPairPlugin(
+            CallableCameraPlugin("cam0", lambda: full_cam0),
+            CallableCameraPlugin("cam1", lambda: full_cam1),
+        ).cropped((1.0, 1.0, 3.0, 2.0), (2.0, 3.0, 2.0, 2.0))
+
+        image_stacks, display_stacks = capture_image_and_display_stacks(
+            camera_pair,
+            1,
+        )
+
+        np.testing.assert_array_equal(image_stacks[0][0], full_cam0[1:3, 1:4])
+        np.testing.assert_array_equal(image_stacks[1][0], full_cam1[3:5, 2:4])
+        np.testing.assert_array_equal(display_stacks[0][0], full_cam0)
+        np.testing.assert_array_equal(display_stacks[1][0], full_cam1)
 
     def test_default_camera_pair_allows_identical_development_images(self):
         with patch.object(constants, "IS_DAQ_PC", False):
