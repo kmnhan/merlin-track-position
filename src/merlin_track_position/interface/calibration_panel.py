@@ -577,6 +577,27 @@ class CalibrationPanel(QtWidgets.QWidget):
             f"Elapsed {_format_duration(elapsed_s)}, ETA {_format_duration(eta_s)}."
         )
 
+    def show_calibration_processing(
+        self,
+        *,
+        completed: int,
+        total: int,
+        elapsed_s: float,
+        eta_s: float | None,
+    ) -> None:
+        total = max(int(total), 1)
+        completed = min(max(int(completed), 0), total)
+        self.calibration_progress_bar.setVisible(True)
+        self.calibration_progress_bar.setRange(0, total)
+        self.calibration_progress_bar.setValue(completed)
+        self.calibration_progress_bar.setFormat(
+            f"{completed} / {total} registrations"
+        )
+        self.calibration_status_label.setText(
+            "Processing calibration scans. "
+            f"Elapsed {_format_duration(elapsed_s)}, ETA {_format_duration(eta_s)}."
+        )
+
     def show_loaded_calibration(
         self,
         calibration: xr.Dataset,

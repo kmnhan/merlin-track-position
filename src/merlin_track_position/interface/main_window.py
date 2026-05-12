@@ -322,6 +322,7 @@ class MainWindow(_MainWindowGUI):
         self._calibration_thread = CalibrationThread(self)
         self._calibration_total_steps = 0
         self._calibration_started_at: float | None = None
+        self._calibration_processing_started_at: float | None = None
         self._latest_images: tuple[np.ndarray, np.ndarray] | None = None
         self._latest_images_by_camera: dict[str, np.ndarray] = {}
         self._image_capture_locks = {
@@ -389,6 +390,9 @@ class MainWindow(_MainWindowGUI):
             self._on_new_calibration_failed
         )
         self._calibration_thread.sigCalibrationStep.connect(self._on_calibration_step)
+        self._calibration_thread.sigCalibrationProcessingStep.connect(
+            self._on_calibration_processing_step
+        )
         self.image_auto_refresh_checkbox.toggled.connect(
             self._on_image_auto_refresh_toggled
         )
@@ -617,6 +621,27 @@ class MainWindow(_MainWindowGUI):
             eta_s=eta_s,
         )
 
+    @QtCore.Slot(int, int)
+    def _on_calibration_processing_step(self, completed: int, total: int) -> None:
+        total = max(int(total), 1)
+        completed = min(max(int(completed), 0), total)
+        if completed == 0 or self._calibration_processing_started_at is None:
+            self._calibration_processing_started_at = time.monotonic()
+
+        elapsed_s = time.monotonic() - self._calibration_processing_started_at
+        remaining = max(total - completed, 0)
+        eta_s = (
+            (elapsed_s / completed) * remaining
+            if completed > 0 and remaining > 0
+            else 0.0 if remaining == 0 else None
+        )
+        self.calibration_panel.show_calibration_processing(
+            completed=completed,
+            total=total,
+            elapsed_s=elapsed_s,
+            eta_s=eta_s,
+        )
+
     @QtCore.Slot(object)
     def _on_new_calibration_ready(self, calibration: object) -> None:
         self._restore_image_auto_refresh_after_calibration()
@@ -636,6 +661,7 @@ class MainWindow(_MainWindowGUI):
         self._calibration = calibration
         self._calibration_path = None
         self._calibration_started_at = None
+        self._calibration_processing_started_at = None
         self._calibration_total_steps = 0
         self.calibration_panel.show_loaded_calibration(calibration, "new calibration")
 
@@ -643,6 +669,7 @@ class MainWindow(_MainWindowGUI):
     def _on_new_calibration_failed(self, error_message: str) -> None:
         self._restore_image_auto_refresh_after_calibration()
         self._calibration_started_at = None
+        self._calibration_processing_started_at = None
         self._calibration_total_steps = 0
         self._restore_calibration_idle_state()
         QtWidgets.QMessageBox.critical(
@@ -660,6 +687,7 @@ class MainWindow(_MainWindowGUI):
 
     def _restore_calibration_idle_state(self) -> None:
         self._calibration_started_at = None
+        self._calibration_processing_started_at = None
         self._calibration_total_steps = 0
         if self._calibration is None:
             self.calibration_panel.reset()

@@ -60,6 +60,7 @@ def run_calibration(
     origin_stability_um: float = 5.0,
     home_tolerance_um: float = 1.0,
     capture_count: int = constants.DEFAULT_CAPTURE_COUNT,
+    processing_callback: Callable[[int, int], None] | None = None,
     step_callback: Callable[
         [int, float, float, float, np.ndarray, np.ndarray],
         None,
@@ -88,6 +89,9 @@ def run_calibration(
     capture_count : int, optional
         Number of image pairs captured at each motor position. The per-step images are
         aggregated during fitting. Defaults to ``constants.DEFAULT_CAPTURE_COUNT``.
+    processing_callback
+        Optional callback function called during post-acquisition image registration
+        with completed and total registration counts.
     step_callback
         Optional callback function that will be called after each move to a grid point
         with the following arguments:
@@ -195,6 +199,7 @@ def run_calibration(
         stage_um=actual_grid_um,
         origin_stability_um=origin_stability_um,
         check_tiles=True,
+        progress_callback=processing_callback,
         additional_context={
             "initial_x_mm": x0,
             "initial_y_mm": y0,

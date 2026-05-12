@@ -75,6 +75,7 @@ class FakeMotorServer(QtCore.QObject):
 class FakeCalibrationThread(QtCore.QObject):
     sigCalibrationReady = QtCore.Signal(object)
     sigCalibrationStep = QtCore.Signal(int, float, float, float, object, object)
+    sigCalibrationProcessingStep = QtCore.Signal(int, int)
     sigCalibrationFailed = QtCore.Signal(str)
 
     def __init__(self, parent=None):
@@ -683,6 +684,18 @@ class MainWindowGUISmokeTests(unittest.TestCase):
                 self.assertEqual(get_cam0.call_count, 2)
                 self.assertEqual(get_cam1.call_count, 2)
 
+                thread.sigCalibrationProcessingStep.emit(1, 6)
+                app.processEvents()
+                self.assertEqual(window.calibration_panel.calibration_progress_bar.value(), 1)
+                self.assertEqual(
+                    window.calibration_panel.calibration_progress_bar.maximum(),
+                    6,
+                )
+                self.assertIn(
+                    "Processing calibration scans.",
+                    window.calibration_panel.calibration_status_label.text(),
+                )
+
                 thread.running = False
                 window._on_new_calibration_failed("boom")
 
@@ -908,6 +921,32 @@ class CalibrationPanelSmokeTests(unittest.TestCase):
 
             self.assertEqual(panel.calibration_progress_bar.value(), 2)
             self.assertEqual(panel.calibration_progress_bar.maximum(), 4)
+        finally:
+            panel.close()
+            app.processEvents()
+
+    def test_show_calibration_processing_updates_progress_and_status(self):
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        panel = CalibrationPanel()
+        try:
+            panel.show_calibration_in_progress(total_steps=4)
+            panel.show_calibration_processing(
+                completed=3,
+                total=8,
+                elapsed_s=12.0,
+                eta_s=20.0,
+            )
+
+            self.assertEqual(panel.calibration_progress_bar.value(), 3)
+            self.assertEqual(panel.calibration_progress_bar.maximum(), 8)
+            self.assertEqual(
+                panel.calibration_progress_bar.format(),
+                "3 / 8 registrations",
+            )
+            self.assertIn(
+                "Processing calibration scans.",
+                panel.calibration_status_label.text(),
+            )
         finally:
             panel.close()
             app.processEvents()

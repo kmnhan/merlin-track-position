@@ -260,6 +260,9 @@ class CalibrationTests(unittest.TestCase):
         def step_callback(idx, dx, dy, dz, image_cam0, image_cam1):
             callback_steps.append((idx, dx, dy, dz, image_cam0, image_cam1))
 
+        def processing_callback(completed, total):
+            del completed, total
+
         camera_pair = camera_pair_from_pair_source(fake_pair_source).cropped(
             (1.0, 1.0, 3.0, 2.0),
             (2.0, 3.0, 2.0, 2.0),
@@ -286,10 +289,12 @@ class CalibrationTests(unittest.TestCase):
                 origin_stability_um=ORIGIN_STABILITY_UM,
                 capture_count=1,
                 step_callback=step_callback,
+                processing_callback=processing_callback,
             )
 
         self.assertEqual(captured_kwargs["images_cam0"][0].shape, (1, 2, 3))
         self.assertEqual(captured_kwargs["images_cam1"][0].shape, (1, 2, 2))
+        self.assertIs(captured_kwargs["progress_callback"], processing_callback)
         np.testing.assert_array_equal(
             callback_steps[0][4],
             np.full((4, 5), 1.0, dtype=np.float32),
@@ -404,6 +409,7 @@ class CalibrationTests(unittest.TestCase):
                 origin_stability_um=ORIGIN_STABILITY_UM,
                 check_tiles=False,
                 clip_percentiles=None,
+                n_jobs=1,
             )
 
         expected_shifts = np.einsum("cpk,sk->scp", stage_to_pixel, stage)
@@ -455,6 +461,7 @@ class CalibrationTests(unittest.TestCase):
                 origin_stability_um=ORIGIN_STABILITY_UM,
                 check_tiles=False,
                 clip_percentiles=None,
+                n_jobs=1,
             )
 
         warning_lines = calibration.attrs["warnings"].splitlines()
@@ -472,6 +479,44 @@ class CalibrationTests(unittest.TestCase):
             calibration["measurement_warnings"].values[2, 1],
             "low texture\nregistration error is not finite",
         )
+
+    def test_fit_calibration_parallel_matches_sequential_and_reports_progress(self):
+        stage_to_pixel = stereo_stage_to_pixel()
+        stage = calibration_stage()
+        images_cam0, images_cam1 = make_stereo_images(stage, stage_to_pixel)
+        capture_stacks_cam0 = as_capture_stacks(images_cam0)
+        capture_stacks_cam1 = as_capture_stacks(images_cam1)
+
+        sequential = fit_calibration_from_images(
+            capture_stacks_cam0,
+            capture_stacks_cam1,
+            stage,
+            origin_stability_um=ORIGIN_STABILITY_UM,
+            check_tiles=False,
+            clip_percentiles=None,
+            n_jobs=1,
+        )
+        progress = []
+        parallel = fit_calibration_from_images(
+            capture_stacks_cam0,
+            capture_stacks_cam1,
+            stage,
+            origin_stability_um=ORIGIN_STABILITY_UM,
+            check_tiles=False,
+            clip_percentiles=None,
+            progress_callback=lambda completed, total: progress.append(
+                (completed, total)
+            ),
+            n_jobs=2,
+        )
+
+        xr.testing.assert_allclose(parallel, sequential)
+        self.assertEqual(parallel.attrs, sequential.attrs)
+        expected_total = stage.shape[0] * len(CAMERAS)
+        self.assertEqual(progress[0], (0, expected_total))
+        self.assertEqual(progress[-1], (expected_total, expected_total))
+        self.assertEqual([completed for completed, _ in progress], list(range(expected_total + 1)))
+        self.assertTrue(all(total == expected_total for _, total in progress))
 
     def test_h5_roundtrip_preserves_stereo_schema(self):
         stage_to_pixel = stereo_stage_to_pixel()

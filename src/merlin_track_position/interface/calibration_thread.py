@@ -18,6 +18,7 @@ __all__ = ("CalibrationThread",)
 class CalibrationThread(QtCore.QThread):
     sigCalibrationReady = QtCore.Signal(object)
     sigCalibrationStep = QtCore.Signal(int, float, float, float, object, object)
+    sigCalibrationProcessingStep = QtCore.Signal(int, int)
     sigCalibrationFailed = QtCore.Signal(str)
 
     def __init__(
@@ -66,6 +67,7 @@ class CalibrationThread(QtCore.QThread):
                     self._step_um,
                     self._camera_pair,
                     step_callback=self._emit_step,
+                    processing_callback=self._emit_processing_step,
                 )
                 calibration = calibration.assign_attrs(self._roi_metadata)
                 _validate_calibration_dataset(calibration)
@@ -90,6 +92,10 @@ class CalibrationThread(QtCore.QThread):
     ) -> None:
         if self._running.is_set() and not self.isInterruptionRequested():
             self.sigCalibrationStep.emit(idx, dx, dy, dz, image_cam0, image_cam1)
+
+    def _emit_processing_step(self, completed: int, total: int) -> None:
+        if self._running.is_set() and not self.isInterruptionRequested():
+            self.sigCalibrationProcessingStep.emit(int(completed), int(total))
 
     def stop(self) -> None:
         self._running.clear()
