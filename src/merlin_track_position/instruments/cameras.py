@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 import time
 from abc import ABC, abstractmethod
@@ -18,6 +19,7 @@ from merlin_track_position.instruments.framegrab import get_framegrabber_image
 
 RoiGeometry = tuple[float, float, float, float]
 _NO_FRAME = object()
+logger = logging.getLogger("merlin_track_position.instruments.cameras")
 
 
 class _ImageContentKey:
@@ -256,9 +258,23 @@ def capture_image_and_display_stacks(
 
     image_stacks: list[list[npt.NDArray]] = [[] for _ in camera_plugins]
     display_stacks: list[list[npt.NDArray]] = [[] for _ in camera_plugins]
-    for _ in range(capture_count):
+    for capture_index in range(capture_count):
         for camera_index, camera in enumerate(camera_plugins):
-            image_stacks[camera_index].append(np.asarray(camera.capture()))
+            logger.info(
+                "Capturing camera frame: camera=%s, sample=%d/%d",
+                camera.name,
+                capture_index + 1,
+                capture_count,
+            )
+            image = np.asarray(camera.capture())
+            logger.info(
+                "Captured camera frame: camera=%s, sample=%d/%d, shape=%s",
+                camera.name,
+                capture_index + 1,
+                capture_count,
+                image.shape,
+            )
+            image_stacks[camera_index].append(image)
             display_stacks[camera_index].append(np.asarray(camera.display_image()))
 
     return (

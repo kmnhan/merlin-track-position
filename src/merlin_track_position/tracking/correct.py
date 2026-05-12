@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
@@ -31,6 +32,8 @@ from merlin_track_position.tracking.calibration_core import (
     validate_visual_calibration_dataset,
     weighted_pixel_residual,
 )
+
+logger = logging.getLogger("merlin_track_position.tracking.correct")
 
 ROI_ATTR_KEYS: dict[str, tuple[str, str, str, str]] = {
     camera: (
@@ -76,6 +79,7 @@ def do_correction(
         calibration,
         calibration_path,
     )
+    logger.info("Correction setup: calibration_path=%s", resolved_path)
     validate_visual_calibration_dataset(calibration)
     capture_count = normalize_capture_count(capture_count)
     if camera_pair is None:
@@ -101,6 +105,16 @@ def do_correction(
         raise ValueError("min_command_norm_mm must be finite and non-negative")
     if max_moves < 0:
         raise ValueError("max_moves must be >= 0")
+    logger.info(
+        "Correction parameters: capture_count=%d, pixel_tolerance_px=%g, "
+        "gain=%g, min_gain=%g, damping_mu=%g, max_moves=%d",
+        capture_count,
+        pixel_tolerance_px,
+        current_gain,
+        min_gain,
+        current_mu,
+        max_moves,
+    )
 
     reference_cam0 = np.asarray(calibration["reference_cam0"].values)
     reference_cam1 = np.asarray(calibration["reference_cam1"].values)
@@ -109,17 +123,20 @@ def do_correction(
         calibration["visual_jacobian_px_per_cmd_mm"].values,
         dtype=np.float64,
     )
+    logger.info("Reading initial commanded x/y/z positions.")
     commanded_position_mm = np.asarray(
         get_positions(COMMAND_AXES),
         dtype=np.float64,
     )
     if commanded_position_mm.shape != (len(COMMAND_AXES),):
         raise ValueError("initial command position readback must have x/y/z values")
+    logger.info("Initial commanded positions: %s", commanded_position_mm.tolist())
     initial_commanded_position_mm = commanded_position_mm.copy()
     correction_log_path = correction_history_path(resolved_path)
     correction_run_id = _next_correction_history_run_id(correction_log_path)
     correction_started_at_utc = datetime.now(UTC).isoformat()
 
+    logger.info("Capturing initial correction measurement.")
     measurement = _capture_measurement(
         calibration,
         camera_pair,
@@ -129,6 +146,7 @@ def do_correction(
         **shift_kwargs,
     )
     residual = weighted_pixel_residual(measurement, weights=weights)
+    logger.info("Initial weighted residual: %.6g px", residual)
 
     iteration_shift_px = [np.asarray(measurement["shift_px"].values, dtype=np.float64)]
     iteration_weighted_residuals = [residual]
@@ -215,15 +233,29 @@ def do_correction(
         )
 
     def save_progress(completed: bool) -> xr.Dataset:
+        logger.info(
+            "Saving correction progress: completed=%s, run_id=%d, path=%s",
+            completed,
+            correction_run_id,
+            correction_log_path,
+        )
         progress = build_result(completed)
         save_correction_history_dataset(
             progress,
             correction_log_path,
             run_id=correction_run_id,
         )
+        logger.info("Saved correction progress: completed=%s", completed)
         return progress
 
     while not converged and move_count < max_moves:
+        logger.info(
+            "Correction iteration %d starting: residual=%.6g px, gain=%g, mu=%g",
+            move_count + 1,
+            residual,
+            current_gain,
+            current_mu,
+        )
         gain_used = float(current_gain)
         mu_used = float(current_mu)
         jacobian_before = jacobian.copy()
@@ -240,10 +272,21 @@ def do_correction(
         correction_cmd_mm = _zero_deadband_axis_corrections(correction_cmd_mm)
         correction_norm_mm = float(np.linalg.norm(correction_cmd_mm))
         active_indices = _active_correction_indices(correction_cmd_mm)
+        logger.info(
+            "Computed correction command: delta_mm=%s, norm_mm=%.6g, "
+            "active_axes=%s",
+            correction_cmd_mm.tolist(),
+            correction_norm_mm,
+            tuple(COMMAND_AXES[index] for index in active_indices),
+        )
         if correction_norm_mm <= min_command_norm_mm or not active_indices:
             warnings.append(
                 "computed correction step is below the minimum command norm "
                 f"{min_command_norm_mm:.4g} mm; stopping before another move"
+            )
+            logger.info(
+                "Stopping correction before move because command norm is below "
+                "minimum."
             )
             break
 
@@ -257,20 +300,28 @@ def do_correction(
         active_requested_position_mm = tuple(
             float(requested_position_mm[index]) for index in active_indices
         )
+        logger.info(
+            "Moving correction axes: active_axes=%s, requested_position_mm=%s",
+            active_axes,
+            active_requested_position_mm,
+        )
         move_motors_and_wait(
             active_axes,
             active_requested_position_mm,
             tolerance=_active_move_tolerance(move_tolerance_mm, active_indices),
             max_retries=max_retries,
         )
+        logger.info("Correction motor move returned; reading final x/y/z positions.")
         final_readback_mm = np.asarray(
             get_positions(COMMAND_AXES),
             dtype=np.float64,
         )
         if final_readback_mm.shape != (len(COMMAND_AXES),):
             raise ValueError("final command position readback must have x/y/z values")
+        logger.info("Final readback positions: %s", final_readback_mm.tolist())
         commanded_position_mm = requested_position_mm
 
+        logger.info("Capturing post-move correction measurement.")
         after_measurement = _capture_measurement(
             calibration,
             camera_pair,
@@ -281,6 +332,11 @@ def do_correction(
         )
         after_residual = weighted_pixel_residual(after_measurement, weights=weights)
         decreased = bool(after_residual < residual)
+        logger.info(
+            "Post-move weighted residual: %.6g px; decreased=%s",
+            after_residual,
+            decreased,
+        )
         jacobian_refined = False
         measured_delta_px = (
             np.asarray(after_measurement["shift_px"].values, dtype=np.float64)
@@ -288,6 +344,7 @@ def do_correction(
         )
         if decreased:
             try:
+                logger.info("Attempting Jacobian refinement from accepted move.")
                 refinement_delta, refinement_measured = (
                     _jacobian_refinement_observations(
                         correction_log_path,
@@ -306,15 +363,23 @@ def do_correction(
                 )
             except ValueError as exc:
                 warnings.append(f"skipped Jacobian refinement: {exc}")
+                logger.info("Skipped Jacobian refinement: %s", exc)
             else:
                 jacobian = np.asarray(
                     calibration["visual_jacobian_px_per_cmd_mm"].values,
                     dtype=np.float64,
                 )
                 jacobian_refined = True
+                logger.info("Jacobian refinement accepted and saved.")
         else:
             current_gain = max(min_gain, 0.5 * current_gain)
             current_mu = 2.0 * current_mu if current_mu > 0.0 else 1e-12
+            logger.info(
+                "Residual did not decrease; reducing gain to %g and increasing "
+                "mu to %g.",
+                current_gain,
+                current_mu,
+            )
 
         move_command_delta_mm.append(correction_cmd_mm)
         move_requested_position_mm.append(requested_position_mm.copy())
@@ -348,6 +413,12 @@ def do_correction(
         )
         move_count += 1
         converged = residual <= pixel_tolerance_px
+        logger.info(
+            "Correction iteration %d complete: residual=%.6g px, converged=%s",
+            move_count,
+            residual,
+            converged,
+        )
         save_progress(completed=False)
 
     if not converged:
@@ -355,6 +426,17 @@ def do_correction(
             "correction did not converge within "
             f"{max_moves} move(s); final residual {residual:.4g} px exceeds "
             f"{pixel_tolerance_px:.4g} px"
+        )
+        logger.info(
+            "Correction finished without convergence: moves=%d, residual=%.6g px",
+            move_count,
+            residual,
+        )
+    else:
+        logger.info(
+            "Correction converged: moves=%d, residual=%.6g px",
+            move_count,
+            residual,
         )
 
     return save_progress(completed=True)
@@ -814,7 +896,13 @@ def _capture_measurement(
     capture_count: int,
     **shift_kwargs: Any,
 ) -> xr.Dataset:
+    logger.info("Capturing image stack: capture_count=%d", capture_count)
     current_cam0, current_cam1 = capture_image_stack(camera_pair, capture_count)
+    logger.info(
+        "Captured image stacks: cam0_shape=%s, cam1_shape=%s",
+        current_cam0.shape,
+        current_cam1.shape,
+    )
     current_cam0 = _crop_current_stack_if_needed(
         calibration,
         "cam0",
@@ -827,13 +915,19 @@ def _capture_measurement(
         reference_cam1,
         current_cam1,
     )
-    return measure_image_error(
+    logger.info("Measuring image error against calibration references.")
+    measurement = measure_image_error(
         reference_cam0,
         current_cam0,
         reference_cam1,
         current_cam1,
         **shift_kwargs,
     )
+    logger.info(
+        "Measured image shift_px=%s",
+        np.asarray(measurement["shift_px"].values, dtype=np.float64).tolist(),
+    )
+    return measurement
 
 
 def _stack_or_empty(rows: Sequence[np.ndarray]) -> np.ndarray:

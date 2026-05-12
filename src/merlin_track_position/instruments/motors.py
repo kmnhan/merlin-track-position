@@ -40,6 +40,10 @@ def _get_positions(
 def _wait_until_move_complete(
     bcs_server: BCSz.BCSServer, motor_aliases: Iterable[str]
 ) -> tuple[float, ...]:
+    motor_aliases = tuple(motor_aliases)
+    started_at = time.monotonic()
+    next_log_at = started_at + 5.0
+    logger.info("Waiting for motor move completion: motor_aliases=%s", motor_aliases)
     while True:
         positions, status = _get_motor_info(
             bcs_server, motor_aliases, ("position", "status")
@@ -53,8 +57,25 @@ def _wait_until_move_complete(
             positions, _ = _get_motor_info(
                 bcs_server, motor_aliases, ("position", "status")
             )
+            logger.info(
+                "Motor move complete: motor_aliases=%s, positions=%s, elapsed_s=%.1f",
+                motor_aliases,
+                positions,
+                time.monotonic() - started_at,
+            )
             return positions
         else:
+            now = time.monotonic()
+            if now >= next_log_at:
+                logger.info(
+                    "Still waiting for motor move completion: motor_aliases=%s, "
+                    "positions=%s, status=%s, elapsed_s=%.1f",
+                    motor_aliases,
+                    positions,
+                    status,
+                    now - started_at,
+                )
+                next_log_at = now + 5.0
             time.sleep(0.2)  # don't hit the api server constantly
 
 
@@ -282,11 +303,17 @@ def _backlash_pre_goals(
 
 def get_positions(motor_aliases: Iterable[str]) -> tuple[float, ...]:
     """Get current positions of the specified motor aliases."""
+    motor_aliases = tuple(motor_aliases)
+    logger.info("Reading motor positions: motor_aliases=%s", motor_aliases)
     if not constants.IS_DAQ_PC:
-        return simulator.get_positions(motor_aliases)
+        positions = simulator.get_positions(motor_aliases)
+        logger.info("Read simulated motor positions: positions=%s", positions)
+        return positions
 
     with _bcs_server_context() as server:
-        return _get_positions(server, motor_aliases)
+        positions = _get_positions(server, motor_aliases)
+        logger.info("Read motor positions: positions=%s", positions)
+        return positions
 
 
 def get_temperatures() -> tuple[float, float, float, float]:
@@ -335,19 +362,31 @@ def move_motors_and_wait(
         max_retries.
 
     """
+    motor_aliases = tuple(motor_aliases)
+    goals = tuple(float(goal) for goal in goals)
+    logger.info(
+        "Moving motors and waiting: motor_aliases=%s, goals=%s, tolerance=%s, "
+        "max_retries=%d",
+        motor_aliases,
+        goals,
+        tolerance,
+        max_retries,
+    )
     if not constants.IS_DAQ_PC:
-        return simulator.move_motors_and_wait(
+        positions = simulator.move_motors_and_wait(
             motor_aliases,
             goals,
             tolerance=tolerance,
             max_retries=max_retries,
         )
+        logger.info("Simulated motor move returned: positions=%s", positions)
+        return positions
 
     if backlash_correction is None:
         backlash_correction = constants.MOTOR_BACKLASH_CORRECTION
 
     with _bcs_server_context() as server:
-        return _move_motors_and_wait(
+        positions = _move_motors_and_wait(
             server,
             motor_aliases,
             goals,
@@ -355,3 +394,5 @@ def move_motors_and_wait(
             max_retries=max_retries,
             backlash_correction=backlash_correction,
         )
+        logger.info("Motor move returned: positions=%s", positions)
+        return positions

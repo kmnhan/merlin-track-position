@@ -510,6 +510,7 @@ class MainWindow(_MainWindowGUI):
 
     @QtCore.Slot(int)
     def _on_move_detected(self, target: int) -> None:
+        logger.info("Move detected by motor server: target=%d", target)
         try:
             self._start_correction()
         except _CorrectionUnavailable as exc:
@@ -538,6 +539,10 @@ class MainWindow(_MainWindowGUI):
         else:
             self._server_correction_pending = True
             self._server_correction_target = int(target)
+            logger.info(
+                "Automatic correction started for target=%d; server reply pending.",
+                target,
+            )
 
     def _raise_for_user_attention(self) -> None:
         if self.isMinimized():
@@ -563,6 +568,7 @@ class MainWindow(_MainWindowGUI):
         if self._calibration is None or self._calibration_path is None:
             raise RuntimeError("correction state changed before startup")
 
+        logger.info("Starting correction: calibration_path=%s", self._calibration_path)
         camera_pair = self._camera_pair_for_current_rois()
         self._correction_thread.configure(
             self._calibration,
@@ -577,10 +583,12 @@ class MainWindow(_MainWindowGUI):
             self._set_roi_editing_enabled(False)
             self.calibration_panel.show_correction_in_progress()
             self._correction_thread.start()
+            logger.info("Correction thread start requested.")
         except Exception:
             if ui_marked_busy:
                 self._restore_image_auto_refresh_after_calibration()
                 self._restore_calibration_idle_state()
+            logger.exception("Failed while starting correction.")
             raise
 
     def _reply_to_pending_server_correction(
@@ -590,6 +598,7 @@ class MainWindow(_MainWindowGUI):
     ) -> None:
         if not self._server_correction_pending:
             return
+        logger.info("Replying to pending server correction: success=%s", success)
         self._server_correction_pending = False
         self._server_correction_target = None
         self._server.set_result(success, message)
@@ -967,6 +976,7 @@ class MainWindow(_MainWindowGUI):
 
     @QtCore.Slot(object)
     def _on_correction_ready(self, result: object) -> None:
+        logger.info("Correction ready signal received.")
         try:
             self._restore_image_auto_refresh_after_calibration()
             if not isinstance(result, xr.Dataset):
@@ -1000,9 +1010,11 @@ class MainWindow(_MainWindowGUI):
             True,
             self._correction_server_result_message(result),
         )
+        logger.info("Correction result applied to GUI.")
 
     @QtCore.Slot(str)
     def _on_correction_failed(self, error_message: str) -> None:
+        logger.error("Correction failed signal received: %s", error_message)
         self._reply_to_pending_server_correction(False, error_message)
         self._restore_image_auto_refresh_after_calibration()
         self._restore_calibration_idle_state()
@@ -1144,6 +1156,11 @@ class MainWindow(_MainWindowGUI):
 
 if __name__ == "__main__":
     multiprocessing.freeze_support()
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+    )
+    logger.info("Starting Track Positions GUI.")
 
     qapp = QtWidgets.QApplication(sys.argv)
     qapp.setStyle("Fusion")
