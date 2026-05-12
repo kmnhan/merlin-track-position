@@ -355,6 +355,7 @@ class MainWindow(_MainWindowGUI):
         self._calibration_total_steps = 0
         self._calibration_started_at: float | None = None
         self._calibration_processing_started_at: float | None = None
+        self._roi_editing_enabled = True
         self._latest_images: tuple[np.ndarray, np.ndarray] | None = None
         self._latest_images_by_camera: dict[str, np.ndarray] = {}
         self._image_capture_locks = {
@@ -429,6 +430,7 @@ class MainWindow(_MainWindowGUI):
             self._on_image_auto_refresh_toggled
         )
         self.calibration_panel.reset()
+        self._set_roi_editing_enabled(True)
 
         self._server = MotorServer(self)
         self._server.sigMoveDetected.connect(self._on_move_detected)
@@ -448,7 +450,18 @@ class MainWindow(_MainWindowGUI):
         del target
         self._server.set_result(True, "")
 
+    def _set_roi_editing_enabled(self, enabled: bool) -> None:
+        enabled = bool(enabled)
+        self._roi_editing_enabled = enabled
+        for roi in self.image_rois.values():
+            roi.translatable = enabled
+            for handle in roi.getHandles():
+                handle.setVisible(enabled)
+
     def _on_roi_region_change_finished(self, camera: str) -> None:
+        if self._calibration is not None or not self._roi_editing_enabled:
+            return
+
         image_width, image_height = CAMERA_IMAGE_SIZES[camera]
         roi = self.image_rois[camera]
         position = roi.pos()
@@ -542,9 +555,10 @@ class MainWindow(_MainWindowGUI):
             )
             return
 
+        self._apply_calibration_roi_metadata(calibration)
         self._calibration = calibration
         self._calibration_path = path
-        self._apply_calibration_roi_metadata(calibration)
+        self._set_roi_editing_enabled(False)
         self.calibration_panel.show_loaded_calibration(calibration, path.name)
 
     @QtCore.Slot()
@@ -577,11 +591,15 @@ class MainWindow(_MainWindowGUI):
             return
 
         self._calibration_path = path
+        self._set_roi_editing_enabled(False)
         self.calibration_panel.show_saved_calibration(path.name)
 
     @QtCore.Slot()
     def _on_new_calibration_clicked(self) -> None:
         if self._calibration_thread.isRunning():
+            return
+        if self._calibration is not None:
+            self._clear_loaded_calibration()
             return
 
         dialog = CalibrationStartDialog(self)
@@ -613,6 +631,7 @@ class MainWindow(_MainWindowGUI):
             return
 
         self._pause_image_auto_refresh_for_calibration()
+        self._set_roi_editing_enabled(False)
         self._calibration_started_at = time.monotonic()
         self.calibration_panel.show_calibration_in_progress(
             self._calibration_total_steps
@@ -689,12 +708,15 @@ class MainWindow(_MainWindowGUI):
             )
             return
 
-        self._calibration = calibration
         path_value = calibration.attrs.get("calibration_path")
-        self._calibration_path = Path(str(path_value)) if path_value else None
+        calibration_path = Path(str(path_value)) if path_value else None
         self._calibration_started_at = None
         self._calibration_processing_started_at = None
         self._calibration_total_steps = 0
+        self._apply_calibration_roi_metadata(calibration, persist=False)
+        self._calibration = calibration
+        self._calibration_path = calibration_path
+        self._set_roi_editing_enabled(False)
         display_name = (
             self._calibration_path.name
             if self._calibration_path is not None
@@ -728,14 +750,21 @@ class MainWindow(_MainWindowGUI):
         self._calibration_total_steps = 0
         if self._calibration is None:
             self.calibration_panel.reset()
+            self._set_roi_editing_enabled(True)
             return
 
+        self._set_roi_editing_enabled(False)
         display_name = (
             self._calibration_path.name
             if self._calibration_path is not None
             else "current calibration"
         )
         self.calibration_panel.show_loaded_calibration(self._calibration, display_name)
+
+    def _clear_loaded_calibration(self) -> None:
+        self._calibration = None
+        self._calibration_path = None
+        self._restore_calibration_idle_state()
 
     def _get_roi_geometry(self, camera: str) -> RoiGeometry:
         image_width, image_height = CAMERA_IMAGE_SIZES[camera]
@@ -777,13 +806,19 @@ class MainWindow(_MainWindowGUI):
             self._settings.setValue(key, float(value))
         self._settings.sync()
 
-    def _apply_calibration_roi_metadata(self, calibration: xr.Dataset) -> bool:
+    def _apply_calibration_roi_metadata(
+        self,
+        calibration: xr.Dataset,
+        *,
+        persist: bool = True,
+    ) -> bool:
         roi_geometries = _roi_geometries_from_calibration_metadata(calibration)
         if roi_geometries is None:
             return False
         for camera, geometry in roi_geometries.items():
             self._set_roi_geometry(camera, geometry)
-            self._persist_roi_geometry(camera, geometry)
+            if persist:
+                self._persist_roi_geometry(camera, geometry)
         return True
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:

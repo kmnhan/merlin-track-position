@@ -496,6 +496,7 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.save_calibration_button.setEnabled(False)
         self.calibration_details_button.setEnabled(False)
         self.new_calibration_button.setEnabled(True)
+        self.new_calibration_button.setText("New calibration")
         self.calibration_status_label.setText("No visual-Jacobian calibration loaded.")
         self.calibration_progress_bar.setVisible(False)
         self.calibration_progress_bar.setRange(0, 1)
@@ -516,6 +517,7 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.save_calibration_button.setEnabled(False)
         self.calibration_details_button.setEnabled(False)
         self.new_calibration_button.setEnabled(False)
+        self.new_calibration_button.setText("New calibration")
         self.calibration_status_label.setText(
             "New visual-Jacobian calibration in progress..."
         )
@@ -584,6 +586,7 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.save_calibration_button.setEnabled(True)
         self.calibration_details_button.setEnabled(True)
         self.new_calibration_button.setEnabled(True)
+        self.new_calibration_button.setText("Clear calibration")
         self.calibration_progress_bar.setVisible(False)
         self.calibration_status_label.setText(
             "Loaded visual-Jacobian calibration: "
