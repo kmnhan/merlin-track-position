@@ -22,7 +22,11 @@ from merlin_track_position.tracking.calibration_core import (
     fit_calibration_from_images,
     get_correction,
 )
-from merlin_track_position.tracking.calibrate import calibration_sample_count, run_calibration
+from merlin_track_position.tracking.calibrate import (
+    _make_calibration_path,
+    calibration_sample_count,
+    run_calibration,
+)
 from merlin_track_position.tracking.correct import do_correction
 from merlin_track_position.tracking.sample_calibration import (
     build_sample_calibration_dataset,
@@ -113,6 +117,60 @@ def camera_pair_from_pair_source(pair_source):
 
 
 class CalibrationTests(unittest.TestCase):
+    def test_calibration_path_prioritizes_positive_y_motion(self):
+        path = _make_calibration_path(3, 10.0)
+
+        np.testing.assert_allclose(
+            path,
+            [
+                [0.0, 0.0, 10.0],
+                [0.0, 0.0, -10.0],
+                [0.0, 10.0, 0.0],
+                [10.0, 10.0, 10.0],
+                [-10.0, 10.0, 10.0],
+                [-10.0, 10.0, -10.0],
+                [10.0, 10.0, -10.0],
+                [10.0, -10.0, -10.0],
+                [10.0, -10.0, 10.0],
+                [-10.0, -10.0, 10.0],
+                [-10.0, -10.0, -10.0],
+                [0.0, -10.0, 0.0],
+                [10.0, 0.0, 0.0],
+                [-10.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0],
+            ],
+        )
+
+        moves = np.diff(np.vstack(([0.0, 0.0, 0.0], path)), axis=0)
+        self.assertEqual(np.count_nonzero(moves[:, 1] < 0.0), 1)
+
+    def test_calibration_path_preserves_sample_positions(self):
+        path = _make_calibration_path(5, 10.0)
+        rows = {tuple(row) for row in path}
+        offsets = (-20.0, -10.0, 10.0, 20.0)
+        expected_rows = {
+            (0.0, 0.0, z_offset)
+            for z_offset in offsets
+        } | {
+            (0.0, y_offset, 0.0)
+            for y_offset in offsets
+        } | {
+            (x_offset, 0.0, 0.0)
+            for x_offset in offsets
+        } | {
+            (x_offset, y_offset, z_offset)
+            for x_offset in (-10.0, 10.0)
+            for y_offset in (-10.0, 10.0)
+            for z_offset in (-10.0, 10.0)
+        } | {
+            (0.0, 0.0, 0.0)
+        }
+
+        self.assertEqual(rows, expected_rows)
+        self.assertEqual(path.shape[0], len(expected_rows))
+        moves = np.diff(np.vstack(([0.0, 0.0, 0.0], path)), axis=0)
+        self.assertEqual(np.count_nonzero(moves[:, 1] < 0.0), 1)
+
     def test_calibration_sample_count_matches_path_shape(self):
         self.assertEqual(calibration_sample_count(3), 16)
         self.assertEqual(calibration_sample_count(5), 22)

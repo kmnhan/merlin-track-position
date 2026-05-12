@@ -22,29 +22,61 @@ def _make_calibration_path(
     n: int,
     step_um: float,
 ) -> np.ndarray:
-    """Build a 3D calibration path as rows of [x_um, y_um, z_um]."""
+    """Build a backlash-aware 3D calibration path as rows of [x_um, y_um, z_um]."""
     if n < 2:
         raise ValueError("n must be >= 2")
 
     offsets = (np.arange(n, dtype=float) - (n - 1) / 2) * step_um
+    offsets = offsets[~np.isclose(offsets, 0.0)]
+    positive_offsets = sorted(float(offset) for offset in offsets if offset > 0.0)
+    negative_offsets = sorted(float(offset) for offset in offsets if offset < 0.0)
 
     rows: list[list[float]] = []
-    for axis in range(3):
-        for offset in offsets:
-            if np.isclose(offset, 0.0):
-                continue
-            row = [0.0, 0.0, 0.0]
-            row[axis] = float(offset)
-            rows.append(row)
 
     corner_step = float(step_um)
-    for dx in (-corner_step, corner_step):
-        for dy in (-corner_step, corner_step):
-            for dz in (-corner_step, corner_step):
-                rows.append([dx, dy, dz])
+
+    # The y axis is the most backlash-sensitive axis. Keep y nondecreasing except
+    # for one transition from the positive-y side to the negative-y side.
+    for z_offset in (*positive_offsets, *negative_offsets):
+        rows.append([0.0, 0.0, z_offset])
+
+    positive_y_levels = sorted({*positive_offsets, corner_step})
+    for y_offset in positive_y_levels:
+        if _contains_offset(positive_offsets, y_offset):
+            rows.append([0.0, y_offset, 0.0])
+        if np.isclose(y_offset, corner_step):
+            rows.extend(
+                [
+                    [corner_step, y_offset, corner_step],
+                    [-corner_step, y_offset, corner_step],
+                    [-corner_step, y_offset, -corner_step],
+                    [corner_step, y_offset, -corner_step],
+                ]
+            )
+
+    negative_y_levels = sorted({*negative_offsets, -corner_step})
+    for y_offset in negative_y_levels:
+        if np.isclose(y_offset, -corner_step):
+            rows.extend(
+                [
+                    [corner_step, y_offset, -corner_step],
+                    [corner_step, y_offset, corner_step],
+                    [-corner_step, y_offset, corner_step],
+                    [-corner_step, y_offset, -corner_step],
+                ]
+            )
+        if _contains_offset(negative_offsets, y_offset):
+            rows.append([0.0, y_offset, 0.0])
+
+    for x_offset in (*positive_offsets, *negative_offsets):
+        rows.append([x_offset, 0.0, 0.0])
 
     rows.append([0.0, 0.0, 0.0])
     return np.asarray(rows, dtype=float)
+
+
+def _contains_offset(offsets: list[float], value: float) -> bool:
+    return any(np.isclose(offset, value) for offset in offsets)
 
 
 def calibration_sample_count(n: int) -> int:
