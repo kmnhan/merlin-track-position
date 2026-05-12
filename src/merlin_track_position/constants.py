@@ -31,6 +31,9 @@ MOTOR_MOVE_DEADBAND: dict[str, float] = {
     "z": 0.001,
 }
 
+# Default number of image pairs captured at each calibration/correction position.
+DEFAULT_CAPTURE_COUNT: int = 3
+
 # Image size for initial crop from each camera array.
 IMAGE_WIDTH_CAM0: int = 704
 IMAGE_HEIGHT_CAM0: int = 480

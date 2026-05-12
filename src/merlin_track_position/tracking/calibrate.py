@@ -5,6 +5,7 @@ from collections.abc import Callable
 import numpy as np
 import xarray as xr
 
+from merlin_track_position import constants
 from merlin_track_position.instruments.cameras import (
     CameraPairPlugin,
     capture_image_and_display_stacks,
@@ -58,7 +59,7 @@ def run_calibration(
     *,
     origin_stability_um: float = 5.0,
     home_tolerance_um: float = 1.0,
-    capture_count: int = 5,
+    capture_count: int = constants.DEFAULT_CAPTURE_COUNT,
     step_callback: Callable[
         [int, float, float, float, np.ndarray, np.ndarray],
         None,
@@ -86,7 +87,7 @@ def run_calibration(
         routine. Default is 1 micron.
     capture_count : int, optional
         Number of image pairs captured at each motor position. The per-step images are
-        aggregated during fitting. Default is 5.
+        aggregated during fitting. Defaults to ``constants.DEFAULT_CAPTURE_COUNT``.
     step_callback
         Optional callback function that will be called after each move to a grid point
         with the following arguments:

@@ -7,6 +7,7 @@ import numpy as np
 import xarray as xr
 from scipy import ndimage
 
+from merlin_track_position import constants
 from merlin_track_position.instruments.cameras import (
     CallableCameraPlugin,
     CameraPairPlugin,
@@ -167,7 +168,7 @@ class CalibrationTests(unittest.TestCase):
         self.assertEqual(calibration.attrs["tilt"], 6.7)
         np.testing.assert_allclose(captured_kwargs["stage_um"][0], [0.0, 0.0, 0.0])
 
-    def test_run_calibration_captures_five_images_per_step_and_reports_once(self):
+    def test_run_calibration_captures_default_images_per_step_and_reports_once(self):
         captured_kwargs = {}
         callback_steps = []
         generator_calls = 0
@@ -216,18 +217,23 @@ class CalibrationTests(unittest.TestCase):
             )
 
         expected_steps = calibration_sample_count(2)
-        self.assertEqual(generator_calls, expected_steps * 5)
+        expected_capture_count = constants.DEFAULT_CAPTURE_COUNT
+        self.assertEqual(generator_calls, expected_steps * expected_capture_count)
         self.assertEqual(len(callback_steps), expected_steps)
         self.assertEqual(len(captured_kwargs["images_cam0"]), expected_steps)
-        self.assertEqual(captured_kwargs["images_cam0"][0].shape, (5, 2, 2))
+        self.assertEqual(
+            captured_kwargs["images_cam0"][0].shape,
+            (expected_capture_count, 2, 2),
+        )
         self.assertEqual(captured_kwargs["images_cam0"][0].dtype, np.float32)
+        expected_representative_value = (expected_capture_count + 1.0) / 2.0
         np.testing.assert_array_equal(
             callback_steps[0][4],
-            np.full((2, 2), 3.0, dtype=np.float32),
+            np.full((2, 2), expected_representative_value, dtype=np.float32),
         )
         np.testing.assert_array_equal(
             callback_steps[0][5],
-            np.full((2, 3), 103.0, dtype=np.float32),
+            np.full((2, 3), expected_representative_value + 100.0, dtype=np.float32),
         )
 
     def test_run_calibration_reports_full_display_images_from_cropped_pair(self):

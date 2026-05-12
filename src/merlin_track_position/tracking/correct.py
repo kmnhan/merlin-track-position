@@ -6,6 +6,7 @@ from typing import Any
 import numpy as np
 import xarray as xr
 
+from merlin_track_position import constants
 from merlin_track_position.instruments.cameras import (
     CameraPairPlugin,
     RoiGeometry,
@@ -35,7 +36,7 @@ def do_correction(
     *,
     move_tolerance_um: float | Iterable[float] | None = None,
     max_retries: int = 4,
-    capture_count: int = 5,
+    capture_count: int = constants.DEFAULT_CAPTURE_COUNT,
     **shift_kwargs: Any,
 ) -> xr.Dataset:
     """Estimate and apply the x/y/z motor correction for current camera images.
@@ -62,7 +63,7 @@ def do_correction(
         Maximum number of motor move retries to pass to :func:`move_motors_and_wait`.
     capture_count
         Number of current image pairs captured before estimating the correction.
-        Default is 5.
+        Defaults to ``constants.DEFAULT_CAPTURE_COUNT``.
     **shift_kwargs
         Additional keyword arguments forwarded to :func:`get_correction` and ultimately
         to the image-shift estimator.
