@@ -26,9 +26,9 @@ MOTOR_BACKLASH_CORRECTION: dict[str, float] = {
 
 # Default no-op deadbands in each motor's command units. For x/y/z, this is mm.
 MOTOR_MOVE_DEADBAND: dict[str, float] = {
-    "x": 0.001,
-    "y": 0.001,
-    "z": 0.001,
+    "x": 0.005,
+    "y": 0.01,
+    "z": 0.005,
 }
 
 # Default number of image pairs captured at each calibration/correction position.
@@ -64,10 +64,10 @@ DEFAULT_VISUAL_JACOBIAN_CONDITION_WARNING: float = 100.0
 # Closed-loop correction defaults in command-mm visual-servo space.
 DEFAULT_CORRECTION_PIXEL_TOLERANCE_PX: float = 0.55
 DEFAULT_CORRECTION_GAIN: float = 0.3
-DEFAULT_CORRECTION_MIN_GAIN: float = 0.05
-DEFAULT_CORRECTION_DAMPING_MU: float = 1e-2
+DEFAULT_CORRECTION_MIN_GAIN: float = 0.15
+DEFAULT_CORRECTION_DAMPING_MU: float = 1.0
 DEFAULT_CORRECTION_MAX_NORMALIZED_STEP: float = 0.5
-DEFAULT_CORRECTION_MIN_AXIS_PREDICTED_SHIFT_PX: float = 0.25
+DEFAULT_CORRECTION_MIN_AXIS_PREDICTED_SHIFT_PX: float = 0.15
 DEFAULT_CORRECTION_MIN_COMMAND_NORM_MM: float = 1e-9
 DEFAULT_CORRECTION_MAX_MOVES: int = 12
 
