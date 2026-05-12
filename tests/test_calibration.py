@@ -244,9 +244,10 @@ class CalibrationTests(unittest.TestCase):
         def fake_pair_source():
             nonlocal generator_calls
             generator_calls += 1
+            value = 1.0 if generator_calls % 2 else 10.0
             return (
-                np.full((4, 5), generator_calls, dtype=np.float32),
-                np.full((6, 7), generator_calls + 100.0, dtype=np.float32),
+                np.full((4, 5), value, dtype=np.float32),
+                np.full((6, 7), value + 100.0, dtype=np.float32),
             )
 
         def fake_move_motors_and_wait(motor_aliases, goals, **kwargs):
@@ -287,21 +288,21 @@ class CalibrationTests(unittest.TestCase):
                 10.0,
                 camera_pair,
                 origin_stability_um=ORIGIN_STABILITY_UM,
-                capture_count=1,
+                capture_count=2,
                 step_callback=step_callback,
                 processing_callback=processing_callback,
             )
 
-        self.assertEqual(captured_kwargs["images_cam0"][0].shape, (1, 2, 3))
-        self.assertEqual(captured_kwargs["images_cam1"][0].shape, (1, 2, 2))
+        self.assertEqual(captured_kwargs["images_cam0"][0].shape, (2, 2, 3))
+        self.assertEqual(captured_kwargs["images_cam1"][0].shape, (2, 2, 2))
         self.assertIs(captured_kwargs["progress_callback"], processing_callback)
         np.testing.assert_array_equal(
             callback_steps[0][4],
-            np.full((4, 5), 1.0, dtype=np.float32),
+            np.full((4, 5), 5.5, dtype=np.float32),
         )
         np.testing.assert_array_equal(
             callback_steps[0][5],
-            np.full((6, 7), 101.0, dtype=np.float32),
+            np.full((6, 7), 105.5, dtype=np.float32),
         )
 
     def test_fit_calibration_from_stereo_numpy_arrays(self):
@@ -349,18 +350,27 @@ class CalibrationTests(unittest.TestCase):
             atol=1.0,
         )
 
-    def test_fit_calibration_uses_median_shift_from_capture_stack(self):
+    def test_fit_calibration_uses_median_shift_and_mean_images_from_capture_stack(self):
         stage_to_pixel = stereo_stage_to_pixel()
         stage = calibration_stage()
         capture_deltas = np.array([-0.2, -0.1, 0.0, 0.1, 200.0], dtype=float)
+        capture_markers = (0, 1, 10, 11, 12)
+        capture_marker_to_index = {
+            marker: capture_index
+            for capture_index, marker in enumerate(capture_markers)
+        }
         images_cam0 = []
         images_cam1 = []
         for sample_index in range(stage.shape[0]):
             images_cam0.append(
                 np.stack(
                     [
-                        np.full((4, 4), sample_index * 10 + capture_index, dtype=np.float32)
-                        for capture_index in range(5)
+                        np.full(
+                            (4, 4),
+                            sample_index * 100 + marker,
+                            dtype=np.float32,
+                        )
+                        for marker in capture_markers
                     ],
                     axis=0,
                 )
@@ -370,10 +380,10 @@ class CalibrationTests(unittest.TestCase):
                     [
                         np.full(
                             (5, 6),
-                            10000 + sample_index * 10 + capture_index,
+                            10000 + sample_index * 100 + marker,
                             dtype=np.float32,
                         )
-                        for capture_index in range(5)
+                        for marker in capture_markers
                     ],
                     axis=0,
                 )
@@ -385,7 +395,8 @@ class CalibrationTests(unittest.TestCase):
             camera_index = 1 if marker >= 10000 else 0
             if camera_index == 1:
                 marker -= 10000
-            sample_index, capture_index = divmod(marker, 10)
+            sample_index, capture_marker = divmod(marker, 100)
+            capture_index = capture_marker_to_index[capture_marker]
             base_shift = stage_to_pixel[camera_index] @ stage[sample_index]
             return xr.Dataset(
                 data_vars={
@@ -421,7 +432,11 @@ class CalibrationTests(unittest.TestCase):
         self.assertEqual(calibration["image_cam1"].dtype, np.float32)
         np.testing.assert_array_equal(
             calibration["image_cam0"].values[0],
-            np.full((4, 4), 2.0, dtype=np.float32),
+            np.full((4, 4), 6.8, dtype=np.float32),
+        )
+        np.testing.assert_array_equal(
+            calibration["image_cam1"].values[0],
+            np.full((5, 6), 10006.8, dtype=np.float32),
         )
 
     def test_fit_calibration_reports_measurement_warning_step_and_camera(self):

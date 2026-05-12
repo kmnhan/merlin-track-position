@@ -211,7 +211,7 @@ def run_calibration(
 
 
 def _representative_image(images: np.ndarray) -> np.ndarray:
-    representative = np.median(images, axis=0)
+    representative = np.mean(images, axis=0)
     return _cast_representative_image(representative, images.dtype)
 
 

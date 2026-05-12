@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
+from collections.abc import Callable, Iterable, Iterator
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Sequence
 
 import numpy as np
@@ -22,6 +22,8 @@ MEASUREMENT_WARNING_SUMMARY = (
     "one or more shift measurements reported image-matching warnings"
 )
 ProgressCallback = Callable[[int, int], None]
+CaptureShiftResult = tuple[np.ndarray, tuple[str, ...]]
+IndexedCaptureShiftResult = tuple[int, int, int, np.ndarray, tuple[str, ...]]
 
 
 def fit_calibration_from_images(
@@ -84,8 +86,8 @@ def fit_calibration_from_images(
     if not np.allclose(stage[0], 0.0, rtol=0.0, atol=1e-9):
         raise ValueError("stage_um[0] must be the origin")
 
-    reference_cam0 = _median_capture_image(capture_arrays_cam0[0])
-    reference_cam1 = _median_capture_image(capture_arrays_cam1[0])
+    reference_cam0 = _mean_capture_image(capture_arrays_cam0[0])
+    reference_cam1 = _mean_capture_image(capture_arrays_cam1[0])
     pixels, capture_shift_mad_px, measurement_warnings = (
         _estimate_calibration_capture_shifts(
             (capture_arrays_cam0, capture_arrays_cam1),
@@ -278,31 +280,33 @@ def _estimate_calibration_capture_shifts(
 ]:
     sample_count = len(capture_arrays_by_camera[0])
     capture_count = int(capture_arrays_by_camera[0][0].shape[0])
-    total = sample_count * len(CAMERAS) * capture_count
+    camera_count = len(CAMERAS)
+    total = sample_count * camera_count * capture_count
     if progress_callback is not None:
         progress_callback(0, total)
 
     shift_array = np.empty(
-        (sample_count, len(CAMERAS), capture_count, len(PIXEL_AXES)),
+        (sample_count, camera_count, capture_count, len(PIXEL_AXES)),
         dtype=np.float64,
     )
     warnings_by_capture: list[list[list[tuple[str, ...]]]] = [
         [[() for _ in range(capture_count)] for _ in CAMERAS]
         for _ in range(sample_count)
     ]
-    tasks = tuple(
-        (
-            sample_index,
-            camera_index,
-            capture_index,
-            references_by_camera[camera_index],
-            captures[capture_index],
-        )
-        for sample_index in range(sample_count)
-        for camera_index, capture_arrays in enumerate(capture_arrays_by_camera)
-        for captures in (capture_arrays[sample_index],)
-        for capture_index in range(capture_count)
-    )
+    tasks: list[tuple[int, int, int, np.ndarray, np.ndarray]] = []
+    for sample_index in range(sample_count):
+        for camera_index, capture_arrays in enumerate(capture_arrays_by_camera):
+            captures = capture_arrays[sample_index]
+            for capture_index, current in enumerate(captures):
+                tasks.append(
+                    (
+                        sample_index,
+                        camera_index,
+                        capture_index,
+                        references_by_camera[camera_index],
+                        current,
+                    )
+                )
 
     completed = 0
     for sample_index, camera_index, capture_index, shift_px, capture_warnings in (
@@ -322,33 +326,25 @@ def _estimate_calibration_capture_shifts(
             progress_callback(completed, total)
 
     pixels = np.empty(
-        (sample_count, len(CAMERAS), len(PIXEL_AXES)),
+        (sample_count, camera_count, len(PIXEL_AXES)),
         dtype=np.float64,
     )
     capture_shift_mad_px = np.empty_like(pixels)
     measurement_warnings: list[tuple[tuple[str, ...], tuple[str, ...]]] = []
     for sample_index in range(sample_count):
         sample_warnings: list[tuple[str, ...]] = []
-        for camera_index in range(len(CAMERAS)):
-            camera_shifts = shift_array[sample_index, camera_index]
-            finite_rows = np.isfinite(camera_shifts).all(axis=1)
-            if not np.any(finite_rows):
-                raise ValueError("all capture shift estimates failed or were non-finite")
-            finite_shifts = camera_shifts[finite_rows]
-            median_shift = np.median(finite_shifts, axis=0)
+        for camera_index in range(camera_count):
+            median_shift, shift_mad, camera_warnings = _summarize_capture_shifts(
+                (
+                    (
+                        shift_array[sample_index, camera_index, capture_index],
+                        warnings_by_capture[sample_index][camera_index][capture_index],
+                    )
+                    for capture_index in range(capture_count)
+                )
+            )
             pixels[sample_index, camera_index, :] = median_shift
-            capture_shift_mad_px[sample_index, camera_index, :] = np.median(
-                np.abs(finite_shifts - median_shift),
-                axis=0,
-            )
-            camera_warnings = tuple(
-                warning
-                for capture_warnings in warnings_by_capture[sample_index][
-                    camera_index
-                ]
-                for warning in capture_warnings
-                if warning
-            )
+            capture_shift_mad_px[sample_index, camera_index, :] = shift_mad
             sample_warnings.append(camera_warnings)
         measurement_warnings.append((sample_warnings[0], sample_warnings[1]))
 
@@ -370,7 +366,7 @@ def _iter_indexed_capture_shift_results(
     *,
     n_jobs: int,
     **shift_kwargs: Any,
-):
+) -> Iterator[IndexedCaptureShiftResult]:
     if n_jobs == 1:
         for task in tasks:
             yield _estimate_indexed_capture_shift(
@@ -402,7 +398,7 @@ def _estimate_indexed_capture_shift(
     current: np.ndarray,
     capture_count: int,
     **shift_kwargs: Any,
-) -> tuple[int, int, int, np.ndarray, tuple[str, ...]]:
+) -> IndexedCaptureShiftResult:
     shift_px, capture_warnings = _estimate_capture_shift(
         reference,
         current,
@@ -420,7 +416,7 @@ def _estimate_capture_shift(
     reference: np.ndarray,
     current: np.ndarray,
     **shift_kwargs: Any,
-) -> tuple[np.ndarray, tuple[str, ...]]:
+) -> CaptureShiftResult:
     try:
         shift = estimate_shift(reference, current, **shift_kwargs)
         shift_px = np.asarray(shift["shift_px"].values, dtype=np.float64)
@@ -636,15 +632,15 @@ def _common_capture_count(
     return capture_count
 
 
-def _median_capture_image(capture_array: np.ndarray) -> np.ndarray:
-    return np.median(np.asarray(capture_array, dtype=np.float64), axis=0)
+def _mean_capture_image(capture_array: np.ndarray) -> np.ndarray:
+    return np.mean(np.asarray(capture_array, dtype=np.float64), axis=0)
 
 
 def _representative_capture_image(
     capture_array: np.ndarray,
     dtype: np.dtype,
 ) -> np.ndarray:
-    image = _median_capture_image(capture_array)
+    image = _mean_capture_image(capture_array)
     return _cast_representative_image(image, dtype)
 
 
@@ -663,40 +659,36 @@ def _estimate_median_capture_shift(
     **shift_kwargs: Any,
 ) -> tuple[np.ndarray, np.ndarray, tuple[str, ...]]:
     capture_count = int(captures.shape[0])
-    capture_shifts: list[np.ndarray] = []
-    warnings: list[str] = []
+    results: list[CaptureShiftResult] = []
     for capture_index, current in enumerate(captures):
-        try:
-            shift = estimate_shift(reference, current, **shift_kwargs)
-            shift_px = np.asarray(shift["shift_px"].values, dtype=np.float64)
-            capture_warnings = tuple(
-                line
-                for line in str(shift.attrs.get("warnings", "")).splitlines()
-                if line
-            )
-        except Exception as exc:
-            shift_px = np.array([np.nan, np.nan], dtype=np.float64)
-            capture_warnings = (f"shift estimation failed: {exc}",)
-
-        if shift_px.shape != (len(PIXEL_AXES),):
-            capture_warnings = (
-                *capture_warnings,
-                f"shift estimate has unexpected shape {shift_px.shape!r}",
-            )
-            shift_px = np.array([np.nan, np.nan], dtype=np.float64)
-        if not np.isfinite(shift_px).all():
-            capture_warnings = (
-                *capture_warnings,
-                "shift estimate is not finite",
-            )
-        capture_shifts.append(shift_px)
-        warnings.extend(
-            _format_capture_warning(line, capture_index, capture_count)
-            for line in capture_warnings
-            if line
+        shift_px, capture_warnings = _estimate_capture_shift(
+            reference,
+            current,
+            **shift_kwargs,
         )
+        results.append(
+            (
+                shift_px,
+                tuple(
+                    _format_capture_warning(line, capture_index, capture_count)
+                    for line in capture_warnings
+                    if line
+                ),
+            )
+        )
+    return _summarize_capture_shifts(results)
 
-    shift_array = np.vstack(capture_shifts)
+
+def _summarize_capture_shifts(
+    results: Iterable[CaptureShiftResult],
+) -> tuple[np.ndarray, np.ndarray, tuple[str, ...]]:
+    shifts: list[np.ndarray] = []
+    warnings: list[str] = []
+    for shift_px, capture_warnings in results:
+        shifts.append(shift_px)
+        warnings.extend(warning for warning in capture_warnings if warning)
+
+    shift_array = np.vstack(shifts)
     finite_rows = np.isfinite(shift_array).all(axis=1)
     if not np.any(finite_rows):
         raise ValueError("all capture shift estimates failed or were non-finite")
