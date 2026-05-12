@@ -173,6 +173,34 @@ class MoveMotorsAndWaitTests(unittest.TestCase):
         self.assertEqual(positions, (10.0005, 1.9995))
         self.assertEqual(len(server.move_calls), 1)
 
+    def test_stale_status_accepts_axis_specific_readback_deadband(self):
+        server = FakeBCSServer(
+            [(10.0005, 2.004)],
+            status=0,
+        )
+
+        with (
+            patch.object(
+                constants,
+                "MOTOR_STALE_READBACK_DEADBAND",
+                {"x": 0.001, "y": 0.005},
+            ),
+            patch("merlin_track_position.instruments.motors.time.sleep"),
+            patch(
+                "merlin_track_position.instruments.motors.time.monotonic",
+                side_effect=[0.0, constants.MOTOR_STALE_READBACK_DELAY_S],
+            ),
+        ):
+            positions = _move_motors_and_wait(
+                server,
+                ("x", "y"),
+                (10.0, 2.0),
+                max_retries=3,
+            )
+
+        self.assertEqual(positions, (10.0005, 2.004))
+        self.assertEqual(len(server.move_calls), 1)
+
     def test_stale_status_does_not_accept_position_readback_before_delay(self):
         server = FakeBCSServer(
             [(10.0, 2.0)],

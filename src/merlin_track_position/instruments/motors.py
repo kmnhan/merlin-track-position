@@ -65,16 +65,16 @@ def _wait_until_move_complete(
     motor_aliases = tuple(motor_aliases)
     goals = tuple(float(goal) for goal in goals)
     timeout_s = _validate_move_timeout(timeout_s)
-    stale_readback_deadband = _stale_readback_deadband()
+    stale_readback_deadbands = _stale_readback_deadbands(motor_aliases)
     stale_readback_delay_s = _stale_readback_delay_s()
     started_at = time.monotonic()
     next_log_elapsed_s = 5.0
     logger.info(
         "Waiting for motor move completion: motor_aliases=%s, goals=%s, "
-        "stale_readback_deadband=%g, stale_readback_delay_s=%g, timeout_s=%g",
+        "stale_readback_deadbands=%s, stale_readback_delay_s=%g, timeout_s=%g",
         motor_aliases,
         goals,
-        stale_readback_deadband,
+        stale_readback_deadbands,
         stale_readback_delay_s,
         timeout_s,
     )
@@ -102,16 +102,16 @@ def _wait_until_move_complete(
         if elapsed_s >= stale_readback_delay_s and _positions_within_deadband(
             positions,
             goals,
-            stale_readback_deadband,
+            stale_readback_deadbands,
         ):
             logger.info(
                 "Motor move accepted by stale-status position readback: "
                 "motor_aliases=%s, positions=%s, goals=%s, "
-                "stale_readback_deadband=%g, status=%s, elapsed_s=%.1f",
+                "stale_readback_deadbands=%s, status=%s, elapsed_s=%.1f",
                 motor_aliases,
                 positions,
                 goals,
-                stale_readback_deadband,
+                stale_readback_deadbands,
                 status,
                 elapsed_s,
             )
@@ -125,18 +125,18 @@ def _wait_until_move_complete(
                 "Timed out waiting for motor move completion: "
                 f"motor_aliases={motor_aliases}, goals={goals}, "
                 f"positions={positions}, position_errors={position_errors}, "
-                f"stale_readback_deadband={stale_readback_deadband}, "
+                f"stale_readback_deadbands={stale_readback_deadbands}, "
                 f"status={status}, elapsed_s={elapsed_s:.1f}"
             )
         if elapsed_s >= next_log_elapsed_s:
             logger.info(
                 "Still waiting for motor move completion: motor_aliases=%s, "
-                "positions=%s, goals=%s, stale_readback_deadband=%g, "
+                "positions=%s, goals=%s, stale_readback_deadbands=%s, "
                 "status=%s, elapsed_s=%.1f",
                 motor_aliases,
                 positions,
                 goals,
-                stale_readback_deadband,
+                stale_readback_deadbands,
                 status,
                 elapsed_s,
             )
@@ -241,11 +241,31 @@ def _validate_move_timeout(timeout_s: float) -> float:
     return timeout
 
 
-def _stale_readback_deadband() -> float:
-    deadband = float(constants.MOTOR_STALE_READBACK_DEADBAND)
+def _stale_readback_deadbands(motor_aliases: Iterable[str]) -> tuple[float, ...]:
+    aliases = tuple(motor_aliases)
+    configured_deadbands = constants.MOTOR_STALE_READBACK_DEADBAND
+    if isinstance(configured_deadbands, Mapping):
+        deadbands = []
+        for alias in aliases:
+            try:
+                deadband_value = configured_deadbands[alias]
+            except KeyError as exc:
+                raise ValueError(
+                    "MOTOR_STALE_READBACK_DEADBAND missing value for "
+                    f"motor alias {alias!r}"
+                ) from exc
+            deadbands.append(_validate_stale_readback_deadband(deadband_value))
+        return tuple(deadbands)
+
+    deadband = _validate_stale_readback_deadband(configured_deadbands)
+    return (deadband,) * len(aliases)
+
+
+def _validate_stale_readback_deadband(deadband_value: float) -> float:
+    deadband = float(deadband_value)
     if not np.isfinite(deadband) or deadband < 0.0:
         raise ValueError(
-            "MOTOR_STALE_READBACK_DEADBAND must be finite and non-negative"
+            "MOTOR_STALE_READBACK_DEADBAND values must be finite and non-negative"
         )
     return deadband
 
@@ -260,11 +280,11 @@ def _stale_readback_delay_s() -> float:
 def _positions_within_deadband(
     positions: Iterable[float],
     goals: Iterable[float],
-    deadband: float,
+    deadbands: Iterable[float],
 ) -> bool:
     return all(
         abs(float(position) - float(goal)) <= float(deadband)
-        for position, goal in zip(positions, goals, strict=True)
+        for position, goal, deadband in zip(positions, goals, deadbands, strict=True)
     )
 
 

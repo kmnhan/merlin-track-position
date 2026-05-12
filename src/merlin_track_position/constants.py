@@ -24,9 +24,20 @@ MOTOR_BACKLASH_CORRECTION: dict[str, float] = {
     "z": 0.1,
 }
 
-# Stale-status readback fallback for motor moves. Values are in each motor's
-# command units. For x/y/z this is mm.
-MOTOR_STALE_READBACK_DEADBAND: float = 0.001
+# Stale-status readback fallback for motor moves. Values are keyed by motor alias
+# and are in each motor's command units. For x/y/z this is mm.
+MOTOR_STALE_READBACK_DEADBAND: dict[str, float] = {
+    "x": 0.005,
+    "y": 0.015,
+    "z": 0.005,
+    "p": 0.05,
+    "t": 0.05,
+    "cam": 0.001,
+    "TA": 0.001,
+    "TB": 0.001,
+    "TC": 0.001,
+    "TD": 0.001,
+}
 MOTOR_STALE_READBACK_DELAY_S: float = 5.0
 
 # Correction offset pruning thresholds. Values are in commanded mm and are applied
