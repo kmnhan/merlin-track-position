@@ -35,6 +35,7 @@ from merlin_track_position.instruments.basler import (
 from merlin_track_position.instruments.framegrab import get_framegrabber_image
 from merlin_track_position.interface.calibration_panel import CalibrationPanel
 from merlin_track_position.interface.calibration_thread import CalibrationThread
+from merlin_track_position.interface.correction_thread import CorrectionThread
 from merlin_track_position.server import MotorServer
 from merlin_track_position.tracking.calibrate import visual_calibration_probe_count
 from merlin_track_position.tracking.calibration_core import (
@@ -352,10 +353,12 @@ class MainWindow(_MainWindowGUI):
         self._calibration: xr.Dataset | None = None
         self._calibration_path: Path | None = None
         self._calibration_thread = CalibrationThread(self)
+        self._correction_thread = CorrectionThread(self)
         self._calibration_total_steps = 0
         self._calibration_started_at: float | None = None
         self._calibration_processing_started_at: float | None = None
         self._roi_editing_enabled = True
+        self._last_correction_result: xr.Dataset | None = None
         self._latest_images: tuple[np.ndarray, np.ndarray] | None = None
         self._latest_images_by_camera: dict[str, np.ndarray] = {}
         self._image_capture_locks = {
@@ -413,6 +416,9 @@ class MainWindow(_MainWindowGUI):
         self.calibration_panel.calibration_details_button.clicked.connect(
             self._on_calibration_details_clicked
         )
+        self.calibration_panel.correct_sample_button.clicked.connect(
+            self._on_correct_sample_clicked
+        )
         self.calibration_panel.new_calibration_button.clicked.connect(
             self._on_new_calibration_clicked
         )
@@ -426,6 +432,8 @@ class MainWindow(_MainWindowGUI):
         self._calibration_thread.sigCalibrationProcessingStep.connect(
             self._on_calibration_processing_step
         )
+        self._correction_thread.sigCorrectionReady.connect(self._on_correction_ready)
+        self._correction_thread.sigCorrectionFailed.connect(self._on_correction_failed)
         self.image_auto_refresh_checkbox.toggled.connect(
             self._on_image_auto_refresh_toggled
         )
@@ -535,6 +543,9 @@ class MainWindow(_MainWindowGUI):
 
     @QtCore.Slot()
     def _on_load_calibration_clicked(self) -> None:
+        if self._correction_thread.isRunning():
+            return
+
         file_name, _ = QtWidgets.QFileDialog.getOpenFileName(
             self,
             "Load visual-Jacobian calibration",
@@ -563,7 +574,7 @@ class MainWindow(_MainWindowGUI):
 
     @QtCore.Slot()
     def _on_save_calibration_clicked(self) -> None:
-        if self._calibration is None:
+        if self._calibration is None or self._correction_thread.isRunning():
             return
 
         default_path = (
@@ -596,7 +607,7 @@ class MainWindow(_MainWindowGUI):
 
     @QtCore.Slot()
     def _on_new_calibration_clicked(self) -> None:
-        if self._calibration_thread.isRunning():
+        if self._calibration_thread.isRunning() or self._correction_thread.isRunning():
             return
         if self._calibration is not None:
             self._clear_loaded_calibration()
@@ -607,14 +618,9 @@ class MainWindow(_MainWindowGUI):
             return
 
         output_path = dialog.output_path()
-        roi_geometries = {
-            camera: self._get_roi_geometry(camera) for camera in CAMERA_IMAGE_SIZES
-        }
+        roi_geometries = self._current_roi_geometries()
         roi_metadata = _roi_metadata_from_geometries(roi_geometries)
-        camera_pair = CameraPairPlugin(
-            CallableCameraPlugin("cam0", self._capture_cam0_image),
-            CallableCameraPlugin("cam1", self._capture_cam1_image),
-        ).cropped(roi_geometries["cam0"], roi_geometries["cam1"])
+        camera_pair = self._camera_pair_for_current_rois()
         try:
             self._calibration_total_steps = visual_calibration_probe_count()
             self._calibration_thread.configure(
@@ -637,6 +643,56 @@ class MainWindow(_MainWindowGUI):
             self._calibration_total_steps
         )
         self._calibration_thread.start()
+
+    @QtCore.Slot()
+    def _on_correct_sample_clicked(self) -> None:
+        if (
+            self._calibration is None
+            or self._calibration_thread.isRunning()
+            or self._correction_thread.isRunning()
+        ):
+            return
+        if self._calibration_path is None or not self._calibration_path.exists():
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Could not start correction",
+                "Correction requires a calibration file on disk.",
+            )
+            return
+
+        response = QtWidgets.QMessageBox.warning(
+            self,
+            "Start sample correction?",
+            (
+                "Correction may move the x/y/z motors and may update the "
+                "calibration file if a Jacobian refinement is accepted."
+            ),
+            QtWidgets.QMessageBox.StandardButton.Ok
+            | QtWidgets.QMessageBox.StandardButton.Cancel,
+            QtWidgets.QMessageBox.StandardButton.Cancel,
+        )
+        if response != QtWidgets.QMessageBox.StandardButton.Ok:
+            return
+
+        try:
+            camera_pair = self._camera_pair_for_current_rois()
+            self._correction_thread.configure(
+                self._calibration,
+                camera_pair,
+                self._calibration_path,
+            )
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Could not start correction",
+                str(exc),
+            )
+            return
+
+        self._pause_image_auto_refresh_for_calibration()
+        self._set_roi_editing_enabled(False)
+        self.calibration_panel.show_correction_in_progress()
+        self._correction_thread.start()
 
     @QtCore.Slot(int, float, float, float, object, object)
     def _on_calibration_step(
@@ -737,9 +793,49 @@ class MainWindow(_MainWindowGUI):
             error_message,
         )
 
+    @QtCore.Slot(object)
+    def _on_correction_ready(self, result: object) -> None:
+        self._restore_image_auto_refresh_after_calibration()
+        try:
+            if not isinstance(result, xr.Dataset):
+                raise TypeError("correction thread did not return an xarray Dataset")
+            self._last_correction_result = result
+            if self._calibration_path is None:
+                raise RuntimeError("correction finished without a calibration path")
+            calibration = self._load_calibration_from_path(self._calibration_path)
+            self._apply_calibration_roi_metadata(calibration, persist=False)
+        except Exception as exc:
+            self._restore_calibration_idle_state()
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Could not use correction result",
+                str(exc),
+            )
+            return
+
+        self._calibration = calibration
+        self._set_roi_editing_enabled(False)
+        display_name = (
+            self._calibration_path.name
+            if self._calibration_path is not None
+            else "current calibration"
+        )
+        self.calibration_panel.show_loaded_calibration(calibration, display_name)
+        self.calibration_panel.show_correction_result(result)
+
+    @QtCore.Slot(str)
+    def _on_correction_failed(self, error_message: str) -> None:
+        self._restore_image_auto_refresh_after_calibration()
+        self._restore_calibration_idle_state()
+        QtWidgets.QMessageBox.critical(
+            self,
+            "Could not correct sample",
+            error_message,
+        )
+
     @QtCore.Slot()
     def _on_calibration_details_clicked(self) -> None:
-        if self._calibration is None:
+        if self._calibration is None or self._correction_thread.isRunning():
             return
 
         self.calibration_panel.build_details_dialog(self._calibration).exec()
@@ -781,6 +877,16 @@ class MainWindow(_MainWindowGUI):
             image_width,
             image_height,
         )
+
+    def _current_roi_geometries(self) -> dict[str, RoiGeometry]:
+        return {camera: self._get_roi_geometry(camera) for camera in CAMERA_IMAGE_SIZES}
+
+    def _camera_pair_for_current_rois(self) -> CameraPairPlugin:
+        roi_geometries = self._current_roi_geometries()
+        return CameraPairPlugin(
+            CallableCameraPlugin("cam0", self._capture_cam0_image),
+            CallableCameraPlugin("cam1", self._capture_cam1_image),
+        ).cropped(roi_geometries["cam0"], roi_geometries["cam1"])
 
     def _set_roi_geometry(
         self,
@@ -829,6 +935,9 @@ class MainWindow(_MainWindowGUI):
 
         self._calibration_thread.stop()
         self._calibration_thread.wait()
+
+        self._correction_thread.stop()
+        self._correction_thread.wait()
 
         close_basler_camera()
 

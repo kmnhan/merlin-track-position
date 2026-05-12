@@ -69,14 +69,13 @@ flattened to the 4 by 3 observation matrix only for linear algebra.
 
 ### Calibration Routine
 
-Calibration learns `J` from before/after image registration for commanded-mm
-probe moves. The current acquisition path is:
+Calibration learns `J` from images captured before and after moves commanded in mm
+coordinates. The current acquisition path is:
 
-1. read the initial BCS `x`, `y`, and `z` positions and keep them as the local
-   commanded-mm state;
-2. capture `reference_cam0` and `reference_cam1`;
-3. build repeated plus/minus single-axis probe deltas for `x`, `y`, and `z`;
-4. for each probe, capture before images, command the absolute BCS target,
+1. read the initial BCS `x`, `y`, and `z` positions
+2. capture `reference_cam0` and `reference_cam1`
+3. build repeated plus/minus single-axis probe delta coordinates for `x`, `y`, and `z`
+4. for each probe, capture before images, command the move,
    capture after images, and register after-vs-before;
 5. fit `visual_jacobian_px_per_cmd_mm` from the valid
    `(probe_command_delta_mm, probe_measured_delta_px)` rows;
@@ -142,7 +141,7 @@ and correction reuses that saved value.
 Let
 
 $$
-S = \operatorname{diag}(s_x, s_y, s_z),
+S = \text{diag}(s_x, s_y, s_z),
 $$
 
 where
@@ -180,7 +179,7 @@ $$
 The target response is the median response over axes:
 
 $$
-r_\star = \operatorname{median}(r_x, r_y, r_z).
+r_\star = \text{median}(r_x, r_y, r_z).
 $$
 
 The unclamped command scale is
@@ -193,7 +192,7 @@ The saved correction scale is clamped to configured operational bounds:
 
 $$
 s_j =
-\operatorname{clip}
+\text{clip}
 \left(
 s_j^{\mathrm{raw}},
 s_{j,\min},

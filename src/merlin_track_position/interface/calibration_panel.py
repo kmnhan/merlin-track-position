@@ -409,11 +409,14 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.load_calibration_button = QtWidgets.QPushButton("Load calibration")
         self.save_calibration_button = QtWidgets.QPushButton("Save copy")
         self.calibration_details_button = QtWidgets.QPushButton("Details...")
+        self.correct_sample_button = QtWidgets.QPushButton("Correct sample")
+        self.correct_sample_button.setEnabled(False)
         self.new_calibration_button = QtWidgets.QPushButton("New calibration")
         self.new_calibration_button.setEnabled(False)
         calibration_button_layout.addWidget(self.load_calibration_button)
         calibration_button_layout.addWidget(self.save_calibration_button)
         calibration_button_layout.addWidget(self.calibration_details_button)
+        calibration_button_layout.addWidget(self.correct_sample_button)
         calibration_button_layout.addWidget(self.new_calibration_button)
         calibration_layout.addLayout(calibration_button_layout)
 
@@ -495,6 +498,7 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.load_calibration_button.setEnabled(True)
         self.save_calibration_button.setEnabled(False)
         self.calibration_details_button.setEnabled(False)
+        self.correct_sample_button.setEnabled(False)
         self.new_calibration_button.setEnabled(True)
         self.new_calibration_button.setText("New calibration")
         self.calibration_status_label.setText("No visual-Jacobian calibration loaded.")
@@ -516,6 +520,7 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.load_calibration_button.setEnabled(False)
         self.save_calibration_button.setEnabled(False)
         self.calibration_details_button.setEnabled(False)
+        self.correct_sample_button.setEnabled(False)
         self.new_calibration_button.setEnabled(False)
         self.new_calibration_button.setText("New calibration")
         self.calibration_status_label.setText(
@@ -585,6 +590,7 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.load_calibration_button.setEnabled(True)
         self.save_calibration_button.setEnabled(True)
         self.calibration_details_button.setEnabled(True)
+        self.correct_sample_button.setEnabled(True)
         self.new_calibration_button.setEnabled(True)
         self.new_calibration_button.setText("Clear calibration")
         self.calibration_progress_bar.setVisible(False)
@@ -617,6 +623,44 @@ class CalibrationPanel(QtWidgets.QWidget):
     def show_saved_calibration(self, display_name: str) -> None:
         self.calibration_status_label.setText(
             f"Saved visual-Jacobian calibration: {display_name}"
+        )
+
+    def show_correction_in_progress(self) -> None:
+        self.load_calibration_button.setEnabled(False)
+        self.save_calibration_button.setEnabled(False)
+        self.calibration_details_button.setEnabled(False)
+        self.correct_sample_button.setEnabled(False)
+        self.new_calibration_button.setEnabled(False)
+        self.new_calibration_button.setText("Clear calibration")
+        self.calibration_progress_bar.setVisible(True)
+        self.calibration_progress_bar.setRange(0, 0)
+        self.calibration_status_label.setText("Correction in progress...")
+
+    def show_correction_result(self, result: xr.Dataset) -> None:
+        converged = bool(result.attrs.get("correction_converged", False))
+        moves = int(result.attrs.get("correction_iterations", result.sizes.get("move", 0)))
+        residual = math.nan
+        if "iteration_weighted_residual_px" in result:
+            residual_values = np.asarray(
+                result["iteration_weighted_residual_px"].values,
+                dtype=float,
+            )
+            if residual_values.size:
+                residual = float(residual_values[-1])
+
+        status = "converged" if converged else "did not converge"
+        self.calibration_status_label.setText(
+            "Correction "
+            f"{status} after {moves} move(s); final residual "
+            f"{_format_number(residual)} px."
+        )
+        warning_lines = [
+            line.strip()
+            for line in str(result.attrs.get("warnings", "")).splitlines()
+            if line.strip()
+        ]
+        self.calibration_warnings_text.setPlainText(
+            "\n".join(warning_lines) if warning_lines else "No correction warnings."
         )
 
     def build_details_dialog(

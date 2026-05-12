@@ -1,9 +1,12 @@
 import os
+import tempfile
 import unittest
 from contextlib import contextmanager
+from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
+import xarray as xr
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -22,6 +25,7 @@ from merlin_track_position.interface.main_window import (  # noqa: E402
 from merlin_track_position.tracking.calibration_core import (  # noqa: E402
     COMMAND_AXES,
     derive_axis_scale_from_jacobian,
+    save_calibration_dataset,
 )
 from merlin_track_position.tracking.sample_calibration import (  # noqa: E402
     build_sample_calibration_dataset,
@@ -96,6 +100,37 @@ class FakeMotorServer(QtCore.QObject):
         pass
 
 
+class FakeCorrectionThread(QtCore.QObject):
+    sigCorrectionReady = QtCore.Signal(object)
+    sigCorrectionFailed = QtCore.Signal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.calibration = None
+        self.camera_pair = None
+        self.calibration_path = None
+        self.started = False
+        self.running = False
+
+    def configure(self, calibration, camera_pair, calibration_path):
+        self.calibration = calibration
+        self.camera_pair = camera_pair
+        self.calibration_path = Path(calibration_path)
+
+    def start(self):
+        self.started = True
+        self.running = True
+
+    def isRunning(self):
+        return self.running
+
+    def stop(self):
+        self.running = False
+
+    def wait(self):
+        pass
+
+
 @contextmanager
 def patched_main_window_runtime(settings=None):
     settings = settings or FakeSettings()
@@ -112,6 +147,10 @@ def patched_main_window_runtime(settings=None):
             "merlin_track_position.interface.main_window.MotorServer",
             FakeMotorServer,
         ),
+        patch(
+            "merlin_track_position.interface.main_window.CorrectionThread",
+            FakeCorrectionThread,
+        ),
         patch("merlin_track_position.interface.main_window.close_basler_camera"),
     ):
         yield settings
@@ -127,6 +166,38 @@ def roi_handles_visible(window):
 
 def roi_editing_enabled(window):
     return all(roi.translatable for roi in window.image_rois.values())
+
+
+def correction_result(
+    *,
+    converged: bool = True,
+    moves: int = 2,
+    residual: float = 0.25,
+    warnings: str = "",
+) -> xr.Dataset:
+    return xr.Dataset(
+        data_vars={
+            "iteration_weighted_residual_px": (
+                ("iteration",),
+                np.asarray([1.0, residual], dtype=float),
+            )
+        },
+        coords={"iteration": np.arange(2)},
+        attrs={
+            "correction_converged": converged,
+            "correction_iterations": moves,
+            "warnings": warnings,
+        },
+    )
+
+
+def write_sample_calibration(path: Path) -> xr.Dataset:
+    calibration = build_sample_calibration_dataset(
+        image_shape_cam0=(4, 5),
+        image_shape_cam1=(6, 7),
+    )
+    save_calibration_dataset(calibration, path)
+    return calibration.assign_attrs({"calibration_path": str(path)})
 
 
 class GUIHelperTests(unittest.TestCase):
@@ -214,6 +285,7 @@ class CalibrationPanelTests(unittest.TestCase):
         self.assertIn("test.h5", panel.calibration_status_label.text())
         self.assertIn("visual-Jacobian", panel.calibration_status_label.text())
         self.assertEqual(panel.new_calibration_button.text(), "Clear calibration")
+        self.assertTrue(panel.correct_sample_button.isEnabled())
         self.assertNotEqual(panel.metric_labels["axis_scale_cmd_mm"].text(), "n/a")
         self.assertEqual(tabs.tabText(0), "Matrices")
         self.assertEqual(tabs.tabText(1), "Axes")
@@ -228,6 +300,16 @@ class CalibrationPanelTests(unittest.TestCase):
 
         panel.reset()
         self.assertEqual(panel.new_calibration_button.text(), "New calibration")
+        self.assertFalse(panel.correct_sample_button.isEnabled())
+
+        panel.show_loaded_calibration(calibration, "test.h5")
+        panel.show_correction_in_progress()
+        self.assertIn("Correction in progress", panel.calibration_status_label.text())
+        self.assertFalse(panel.load_calibration_button.isEnabled())
+        self.assertFalse(panel.save_calibration_button.isEnabled())
+        self.assertFalse(panel.calibration_details_button.isEnabled())
+        self.assertFalse(panel.correct_sample_button.isEnabled())
+        self.assertFalse(panel.new_calibration_button.isEnabled())
 
 
 class MainWindowCalibrationStateTests(unittest.TestCase):
@@ -240,6 +322,7 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                     window.calibration_panel.new_calibration_button.text(),
                     "New calibration",
                 )
+                self.assertFalse(window.calibration_panel.correct_sample_button.isEnabled())
                 self.assertTrue(roi_handles_visible(window))
                 self.assertTrue(roi_editing_enabled(window))
             finally:
@@ -261,6 +344,7 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                     window.calibration_panel.new_calibration_button.text(),
                     "Clear calibration",
                 )
+                self.assertTrue(window.calibration_panel.correct_sample_button.isEnabled())
                 self.assertFalse(roi_handles_visible(window))
                 self.assertFalse(roi_editing_enabled(window))
 
@@ -277,6 +361,7 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                     window.calibration_panel.new_calibration_button.text(),
                     "New calibration",
                 )
+                self.assertFalse(window.calibration_panel.correct_sample_button.isEnabled())
                 self.assertTrue(roi_handles_visible(window))
                 self.assertTrue(roi_editing_enabled(window))
             finally:
@@ -326,6 +411,112 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                 self.assertEqual(settings.set_calls, [])
             finally:
                 window.close()
+
+    def test_correction_cancel_does_not_start_thread(self):
+        get_qapp()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            calibration = write_sample_calibration(Path(tmpdir) / "calibration.h5")
+            with patched_main_window_runtime():
+                window = MainWindow()
+                try:
+                    window._on_new_calibration_ready(calibration)
+                    with patch(
+                        "merlin_track_position.interface.main_window.QtWidgets.QMessageBox.warning",
+                        return_value=QtWidgets.QMessageBox.StandardButton.Cancel,
+                    ):
+                        window._on_correct_sample_clicked()
+
+                    self.assertFalse(window._correction_thread.started)
+                finally:
+                    window.close()
+
+    def test_correction_confirmation_starts_thread_and_disables_actions(self):
+        get_qapp()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "calibration.h5"
+            calibration = write_sample_calibration(path)
+            with patched_main_window_runtime():
+                window = MainWindow()
+                try:
+                    window._on_new_calibration_ready(calibration)
+                    with patch(
+                        "merlin_track_position.interface.main_window.QtWidgets.QMessageBox.warning",
+                        return_value=QtWidgets.QMessageBox.StandardButton.Ok,
+                    ):
+                        window._on_correct_sample_clicked()
+
+                    thread = window._correction_thread
+                    self.assertTrue(thread.started)
+                    self.assertIs(thread.calibration, window._calibration)
+                    self.assertEqual(thread.calibration_path, path)
+                    self.assertIsNotNone(thread.camera_pair)
+                    self.assertIn(
+                        "Correction in progress",
+                        window.calibration_panel.calibration_status_label.text(),
+                    )
+                    self.assertFalse(
+                        window.calibration_panel.correct_sample_button.isEnabled()
+                    )
+                    self.assertFalse(
+                        window.calibration_panel.new_calibration_button.isEnabled()
+                    )
+                finally:
+                    window.close()
+
+    def test_correction_success_stores_result_reloads_calibration_and_reports_status(self):
+        get_qapp()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "calibration.h5"
+            calibration = write_sample_calibration(path)
+            result = correction_result(converged=True, moves=2, residual=0.125)
+            with patched_main_window_runtime():
+                window = MainWindow()
+                try:
+                    window._on_new_calibration_ready(calibration)
+                    window.calibration_panel.show_correction_in_progress()
+
+                    window._on_correction_ready(result)
+
+                    self.assertIs(window._last_correction_result, result)
+                    self.assertEqual(window._calibration_path, path)
+                    self.assertTrue(
+                        window.calibration_panel.correct_sample_button.isEnabled()
+                    )
+                    self.assertIn(
+                        "Correction converged after 2 move(s)",
+                        window.calibration_panel.calibration_status_label.text(),
+                    )
+                    self.assertEqual(
+                        window.calibration_panel.calibration_warnings_text.toPlainText(),
+                        "No correction warnings.",
+                    )
+                finally:
+                    window.close()
+
+    def test_correction_failure_restores_loaded_state_and_shows_error(self):
+        get_qapp()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            calibration = write_sample_calibration(Path(tmpdir) / "calibration.h5")
+            with patched_main_window_runtime():
+                window = MainWindow()
+                try:
+                    window._on_new_calibration_ready(calibration)
+                    window.calibration_panel.show_correction_in_progress()
+                    with patch(
+                        "merlin_track_position.interface.main_window.QtWidgets.QMessageBox.critical"
+                    ) as critical:
+                        window._on_correction_failed("boom")
+
+                    self.assertTrue(
+                        window.calibration_panel.correct_sample_button.isEnabled()
+                    )
+                    self.assertEqual(
+                        window.calibration_panel.new_calibration_button.text(),
+                        "Clear calibration",
+                    )
+                    critical.assert_called_once()
+                finally:
+                    window.close()
 
 
 class CalibrationStartDialogTests(unittest.TestCase):

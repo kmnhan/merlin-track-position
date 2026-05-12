@@ -5,6 +5,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
+import xarray as xr
 from qtpy import QtWidgets
 
 from merlin_track_position.instruments.cameras import (
@@ -12,6 +13,7 @@ from merlin_track_position.instruments.cameras import (
     CameraPairPlugin,
 )
 from merlin_track_position.interface.calibration_thread import CalibrationThread
+from merlin_track_position.interface.correction_thread import CorrectionThread
 from merlin_track_position.tracking.sample_calibration import build_sample_calibration_dataset
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -139,6 +141,82 @@ class CalibrationThreadTests(unittest.TestCase):
             with patch(
                 "merlin_track_position.interface.calibration_thread.run_calibration",
                 side_effect=fake_run_calibration,
+            ):
+                thread.run()
+
+        self.assertEqual(ready, [])
+        self.assertEqual(failed, ["boom"])
+
+
+class CorrectionThreadTests(unittest.TestCase):
+    def test_run_calls_do_correction_and_emits_ready(self):
+        get_qapp()
+        image_cam0 = np.arange(4 * 5, dtype=float).reshape(4, 5)
+        image_cam1 = np.arange(6 * 7, dtype=float).reshape(6, 7)
+        camera_pair = CameraPairPlugin(
+            CallableCameraPlugin("cam0", lambda: image_cam0),
+            CallableCameraPlugin("cam1", lambda: image_cam1),
+        )
+        calibration = build_sample_calibration_dataset(
+            image_shape_cam0=(4, 5),
+            image_shape_cam1=(6, 7),
+        )
+        result = xr.Dataset(attrs={"correction_converged": True})
+        calls = []
+
+        def fake_do_correction(
+            passed_calibration,
+            passed_camera_pair,
+            *,
+            calibration_path,
+        ):
+            calls.append(
+                (passed_calibration, passed_camera_pair, Path(calibration_path))
+            )
+            return result
+
+        thread = CorrectionThread()
+        ready = []
+        failed = []
+        thread.sigCorrectionReady.connect(lambda value: ready.append(value))
+        thread.sigCorrectionFailed.connect(lambda message: failed.append(message))
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "calibration.h5"
+            thread.configure(calibration, camera_pair, path)
+            with patch(
+                "merlin_track_position.interface.correction_thread.do_correction",
+                side_effect=fake_do_correction,
+            ):
+                thread.run()
+
+        self.assertEqual(calls, [(calibration, camera_pair, path)])
+        self.assertEqual(ready, [result])
+        self.assertEqual(failed, [])
+
+    def test_run_emits_failure_when_do_correction_raises(self):
+        get_qapp()
+        thread = CorrectionThread()
+        ready = []
+        failed = []
+        thread.sigCorrectionReady.connect(lambda value: ready.append(value))
+        thread.sigCorrectionFailed.connect(lambda message: failed.append(message))
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            thread.configure(
+                build_sample_calibration_dataset(
+                    image_shape_cam0=(4, 5),
+                    image_shape_cam1=(6, 7),
+                ),
+                CameraPairPlugin(
+                    CallableCameraPlugin("cam0", lambda: np.zeros((2, 2))),
+                    CallableCameraPlugin("cam1", lambda: np.zeros((2, 2))),
+                ),
+                Path(tmpdir) / "calibration.h5",
+            )
+            with patch(
+                "merlin_track_position.interface.correction_thread.do_correction",
+                side_effect=RuntimeError("boom"),
             ):
                 thread.run()
 
