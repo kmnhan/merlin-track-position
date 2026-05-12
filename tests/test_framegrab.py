@@ -468,17 +468,19 @@ class DevelopmentModeFramegrabTests(unittest.TestCase):
         np.testing.assert_array_equal(cropped_cam1, image_cam1[3:5, 2:4])
 
     def test_simulated_frame_shift_tracks_motor_positions(self):
-        stage_um = np.array([60.0, -30.0, 20.0], dtype=np.float64)
+        command_offset_um = np.array([60.0, -30.0, 20.0], dtype=np.float64)
 
         with (
             patch.object(constants, "IS_DAQ_PC", False),
             patch("merlin_track_position.instruments.simulated_hardware.time.sleep"),
         ):
             reference = get_framegrabber_image()
-            move_motors_and_wait(("x", "y", "z"), stage_um * 1e-3)
+            move_motors_and_wait(("x", "y", "z"), command_offset_um * 1e-3)
             shifted = get_framegrabber_image()
 
-        expected_shift_px = simulator.get_stage_to_pixel("cam0") @ stage_um
+        expected_shift_px = (
+            simulator.get_command_um_to_pixel("cam0") @ command_offset_um
+        )
         measured = estimate_shift(
             reference,
             shifted,

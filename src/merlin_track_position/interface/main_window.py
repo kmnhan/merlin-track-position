@@ -15,12 +15,13 @@ import xarray as xr
 from qtpy import QtCore, QtGui, QtWidgets
 
 from merlin_track_position.constants import (
+    DEFAULT_VISUAL_CALIBRATION_MIN_SHIFT_PX,
+    DEFAULT_VISUAL_CALIBRATION_REPEATS_PER_DIRECTION,
+    DEFAULT_VISUAL_CALIBRATION_STEP_MM_BY_AXIS,
     IMAGE_HEIGHT_CAM0,
     IMAGE_HEIGHT_CAM1,
     IMAGE_WIDTH_CAM0,
     IMAGE_WIDTH_CAM1,
-    DEFAULT_CALIBRATION_N,
-    DEFAULT_CALIBRATION_STEP_UM,
 )
 from merlin_track_position.instruments.cameras import (
     CallableCameraPlugin,
@@ -32,13 +33,15 @@ from merlin_track_position.instruments.basler import (
     get_basler_image,
 )
 from merlin_track_position.instruments.framegrab import get_framegrabber_image
-from merlin_track_position.interface.calibration_panel import (
-    CalibrationPanel,
-    _validate_calibration_dataset,
-)
+from merlin_track_position.interface.calibration_panel import CalibrationPanel
 from merlin_track_position.interface.calibration_thread import CalibrationThread
 from merlin_track_position.server import MotorServer
-from merlin_track_position.tracking.calibrate import calibration_sample_count
+from merlin_track_position.tracking.calibrate import visual_calibration_probe_count
+from merlin_track_position.tracking.calibration_core import (
+    load_calibration_dataset,
+    save_calibration_dataset,
+    validate_visual_calibration_dataset,
+)
 
 __all__ = ("CalibrationStartDialog", "MainWindow")
 
@@ -140,25 +143,34 @@ def _roi_geometries_from_calibration_metadata(
 class CalibrationStartDialog(QtWidgets.QDialog):
     def __init__(self, parent: QtWidgets.QWidget | None = None):
         super().__init__(parent)
-        self.setWindowTitle("New Calibration")
+        self.setWindowTitle("New Visual-Jacobian Calibration")
 
         layout = QtWidgets.QVBoxLayout(self)
         form_layout = QtWidgets.QFormLayout()
 
-        self.n_spin = QtWidgets.QSpinBox()
-        self.n_spin.setObjectName("calibration_n_spin")
-        self.n_spin.setRange(2, 101)
-        self.n_spin.setValue(DEFAULT_CALIBRATION_N)
-        form_layout.addRow("n", self.n_spin)
+        step_text = ", ".join(
+            f"{axis}={value:g} mm"
+            for axis, value in DEFAULT_VISUAL_CALIBRATION_STEP_MM_BY_AXIS.items()
+        )
+        form_layout.addRow("Probe steps (cmd mm)", QtWidgets.QLabel(step_text))
+        form_layout.addRow(
+            "Repeats",
+            QtWidgets.QLabel(str(DEFAULT_VISUAL_CALIBRATION_REPEATS_PER_DIRECTION)),
+        )
+        form_layout.addRow(
+            "Minimum image response",
+            QtWidgets.QLabel(f"{DEFAULT_VISUAL_CALIBRATION_MIN_SHIFT_PX:g} px"),
+        )
 
-        self.step_um_spin = QtWidgets.QDoubleSpinBox()
-        self.step_um_spin.setObjectName("calibration_step_um_spin")
-        self.step_um_spin.setRange(0.001, 1_000_000.0)
-        self.step_um_spin.setDecimals(3)
-        self.step_um_spin.setSingleStep(1.0)
-        self.step_um_spin.setSuffix(" um")
-        self.step_um_spin.setValue(DEFAULT_CALIBRATION_STEP_UM)
-        form_layout.addRow("step_um", self.step_um_spin)
+        path_row = QtWidgets.QHBoxLayout()
+        self.path_edit = QtWidgets.QLineEdit()
+        self.path_edit.setObjectName("calibration_output_path_edit")
+        self.path_edit.setText(str(Path.home() / "visual_jacobian_calibration.h5"))
+        browse_button = QtWidgets.QPushButton("Browse...")
+        browse_button.clicked.connect(self._browse_output_path)
+        path_row.addWidget(self.path_edit, stretch=1)
+        path_row.addWidget(browse_button)
+        form_layout.addRow("Save to", path_row)
 
         layout.addLayout(form_layout)
 
@@ -170,8 +182,28 @@ class CalibrationStartDialog(QtWidgets.QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
-    def parameters(self) -> tuple[int, float]:
-        return int(self.n_spin.value()), float(self.step_um_spin.value())
+    def _browse_output_path(self) -> None:
+        file_name, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Save visual-Jacobian calibration",
+            self.path_edit.text(),
+            "Calibration files (*.h5 *.hdf5 *.nc);;All files (*)",
+        )
+        if file_name:
+            self.path_edit.setText(file_name)
+
+    def accept(self) -> None:
+        if not self.path_edit.text().strip():
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Visual-Jacobian calibration path required",
+                "Choose a file path for the calibration dataset.",
+            )
+            return
+        super().accept()
+
+    def output_path(self) -> Path:
+        return Path(self.path_edit.text()).expanduser()
 
 
 class _ImageCaptureThread(QtCore.QThread):
@@ -408,10 +440,7 @@ class MainWindow(_MainWindowGUI):
 
     @staticmethod
     def _load_calibration_from_path(path: Path) -> xr.Dataset:
-        with xr.open_dataset(path, engine="h5netcdf") as dataset_on_disk:
-            calibration = dataset_on_disk.load()
-        _validate_calibration_dataset(calibration)
-        return calibration
+        return load_calibration_dataset(path)
 
     @QtCore.Slot(int)
     def _on_move_detected(self, target: int) -> None:
@@ -495,7 +524,7 @@ class MainWindow(_MainWindowGUI):
     def _on_load_calibration_clicked(self) -> None:
         file_name, _ = QtWidgets.QFileDialog.getOpenFileName(
             self,
-            "Load calibration",
+            "Load visual-Jacobian calibration",
             "",
             "Calibration files (*.h5 *.hdf5 *.nc);;All files (*)",
         )
@@ -523,10 +552,12 @@ class MainWindow(_MainWindowGUI):
         if self._calibration is None:
             return
 
-        default_path = self._calibration_path or Path.home() / "calibration.h5"
+        default_path = (
+            self._calibration_path or Path.home() / "visual_jacobian_calibration.h5"
+        )
         file_name, _ = QtWidgets.QFileDialog.getSaveFileName(
             self,
-            "Save calibration",
+            "Save visual-Jacobian calibration",
             str(default_path),
             "Calibration files (*.h5 *.hdf5 *.nc);;All files (*)",
         )
@@ -535,7 +566,8 @@ class MainWindow(_MainWindowGUI):
 
         path = Path(file_name)
         try:
-            self._calibration.to_netcdf(path, engine="h5netcdf")
+            save_calibration_dataset(self._calibration, path)
+            self._calibration = load_calibration_dataset(path)
         except Exception as exc:
             QtWidgets.QMessageBox.critical(
                 self,
@@ -556,7 +588,7 @@ class MainWindow(_MainWindowGUI):
         if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
             return
 
-        n, step_um = dialog.parameters()
+        output_path = dialog.output_path()
         roi_geometries = {
             camera: self._get_roi_geometry(camera) for camera in CAMERA_IMAGE_SIZES
         }
@@ -566,12 +598,11 @@ class MainWindow(_MainWindowGUI):
             CallableCameraPlugin("cam1", self._capture_cam1_image),
         ).cropped(roi_geometries["cam0"], roi_geometries["cam1"])
         try:
-            self._calibration_total_steps = calibration_sample_count(n)
+            self._calibration_total_steps = visual_calibration_probe_count()
             self._calibration_thread.configure(
-                n,
-                step_um,
                 camera_pair,
                 roi_metadata,
+                output_path,
             )
         except Exception as exc:
             QtWidgets.QMessageBox.critical(
@@ -648,7 +679,7 @@ class MainWindow(_MainWindowGUI):
         try:
             if not isinstance(calibration, xr.Dataset):
                 raise TypeError("calibration thread did not return an xarray Dataset")
-            _validate_calibration_dataset(calibration)
+            validate_visual_calibration_dataset(calibration)
         except Exception as exc:
             self._restore_calibration_idle_state()
             QtWidgets.QMessageBox.critical(
@@ -659,11 +690,17 @@ class MainWindow(_MainWindowGUI):
             return
 
         self._calibration = calibration
-        self._calibration_path = None
+        path_value = calibration.attrs.get("calibration_path")
+        self._calibration_path = Path(str(path_value)) if path_value else None
         self._calibration_started_at = None
         self._calibration_processing_started_at = None
         self._calibration_total_steps = 0
-        self.calibration_panel.show_loaded_calibration(calibration, "new calibration")
+        display_name = (
+            self._calibration_path.name
+            if self._calibration_path is not None
+            else "new calibration"
+        )
+        self.calibration_panel.show_loaded_calibration(calibration, display_name)
 
     @QtCore.Slot(str)
     def _on_new_calibration_failed(self, error_message: str) -> None:

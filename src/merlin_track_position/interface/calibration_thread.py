@@ -2,15 +2,16 @@ from __future__ import annotations
 
 import threading
 from collections.abc import Mapping
+from pathlib import Path
 
 import numpy as np
 from qtpy import QtCore
 
 from merlin_track_position.instruments.cameras import CameraPairPlugin
-from merlin_track_position.interface.calibration_panel import (
-    _validate_calibration_dataset,
-)
 from merlin_track_position.tracking.calibrate import run_calibration
+from merlin_track_position.tracking.calibration_core import (
+    validate_visual_calibration_dataset,
+)
 
 __all__ = ("CalibrationThread",)
 
@@ -27,27 +28,24 @@ class CalibrationThread(QtCore.QThread):
     ):
         super().__init__(parent)
         self._running = threading.Event()
-        self._n: int | None = None
-        self._step_um: float | None = None
         self._camera_pair: CameraPairPlugin | None = None
         self._roi_metadata: dict[str, float] = {}
+        self._output_path: Path | None = None
 
     def configure(
         self,
-        n: int,
-        step_um: float,
         camera_pair: CameraPairPlugin,
         roi_metadata: Mapping[str, float],
+        output_path: str | Path,
     ) -> None:
         """Set the parameters for the next calibration run."""
         if self.isRunning():
             raise RuntimeError("cannot configure calibration while it is running")
-        self._n = int(n)
-        self._step_um = float(step_um)
         self._camera_pair = camera_pair
         self._roi_metadata = {
             str(key): float(value) for key, value in roi_metadata.items()
         }
+        self._output_path = Path(output_path)
 
     def run(self) -> None:
         self._running.set()
@@ -56,21 +54,16 @@ class CalibrationThread(QtCore.QThread):
                 return
 
             try:
-                if (
-                    self._n is None
-                    or self._step_um is None
-                    or self._camera_pair is None
-                ):
+                if self._camera_pair is None or self._output_path is None:
                     raise RuntimeError("calibration thread has not been configured")
                 calibration = run_calibration(
-                    self._n,
-                    self._step_um,
                     self._camera_pair,
+                    output_path=self._output_path,
+                    additional_context=self._roi_metadata,
                     step_callback=self._emit_step,
                     processing_callback=self._emit_processing_step,
                 )
-                calibration = calibration.assign_attrs(self._roi_metadata)
-                _validate_calibration_dataset(calibration)
+                validate_visual_calibration_dataset(calibration)
             except Exception as exc:
                 if self._running.is_set() and not self.isInterruptionRequested():
                     self.sigCalibrationFailed.emit(str(exc))

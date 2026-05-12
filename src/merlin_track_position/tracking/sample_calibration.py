@@ -1,4 +1,4 @@
-"""Generate deterministic sample stereo calibration datasets."""
+"""Generate deterministic sample visual-Jacobian calibration datasets."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ import numpy as np
 import xarray as xr
 from scipy import ndimage
 
+from merlin_track_position import constants
 from merlin_track_position.constants import (
     IMAGE_HEIGHT_CAM0,
     IMAGE_HEIGHT_CAM1,
@@ -16,31 +17,20 @@ from merlin_track_position.constants import (
 )
 from merlin_track_position.tracking.calibration_core import (
     CAMERAS,
+    COMMAND_AXES,
     OBSERVATION_AXES,
     PIXEL_AXES,
-    STAGE_AXES,
+    derive_axis_scale_from_jacobian,
+    save_calibration_dataset,
 )
 
 DEFAULT_SAMPLE_CALIBRATION_PATH = Path(
-    "/Users/khan/Downloads/cal_30.0um_origin_new_scheme.h5"
+    "/Users/khan/Downloads/visual_jacobian_calibration.h5"
 )
-SAMPLE_STAGE_TO_PIXEL = np.array(
+SAMPLE_VISUAL_JACOBIAN_PX_PER_CMD_MM = np.array(
     [
-        [[0.27, -0.14, 0.07], [0.09, 0.31, -0.12]],
-        [[-0.21, 0.18, 0.33], [0.24, 0.05, 0.16]],
-    ],
-    dtype=np.float64,
-)
-SAMPLE_STAGE_UM = np.array(
-    [
-        [0.0, 0.0, 0.0],
-        [30.0, 0.0, 0.0],
-        [-30.0, 0.0, 0.0],
-        [0.0, 30.0, 0.0],
-        [0.0, -30.0, 0.0],
-        [0.0, 0.0, 30.0],
-        [0.0, 0.0, -30.0],
-        [0.0, 0.0, 0.0],
+        [[270.0, -140.0, 70.0], [90.0, 310.0, -120.0]],
+        [[-210.0, 180.0, 330.0], [240.0, 50.0, 160.0]],
     ],
     dtype=np.float64,
 )
@@ -51,23 +41,34 @@ def build_sample_calibration_dataset(
     image_shape_cam0: tuple[int, int] = (IMAGE_HEIGHT_CAM0, IMAGE_WIDTH_CAM0),
     image_shape_cam1: tuple[int, int] = (IMAGE_HEIGHT_CAM1, IMAGE_WIDTH_CAM1),
 ) -> xr.Dataset:
-    """Build a deterministic two-camera calibration dataset."""
-    stage_to_observation = SAMPLE_STAGE_TO_PIXEL.reshape(
+    """Build a deterministic commanded-mm calibration dataset."""
+
+    command_delta = _sample_probe_deltas()
+    jacobian_observation = SAMPLE_VISUAL_JACOBIAN_PX_PER_CMD_MM.reshape(
         len(OBSERVATION_AXES),
-        len(STAGE_AXES),
+        len(COMMAND_AXES),
     )
-    measured = (SAMPLE_STAGE_UM @ stage_to_observation.T).reshape(
-        SAMPLE_STAGE_UM.shape[0],
+    measured = (command_delta @ jacobian_observation.T).reshape(
+        command_delta.shape[0],
         len(CAMERAS),
         len(PIXEL_AXES),
     )
+    axis_scale, *_ = derive_axis_scale_from_jacobian(
+        SAMPLE_VISUAL_JACOBIAN_PX_PER_CMD_MM,
+        command_delta,
+    )
 
-    images_cam0 = _shifted_stack(_texture(image_shape_cam0, 1100), measured[:, 0, :])
-    images_cam1 = _shifted_stack(_texture(image_shape_cam1, 2200), measured[:, 1, :])
+    reference_cam0 = _texture(image_shape_cam0, 1100)
+    reference_cam1 = _texture(image_shape_cam1, 2200)
+
+    pre_commanded, post_commanded = _command_positions(command_delta)
+    readback_offset = np.array([0.002, -0.004, 0.001], dtype=np.float64)
+    pre_readback = pre_commanded + readback_offset
+    post_readback = post_commanded + readback_offset
 
     coords = {
-        "sample": np.arange(SAMPLE_STAGE_UM.shape[0], dtype=np.int64),
-        "stage_axis": list(STAGE_AXES),
+        "probe": np.arange(command_delta.shape[0], dtype=np.int64),
+        "command_axis": list(COMMAND_AXES),
         "camera": list(CAMERAS),
         "pixel_axis": list(PIXEL_AXES),
         "y_cam0": np.arange(image_shape_cam0[0], dtype=np.int64),
@@ -75,39 +76,65 @@ def build_sample_calibration_dataset(
         "y_cam1": np.arange(image_shape_cam1[0], dtype=np.int64),
         "x_cam1": np.arange(image_shape_cam1[1], dtype=np.int64),
     }
-
     return xr.Dataset(
         data_vars={
-            "stage_to_pixel": (
-                ("camera", "pixel_axis", "stage_axis"),
-                SAMPLE_STAGE_TO_PIXEL,
-                {"units": "px/um"},
+            "visual_jacobian_px_per_cmd_mm": (
+                ("camera", "pixel_axis", "command_axis"),
+                SAMPLE_VISUAL_JACOBIAN_PX_PER_CMD_MM,
+                {"units": "px/commanded-mm"},
             ),
-            "stage_um": (
-                ("sample", "stage_axis"),
-                SAMPLE_STAGE_UM,
-                {"units": "um"},
+            "axis_scale_cmd_mm": (
+                ("command_axis",),
+                axis_scale,
+                {"units": "commanded-mm"},
             ),
-            "measured_shift_px": (
-                ("sample", "camera", "pixel_axis"),
+            "reference_cam0": (("y_cam0", "x_cam0"), reference_cam0),
+            "reference_cam1": (("y_cam1", "x_cam1"), reference_cam1),
+            "probe_command_delta_mm": (
+                ("probe", "command_axis"),
+                command_delta,
+                {"units": "commanded-mm"},
+            ),
+            "probe_measured_delta_px": (
+                ("probe", "camera", "pixel_axis"),
                 measured,
                 {"units": "px"},
             ),
-            "image_cam0": (
-                ("sample", "y_cam0", "x_cam0"),
-                images_cam0,
-                {"description": "camera 0 calibration grayscale image stack"},
+            "pre_commanded_position_mm": (
+                ("probe", "command_axis"),
+                pre_commanded,
+                {"units": "commanded-mm"},
             ),
-            "image_cam1": (
-                ("sample", "y_cam1", "x_cam1"),
-                images_cam1,
-                {"description": "camera 1 calibration grayscale image stack"},
+            "post_commanded_position_mm": (
+                ("probe", "command_axis"),
+                post_commanded,
+                {"units": "commanded-mm"},
+            ),
+            "pre_readback_position_mm": (
+                ("probe", "command_axis"),
+                pre_readback,
+                {"units": "readback-mm"},
+            ),
+            "post_readback_position_mm": (
+                ("probe", "command_axis"),
+                post_readback,
+                {"units": "readback-mm"},
+            ),
+            "probe_capture_shift_mad_px": (
+                ("probe", "camera", "pixel_axis"),
+                np.zeros_like(measured),
+                {"units": "px"},
+            ),
+            "probe_registration_warnings": (
+                ("probe", "camera"),
+                np.full((command_delta.shape[0], len(CAMERAS)), "", dtype=str),
             ),
         },
         coords=coords,
         attrs={
-            "format_version": "1",
+            "capture_count": 1,
             "warnings": "",
+            "broyden_update_count": 0,
         },
     )
 
@@ -116,9 +143,33 @@ def write_sample_calibration_dataset(
     path: Path = DEFAULT_SAMPLE_CALIBRATION_PATH,
 ) -> Path:
     """Write the deterministic sample calibration dataset and return its path."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    build_sample_calibration_dataset().to_netcdf(path, engine="h5netcdf")
-    return path
+
+    return save_calibration_dataset(build_sample_calibration_dataset(), path)
+
+
+def _sample_probe_deltas() -> np.ndarray:
+    rows: list[list[float]] = []
+    for _ in range(constants.DEFAULT_VISUAL_CALIBRATION_REPEATS_PER_DIRECTION):
+        for axis in COMMAND_AXES:
+            step = constants.DEFAULT_VISUAL_CALIBRATION_STEP_MM_BY_AXIS[axis]
+            for sign in (1.0, -1.0):
+                row = [0.0, 0.0, 0.0]
+                row[COMMAND_AXES.index(axis)] = sign * step
+                rows.append(row)
+    return np.asarray(rows, dtype=np.float64)
+
+
+def _command_positions(
+    command_delta: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    current = np.array([1.0, 2.0, 3.0], dtype=np.float64)
+    pre_rows: list[np.ndarray] = []
+    post_rows: list[np.ndarray] = []
+    for delta in command_delta:
+        pre_rows.append(current.copy())
+        current = current + delta
+        post_rows.append(current.copy())
+    return np.stack(pre_rows, axis=0), np.stack(post_rows, axis=0)
 
 
 def _texture(shape: tuple[int, int], seed: int) -> np.ndarray:
@@ -132,16 +183,3 @@ def _texture(shape: tuple[int, int], seed: int) -> np.ndarray:
     if maximum > 0.0:
         image /= maximum
     return image.astype(np.float32)
-
-
-def _shifted_stack(reference: np.ndarray, shifts_px: np.ndarray) -> np.ndarray:
-    images = [
-        ndimage.shift(
-            reference,
-            shift=(float(dv_px), float(du_px)),
-            order=3,
-            mode="nearest",
-        ).astype(np.float32)
-        for du_px, dv_px in shifts_px
-    ]
-    return np.stack(images, axis=0).astype(np.float32)

@@ -9,25 +9,19 @@ from qtpy import QtCore, QtWidgets
 
 from merlin_track_position.tracking.calibration_core import (
     CAMERAS,
+    COMMAND_AXES,
     MEASUREMENT_WARNING_SUMMARY,
     OBSERVATION_AXES,
     PIXEL_AXES,
-    STAGE_AXES,
-    format_measurement_warning_lines,
+    derive_axis_scale_from_jacobian,
+    format_probe_warning_lines,
+    validate_visual_calibration_dataset,
 )
 
 RESIDUAL_PROJECTIONS: tuple[tuple[str, str, int, int], ...] = (
     ("x", "y", 0, 1),
     ("x", "z", 0, 2),
     ("y", "z", 1, 2),
-)
-
-REQUIRED_CALIBRATION_VARIABLES: tuple[str, ...] = (
-    "image_cam0",
-    "image_cam1",
-    "stage_um",
-    "measured_shift_px",
-    "stage_to_pixel",
 )
 
 
@@ -45,17 +39,11 @@ def _tooltip_html(
 
 METRIC_ROWS: tuple[tuple[str, str, str], ...] = (
     (
-        "sample_count",
-        "Samples",
+        "probe_count",
+        "Probes",
         _tooltip_html(
-            (
-                "Number of calibration image pairs: <tt>stage_um.shape[0]</tt>.",
-                "Includes the first origin sample and final return-to-origin sample.",
-            ),
-            (
-                "More samples can constrain the fit better.",
-                "Use residuals and condition number as the real quality checks.",
-            ),
+            ("Number of commanded-mm before/after visual probes.",),
+            ("The default calibration uses repeated +axis/-axis probes.",),
         ),
     ),
     (
@@ -63,16 +51,55 @@ METRIC_ROWS: tuple[tuple[str, str, str], ...] = (
         "Condition number",
         _tooltip_html(
             (
-                "<tt>np.linalg.cond(stage_to_observation)</tt>.",
-                "<tt>stage_to_observation</tt> is <tt>stage_to_pixel</tt> reshaped "
-                "into the 4x3 mapping from x/y/z microns to two-camera pixel shifts.",
+                "<tt>np.linalg.cond(visual_jacobian)</tt> after reshaping "
+                "to the 4x3 observation matrix.",
             ),
             (
                 "Lower is better.",
-                "High values mean the camera observations do not separate the three "
-                "stage axes cleanly.",
-                "Small pixel errors can then become large stage errors.",
+                "High values mean the cameras cannot cleanly separate x/y/z commands.",
             ),
+        ),
+    ),
+    (
+        "axis_scale_cmd_mm",
+        "Axis scale cmd mm",
+        _tooltip_html(
+            (
+                "Saved x/y/z command scales used by normalized damped correction.",
+            ),
+            (
+                "These are commanded-mm damping scales, not measured physical "
+                "travel.",
+            ),
+        ),
+    ),
+    (
+        "axis_sensitivity_px_per_cmd_mm",
+        "Axis response px/cmd mm",
+        _tooltip_html(
+            (
+                "Euclidean image response of each visual-Jacobian command-axis "
+                "column.",
+            ),
+            ("This is the per-axis command-to-image response.",),
+        ),
+    ),
+    (
+        "axis_scale_target_response_px",
+        "Scale target px",
+        _tooltip_html(
+            (
+                "Target image response used when deriving correction axis scales.",
+            ),
+            ("Shown for diagnosing scale clamping during calibration.",),
+        ),
+    ),
+    (
+        "broyden_update_count",
+        "Jacobian updates",
+        _tooltip_html(
+            ("Number of accepted Broyden refinements saved into this dataset.",),
+            ("Nonzero means correction has refined the calibration on disk.",),
         ),
     ),
     (
@@ -80,86 +107,57 @@ METRIC_ROWS: tuple[tuple[str, str, str], ...] = (
         "Residual RMS px",
         _tooltip_html(
             (
-                "Predicted shifts come from <tt>stage_um</tt> and "
-                "<tt>stage_to_pixel</tt>.",
-                "Residual is <tt>measured_shift_px - predicted_shift_px</tt>.",
-                "<tt>sqrt(mean(sum(residual^2)))</tt> across both cameras and pixel axes.",
+                "Residual is measured probe image delta minus visual-Jacobian "
+                "prediction.",
             ),
-            (
-                "Lower means measured image shifts match the linear model better.",
-                "High values indicate noisy images or bad motor positions.",
-            ),
+            ("Lower means the local linear command-to-image model is more consistent.",),
         ),
     ),
     (
         "residual_max_px",
         "Residual max px",
         _tooltip_html(
-            (
-                "Largest per-sample pixel residual length.",
-                "Uses the same two-camera residual vector as Residual RMS px.",
-            ),
-            (
-                "Shows the worst sample in pixel units.",
-                "A large max with modest RMS usually points to one bad image match or motor position.",
-            ),
+            ("Largest two-camera pixel residual length among all probes.",),
+            ("Use this to find one bad registration or mechanical outlier.",),
         ),
     ),
     (
-        "residual_rms_um",
-        "Residual RMS um",
+        "residual_rms_cmd_mm",
+        "Residual RMS cmd mm",
         _tooltip_html(
             (
-                "Pixel residuals are converted to stage space with "
-                "<tt>pinv(stage_to_pixel)</tt>.",
-                "Then reduced as RMS Euclidean length in x/y/z microns.",
+                "Pixel residuals are converted through "
+                "<tt>pinv(visual_jacobian)</tt> into commanded-mm coordinates.",
             ),
-            (
-                "Approximate stage-space size of the calibration fit error.",
-                "Lower is better and is usually easier to reason about than pixel residuals.",
-            ),
+            ("This is a command-space fit-error diagnostic, not physical microns.",),
         ),
     ),
     (
-        "residual_max_um",
-        "Residual max um",
+        "residual_max_cmd_mm",
+        "Residual max cmd mm",
         _tooltip_html(
-            (
-                "Largest stage-space residual length after converting pixel fit error to x/y/z microns.",
-            ),
-            (
-                "Shows the worst calibration sample in stage units.",
-                "Use it to spot outliers hidden by the RMS average.",
-            ),
+            ("Largest command-space residual length among all probes.",),
+            ("Large values point to poor local repeatability or a bad probe.",),
         ),
     ),
     (
-        "return_to_origin_motor_error_um",
-        "Return motor error um",
+        "readback_command_rms_mm",
+        "Readback disagreement RMS mm",
         _tooltip_html(
             (
-                "Final row of <tt>stage_um</tt>.",
-                "This is the measured motor offset vector (x, y, z) after return-to-origin.",
+                "RMS of <tt>(post_readback - pre_readback) - commanded_delta</tt>.",
             ),
-            (
-                "Ideally near <tt>(0, 0, 0)</tt>.",
-                "Component signs show the direction of remaining motor offset.",
-            ),
+            ("Readback is diagnostic only and does not affect the fitted Jacobian.",),
         ),
     ),
     (
-        "return_to_origin_image_error_um",
-        "Return image error um",
+        "readback_command_max_mm",
+        "Readback disagreement max mm",
         _tooltip_html(
             (
-                "Final row of <tt>measured_shift_px</tt>.",
-                "Converted to x/y/z stage displacement with <tt>pinv(stage_to_pixel)</tt>.",
+                "Worst readback-vs-command disagreement among all visual probes.",
             ),
-            (
-                "Estimates how far the final image looks from the first image.",
-                "Ideally near <tt>(0, 0, 0)</tt>.",
-                "Disagreement with Return motor error means encoders and image content disagree.",
-            ),
+            ("Useful for spotting BCS or mechanical reproducibility issues.",),
         ),
     ),
 )
@@ -169,28 +167,18 @@ REPEATABILITY_ROWS: tuple[tuple[str, str, str], ...] = (
         "Mean RMS std px",
         _tooltip_html(
             (
-                "Samples are grouped by identical <tt>stage_um</tt> positions.",
-                "For groups with at least two captures, compute sample std for each camera/pixel component.",
-                "RMS-combine the four component stds, then average across repeated positions.",
+                "Repeated probes with identical commanded-mm deltas are grouped.",
+                "The four camera/pixel components are RMS-combined after sample std.",
             ),
-            (
-                "Lower means repeated captures at the same motor position agree better.",
-                "With only the origin repeated, this equals Max RMS std px.",
-            ),
+            ("Lower means repeated command probes produce more consistent image motion.",),
         ),
     ),
     (
         "max_rms_std_px",
         "Max RMS std px",
         _tooltip_html(
-            (
-                "Same per-position RMS standard deviation as Mean RMS std px.",
-                "Reports the largest value among repeated <tt>stage_um</tt> positions.",
-            ),
-            (
-                "Highlights the worst repeated-position image stability.",
-                "With only the origin repeated, this equals Mean RMS std px.",
-            ),
+            ("Largest repeated-probe RMS standard deviation.",),
+            ("Highlights the least repeatable commanded move direction.",),
         ),
     ),
 )
@@ -226,43 +214,53 @@ def _format_duration(seconds: float | None) -> str:
 
 
 def _calibration_arrays(dataset: xr.Dataset) -> dict[str, np.ndarray]:
-    stage = np.asarray(dataset["stage_um"].values, dtype=float)
-    measured_shift = np.asarray(dataset["measured_shift_px"].values, dtype=float)
-    stage_to_pixel = np.asarray(dataset["stage_to_pixel"].values, dtype=float)
-    stage_to_observation = stage_to_pixel.reshape(
-        len(OBSERVATION_AXES),
-        len(STAGE_AXES),
+    validate_visual_calibration_dataset(dataset)
+    command_delta = np.asarray(dataset["probe_command_delta_mm"].values, dtype=float)
+    measured_shift = np.asarray(dataset["probe_measured_delta_px"].values, dtype=float)
+    visual_jacobian = np.asarray(
+        dataset["visual_jacobian_px_per_cmd_mm"].values,
+        dtype=float,
     )
-    pixel_to_stage = np.linalg.pinv(stage_to_observation)
-    predicted_shift = (stage @ stage_to_observation.T).reshape(
-        stage.shape[0],
+    jacobian_observation = visual_jacobian.reshape(
+        len(OBSERVATION_AXES),
+        len(COMMAND_AXES),
+    )
+    pixel_to_command = np.linalg.pinv(jacobian_observation)
+    predicted_shift = (command_delta @ jacobian_observation.T).reshape(
+        command_delta.shape[0],
         len(CAMERAS),
         len(PIXEL_AXES),
     )
     residual_shift = measured_shift - predicted_shift
-    residual_stage = residual_shift.reshape(
-        stage.shape[0],
+    residual_command = residual_shift.reshape(
+        command_delta.shape[0],
         len(OBSERVATION_AXES),
-    ) @ pixel_to_stage.T
+    ) @ pixel_to_command.T
+    readback_disagreement = (
+        np.asarray(dataset["post_readback_position_mm"].values, dtype=float)
+        - np.asarray(dataset["pre_readback_position_mm"].values, dtype=float)
+        - command_delta
+    )
     return {
-        "stage": stage,
+        "command_delta": command_delta,
         "measured_shift": measured_shift,
-        "stage_to_pixel": stage_to_pixel,
-        "stage_to_observation": stage_to_observation,
-        "pixel_to_stage": pixel_to_stage,
+        "visual_jacobian": visual_jacobian,
+        "jacobian_observation": jacobian_observation,
+        "pixel_to_command": pixel_to_command,
         "predicted_shift": predicted_shift,
         "residual_shift": residual_shift,
-        "residual_stage": residual_stage,
+        "residual_command": residual_command,
+        "readback_disagreement": readback_disagreement,
     }
 
 
 def _repeatability_summary(
-    stage: np.ndarray,
+    command_delta: np.ndarray,
     measured_shift: np.ndarray,
 ) -> dict[str, float] | None:
     groups: dict[tuple[float, float, float], list[np.ndarray]] = {}
-    for stage_row, shift_row in zip(stage, measured_shift, strict=True):
-        key = (float(stage_row[0]), float(stage_row[1]), float(stage_row[2]))
+    for command_row, shift_row in zip(command_delta, measured_shift, strict=True):
+        key = (float(command_row[0]), float(command_row[1]), float(command_row[2]))
         groups.setdefault(key, []).append(shift_row)
 
     rms_std_px: list[float] = []
@@ -283,51 +281,15 @@ def _repeatability_summary(
     }
 
 
-def _validate_calibration_dataset(dataset: xr.Dataset) -> None:
-    missing = tuple(
-        name for name in REQUIRED_CALIBRATION_VARIABLES if name not in dataset
-    )
-    if missing:
-        raise ValueError(
-            "missing required calibration variables: " + ", ".join(missing)
-        )
-
-    stage = np.asarray(dataset["stage_um"].values, dtype=float)
-    measured_shift = np.asarray(dataset["measured_shift_px"].values, dtype=float)
-    stage_to_pixel = np.asarray(dataset["stage_to_pixel"].values, dtype=float)
-    image_cam0 = np.asarray(dataset["image_cam0"].values)
-    image_cam1 = np.asarray(dataset["image_cam1"].values)
-
-    if stage.ndim != 2 or stage.shape[1] != len(STAGE_AXES) or stage.shape[0] == 0:
-        raise ValueError("stage_um must have shape (sample, 3)")
-    if not np.allclose(stage[0], 0.0, rtol=0.0, atol=1e-9):
-        raise ValueError("stage_um[0] must be the origin")
-    if not np.isfinite(stage).all():
-        raise ValueError("stage_um must contain only finite values")
-    expected_shift_shape = (stage.shape[0], len(CAMERAS), len(PIXEL_AXES))
-    if measured_shift.shape != expected_shift_shape:
-        raise ValueError("measured_shift_px must have shape (sample, camera, pixel_axis)")
-    if not np.isfinite(measured_shift).all():
-        raise ValueError("measured_shift_px must contain only finite values")
-    if image_cam0.ndim != 3 or image_cam0.shape[0] != stage.shape[0]:
-        raise ValueError("image_cam0 must have shape (sample, y_cam0, x_cam0)")
-    if image_cam1.ndim != 3 or image_cam1.shape[0] != stage.shape[0]:
-        raise ValueError("image_cam1 must have shape (sample, y_cam1, x_cam1)")
-    if stage_to_pixel.shape != (len(CAMERAS), len(PIXEL_AXES), len(STAGE_AXES)):
-        raise ValueError("stage_to_pixel must have shape (camera, pixel_axis, stage_axis)")
-    if not np.isfinite(stage_to_pixel).all():
-        raise ValueError("stage_to_pixel must contain only finite values")
-
-
 def _calibration_summary(dataset: xr.Dataset) -> dict[str, object]:
-    _validate_calibration_dataset(dataset)
-
+    validate_visual_calibration_dataset(dataset)
     arrays = _calibration_arrays(dataset)
-    stage = arrays["stage"]
+    command_delta = arrays["command_delta"]
     measured_shift = arrays["measured_shift"]
     residual_shift = arrays["residual_shift"]
-    residual_stage = arrays["residual_stage"]
-    pixel_to_stage = arrays["pixel_to_stage"]
+    residual_command = arrays["residual_command"]
+    readback_disagreement = arrays["readback_disagreement"]
+
     residual_shift_norms = np.sqrt(np.sum(residual_shift * residual_shift, axis=(1, 2)))
     finite_shift_norms = residual_shift_norms[np.isfinite(residual_shift_norms)]
     if finite_shift_norms.size:
@@ -339,18 +301,31 @@ def _calibration_summary(dataset: xr.Dataset) -> dict[str, object]:
         residual_rms_px = math.nan
         residual_max_px = math.nan
 
-    residual_stage_norms = np.linalg.norm(residual_stage, axis=1)
-    finite_stage_norms = residual_stage_norms[np.isfinite(residual_stage_norms)]
-    if finite_stage_norms.size:
-        residual_rms_um = float(
-            np.sqrt(np.mean(finite_stage_norms * finite_stage_norms))
+    residual_command_norms = np.linalg.norm(residual_command, axis=1)
+    finite_command_norms = residual_command_norms[
+        np.isfinite(residual_command_norms)
+    ]
+    if finite_command_norms.size:
+        residual_rms_cmd_mm = float(
+            np.sqrt(np.mean(finite_command_norms * finite_command_norms))
         )
-        residual_max_um = float(np.max(finite_stage_norms))
+        residual_max_cmd_mm = float(np.max(finite_command_norms))
     else:
-        residual_rms_um = math.nan
-        residual_max_um = math.nan
+        residual_rms_cmd_mm = math.nan
+        residual_max_cmd_mm = math.nan
 
-    condition_number = float(np.linalg.cond(arrays["stage_to_observation"]))
+    readback_norms = np.linalg.norm(readback_disagreement, axis=1)
+    finite_readback_norms = readback_norms[np.isfinite(readback_norms)]
+    if finite_readback_norms.size:
+        readback_command_rms_mm = float(
+            np.sqrt(np.mean(finite_readback_norms * finite_readback_norms))
+        )
+        readback_command_max_mm = float(np.max(finite_readback_norms))
+    else:
+        readback_command_rms_mm = math.nan
+        readback_command_max_mm = math.nan
+
+    condition_number = float(np.linalg.cond(arrays["jacobian_observation"]))
     warning_lines = [
         line.strip()
         for line in str(dataset.attrs.get("warnings", "")).splitlines()
@@ -366,64 +341,61 @@ def _calibration_summary(dataset: xr.Dataset) -> dict[str, object]:
         warning_lines.extend(measurement_warning_lines)
     warnings = tuple(dict.fromkeys(warning_lines))
 
-    repeatability = _repeatability_summary(stage, measured_shift)
-    if repeatability is None and "repeatability_rms_std_px" in dataset:
-        rms_std = np.asarray(
-            dataset["repeatability_rms_std_px"].values,
-            dtype=float,
-        ).ravel()
-        finite_rms = rms_std[np.isfinite(rms_std)]
-        if finite_rms.size:
-            repeatability = {
-                "mean_rms_std_px": float(np.nanmean(finite_rms)),
-                "max_rms_std_px": float(np.nanmax(finite_rms)),
-            }
-
-    return_to_origin_image_error_um = measured_shift[-1].reshape(-1) @ pixel_to_stage.T
+    repeatability = _repeatability_summary(command_delta, measured_shift)
+    axis_scale = np.asarray(dataset["axis_scale_cmd_mm"].values, dtype=float)
+    (
+        _derived_axis_scale,
+        axis_sensitivity,
+        axis_scale_unclamped,
+        axis_scale_bounds,
+        axis_scale_target_response_px,
+    ) = derive_axis_scale_from_jacobian(
+        arrays["visual_jacobian"],
+        command_delta,
+    )
     return {
-        "sample_count": int(stage.shape[0]),
-        "condition_number": float(condition_number),
+        "probe_count": int(command_delta.shape[0]),
+        "condition_number": condition_number,
+        "axis_scale_cmd_mm": axis_scale,
+        "axis_sensitivity_px_per_cmd_mm": axis_sensitivity,
+        "axis_scale_unclamped_cmd_mm": axis_scale_unclamped,
+        "axis_scale_bounds_cmd_mm": axis_scale_bounds,
+        "axis_scale_target_response_px": axis_scale_target_response_px,
+        "broyden_update_count": int(dataset.attrs.get("broyden_update_count", 0)),
         "residual_rms_px": residual_rms_px,
         "residual_max_px": residual_max_px,
-        "residual_rms_um": residual_rms_um,
-        "residual_max_um": residual_max_um,
-        "return_to_origin_motor_error_um": tuple(
-            float(value) for value in np.asarray(stage[-1], dtype=float).reshape(-1)
-        ),
-        "return_to_origin_image_error_um": tuple(
-            float(value)
-            for value in np.asarray(return_to_origin_image_error_um, dtype=float).reshape(
-                -1
-            )
-        ),
-        "stage_to_pixel": arrays["stage_to_pixel"],
-        "pixel_to_stage": pixel_to_stage,
+        "residual_rms_cmd_mm": residual_rms_cmd_mm,
+        "residual_max_cmd_mm": residual_max_cmd_mm,
+        "readback_command_rms_mm": readback_command_rms_mm,
+        "readback_command_max_mm": readback_command_max_mm,
+        "visual_jacobian": arrays["visual_jacobian"],
+        "pixel_to_command": arrays["pixel_to_command"],
         "warnings": warnings,
         "repeatability": repeatability,
     }
 
 
 def _measurement_warning_lines(dataset: xr.Dataset) -> tuple[str, ...]:
-    if "measurement_warnings" not in dataset:
+    if "probe_registration_warnings" not in dataset:
         return ()
 
-    stage = np.asarray(dataset["stage_um"].values, dtype=float)
-    warning_values = np.asarray(dataset["measurement_warnings"].values, dtype=str)
-    if warning_values.shape != (stage.shape[0], len(CAMERAS)):
+    command_delta = np.asarray(dataset["probe_command_delta_mm"].values, dtype=float)
+    warning_values = np.asarray(dataset["probe_registration_warnings"].values, dtype=str)
+    if warning_values.shape != (command_delta.shape[0], len(CAMERAS)):
         return ()
 
     measurement_warnings = tuple(
         tuple(
             tuple(
                 line.strip()
-                for line in str(warning_values[sample_index, camera_index]).splitlines()
+                for line in str(warning_values[probe_index, camera_index]).splitlines()
                 if line.strip()
             )
             for camera_index in range(len(CAMERAS))
         )
-        for sample_index in range(stage.shape[0])
+        for probe_index in range(command_delta.shape[0])
     )
-    return format_measurement_warning_lines(measurement_warnings, stage)
+    return format_probe_warning_lines(measurement_warnings, command_delta)
 
 
 class CalibrationPanel(QtWidgets.QWidget):
@@ -435,7 +407,7 @@ class CalibrationPanel(QtWidgets.QWidget):
 
         calibration_button_layout = QtWidgets.QHBoxLayout()
         self.load_calibration_button = QtWidgets.QPushButton("Load calibration")
-        self.save_calibration_button = QtWidgets.QPushButton("Save calibration")
+        self.save_calibration_button = QtWidgets.QPushButton("Save copy")
         self.calibration_details_button = QtWidgets.QPushButton("Details...")
         self.new_calibration_button = QtWidgets.QPushButton("New calibration")
         self.new_calibration_button.setEnabled(False)
@@ -461,14 +433,14 @@ class CalibrationPanel(QtWidgets.QWidget):
         content_layout.addLayout(right_column, stretch=1)
         calibration_layout.addLayout(content_layout)
 
-        warnings_group = QtWidgets.QGroupBox("Calibration Warnings")
+        warnings_group = QtWidgets.QGroupBox("Visual-Jacobian Warnings")
         warnings_layout = QtWidgets.QVBoxLayout(warnings_group)
         self.calibration_warnings_text = QtWidgets.QPlainTextEdit()
         self.calibration_warnings_text.setReadOnly(True)
         self.calibration_warnings_text.setMaximumHeight(90)
         warnings_layout.addWidget(self.calibration_warnings_text)
 
-        metrics_group = QtWidgets.QGroupBox("Calibration Metrics")
+        metrics_group = QtWidgets.QGroupBox("Visual-Jacobian Metrics")
         metrics_layout = QtWidgets.QFormLayout(metrics_group)
         self.metric_labels: dict[str, QtWidgets.QLabel] = {}
         for key, label, tooltip in METRIC_ROWS:
@@ -507,10 +479,10 @@ class CalibrationPanel(QtWidgets.QWidget):
             residual_plot = self.residual_graphics_layout.addPlot(row=0, col=column)
             residual_plot.setTitle(f"{x_label}-{y_label}")
             residual_plot.setLabel(
-                "bottom", x_label, units="um", siPrefixEnableRanges=()
+                "bottom", x_label, units="cmd mm", siPrefixEnableRanges=()
             )
             residual_plot.setLabel(
-                "left", y_label, units="um", siPrefixEnableRanges=()
+                "left", y_label, units="cmd mm", siPrefixEnableRanges=()
             )
             residual_plot.showGrid(x=True, y=True, alpha=0.25)
             residual_plot.setAspectLocked(True)
@@ -524,11 +496,13 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.save_calibration_button.setEnabled(False)
         self.calibration_details_button.setEnabled(False)
         self.new_calibration_button.setEnabled(True)
-        self.calibration_status_label.setText("No calibration loaded.")
+        self.calibration_status_label.setText("No visual-Jacobian calibration loaded.")
         self.calibration_progress_bar.setVisible(False)
         self.calibration_progress_bar.setRange(0, 1)
         self.calibration_progress_bar.setValue(0)
-        self.calibration_warnings_text.setPlainText("No calibration loaded.")
+        self.calibration_warnings_text.setPlainText(
+            "No visual-Jacobian calibration loaded."
+        )
         for label in self.metric_labels.values():
             label.setText("n/a")
         for label in self.repeatability_labels.values():
@@ -542,14 +516,16 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.save_calibration_button.setEnabled(False)
         self.calibration_details_button.setEnabled(False)
         self.new_calibration_button.setEnabled(False)
-        self.calibration_status_label.setText("New calibration in progress...")
+        self.calibration_status_label.setText(
+            "New visual-Jacobian calibration in progress..."
+        )
         self.calibration_progress_bar.setVisible(True)
         if total_steps is None or total_steps < 1:
             self.calibration_progress_bar.setRange(0, 0)
             return
         self.calibration_progress_bar.setRange(0, int(total_steps))
         self.calibration_progress_bar.setValue(0)
-        self.calibration_progress_bar.setFormat(f"0 / {int(total_steps)} samples")
+        self.calibration_progress_bar.setFormat(f"0 / {int(total_steps)} probes")
 
     def show_calibration_step(
         self,
@@ -568,12 +544,12 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.calibration_progress_bar.setRange(0, total_steps)
         self.calibration_progress_bar.setValue(completed)
         self.calibration_progress_bar.setFormat(
-            f"{completed} / {total_steps} samples"
+            f"{completed} / {total_steps} probes"
         )
         self.calibration_status_label.setText(
-            "New calibration in progress. "
-            f"Stage ({_format_number(dx)}, {_format_number(dy)}, "
-            f"{_format_number(dz)}) um. "
+            "New visual-Jacobian calibration in progress. "
+            f"Command delta ({_format_number(dx)}, {_format_number(dy)}, "
+            f"{_format_number(dz)}) mm. "
             f"Elapsed {_format_duration(elapsed_s)}, ETA {_format_duration(eta_s)}."
         )
 
@@ -594,7 +570,7 @@ class CalibrationPanel(QtWidgets.QWidget):
             f"{completed} / {total} registrations"
         )
         self.calibration_status_label.setText(
-            "Processing calibration scans. "
+            "Processing visual-Jacobian probes. "
             f"Elapsed {_format_duration(elapsed_s)}, ETA {_format_duration(eta_s)}."
         )
 
@@ -610,11 +586,16 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.new_calibration_button.setEnabled(True)
         self.calibration_progress_bar.setVisible(False)
         self.calibration_status_label.setText(
-            f"Loaded calibration: {display_name} ({summary['sample_count']} samples)"
+            "Loaded visual-Jacobian calibration: "
+            f"{display_name} ({summary['probe_count']} probes)"
         )
 
         warnings = summary["warnings"]
-        warnings_text = "\n".join(warnings) if warnings else "No calibration warnings."
+        warnings_text = (
+            "\n".join(warnings)
+            if warnings
+            else "No visual-Jacobian calibration warnings."
+        )
         self.calibration_warnings_text.setPlainText(warnings_text)
 
         for key, _, _ in METRIC_ROWS:
@@ -631,7 +612,9 @@ class CalibrationPanel(QtWidgets.QWidget):
         self._plot_residuals(calibration)
 
     def show_saved_calibration(self, display_name: str) -> None:
-        self.calibration_status_label.setText(f"Saved calibration: {display_name}")
+        self.calibration_status_label.setText(
+            f"Saved visual-Jacobian calibration: {display_name}"
+        )
 
     def build_details_dialog(
         self,
@@ -640,7 +623,7 @@ class CalibrationPanel(QtWidgets.QWidget):
         summary = _calibration_summary(calibration)
         arrays = _calibration_arrays(calibration)
         dialog = QtWidgets.QDialog(self)
-        dialog.setWindowTitle("Calibration Details")
+        dialog.setWindowTitle("Visual-Jacobian Calibration Details")
         layout = QtWidgets.QVBoxLayout(dialog)
 
         tabs = QtWidgets.QTabWidget()
@@ -650,19 +633,19 @@ class CalibrationPanel(QtWidgets.QWidget):
         matrices_layout = QtWidgets.QVBoxLayout(matrices_tab)
         for title, row_labels, column_labels, values in (
             (
-                "stage_to_pixel",
+                "visual_jacobian_px_per_cmd_mm",
                 OBSERVATION_AXES,
-                STAGE_AXES,
-                np.asarray(summary["stage_to_pixel"], dtype=float).reshape(
+                COMMAND_AXES,
+                np.asarray(summary["visual_jacobian"], dtype=float).reshape(
                     len(OBSERVATION_AXES),
-                    len(STAGE_AXES),
+                    len(COMMAND_AXES),
                 ),
             ),
             (
-                "pixel_to_stage",
-                STAGE_AXES,
+                "pixel_to_command_mm",
+                COMMAND_AXES,
                 OBSERVATION_AXES,
-                np.asarray(summary["pixel_to_stage"], dtype=float),
+                np.asarray(summary["pixel_to_command"], dtype=float),
             ),
         ):
             table = QtWidgets.QTableWidget(len(row_labels), len(column_labels))
@@ -677,11 +660,9 @@ class CalibrationPanel(QtWidgets.QWidget):
             table.horizontalHeader().setSectionResizeMode(
                 QtWidgets.QHeaderView.ResizeMode.ResizeToContents
             )
-            table.horizontalHeader().setMinimumSectionSize(88)
             table.verticalHeader().setSectionResizeMode(
                 QtWidgets.QHeaderView.ResizeMode.ResizeToContents
             )
-            table.verticalHeader().setMinimumWidth(64)
             table.setMinimumHeight(88)
             table.setSizeAdjustPolicy(
                 QtWidgets.QAbstractScrollArea.SizeAdjustPolicy.AdjustToContents
@@ -702,14 +683,70 @@ class CalibrationPanel(QtWidgets.QWidget):
         matrices_layout.addStretch(1)
         tabs.addTab(matrices_tab, "Matrices")
 
+        axes_tab = QtWidgets.QWidget()
+        axes_layout = QtWidgets.QVBoxLayout(axes_tab)
+        axis_headers = (
+            "axis",
+            "axis_scale_cmd_mm",
+            "response_px_per_cmd_mm",
+            "unclamped_scale_cmd_mm",
+            "scale_min_cmd_mm",
+            "scale_max_cmd_mm",
+        )
+        axis_scale = np.asarray(summary["axis_scale_cmd_mm"], dtype=float)
+        axis_sensitivity = np.asarray(
+            summary["axis_sensitivity_px_per_cmd_mm"],
+            dtype=float,
+        )
+        axis_scale_unclamped = np.asarray(
+            summary["axis_scale_unclamped_cmd_mm"],
+            dtype=float,
+        )
+        axis_scale_bounds = np.asarray(
+            summary["axis_scale_bounds_cmd_mm"],
+            dtype=float,
+        )
+        axis_table = QtWidgets.QTableWidget(len(COMMAND_AXES), len(axis_headers))
+        axis_table.setObjectName("calibration_axes_table")
+        axis_table.setHorizontalHeaderLabels(axis_headers)
+        axis_table.setEditTriggers(
+            QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers
+        )
+        axis_table.setSelectionMode(
+            QtWidgets.QAbstractItemView.SelectionMode.NoSelection
+        )
+        axis_table.horizontalHeader().setSectionResizeMode(
+            QtWidgets.QHeaderView.ResizeMode.ResizeToContents
+        )
+        for row, axis in enumerate(COMMAND_AXES):
+            values = (
+                axis,
+                _format_number(axis_scale[row]),
+                _format_number(axis_sensitivity[row]),
+                _format_number(axis_scale_unclamped[row]),
+                _format_number(axis_scale_bounds[row, 0]),
+                _format_number(axis_scale_bounds[row, 1]),
+            )
+            for column, value in enumerate(values):
+                item = QtWidgets.QTableWidgetItem(value)
+                if column > 0:
+                    item.setTextAlignment(
+                        QtCore.Qt.AlignmentFlag.AlignRight
+                        | QtCore.Qt.AlignmentFlag.AlignVCenter
+                    )
+                axis_table.setItem(row, column, item)
+        axes_layout.addWidget(axis_table)
+        axes_layout.addStretch(1)
+        tabs.addTab(axes_tab, "Axes")
+
         samples_tab = QtWidgets.QWidget()
         samples_layout = QtWidgets.QVBoxLayout(samples_tab)
 
         headers = (
-            "sample",
-            "x_um",
-            "y_um",
-            "z_um",
+            "probe",
+            "dx_cmd_mm",
+            "dy_cmd_mm",
+            "dz_cmd_mm",
             "measured_cam0_du_px",
             "measured_cam0_dv_px",
             "measured_cam1_du_px",
@@ -722,23 +759,27 @@ class CalibrationPanel(QtWidgets.QWidget):
             "residual_cam0_dv_px",
             "residual_cam1_du_px",
             "residual_cam1_dv_px",
-            "residual_x_um",
-            "residual_y_um",
-            "residual_z_um",
-            "measurement_warnings",
+            "residual_x_cmd_mm",
+            "residual_y_cmd_mm",
+            "residual_z_cmd_mm",
+            "readback_x_disagree_mm",
+            "readback_y_disagree_mm",
+            "readback_z_disagree_mm",
+            "registration_warnings",
         )
-        stage = arrays["stage"]
+        command_delta = arrays["command_delta"]
         measured = arrays["measured_shift"]
         predicted = arrays["predicted_shift"]
         residual_px = arrays["residual_shift"]
-        residual_um = arrays["residual_stage"]
+        residual_cmd = arrays["residual_command"]
+        readback_disagreement = arrays["readback_disagreement"]
         warnings = (
-            np.asarray(calibration["measurement_warnings"].values, dtype=str)
-            if "measurement_warnings" in calibration
-            else np.full((stage.shape[0], len(CAMERAS)), "", dtype=str)
+            np.asarray(calibration["probe_registration_warnings"].values, dtype=str)
+            if "probe_registration_warnings" in calibration
+            else np.full((command_delta.shape[0], len(CAMERAS)), "", dtype=str)
         )
 
-        table = QtWidgets.QTableWidget(stage.shape[0], len(headers))
+        table = QtWidgets.QTableWidget(command_delta.shape[0], len(headers))
         table.setObjectName("calibration_samples_table")
         table.setHorizontalHeaderLabels(headers)
         table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -749,21 +790,18 @@ class CalibrationPanel(QtWidgets.QWidget):
             QtWidgets.QHeaderView.ResizeMode.ResizeToContents
         )
         table.horizontalHeader().setMinimumSectionSize(72)
-        for row in range(stage.shape[0]):
+        for row in range(command_delta.shape[0]):
             warning_row = warnings[row]
-            if np.ndim(warning_row) == 0:
-                warning_text = str(warning_row)
-            else:
-                warning_text = "; ".join(
-                    f"{camera}: {text}"
-                    for camera, text in zip(CAMERAS, warning_row, strict=True)
-                    if str(text)
-                )
+            warning_text = "; ".join(
+                f"{camera}: {text}"
+                for camera, text in zip(CAMERAS, warning_row, strict=True)
+                if str(text)
+            )
             values = (
                 str(row),
-                _format_number(stage[row, 0]),
-                _format_number(stage[row, 1]),
-                _format_number(stage[row, 2]),
+                _format_number(command_delta[row, 0]),
+                _format_number(command_delta[row, 1]),
+                _format_number(command_delta[row, 2]),
                 _format_number(measured[row, 0, 0]),
                 _format_number(measured[row, 0, 1]),
                 _format_number(measured[row, 1, 0]),
@@ -776,9 +814,12 @@ class CalibrationPanel(QtWidgets.QWidget):
                 _format_number(residual_px[row, 0, 1]),
                 _format_number(residual_px[row, 1, 0]),
                 _format_number(residual_px[row, 1, 1]),
-                _format_number(residual_um[row, 0]),
-                _format_number(residual_um[row, 1]),
-                _format_number(residual_um[row, 2]),
+                _format_number(residual_cmd[row, 0]),
+                _format_number(residual_cmd[row, 1]),
+                _format_number(residual_cmd[row, 2]),
+                _format_number(readback_disagreement[row, 0]),
+                _format_number(readback_disagreement[row, 1]),
+                _format_number(readback_disagreement[row, 2]),
                 warning_text,
             )
             for column, value in enumerate(values):
@@ -791,77 +832,8 @@ class CalibrationPanel(QtWidgets.QWidget):
                 table.setItem(row, column, item)
 
         samples_layout.addWidget(table)
-        tabs.addTab(samples_tab, "Samples")
+        tabs.addTab(samples_tab, "Probes")
 
-        images_tab = QtWidgets.QWidget()
-        images_layout = QtWidgets.QVBoxLayout(images_tab)
-        if "image_cam0" not in calibration or "image_cam1" not in calibration:
-            images_layout.addWidget(
-                QtWidgets.QLabel("No calibration images in dataset.")
-            )
-            images_layout.addStretch(1)
-        else:
-            images_by_camera = {
-                "cam0": np.asarray(calibration["image_cam0"].values),
-                "cam1": np.asarray(calibration["image_cam1"].values),
-            }
-            stage = np.asarray(calibration["stage_um"].values, dtype=float)
-            if any(
-                images.ndim != 3 or images.shape[0] != stage.shape[0]
-                for images in images_by_camera.values()
-            ):
-                images_layout.addWidget(
-                    QtWidgets.QLabel("No usable calibration image stacks.")
-                )
-                images_layout.addStretch(1)
-            else:
-                controls_layout = QtWidgets.QHBoxLayout()
-                camera_selector = QtWidgets.QComboBox()
-                camera_selector.setObjectName("calibration_image_camera_selector")
-                camera_selector.addItems(CAMERAS)
-                sample_selector = QtWidgets.QSpinBox()
-                sample_selector.setObjectName("calibration_image_sample_selector")
-                sample_selector.setRange(0, stage.shape[0] - 1)
-                stage_label = QtWidgets.QLabel()
-                stage_label.setTextInteractionFlags(
-                    QtCore.Qt.TextInteractionFlag.TextSelectableByMouse
-                )
-                controls_layout.addWidget(QtWidgets.QLabel("Camera"))
-                controls_layout.addWidget(camera_selector)
-                controls_layout.addWidget(QtWidgets.QLabel("Sample"))
-                controls_layout.addWidget(sample_selector)
-                controls_layout.addWidget(stage_label, stretch=1)
-                images_layout.addLayout(controls_layout)
-
-                image_plot = pg.PlotWidget()
-                image_plot.setObjectName("calibration_image_plot")
-                image_plot.setAspectLocked(True)
-                image_plot.invertY(True)
-                image_plot.setLabel(
-                    "bottom", "x", units="px", siPrefixEnableRanges=()
-                )
-                image_plot.setLabel(
-                    "left", "y", units="px", siPrefixEnableRanges=()
-                )
-                image_item = pg.ImageItem(axisOrder="row-major")
-                image_plot.addItem(image_item)
-                images_layout.addWidget(image_plot, stretch=1)
-
-                def update_image() -> None:
-                    camera = str(camera_selector.currentText())
-                    index = int(sample_selector.value())
-                    images = images_by_camera[camera]
-                    image_item.setImage(images[index], autoLevels=True)
-                    stage_label.setText(
-                        f"stage: ({_format_number(stage[index, 0])}, "
-                        f"{_format_number(stage[index, 1])}, "
-                        f"{_format_number(stage[index, 2])}) um"
-                    )
-
-                camera_selector.currentTextChanged.connect(lambda _: update_image())
-                sample_selector.valueChanged.connect(lambda _: update_image())
-                update_image()
-        tabs.addTab(images_tab, "Images")
         layout.addWidget(tabs)
 
         close_button = QtWidgets.QPushButton("Close")
@@ -874,14 +846,14 @@ class CalibrationPanel(QtWidgets.QWidget):
         for residual_plot in self.residual_plots.values():
             residual_plot.clear()
         arrays = _calibration_arrays(calibration)
-        stage = arrays["stage"]
-        residual = arrays["residual_stage"]
+        command_delta = arrays["command_delta"]
+        residual = arrays["residual_command"]
 
         for x_label, y_label, x_index, y_index in RESIDUAL_PROJECTIONS:
             residual_plot = self.residual_plots[f"{x_label}{y_label}"]
             residual_plot.plot(
-                stage[:, x_index],
-                stage[:, y_index],
+                command_delta[:, x_index],
+                command_delta[:, y_index],
                 pen=None,
                 symbol="o",
                 symbolBrush=pg.mkBrush("#1f77b4"),
@@ -892,9 +864,9 @@ class CalibrationPanel(QtWidgets.QWidget):
             y_values: list[float] = []
             residual_x_values: list[float] = []
             residual_y_values: list[float] = []
-            for stage_row, residual_row in zip(stage, residual, strict=True):
-                x0 = stage_row[x_index]
-                y0 = stage_row[y_index]
+            for command_row, residual_row in zip(command_delta, residual, strict=True):
+                x0 = command_row[x_index]
+                y0 = command_row[y_index]
                 dx = residual_row[x_index]
                 dy = residual_row[y_index]
                 if not np.isfinite((x0, y0, dx, dy)).all():

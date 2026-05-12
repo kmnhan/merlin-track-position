@@ -38,11 +38,36 @@ DEFAULT_CAPTURE_COUNT: int = 3
 CALIBRATION_FIT_N_JOBS: int = 2
 
 
-# Default number of points along each axis for the calibration grid.
-DEFAULT_CALIBRATION_N: int = 3
+# Default commanded-mm probe steps for visual-Jacobian calibration.
+DEFAULT_VISUAL_CALIBRATION_STEP_MM_BY_AXIS: dict[str, float] = {
+    "x": 0.5,
+    "y": 0.5,
+    "z": 0.5,
+}
 
-# Default step size in microns for the calibration grid.
-DEFAULT_CALIBRATION_STEP_UM: float = 60.0
+# Bounds used when deriving correction damping scales from the fitted visual Jacobian.
+DEFAULT_AXIS_SCALE_BOUNDS_CMD_MM_BY_AXIS: dict[str, tuple[float, float]] = {
+    "x": (0.1, 0.8),
+    "y": (0.3, 1.0),
+    "z": (0.1, 0.8),
+}
+
+# Number of repeated +axis/-axis visual-Jacobian probes per command axis.
+DEFAULT_VISUAL_CALIBRATION_REPEATS_PER_DIRECTION: int = 3
+
+# Minimum two-camera image response accepted for a calibration probe.
+DEFAULT_VISUAL_CALIBRATION_MIN_SHIFT_PX: float = 2.0
+
+# Calibration condition number threshold above which the fit is rejected.
+DEFAULT_VISUAL_JACOBIAN_CONDITION_WARNING: float = 100.0
+
+# Closed-loop correction defaults in command-mm visual-servo space.
+DEFAULT_CORRECTION_PIXEL_TOLERANCE_PX: float = 0.5
+DEFAULT_CORRECTION_GAIN: float = 0.3
+DEFAULT_CORRECTION_MIN_GAIN: float = 0.05
+DEFAULT_CORRECTION_DAMPING_MU: float = 1e-2
+DEFAULT_CORRECTION_MAX_MOVES: int = 8
+DEFAULT_BROYDEN_UPDATE_BLEND: float = 0.5
 
 # Image size for initial crop from each camera array.
 IMAGE_WIDTH_CAM0: int = 704

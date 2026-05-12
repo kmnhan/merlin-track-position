@@ -37,18 +37,16 @@ DEFAULT_POSITIONS = {
 @dataclass(frozen=True)
 class SyntheticCalibration:
     reference_image: npt.NDArray[np.float64]
-    stage_to_pixel: npt.NDArray[np.float64]
-    reference_stage_um: npt.NDArray[np.float64]
 
 
-CAM0_STAGE_TO_PIXEL_3D = np.array(
+CAM0_COMMAND_UM_TO_PIXEL_3D = np.array(
     [
         [0.27, -0.14, 0.07],
         [0.09, 0.31, -0.12],
     ],
     dtype=np.float64,
 )
-CAM1_STAGE_TO_PIXEL_3D = np.array(
+CAM1_COMMAND_UM_TO_PIXEL_3D = np.array(
     [
         [-0.21, 0.18, 0.33],
         [0.24, 0.05, 0.16],
@@ -75,8 +73,6 @@ def load_synthetic_calibration() -> SyntheticCalibration:
         with np.load(file) as archive:
             return SyntheticCalibration(
                 reference_image=_readonly_float64(archive["reference_image"]),
-                stage_to_pixel=_readonly_float64(archive["stage_to_pixel"]),
-                reference_stage_um=_readonly_float64(archive["reference_stage_um"]),
             )
 
 
@@ -178,23 +174,26 @@ class SimulatedHardware:
     def get_reference_image_cam1(self) -> npt.NDArray[np.float64]:
         return load_synthetic_cam1_reference().copy()
 
-    def get_stage_to_pixel(self, camera: str | None = None) -> npt.NDArray[np.float64]:
+    def get_command_um_to_pixel(
+        self,
+        camera: str | None = None,
+    ) -> npt.NDArray[np.float64]:
         if camera == "cam0":
-            return CAM0_STAGE_TO_PIXEL_3D.copy()
+            return CAM0_COMMAND_UM_TO_PIXEL_3D.copy()
         if camera == "cam1":
-            return CAM1_STAGE_TO_PIXEL_3D.copy()
+            return CAM1_COMMAND_UM_TO_PIXEL_3D.copy()
         return np.stack(
-            [CAM0_STAGE_TO_PIXEL_3D, CAM1_STAGE_TO_PIXEL_3D],
+            [CAM0_COMMAND_UM_TO_PIXEL_3D, CAM1_COMMAND_UM_TO_PIXEL_3D],
             axis=0,
         )
 
     def get_framegrabber_image(self) -> npt.NDArray[np.float64]:
         x_mm, y_mm, z_mm = self.get_positions(("x", "y", "z"))
-        stage_offset_um = np.array(
+        command_offset_um = np.array(
             [x_mm * 1000.0, y_mm * 1000.0, z_mm * 1000.0],
             dtype=np.float64,
         )
-        du_px, dv_px = CAM0_STAGE_TO_PIXEL_3D @ stage_offset_um
+        du_px, dv_px = CAM0_COMMAND_UM_TO_PIXEL_3D @ command_offset_um
         shifted = ndimage.shift(
             load_synthetic_calibration().reference_image,
             shift=(float(dv_px), float(du_px)),
@@ -210,11 +209,11 @@ class SimulatedHardware:
 
     def get_basler_image(self) -> npt.NDArray[np.float64]:
         x_mm, y_mm, z_mm = self.get_positions(("x", "y", "z"))
-        stage_offset_um = np.array(
+        command_offset_um = np.array(
             [x_mm * 1000.0, y_mm * 1000.0, z_mm * 1000.0],
             dtype=np.float64,
         )
-        du_px, dv_px = CAM1_STAGE_TO_PIXEL_3D @ stage_offset_um
+        du_px, dv_px = CAM1_COMMAND_UM_TO_PIXEL_3D @ command_offset_um
         shifted = ndimage.shift(
             load_synthetic_cam1_reference(),
             shift=(float(dv_px), float(du_px)),
