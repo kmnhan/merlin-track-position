@@ -1,19 +1,23 @@
-# merlin-track-position
+# Image-Space Visual Servoing for MERLIN Sample-Position Correction
 
-Software for tracking the sample position at Beamline 4.0.3 MERLIN at the Advanced Light
-Source. The main goal is to implement a visual closed loop for sample position
-correction, using the existing motor system and two cameras.
+This repository implements image-based sample-position tracking and correction
+for Beamline 4.0.3 MERLIN at the Advanced Light Source. The method estimates a
+local visual Jacobian between commanded motor displacements and two-camera image
+displacements, then applies closed-loop damped visual servoing in the same
+command coordinate system used by the beamline control software.
 
-One camera is the existing camera that looks at the sample (#5), exposed through the
-FrameGrabber window. The second camera is a new camera (Basler ac1440-73gm) that loos
-through the same viewport at a slightly different angle and has a different field of
-view and resolution.
+The imaging system consists of the existing sample-view camera exposed through
+the FrameGrabber window and a Basler acA1440-73gm camera viewing the same
+viewport from a different angle. The two views have distinct pixel scales,
+fields of view, and image content; therefore, all correction is formulated in a
+joint four-dimensional image space rather than in either individual camera
+coordinate system.
 
-## Design
+## Method
 
 ### Variables
 
-The image residual for the two cameras is
+Let the two-camera image residual be
 
 $$
 \mathbf p =
@@ -25,7 +29,7 @@ $$
 \end{bmatrix}.
 $$
 
-The absolute motor command state is
+Let the commanded motor state be
 
 $$
 \mathbf a =
@@ -36,8 +40,8 @@ a_z
 \end{bmatrix},
 $$
 
-where each component is the absolute commanded value sent for that motor.
-Calibration and correction use command deltas
+where each component denotes an absolute BCS motor command in millimeters. The
+calibration and correction algorithms use command increments
 
 $$
 \Delta \mathbf a =
@@ -48,9 +52,9 @@ $$
 \end{bmatrix}
 $$
 
-in mm units.
+in the same commanded-mm coordinate system.
 
-The visual model is
+The local image-space response is modeled as
 
 $$
 \Delta \mathbf p \approx J\,\Delta \mathbf a,
@@ -62,26 +66,27 @@ $$
 J \in \mathbb R^{4\times3}
 $$
 
-in units of pixels per commanded-mm. In the xarray calibration dataset,
-`J` is stored as
+with units of pixels per commanded millimeter. In the xarray calibration
+dataset, `J` is stored as
 `visual_jacobian_px_per_cmd_mm(camera, pixel_axis, command_axis)` and is
-flattened to the 4 by 3 observation matrix only for linear algebra.
+reshaped to a \(4\times3\) observation matrix only for linear algebra.
 
 ### Calibration Routine
 
-Calibration learns `J` from images captured before and after moves commanded in mm
-coordinates. The current acquisition path is:
+Calibration estimates \(J\) from before/after image pairs acquired around
+single-axis commanded-mm probe moves. The acquisition procedure is:
 
-1. read the initial BCS `x`, `y`, and `z` positions
-2. capture `reference_cam0` and `reference_cam1`
-3. build repeated plus/minus single-axis probe delta coordinates for `x`, `y`, and `z`
-4. for each probe, capture before images, command the move,
-   capture after images, and register after-vs-before;
-5. fit `visual_jacobian_px_per_cmd_mm` from the valid
+1. read the initial BCS `x`, `y`, and `z` command positions;
+2. acquire `reference_cam0` and `reference_cam1`;
+3. generate repeated positive and negative single-axis probes for `x`, `y`, and
+   `z`;
+4. for each probe, acquire pre-move images, command the move, acquire post-move
+   images, and register the post-move images against the pre-move images;
+5. estimate `visual_jacobian_px_per_cmd_mm` from the valid
    `(probe_command_delta_mm, probe_measured_delta_px)` rows;
-6. save the calibration dataset to disk and reload it from that path.
+6. persist the calibration dataset to disk and reload it from that path.
 
-The default probe step is currently
+The default probe magnitude is
 
 $$
 \Delta a_x = \Delta a_y = \Delta a_z = 0.5\ \mathrm{mm}
@@ -90,14 +95,15 @@ $$
 for each plus/minus probe direction, with
 `DEFAULT_VISUAL_CALIBRATION_REPEATS_PER_DIRECTION = 3`.
 
-Motor readback is saved as diagnostics only:
+Motor readback is retained only as diagnostic metadata:
 
 ```python
 pre_readback_position_mm
 post_readback_position_mm
 ```
 
-It is not used to fit `J`. The fit uses commanded deltas:
+These readback quantities are excluded from the Jacobian fit. The regression
+uses commanded deltas, defined by
 
 ```python
 post_commanded_position_mm - pre_commanded_position_mm
@@ -111,14 +117,14 @@ J =
 \frac{\partial \mathbf p}{\partial \mathbf a},
 $$
 
-not
+and not
 
 $$
 \frac{\partial \mathbf p}{\partial \mathbf x_{\mathrm{physical}}}.
 $$
 
-The core fit uses a robust iteratively reweighted least-squares solve over
-probe residuals. Calibration fails if:
+The estimator is a robust iteratively reweighted least-squares regression over
+probe residuals. Calibration is rejected if:
 
 - a probe image response is below `DEFAULT_VISUAL_CALIBRATION_MIN_SHIFT_PX`
   (`2.0 px` by default);
@@ -129,14 +135,14 @@ probe residuals. Calibration fails if:
 
 ### Axis Scale
 
-Correction is solved in normalized command coordinates. The calibration
-therefore stores
+For numerical conditioning, correction is posed in normalized command
+coordinates. Each calibration dataset therefore stores
 
 ```text
 axis_scale_cmd_mm(command_axis)
 ```
 
-and correction reuses that saved value.
+and subsequent correction runs reuse this saved scale.
 
 Let
 
@@ -155,16 +161,16 @@ s_z
 \end{bmatrix}
 $$
 
-which is stored in `axis_scale_cmd_mm`.
+as represented by `axis_scale_cmd_mm`.
 
-The code derives this scale from the fitted visual Jacobian:
+The scale is derived from the fitted visual Jacobian. The quantity
 
 $$
 c_j = \|J_{:,j}\|_2
 $$
 
-is the image sensitivity of command axis `j` in px/commanded-mm. With
-calibration probe step magnitude
+is the image sensitivity of command axis \(j\), expressed in
+px/commanded-mm. Given the calibration probe magnitude
 
 $$
 h_j = \max_i |\Delta a_{i,j}|,
@@ -200,7 +206,7 @@ s_{j,\max}
 \right).
 $$
 
-The current bounds are:
+The configured bounds are:
 
 ```text
 x: 0.1 to 0.8 commanded-mm
@@ -211,27 +217,28 @@ z: 0.1 to 0.8 commanded-mm
 The calibration dataset stores only the final `axis_scale_cmd_mm`. The
 unclamped scale, sensitivity, bounds, and target response are not persisted
 because they are exactly derivable from `J`, `probe_command_delta_mm`, and the
-current constants. The GUI recomputes those diagnostics when displaying a
+configured constants. The GUI recomputes those diagnostics when displaying a
 calibration.
 
 ### Weighted Correction Objective
 
-Correction uses the formal weighted image residual
+Correction minimizes the weighted image-space residual
 
 $$
 \rho(\mathbf p) =
 \sqrt{\mathbf p^\mathsf T W \mathbf p}.
 $$
 
-If no weights are passed, the code uses
+When no weights are specified,
 
 $$
 W = I_4.
 $$
 
-If weights are supplied, they must contain four finite nonnegative observation
-weights, with at least one positive value, or have shape `(camera, pixel_axis)`,
-which is then flattened to the same observation order as `p`.
+Weights, when supplied, must contain four finite nonnegative observation
+weights with at least one positive entry. They may also have shape
+`(camera, pixel_axis)`, in which case they are flattened to the same
+observation order as \(\mathbf p\).
 
 Convergence is declared when
 
@@ -241,7 +248,8 @@ $$
 \text{tol},
 $$
 
-Where `tol` is `DEFAULT_CORRECTION_PIXEL_TOLERANCE_PX`, which is currently `0.5 px`.
+where `tol` is `DEFAULT_CORRECTION_PIXEL_TOLERANCE_PX`, with a default value
+of `0.5 px`.
 
 This is the only correction residual recorded in the iteration history:
 
@@ -249,8 +257,7 @@ This is the only correction residual recorded in the iteration history:
 iteration_weighted_residual_px
 ```
 
-The previous unweighted RMS correction residual is no longer part of the
-current correction output.
+Unweighted RMS residuals are not part of the correction output.
 
 ### Damped Normalized Command Solve
 
@@ -266,7 +273,7 @@ $$
 J_q = J S.
 $$
 
-Each correction proposal solves
+At correction iteration \(k\), the command increment is obtained from
 
 $$
 \Delta \mathbf q
@@ -284,7 +291,7 @@ $$
 \Delta \mathbf a = S\,\Delta \mathbf q.
 $$
 
-The current defaults are:
+The default numerical parameters are:
 
 ```text
 lambda = DEFAULT_CORRECTION_GAIN = 0.3
@@ -297,9 +304,8 @@ min command norm = DEFAULT_CORRECTION_MIN_COMMAND_NORM_MM = 1e-9 mm
 max_moves = DEFAULT_CORRECTION_MAX_MOVES = 12
 ```
 
-Before a motor command is sent, the implementation applies two guards to the
-least-squares proposal. First, it clips the largest normalized component by
-scaling the whole vector if
+Before a motor command is issued, two safeguards are applied to the
+least-squares proposal. First, the full normalized vector is scaled when
 
 $$
 \max_j |\Delta q_j|
@@ -307,8 +313,8 @@ $$
 \texttt{DEFAULT\_CORRECTION\_MAX\_NORMALIZED\_STEP}.
 $$
 
-Second, it suppresses nuisance axis components whose predicted image effect is
-below the configured threshold:
+Second, axis components are suppressed when their predicted weighted image
+effect is below the configured threshold:
 
 $$
 |\Delta a_j|\sqrt{J_{:,j}^\mathsf T WJ_{:,j}}
@@ -317,8 +323,8 @@ $$
 $$
 
 Components at or below the configured motor move deadband are also set to zero.
-If the remaining command vector is effectively zero, the loop stops before
-sending another motor move and reports non-convergence with a warning.
+If the remaining command vector is effectively zero, correction stops before
+issuing another motor command and reports non-convergence with a warning.
 
 The absolute BCS-mm target sent to the motors is
 
@@ -328,19 +334,18 @@ $$
 \mathbf a_{\mathrm{commanded}} + \Delta \mathbf a.
 $$
 
-The implementation initializes `commanded_position_mm` from the current BCS
-`x/y/z` values and then updates that internal command state to each requested
-absolute target. It does not use post-move readback as the next command-state
-anchor.
+The internal `commanded_position_mm` state is initialized from the BCS `x`,
+`y`, and `z` values and is subsequently advanced to each requested absolute
+target. Post-move readback is not used as the command-state anchor.
 
 ### Correction Loop
 
-The implemented correction loop is:
+The closed-loop correction algorithm proceeds as follows:
 
 1. load and validate a saved calibration dataset;
 2. require a real calibration file path, because accepted Jacobian refinements
-   are persisted back to disk;
-3. capture current images and compute `shift_px`;
+   are persisted to disk;
+3. capture images and compute `shift_px`;
 4. compute
    $\rho_k = \sqrt{\mathbf p_k^\mathsf T W \mathbf p_k}$;
 5. stop immediately if $\rho_k$ is at or below the pixel tolerance;
@@ -350,15 +355,16 @@ The implemented correction loop is:
    command norm;
 9. send absolute BCS-mm targets only for axes with nonzero correction components;
 10. re-image and compute the new residual;
-11. if the residual decreased, apply a guarded blended Broyden update and save
-   the refined calibration dataset to disk;
+11. if the residual decreased, refit the visual Jacobian from the calibration
+   probes plus accepted correction observations and save the refined
+   calibration dataset to disk;
 12. if the residual increased or stayed flat, skip the Jacobian update, halve
     the gain down to `DEFAULT_CORRECTION_MIN_GAIN`, double `mu`, and continue
     from the newly measured image state;
-13. save the current correction result into the sibling correction-history file.
+13. save the correction result into the sibling correction-history file.
 
-The code does not roll back the motor position after a bad move. The camera
-measurement after that move becomes the next state.
+No rollback is performed after a residual-increasing move. The image
+measurement acquired after that move defines the next closed-loop state.
 
 If convergence is not reached after `max_moves`, correction returns a dataset
 with
@@ -367,10 +373,10 @@ with
 correction_converged = False
 ```
 
-and a warning. It does not raise merely because the closed loop did not
-converge after motion.
+and an associated warning. Lack of convergence after motion is therefore
+reported as data rather than raised as an exception.
 
-### Broyden Refinement
+### Jacobian Refinement
 
 After a move, the measured image change is
 
@@ -380,44 +386,48 @@ $$
 \mathbf p_{k+1} - \mathbf p_k.
 $$
 
-The predicted image change is
+Accepted correction moves are treated as additional observations of the same
+linear model used during calibration:
 
 $$
-\Delta \mathbf p_{\mathrm{pred}}
+\Delta \mathbf p_i \approx J \Delta \mathbf a_i.
+$$
+
+The refined Jacobian is not overwritten from one correction move. It is refit
+by pooling the original calibration probes with all accepted correction
+observations:
+
+$$
+\widehat{J}
 =
-J_k \Delta \mathbf a_k.
-$$
-
-The implemented update is the blended rank-one Broyden update
-
-$$
-J_{k+1}
-=
-J_k
-+
-\alpha
-\frac{
+\arg\min_J
+\sum_i
+\rho
 \left(
-\Delta \mathbf p_{\mathrm{meas}}
-- J_k\Delta \mathbf a_k
-\right)
-\Delta \mathbf a_k^\mathsf T
-}{
-\Delta \mathbf a_k^\mathsf T\Delta \mathbf a_k
-}.
+\left\|
+\Delta \mathbf p_i - J\Delta \mathbf a_i
+\right\|_2
+\right),
 $$
 
-The blend $\alpha$ is defined by `DEFAULT_BROYDEN_UPDATE_BLEND`, which is currently
-`0.5` for a 50/50 blend of the previous Jacobian and the new rank-one update.
+where the first rows are the large calibration probes and later rows are
+closed-loop correction moves. The estimate is obtained with the same
+Huber-style iteratively reweighted least-squares procedure used during
+calibration.
 
-The update is only attempted when the weighted image residual decreased. The update also
-requires a finite command vector with norm at least `1e-9 commanded-mm`. If the update
-fails validation, it is skipped and the warning is recorded.
+This weighting is important for small corrections. In the pooled least-squares
+normal equation, an observation contributes through
+$\Delta\mathbf a_i\Delta\mathbf a_i^\mathsf T$. A 5 micron correction therefore
+has approximately $(0.005/0.5)^2 = 10^{-4}$ the Jacobian leverage of a 0.5 mm
+calibration probe, preventing a single small move from dominating a Jacobian
+column.
 
-Accepted updates call `assign_refined_visual_jacobian(...)`, which updates
-`visual_jacobian_px_per_cmd_mm`, increments `broyden_update_count`, marks
-`jacobian_refined = "true"`, validates the dataset, and saves it back to the calibration
-file path.
+Refinement is only attempted when the weighted image residual decreased. If the
+refit is rank-deficient, poorly conditioned, or otherwise invalid, it is skipped
+and the warning is recorded. Accepted refinements update
+`visual_jacobian_px_per_cmd_mm`, increment `jacobian_refinement_count`, mark
+`jacobian_refined = "true"`, validate the dataset, and save it back to the
+calibration file path.
 
 ### Dataset Schema
 
@@ -436,19 +446,19 @@ pre_readback_position_mm(probe, command_axis)
 post_readback_position_mm(probe, command_axis)
 ```
 
-The current calibration writer also includes non-derivable diagnostics:
+Calibration datasets also include non-derivable diagnostics:
 
 ```text
 probe_capture_shift_mad_px(probe, camera, pixel_axis)
 probe_registration_warnings(probe, camera)
 ```
 
-The writer deliberately omits values that can be recomputed exactly, such as
-predicted probe shifts, probe residuals, axis sensitivities, scale bounds, and
-condition number. `calibration_path` is also not written into the file; it is
-attached only to loaded in-memory datasets.
+Persisted calibration datasets omit values that can be recomputed exactly, such
+as predicted probe shifts, probe residuals, axis sensitivities, scale bounds,
+and condition number. `calibration_path` is also not written into the file; it
+is attached only to loaded in-memory datasets.
 
-The current correction output uses commanded-mm names:
+Correction outputs are expressed in commanded-mm units:
 
 ```text
 estimated_command_offset_mm(command_axis)
@@ -469,7 +479,7 @@ move_gain(move)
 move_damping_mu(move)
 move_max_normalized_component(move)
 move_active_axis_mask(move, command_axis)
-move_jacobian_updated(move)
+move_jacobian_refined(move)
 ```
 
 The correction result keeps per-move diagnostic state because that dataset is
@@ -477,12 +487,13 @@ also used as the on-disk correction log. For a calibration file such as
 `calibration.h5`, corrections are saved next to it in
 `calibration_corrections.h5`. Each correction run is written to an HDF5 group
 named `run_000000`, `run_000001`, and so on. During an active correction, the
-current run group is rewritten after every completed motor move, so the file
+active run group is rewritten after every completed motor move, so the file
 contains the latest available residual trace, move commands, measured image
-response, and Jacobian before/after any accepted Broyden update.
+response, and Jacobian before/after any accepted pooled least-squares
+refinement.
 
-At result assembly, the reported command offset is computed from the current
-image residual as
+At result assembly, the reported command offset is computed from the final image
+residual as
 
 $$
 \widehat{\Delta \mathbf a}
@@ -508,13 +519,13 @@ computed with the final gain and damping values.
 
 [5] S. Chiaverini, B. Siciliano, and O. Egeland, "Review of the Damped Least-Squares Inverse Kinematics with Experiments on an Industrial Robot Manipulator," *IEEE Transactions on Control Systems Technology* **2**(2), 123--134, 1994. <https://doi.org/10.1109/87.294335>
 
-[6] C. G. Broyden, "A Class of Methods for Solving Nonlinear Simultaneous Equations," *Mathematics of Computation* **19**(92), 577--593, 1965. <https://doi.org/10.1090/S0025-5718-1965-0198670-6>
+[6] P. J. Huber, "Robust Estimation of a Location Parameter," *The Annals of Mathematical Statistics* **35**(1), 73--101, 1964. <https://doi.org/10.1214/aoms/1177703732>
 
 [7] J. Music, M. Bonkovic, and M. Cecic, "Comparison of Uncalibrated Model-Free Visual Servoing Methods for Small-Amplitude Movements: A Simulation Study," *International Journal of Advanced Robotic Systems* **11**, 2014. <https://doi.org/10.5772/58822>
 
 [8] J. Nocedal and S. J. Wright, *Numerical Optimization*, 2nd ed., Springer, 2006. <https://doi.org/10.1007/978-0-387-40065-5>
 
-## Quick Start
+## Programmatic Use
 
 ```python
 from merlin_track_position.tracking.correct import do_correction
@@ -528,9 +539,10 @@ print(result.attrs["correction_converged"])
 print(result.attrs["warnings"])
 ```
 
-## Calibration
+## Calibration Entry Point
 
-Run visual-Jacobian calibration from before/after commanded-mm probe moves:
+Visual-Jacobian calibration can be initiated from before/after commanded-mm
+probe moves:
 
 ```python
 from merlin_track_position.tracking.calibrate import run_calibration
@@ -551,10 +563,9 @@ No assumption is made that motor axes are aligned with camera pixel axes. Motor
 readback is recorded as a diagnostic only; the fitted Jacobian uses commanded
 BCS-mm deltas and measured image deltas.
 
-## Xarray And HDF5
+## Xarray and HDF5
 
-Calibration results are xarray datasets with one current visual-Jacobian
-schema.
+Calibration results are xarray datasets using a single visual-Jacobian schema.
 
 The main dataset variables are:
 
@@ -577,8 +588,8 @@ computed on demand by the GUI and correction code.
 Saved calibration attributes include `warnings`, initial motor context
 (`initial_x_mm`, `initial_y_mm`, `initial_z_mm`, `polar`, `tilt`), and GUI ROI
 bounds (`roi_cam0_*`, `roi_cam1_*`) when created from the GUI. Accepted
-closed-loop Broyden updates rewrite the calibration file so the refined
-Jacobian persists across correction runs.
+closed-loop pooled least-squares refinements rewrite the calibration file so the
+refined Jacobian persists across correction runs.
 
 ## Hardware Notes
 

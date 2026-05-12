@@ -11,10 +11,10 @@ from merlin_track_position.tracking.calibration_core import (
     CAMERAS,
     COMMAND_AXES,
     PIXEL_AXES,
-    broyden_update_jacobian,
     derive_axis_scale_from_jacobian,
     fit_visual_jacobian_calibration,
     load_calibration_dataset,
+    refine_visual_jacobian_from_observations,
     save_calibration_dataset,
     solve_damped_command_correction,
     validate_visual_calibration_dataset,
@@ -131,7 +131,7 @@ def calibration_dataset(jacobian=None):
         },
         attrs={
             "warnings": "",
-            "broyden_update_count": 0,
+            "jacobian_refinement_count": 0,
         },
     )
     validate_visual_calibration_dataset(dataset)
@@ -249,11 +249,11 @@ class VisualCalibrationTests(unittest.TestCase):
             calibration["probe_command_delta_mm"].values,
         )
         np.testing.assert_allclose(axis_sensitivity, [1000.0, 10.0, 100.0], atol=1e-9)
-        np.testing.assert_allclose(axis_scale_unclamped, [0.05, 5.0, 0.5], atol=1e-9)
-        np.testing.assert_allclose(derived_axis_scale, [0.1, 1.0, 0.5], atol=1e-9)
+        np.testing.assert_allclose(axis_scale_unclamped, [0.03, 3.0, 0.3], atol=1e-9)
+        np.testing.assert_allclose(derived_axis_scale, [0.1, 1.0, 0.3], atol=1e-9)
         np.testing.assert_allclose(
             calibration["axis_scale_cmd_mm"].values,
-            [0.1, 1.0, 0.5],
+            [0.1, 1.0, 0.3],
             atol=1e-9,
         )
 
@@ -590,7 +590,7 @@ class CorrectionTests(unittest.TestCase):
         self.assertEqual(move.call_args.args[0], ("x",))
         self.assertEqual(result["move_active_axis_mask"].values.tolist(), [[True, False, False]])
 
-    def test_residual_improvement_applies_broyden_update_and_updates_file(self):
+    def test_residual_improvement_refines_jacobian_and_updates_file(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = self.save_calibration(tmpdir)
             p0 = np.array([[3.0, 0.0], [0.0, 0.0]])
@@ -611,13 +611,30 @@ class CorrectionTests(unittest.TestCase):
 
             reloaded = load_calibration_dataset(path)
 
-        self.assertTrue(bool(result["move_jacobian_updated"].values[0]))
-        self.assertEqual(int(reloaded.attrs["broyden_update_count"]), 1)
+        self.assertTrue(bool(result["move_jacobian_refined"].values[0]))
+        self.assertEqual(int(reloaded.attrs["jacobian_refinement_count"]), 1)
         self.assertFalse(
             np.allclose(
                 reloaded["visual_jacobian_px_per_cmd_mm"].values,
                 visual_jacobian(),
             )
+        )
+
+    def test_jacobian_refinement_keeps_tiny_move_low_leverage(self):
+        calibration = calibration_dataset()
+        tiny_delta = np.array([[0.001, 0.0, 0.0]])
+        bad_tiny_measurement = np.full((1, len(CAMERAS), len(PIXEL_AXES)), 5.0)
+
+        refined = refine_visual_jacobian_from_observations(
+            calibration,
+            tiny_delta,
+            bad_tiny_measurement,
+        )
+
+        np.testing.assert_allclose(
+            refined["visual_jacobian_px_per_cmd_mm"].values,
+            calibration["visual_jacobian_px_per_cmd_mm"].values,
+            atol=0.1,
         )
 
     def test_correction_history_file_records_move_diagnostics(self):
@@ -677,10 +694,10 @@ class CorrectionTests(unittest.TestCase):
 
             reloaded = load_calibration_dataset(path)
 
-        self.assertFalse(bool(result["move_jacobian_updated"].values[0]))
+        self.assertFalse(bool(result["move_jacobian_refined"].values[0]))
         self.assertAlmostEqual(float(result.attrs["correction_final_gain"]), 0.15)
         self.assertAlmostEqual(float(result.attrs["correction_final_damping_mu"]), 0.02)
-        self.assertEqual(int(reloaded.attrs["broyden_update_count"]), 0)
+        self.assertEqual(int(reloaded.attrs["jacobian_refinement_count"]), 0)
 
     def test_non_convergence_returns_false_without_raising_after_motion(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -703,17 +720,6 @@ class CorrectionTests(unittest.TestCase):
 
         self.assertFalse(result.attrs["correction_converged"])
         self.assertIn("did not converge", result.attrs["warnings"])
-
-    def test_broyden_update_matches_formula(self):
-        jacobian = visual_jacobian()
-        delta = np.array([0.1, 0.0, 0.0])
-        measured_delta = np.array([[1.0, 2.0], [3.0, 4.0]])
-        updated = broyden_update_jacobian(jacobian, delta, measured_delta, blend=0.5)
-        expected = jacobian.reshape(4, 3) + 0.5 * np.outer(
-            measured_delta.reshape(-1) - jacobian.reshape(4, 3) @ delta,
-            delta,
-        ) / float(delta @ delta)
-        np.testing.assert_allclose(updated.reshape(4, 3), expected)
 
     def test_correction_requires_saved_calibration_path(self):
         with self.assertRaisesRegex(ValueError, "requires a calibration file path"):

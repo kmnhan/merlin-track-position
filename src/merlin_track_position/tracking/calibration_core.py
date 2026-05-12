@@ -234,7 +234,7 @@ def fit_visual_jacobian_calibration(
         "min_shift_px": min_shift_px,
         "condition_warning_threshold": condition_warning_threshold,
         "warnings": "\n".join(tuple(warnings)),
-        "broyden_update_count": 0,
+        "jacobian_refinement_count": 0,
     }
     if additional_context is not None:
         attrs |= additional_context
@@ -493,8 +493,8 @@ def assign_refined_visual_jacobian(
         jacobian,
         {"units": "px/commanded-mm"},
     )
-    updated.attrs["broyden_update_count"] = (
-        int(updated.attrs.get("broyden_update_count", 0)) + 1
+    updated.attrs["jacobian_refinement_count"] = (
+        int(updated.attrs.get("jacobian_refinement_count", 0)) + 1
     )
     updated.attrs["jacobian_refined"] = "true"
     validate_visual_calibration_dataset(updated)
@@ -502,6 +502,53 @@ def assign_refined_visual_jacobian(
     if save_path is not None:
         save_calibration_dataset(updated, save_path)
     return updated
+
+
+def refine_visual_jacobian_from_observations(
+    calibration: xr.Dataset,
+    correction_command_delta_mm: Sequence[Sequence[float]],
+    correction_measured_delta_px: Sequence[Any],
+    *,
+    save_path: str | Path | None = None,
+) -> xr.Dataset:
+    """Refine ``J`` by pooling calibration probes with accepted correction moves.
+
+    The original calibration probes remain in the fit, so small correction moves
+    affect the normal equations in proportion to their command magnitude instead
+    of overwriting the fit from a single low-leverage move.
+    """
+
+    validate_visual_calibration_dataset(calibration)
+    correction_delta = _as_probe_command_matrix(
+        "correction_command_delta_mm",
+        correction_command_delta_mm,
+    )
+    correction_observation = _as_correction_observation_matrix(
+        correction_measured_delta_px,
+        correction_delta.shape[0],
+    )
+
+    probe_delta = np.asarray(
+        calibration["probe_command_delta_mm"].values,
+        dtype=np.float64,
+    )
+    probe_observation = _pixels_to_observations(
+        np.asarray(calibration["probe_measured_delta_px"].values, dtype=np.float64)
+    )
+    combined_delta = np.vstack([probe_delta, correction_delta])
+    combined_observation = np.vstack([probe_observation, correction_observation])
+    coef = _fit_robust_least_squares(combined_delta, combined_observation)
+    visual_jacobian = coef.T.reshape(
+        len(CAMERAS),
+        len(PIXEL_AXES),
+        len(COMMAND_AXES),
+    )
+    _validate_refined_visual_jacobian(calibration, visual_jacobian)
+    return assign_refined_visual_jacobian(
+        calibration,
+        visual_jacobian,
+        save_path=save_path,
+    )
 
 
 def measure_image_error(
@@ -699,37 +746,49 @@ def weighted_pixel_residual(
     return float(np.sqrt(observation @ weight_matrix @ observation))
 
 
-def broyden_update_jacobian(
-    visual_jacobian: np.ndarray,
-    command_delta_mm: Sequence[float],
-    measured_delta_px: xr.Dataset | xr.DataArray | Sequence[float],
-    *,
-    blend: float = constants.DEFAULT_BROYDEN_UPDATE_BLEND,
-    min_command_norm_mm: float = 1e-9,
+def _as_correction_observation_matrix(
+    values: Sequence[Any],
+    expected_rows: int,
 ) -> np.ndarray:
-    """Apply a blended Broyden update to the visual Jacobian."""
+    observations = _pixels_to_observations(np.asarray(values, dtype=np.float64))
+    if observations.ndim == 1:
+        observations = observations.reshape(1, -1)
+    if observations.shape != (expected_rows, len(OBSERVATION_AXES)):
+        raise ValueError(
+            "correction_measured_delta_px must have one measured pixel delta "
+            "per correction command"
+        )
+    if not np.isfinite(observations).all():
+        raise ValueError("correction_measured_delta_px must contain only finite values")
+    return observations
 
-    jacobian = _as_visual_jacobian(visual_jacobian)
-    jacobian_observation = _jacobian_to_observation(jacobian)
-    command_delta = np.asarray(command_delta_mm, dtype=np.float64)
-    if command_delta.shape != (len(COMMAND_AXES),):
-        raise ValueError("command_delta_mm must have one value for x/y/z")
-    if not np.isfinite(command_delta).all():
-        raise ValueError("command_delta_mm must contain only finite values")
-    measured_delta = _shift_to_observation(_shift_values(measured_delta_px))
-    blend = float(blend)
-    min_command_norm_mm = float(min_command_norm_mm)
-    if not np.isfinite(blend) or blend < 0.0 or blend > 1.0:
-        raise ValueError("blend must be finite and between 0 and 1")
-    if not np.isfinite(min_command_norm_mm) or min_command_norm_mm <= 0.0:
-        raise ValueError("min_command_norm_mm must be finite and positive")
 
-    denom = float(command_delta @ command_delta)
-    if denom < min_command_norm_mm * min_command_norm_mm:
-        raise ValueError("command_delta_mm norm is too small for Broyden update")
-    residual = measured_delta - jacobian_observation @ command_delta
-    updated = jacobian_observation + blend * np.outer(residual, command_delta) / denom
-    return updated.reshape(len(CAMERAS), len(PIXEL_AXES), len(COMMAND_AXES))
+def _validate_refined_visual_jacobian(
+    calibration: xr.Dataset,
+    visual_jacobian: np.ndarray,
+) -> None:
+    jacobian_observation = _jacobian_to_observation(visual_jacobian)
+    singular_values = np.linalg.svd(jacobian_observation, compute_uv=False)
+    largest_singular_value = float(singular_values[0]) if singular_values.size else 0.0
+    rank_tolerance = 1e-3 * largest_singular_value
+    rank = int(np.count_nonzero(singular_values > rank_tolerance))
+    if rank < len(COMMAND_AXES):
+        raise ValueError(f"refined visual Jacobian must have rank 3; got rank {rank}")
+
+    condition_number = float(np.linalg.cond(jacobian_observation))
+    threshold = float(
+        calibration.attrs.get(
+            "condition_warning_threshold",
+            constants.DEFAULT_VISUAL_JACOBIAN_CONDITION_WARNING,
+        )
+    )
+    if not np.isfinite(threshold) or threshold <= 0.0:
+        threshold = constants.DEFAULT_VISUAL_JACOBIAN_CONDITION_WARNING
+    if condition_number > threshold:
+        raise ValueError(
+            "refined visual Jacobian is poorly conditioned: condition number "
+            f"{condition_number:.4g} > {threshold:.4g}"
+        )
 
 
 def _estimate_probe_capture_shifts(

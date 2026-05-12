@@ -95,10 +95,13 @@ METRIC_ROWS: tuple[tuple[str, str, str], ...] = (
         ),
     ),
     (
-        "broyden_update_count",
+        "jacobian_refinement_count",
         "Jacobian updates",
         _tooltip_html(
-            ("Number of accepted Broyden refinements saved into this dataset.",),
+            (
+                "Number of accepted closed-loop Jacobian refinements saved "
+                "into this dataset.",
+            ),
             ("Nonzero means correction has refined the calibration on disk.",),
         ),
     ),
@@ -361,7 +364,9 @@ def _calibration_summary(dataset: xr.Dataset) -> dict[str, object]:
         "axis_scale_unclamped_cmd_mm": axis_scale_unclamped,
         "axis_scale_bounds_cmd_mm": axis_scale_bounds,
         "axis_scale_target_response_px": axis_scale_target_response_px,
-        "broyden_update_count": int(dataset.attrs.get("broyden_update_count", 0)),
+        "jacobian_refinement_count": int(
+            dataset.attrs.get("jacobian_refinement_count", 0)
+        ),
         "residual_rms_px": residual_rms_px,
         "residual_max_px": residual_max_px,
         "residual_rms_cmd_mm": residual_rms_cmd_mm,

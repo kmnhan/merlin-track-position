@@ -23,11 +23,10 @@ from merlin_track_position.tracking.calibration_core import (
     CAMERAS,
     COMMAND_AXES,
     PIXEL_AXES,
-    assign_refined_visual_jacobian,
-    broyden_update_jacobian,
     estimate_command_offset,
     load_calibration_dataset,
     measure_image_error,
+    refine_visual_jacobian_from_observations,
     solve_damped_command_correction,
     validate_visual_calibration_dataset,
     weighted_pixel_residual,
@@ -64,13 +63,12 @@ def do_correction(
     ),
     min_command_norm_mm: float = constants.DEFAULT_CORRECTION_MIN_COMMAND_NORM_MM,
     max_moves: int = constants.DEFAULT_CORRECTION_MAX_MOVES,
-    broyden_update_blend: float = constants.DEFAULT_BROYDEN_UPDATE_BLEND,
     weights: Sequence[float] | np.ndarray | None = None,
     **shift_kwargs: Any,
 ) -> xr.Dataset:
     """Run guarded closed-loop visual-servo correction in commanded-mm space.
 
-    The calibration must have a backing file. Accepted Broyden updates rewrite that
+    The calibration must have a backing file. Accepted Jacobian refinements rewrite that
     calibration file so future corrections continue from the refined Jacobian.
     """
 
@@ -147,7 +145,7 @@ def do_correction(
     move_jacobian_after: list[np.ndarray] = []
     move_max_normalized_component: list[float] = []
     move_active_axis_mask: list[np.ndarray] = []
-    move_jacobian_updated: list[bool] = []
+    move_jacobian_refined: list[bool] = []
     warnings: list[str] = [
         line.strip()
         for line in str(measurement.attrs.get("warnings", "")).splitlines()
@@ -193,7 +191,7 @@ def do_correction(
             move_jacobian_after=move_jacobian_after,
             move_max_normalized_component=move_max_normalized_component,
             move_active_axis_mask=move_active_axis_mask,
-            move_jacobian_updated=move_jacobian_updated,
+            move_jacobian_refined=move_jacobian_refined,
             calibration_path=resolved_path,
             correction_history_path=correction_log_path,
             correction_run_id=correction_run_id,
@@ -283,29 +281,37 @@ def do_correction(
         )
         after_residual = weighted_pixel_residual(after_measurement, weights=weights)
         decreased = bool(after_residual < residual)
-        jacobian_updated = False
+        jacobian_refined = False
         measured_delta_px = (
             np.asarray(after_measurement["shift_px"].values, dtype=np.float64)
             - np.asarray(measurement["shift_px"].values, dtype=np.float64)
         )
         if decreased:
             try:
-                candidate_jacobian = broyden_update_jacobian(
-                    jacobian,
-                    correction_cmd_mm,
-                    measured_delta_px,
-                    blend=broyden_update_blend,
+                refinement_delta, refinement_measured = (
+                    _jacobian_refinement_observations(
+                        correction_log_path,
+                        move_command_delta_mm,
+                        move_measured_delta_px,
+                        move_jacobian_refined,
+                        correction_cmd_mm,
+                        measured_delta_px,
+                    )
                 )
-                calibration = assign_refined_visual_jacobian(
+                calibration = refine_visual_jacobian_from_observations(
                     calibration,
-                    candidate_jacobian,
+                    refinement_delta,
+                    refinement_measured,
                     save_path=resolved_path,
                 )
             except ValueError as exc:
-                warnings.append(f"skipped Broyden update: {exc}")
+                warnings.append(f"skipped Jacobian refinement: {exc}")
             else:
-                jacobian = candidate_jacobian
-                jacobian_updated = True
+                jacobian = np.asarray(
+                    calibration["visual_jacobian_px_per_cmd_mm"].values,
+                    dtype=np.float64,
+                )
+                jacobian_refined = True
         else:
             current_gain = max(min_gain, 0.5 * current_gain)
             current_mu = 2.0 * current_mu if current_mu > 0.0 else 1e-12
@@ -327,7 +333,7 @@ def do_correction(
         active_axis_mask = np.zeros(len(COMMAND_AXES), dtype=bool)
         active_axis_mask[list(active_indices)] = True
         move_active_axis_mask.append(active_axis_mask)
-        move_jacobian_updated.append(jacobian_updated)
+        move_jacobian_refined.append(jacobian_refined)
 
         measurement = after_measurement
         residual = after_residual
@@ -388,6 +394,80 @@ def correction_history_path(calibration_path: str | Path) -> Path:
     path = Path(calibration_path)
     suffix = path.suffix if path.suffix else ".h5"
     return path.with_name(f"{path.stem}_corrections{suffix}")
+
+
+def _jacobian_refinement_observations(
+    history_path: Path,
+    run_command_delta_mm: Sequence[np.ndarray],
+    run_measured_delta_px: Sequence[np.ndarray],
+    run_jacobian_refined: Sequence[bool],
+    current_command_delta_mm: np.ndarray,
+    current_measured_delta_px: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    history_delta, history_measured = _load_jacobian_refinement_history(history_path)
+    rows: list[np.ndarray] = [*history_delta]
+    measurements: list[np.ndarray] = [*history_measured]
+    rows.extend(
+        np.asarray(delta, dtype=np.float64)
+        for delta, updated in zip(
+            run_command_delta_mm,
+            run_jacobian_refined,
+            strict=True,
+        )
+        if updated
+    )
+    measurements.extend(
+        np.asarray(measured, dtype=np.float64)
+        for measured, updated in zip(
+            run_measured_delta_px,
+            run_jacobian_refined,
+            strict=True,
+        )
+        if updated
+    )
+    rows.append(np.asarray(current_command_delta_mm, dtype=np.float64))
+    measurements.append(np.asarray(current_measured_delta_px, dtype=np.float64))
+    return np.stack(rows, axis=0), np.stack(measurements, axis=0)
+
+
+def _load_jacobian_refinement_history(path: Path) -> tuple[np.ndarray, np.ndarray]:
+    if not path.exists():
+        return _empty_refinement_observations()
+
+    command_rows: list[np.ndarray] = []
+    measured_rows: list[np.ndarray] = []
+    with h5py.File(path, "r") as history_file:
+        for group_name in sorted(history_file.keys()):
+            group = history_file[group_name]
+            required = (
+                "move_command_delta_mm",
+                "move_measured_delta_px",
+                "move_jacobian_refined",
+            )
+            if not all(name in group for name in required):
+                continue
+            updated = np.asarray(group["move_jacobian_refined"], dtype=bool)
+            if updated.size == 0 or not np.any(updated):
+                continue
+            command_rows.extend(
+                np.asarray(row, dtype=np.float64)
+                for row in np.asarray(group["move_command_delta_mm"])[updated]
+            )
+            measured_rows.extend(
+                np.asarray(row, dtype=np.float64)
+                for row in np.asarray(group["move_measured_delta_px"])[updated]
+            )
+
+    if not command_rows:
+        return _empty_refinement_observations()
+    return np.stack(command_rows, axis=0), np.stack(measured_rows, axis=0)
+
+
+def _empty_refinement_observations() -> tuple[np.ndarray, np.ndarray]:
+    return (
+        np.empty((0, len(COMMAND_AXES)), dtype=np.float64),
+        np.empty((0, len(CAMERAS), len(PIXEL_AXES)), dtype=np.float64),
+    )
 
 
 def save_correction_history_dataset(
@@ -502,7 +582,7 @@ def _build_correction_result(
     move_jacobian_after: Sequence[np.ndarray],
     move_max_normalized_component: Sequence[float],
     move_active_axis_mask: Sequence[np.ndarray],
-    move_jacobian_updated: Sequence[bool],
+    move_jacobian_refined: Sequence[bool],
     calibration_path: Path,
     correction_history_path: Path,
     correction_run_id: int,
@@ -627,9 +707,9 @@ def _build_correction_result(
                 ("move", "command_axis"),
                 _stack_bool_or_empty(move_active_axis_mask),
             ),
-            "move_jacobian_updated": (
+            "move_jacobian_refined": (
                 ("move",),
-                np.asarray(move_jacobian_updated, dtype=bool),
+                np.asarray(move_jacobian_refined, dtype=bool),
             ),
         }
     ).assign_coords(
