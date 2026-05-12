@@ -35,7 +35,7 @@ MOTOR_MOVE_DEADBAND: dict[str, float] = {
 DEFAULT_CAPTURE_COUNT: int = 3
 
 # Default number of worker threads for calibration fitting.
-CALIBRATION_FIT_N_JOBS: int = 1
+CALIBRATION_FIT_N_JOBS: int = 2
 
 
 # Default number of points along each axis for the calibration grid.
