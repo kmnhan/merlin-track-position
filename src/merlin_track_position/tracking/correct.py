@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -67,6 +67,7 @@ def do_correction(
     min_command_norm_mm: float = constants.DEFAULT_CORRECTION_MIN_COMMAND_NORM_MM,
     max_moves: int = constants.DEFAULT_CORRECTION_MAX_MOVES,
     weights: Sequence[float] | np.ndarray | None = None,
+    progress_callback: Callable[[xr.Dataset], None] | None = None,
     **shift_kwargs: Any,
 ) -> xr.Dataset:
     """Run guarded closed-loop visual-servo correction in commanded-mm space.
@@ -245,6 +246,8 @@ def do_correction(
             correction_log_path,
             run_id=correction_run_id,
         )
+        if progress_callback is not None and not completed:
+            progress_callback(progress)
         logger.info("Saved correction progress: completed=%s", completed)
         return progress
 

@@ -108,6 +108,7 @@ class FakeMotorServer(QtCore.QObject):
 
 
 class FakeCorrectionThread(QtCore.QObject):
+    sigCorrectionProgress = QtCore.Signal(object)
     sigCorrectionReady = QtCore.Signal(object)
     sigCorrectionFailed = QtCore.Signal(str)
 
@@ -628,7 +629,7 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                 finally:
                     window.close()
 
-    def test_server_triggered_correction_failure_replies_error(self):
+    def test_server_triggered_motor_timeout_replies_error(self):
         get_qapp()
         with tempfile.TemporaryDirectory() as tmpdir:
             calibration = write_sample_calibration(Path(tmpdir) / "calibration.h5")
@@ -639,14 +640,18 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                     window._on_move_detected(9)
 
                     window._correction_thread.running = False
+                    error_message = "Timed out waiting for motor move completion"
                     with patch(
                         "merlin_track_position.interface.main_window.QtWidgets.QMessageBox.critical"
                     ) as critical:
-                        window._on_correction_failed("boom")
+                        window._on_correction_failed(error_message)
 
                     self.assertFalse(window._server_correction_pending)
                     self.assertIsNone(window._server_correction_target)
-                    self.assertEqual(window._server.result_calls, [(False, "boom")])
+                    self.assertEqual(
+                        window._server.result_calls,
+                        [(False, error_message)],
+                    )
                     critical.assert_called_once()
                 finally:
                     window.close()
@@ -703,6 +708,39 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                     self.assertEqual(
                         window.calibration_panel.calibration_warnings_text.toPlainText(),
                         "No correction warnings.",
+                    )
+                finally:
+                    window.close()
+
+    def test_correction_progress_updates_steps_while_in_progress(self):
+        get_qapp()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "calibration.h5"
+            calibration = write_sample_calibration(path)
+            result = correction_result_with_moves()
+            with patched_main_window_runtime():
+                window = MainWindow()
+                try:
+                    window._on_new_calibration_ready(calibration)
+                    window.calibration_panel.show_correction_in_progress()
+
+                    window._on_correction_progress(result)
+
+                    self.assertIs(window._last_correction_result, result)
+                    self.assertFalse(
+                        window.calibration_panel.correct_sample_button.isEnabled()
+                    )
+                    self.assertIn(
+                        "Correction in progress after 2 move(s)",
+                        window.calibration_panel.calibration_status_label.text(),
+                    )
+                    self.assertEqual(
+                        window.calibration_panel.correction_steps_table.rowCount(),
+                        2,
+                    )
+                    self.assertIn(
+                        "Applied total: x=1 um, y=-2 um, z=3.25 um.",
+                        window.calibration_panel.correction_steps_summary_label.text(),
                     )
                 finally:
                     window.close()

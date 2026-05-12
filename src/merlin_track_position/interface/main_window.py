@@ -488,6 +488,9 @@ class MainWindow(_MainWindowGUI):
         self._calibration_thread.sigCalibrationProcessingStep.connect(
             self._on_calibration_processing_step
         )
+        self._correction_thread.sigCorrectionProgress.connect(
+            self._on_correction_progress
+        )
         self._correction_thread.sigCorrectionReady.connect(self._on_correction_ready)
         self._correction_thread.sigCorrectionFailed.connect(self._on_correction_failed)
         self.image_auto_refresh_checkbox.toggled.connect(
@@ -1011,6 +1014,18 @@ class MainWindow(_MainWindowGUI):
             self._correction_server_result_message(result),
         )
         logger.info("Correction result applied to GUI.")
+
+    @QtCore.Slot(object)
+    def _on_correction_progress(self, result: object) -> None:
+        logger.info("Correction progress signal received.")
+        if not isinstance(result, xr.Dataset):
+            logger.warning(
+                "Ignoring correction progress with unexpected type: %s",
+                type(result).__name__,
+            )
+            return
+        self._last_correction_result = result
+        self.calibration_panel.show_correction_progress(result)
 
     @QtCore.Slot(str)
     def _on_correction_failed(self, error_message: str) -> None:

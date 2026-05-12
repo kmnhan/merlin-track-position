@@ -16,11 +16,17 @@ from merlin_track_position.instruments.simulated_hardware import simulator
 
 
 class FakeBCSServer:
-    def __init__(self, final_positions_by_move, initial_positions=()):
+    def __init__(
+        self,
+        final_positions_by_move,
+        initial_positions=(),
+        status=BCSz.MotorStatus.MOVE_COMPLETE.value,
+    ):
         self._final_positions_by_move = [
             tuple(positions) for positions in final_positions_by_move
         ]
         self._initial_positions = tuple(initial_positions)
+        self._status = int(status)
         self._positions_by_motor = {}
         self.move_calls = []
 
@@ -40,7 +46,7 @@ class FakeBCSServer:
             "data": [
                 {
                     "position": self._positions_by_motor[motor],
-                    "status": BCSz.MotorStatus.MOVE_COMPLETE.value,
+                    "status": self._status,
                 }
                 for motor in motors
             ]
@@ -90,6 +96,7 @@ class MoveMotorsAndWaitTests(unittest.TestCase):
             tolerance=0.01,
             max_retries=2,
             backlash_correction=constants.MOTOR_BACKLASH_CORRECTION,
+            move_timeout_s=60.0,
         )
 
     def test_returns_after_one_move_when_tolerance_is_not_requested(self):
@@ -104,6 +111,42 @@ class MoveMotorsAndWaitTests(unittest.TestCase):
             )
 
         self.assertEqual(positions, (9.5, 2.5))
+        self.assertEqual(len(server.move_calls), 1)
+
+    def test_accepts_position_readback_when_move_complete_status_is_stale(self):
+        server = FakeBCSServer(
+            [(10.0, 2.0)],
+            status=0,
+        )
+
+        with patch("merlin_track_position.instruments.motors.time.sleep"):
+            positions = _move_motors_and_wait(
+                server,
+                ("x", "y"),
+                (10.0, 2.0),
+                max_retries=3,
+            )
+
+        self.assertEqual(positions, (10.0, 2.0))
+        self.assertEqual(len(server.move_calls), 1)
+
+    def test_raises_when_move_status_and_position_do_not_complete_before_timeout(self):
+        server = FakeBCSServer(
+            [(9.5, 2.5)],
+            status=0,
+        )
+
+        with (
+            patch("merlin_track_position.instruments.motors.time.sleep"),
+            self.assertRaisesRegex(TimeoutError, "Timed out waiting"),
+        ):
+            _move_motors_and_wait(
+                server,
+                ("x", "y"),
+                (10.0, 2.0),
+                move_timeout_s=0.0,
+            )
+
         self.assertEqual(len(server.move_calls), 1)
 
     def test_retries_until_positions_are_within_scalar_tolerance(self):

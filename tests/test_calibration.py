@@ -677,6 +677,37 @@ class CorrectionTests(unittest.TestCase):
         self.assertIn("move_visual_jacobian_before_px_per_cmd_mm", saved)
         self.assertIn("move_visual_jacobian_after_px_per_cmd_mm", saved)
 
+    def test_progress_callback_receives_intermediate_correction_result(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self.save_calibration(tmpdir)
+            p0 = np.array([[3.0, 0.0], [0.0, 0.0]])
+            p1 = np.array([[1.0, 0.0], [0.0, 0.0]])
+            progress_results = []
+            hardware_patches = self.patch_hardware(
+                [shift_dataset(p0), shift_dataset(p1)]
+            )
+            with (
+                hardware_patches[0],
+                hardware_patches[1],
+                hardware_patches[2],
+                patch(
+                    "merlin_track_position.tracking.correct.move_motors_and_wait",
+                    return_value=(10.0, 20.0, 30.0),
+                ),
+            ):
+                result = do_correction(
+                    path,
+                    capture_count=1,
+                    max_moves=1,
+                    progress_callback=progress_results.append,
+                )
+
+        self.assertEqual(len(progress_results), 1)
+        progress = progress_results[0]
+        self.assertFalse(progress.attrs["correction_history_completed"])
+        self.assertEqual(progress.sizes["move"], 1)
+        self.assertEqual(result.attrs["correction_history_completed"], True)
+
     def test_latest_correction_history_dataset_can_be_reloaded(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = self.save_calibration(tmpdir)

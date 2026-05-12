@@ -16,6 +16,7 @@ logger = logging.getLogger("merlin_track_position.interface.correction_thread")
 
 
 class CorrectionThread(QtCore.QThread):
+    sigCorrectionProgress = QtCore.Signal(object)
     sigCorrectionReady = QtCore.Signal(object)
     sigCorrectionFailed = QtCore.Signal(str)
 
@@ -68,6 +69,7 @@ class CorrectionThread(QtCore.QThread):
                     self._calibration,
                     self._camera_pair,
                     calibration_path=self._calibration_path,
+                    progress_callback=self._emit_progress,
                 )
             except Exception as exc:
                 logger.exception("Correction thread failed.")
@@ -90,3 +92,7 @@ class CorrectionThread(QtCore.QThread):
         logger.info("Correction thread stop requested.")
         self._running.clear()
         self.requestInterruption()
+
+    def _emit_progress(self, result: xr.Dataset) -> None:
+        if self._running.is_set() and not self.isInterruptionRequested():
+            self.sigCorrectionProgress.emit(result)

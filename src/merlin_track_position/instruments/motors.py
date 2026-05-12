@@ -10,6 +10,7 @@ from merlin_track_position import constants
 from merlin_track_position.instruments.simulated_hardware import simulator
 
 logger = logging.getLogger("merlin_track_position.instruments.motors")
+DEFAULT_MOVE_TIMEOUT_S = 60.0
 
 
 @contextlib.contextmanager
@@ -38,16 +39,32 @@ def _get_positions(
 
 
 def _wait_until_move_complete(
-    bcs_server: BCSz.BCSServer, motor_aliases: Iterable[str]
+    bcs_server: BCSz.BCSServer,
+    motor_aliases: Iterable[str],
+    goals: Iterable[float],
+    deadbands: Iterable[float],
+    *,
+    timeout_s: float = DEFAULT_MOVE_TIMEOUT_S,
 ) -> tuple[float, ...]:
     motor_aliases = tuple(motor_aliases)
+    goals = tuple(float(goal) for goal in goals)
+    deadbands = tuple(float(deadband) for deadband in deadbands)
+    timeout_s = _validate_move_timeout(timeout_s)
     started_at = time.monotonic()
     next_log_at = started_at + 5.0
-    logger.info("Waiting for motor move completion: motor_aliases=%s", motor_aliases)
+    logger.info(
+        "Waiting for motor move completion: motor_aliases=%s, goals=%s, "
+        "deadbands=%s, timeout_s=%g",
+        motor_aliases,
+        goals,
+        deadbands,
+        timeout_s,
+    )
     while True:
         positions, status = _get_motor_info(
             bcs_server, motor_aliases, ("position", "status")
         )
+        elapsed_s = time.monotonic() - started_at
         if all(
             BCSz.MotorStatus(s).is_set(BCSz.MotorStatus.MOVE_COMPLETE) for s in status
         ):
@@ -64,19 +81,43 @@ def _wait_until_move_complete(
                 time.monotonic() - started_at,
             )
             return positions
-        else:
-            now = time.monotonic()
-            if now >= next_log_at:
-                logger.info(
-                    "Still waiting for motor move completion: motor_aliases=%s, "
-                    "positions=%s, status=%s, elapsed_s=%.1f",
-                    motor_aliases,
-                    positions,
-                    status,
-                    now - started_at,
-                )
-                next_log_at = now + 5.0
-            time.sleep(0.2)  # don't hit the api server constantly
+        if not _active_move_indices(positions, goals, deadbands):
+            logger.info(
+                "Motor move accepted by position readback: motor_aliases=%s, "
+                "positions=%s, goals=%s, deadbands=%s, status=%s, elapsed_s=%.1f",
+                motor_aliases,
+                positions,
+                goals,
+                deadbands,
+                status,
+                elapsed_s,
+            )
+            return positions
+        if elapsed_s >= timeout_s:
+            position_errors = tuple(
+                position - goal
+                for position, goal in zip(positions, goals, strict=True)
+            )
+            raise TimeoutError(
+                "Timed out waiting for motor move completion: "
+                f"motor_aliases={motor_aliases}, goals={goals}, "
+                f"positions={positions}, position_errors={position_errors}, "
+                f"deadbands={deadbands}, status={status}, elapsed_s={elapsed_s:.1f}"
+            )
+        now = time.monotonic()
+        if now >= next_log_at:
+            logger.info(
+                "Still waiting for motor move completion: motor_aliases=%s, "
+                "positions=%s, goals=%s, deadbands=%s, status=%s, elapsed_s=%.1f",
+                motor_aliases,
+                positions,
+                goals,
+                deadbands,
+                status,
+                elapsed_s,
+            )
+            next_log_at = now + 5.0
+        time.sleep(0.2)  # don't hit the api server constantly
 
 
 def _move_motors_and_wait(
@@ -86,6 +127,7 @@ def _move_motors_and_wait(
     *,
     tolerance: float | Iterable[float] | None = None,
     max_retries: int = 4,
+    move_timeout_s: float = DEFAULT_MOVE_TIMEOUT_S,
     backlash_correction: Mapping[str, float] | None = None,
 ) -> tuple[float, ...]:
     motor_aliases = tuple(motor_aliases)
@@ -108,6 +150,7 @@ def _move_motors_and_wait(
     if max_retries < 0:
         logger.error("Move failed: max_retries must be non-negative.")
         return get_positions(motor_aliases)
+    move_timeout_s = _validate_move_timeout(move_timeout_s)
 
     tolerances = _move_tolerances(motor_aliases, tolerance)
     deadbands = _move_deadbands(motor_aliases, tolerances)
@@ -165,7 +208,13 @@ def _move_motors_and_wait(
                 goals=list(pre_goals),
             )
             time.sleep(0.2)
-            _wait_until_move_complete(bcs_server, pre_aliases)
+            _wait_until_move_complete(
+                bcs_server,
+                pre_aliases,
+                pre_goals,
+                _items_at(deadbands, pre_indices),
+                timeout_s=move_timeout_s,
+            )
 
         bcs_server.move_motor(
             motors=[constants.MOTOR_NAMES[alias] for alias in active_aliases],
@@ -173,7 +222,13 @@ def _move_motors_and_wait(
         )
         # wait just a bit to let the move begin.
         time.sleep(0.2)
-        _wait_until_move_complete(bcs_server, active_aliases)
+        _wait_until_move_complete(
+            bcs_server,
+            active_aliases,
+            active_goals,
+            _items_at(deadbands, active_indices),
+            timeout_s=move_timeout_s,
+        )
         final_positions = _get_positions(bcs_server, motor_aliases)
 
         logger.debug(
@@ -244,6 +299,13 @@ def _move_deadbands(
             raise ValueError("move deadbands must be finite and non-negative")
         deadbands.append(deadband)
     return tuple(deadbands)
+
+
+def _validate_move_timeout(timeout_s: float) -> float:
+    timeout = float(timeout_s)
+    if not np.isfinite(timeout) or timeout < 0.0:
+        raise ValueError("move_timeout_s must be finite and non-negative")
+    return timeout
 
 
 def _active_move_indices(
@@ -330,6 +392,7 @@ def move_motors_and_wait(
     *,
     tolerance: float | Iterable[float] | None = None,
     max_retries: int = 4,
+    move_timeout_s: float = DEFAULT_MOVE_TIMEOUT_S,
     backlash_correction: Mapping[str, float] | None = None,
 ) -> tuple[float, ...]:
     """Move the specified motor aliases and wait until move is complete.
@@ -349,6 +412,9 @@ def move_motors_and_wait(
     max_retries
         Maximum number of times to retry the move if the final positions are not within
         tolerance of the goals. Default is 4.
+    move_timeout_s
+        Maximum time to wait for each move phase to either report complete or reach
+        its requested readback position. Default is 60 seconds.
     backlash_correction
         Mapping from motor alias to backlash take-up distance in that motor's command
         units. For x and z this is millimeters. When omitted,
@@ -364,13 +430,15 @@ def move_motors_and_wait(
     """
     motor_aliases = tuple(motor_aliases)
     goals = tuple(float(goal) for goal in goals)
+    move_timeout_s = _validate_move_timeout(move_timeout_s)
     logger.info(
         "Moving motors and waiting: motor_aliases=%s, goals=%s, tolerance=%s, "
-        "max_retries=%d",
+        "max_retries=%d, move_timeout_s=%g",
         motor_aliases,
         goals,
         tolerance,
         max_retries,
+        move_timeout_s,
     )
     if not constants.IS_DAQ_PC:
         positions = simulator.move_motors_and_wait(
@@ -392,6 +460,7 @@ def move_motors_and_wait(
             goals,
             tolerance=tolerance,
             max_retries=max_retries,
+            move_timeout_s=move_timeout_s,
             backlash_correction=backlash_correction,
         )
         logger.info("Motor move returned: positions=%s", positions)

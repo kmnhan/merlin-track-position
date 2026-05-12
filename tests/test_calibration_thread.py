@@ -161,6 +161,7 @@ class CorrectionThreadTests(unittest.TestCase):
             image_shape_cam0=(4, 5),
             image_shape_cam1=(6, 7),
         )
+        progress = xr.Dataset(attrs={"correction_iterations": 1})
         result = xr.Dataset(attrs={"correction_converged": True})
         calls = []
 
@@ -169,15 +170,21 @@ class CorrectionThreadTests(unittest.TestCase):
             passed_camera_pair,
             *,
             calibration_path,
+            progress_callback,
         ):
             calls.append(
                 (passed_calibration, passed_camera_pair, Path(calibration_path))
             )
+            progress_callback(progress)
             return result
 
         thread = CorrectionThread()
+        progress_results = []
         ready = []
         failed = []
+        thread.sigCorrectionProgress.connect(
+            lambda value: progress_results.append(value)
+        )
         thread.sigCorrectionReady.connect(lambda value: ready.append(value))
         thread.sigCorrectionFailed.connect(lambda message: failed.append(message))
 
@@ -191,6 +198,7 @@ class CorrectionThreadTests(unittest.TestCase):
                 thread.run()
 
         self.assertEqual(calls, [(calibration, camera_pair, path)])
+        self.assertEqual(progress_results, [progress])
         self.assertEqual(ready, [result])
         self.assertEqual(failed, [])
 

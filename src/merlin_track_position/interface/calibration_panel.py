@@ -752,6 +752,33 @@ class CalibrationPanel(QtWidgets.QWidget):
         self._clear_correction_steps()
         self.calibration_status_label.setText("Correction in progress...")
 
+    def show_correction_progress(self, result: xr.Dataset) -> None:
+        moves = int(
+            result.attrs.get("correction_iterations", result.sizes.get("move", 0))
+        )
+        residual = math.nan
+        if "iteration_weighted_residual_px" in result:
+            residual_values = np.asarray(
+                result["iteration_weighted_residual_px"].values,
+                dtype=float,
+            )
+            if residual_values.size:
+                residual = float(residual_values[-1])
+
+        self.calibration_status_label.setText(
+            "Correction in progress after "
+            f"{moves} move(s); current residual {_format_number(residual)} px."
+        )
+        warning_lines = [
+            line.strip()
+            for line in str(result.attrs.get("warnings", "")).splitlines()
+            if line.strip()
+        ]
+        self.calibration_warnings_text.setPlainText(
+            "\n".join(warning_lines) if warning_lines else "No correction warnings."
+        )
+        self._show_correction_steps(result)
+
     def show_correction_result(self, result: xr.Dataset) -> None:
         converged = bool(result.attrs.get("correction_converged", False))
         moves = int(
