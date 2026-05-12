@@ -21,7 +21,11 @@ from merlin_track_position.tracking.calibration_core import (
     weighted_pixel_residual,
 )
 from merlin_track_position.tracking.calibrate import visual_calibration_probe_count
-from merlin_track_position.tracking.correct import correction_history_path, do_correction
+from merlin_track_position.tracking.correct import (
+    correction_history_path,
+    do_correction,
+    load_latest_correction_history_dataset,
+)
 
 
 def visual_jacobian():
@@ -672,6 +676,34 @@ class CorrectionTests(unittest.TestCase):
         self.assertIn("move_predicted_delta_px", saved)
         self.assertIn("move_visual_jacobian_before_px_per_cmd_mm", saved)
         self.assertIn("move_visual_jacobian_after_px_per_cmd_mm", saved)
+
+    def test_latest_correction_history_dataset_can_be_reloaded(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self.save_calibration(tmpdir)
+            p0 = np.array([[3.0, 0.0], [0.0, 0.0]])
+            p1 = np.array([[1.0, 0.0], [0.0, 0.0]])
+            hardware_patches = self.patch_hardware(
+                [shift_dataset(p0), shift_dataset(p1)]
+            )
+            with (
+                hardware_patches[0],
+                hardware_patches[1],
+                hardware_patches[2],
+                patch(
+                    "merlin_track_position.tracking.correct.move_motors_and_wait",
+                    return_value=(10.0, 20.0, 30.0),
+                ),
+            ):
+                do_correction(path, capture_count=1, max_moves=1)
+
+            loaded = load_latest_correction_history_dataset(path)
+
+        self.assertIsNotNone(loaded)
+        assert loaded is not None
+        self.assertTrue(loaded.attrs["correction_history_completed"])
+        self.assertTrue(loaded.attrs["correction_applied"])
+        self.assertEqual(loaded.sizes["move"], 1)
+        self.assertEqual(loaded["move_jacobian_refined"].dtype, bool)
 
     def test_residual_increase_reduces_gain_increases_damping_and_skips_update(self):
         with tempfile.TemporaryDirectory() as tmpdir:

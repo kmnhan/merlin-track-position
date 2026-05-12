@@ -502,6 +502,32 @@ def save_correction_history_dataset(
     return output_path
 
 
+def load_latest_correction_history_dataset(
+    calibration_path: str | Path,
+) -> xr.Dataset | None:
+    """Load the most recent correction run for a calibration, if one exists."""
+
+    history_path = correction_history_path(calibration_path)
+    if not history_path.exists():
+        return None
+
+    group_name = _latest_correction_history_group_name(history_path)
+    if group_name is None:
+        return None
+
+    with xr.open_dataset(
+        history_path,
+        engine="h5netcdf",
+        group=group_name,
+    ) as dataset_on_disk:
+        result = dataset_on_disk.load()
+
+    result = _restore_netcdf_safe_correction_result(result)
+    result.attrs.setdefault("calibration_path", str(calibration_path))
+    result.attrs.setdefault("correction_history_path", str(history_path))
+    return result
+
+
 def _netcdf_safe_correction_result(result: xr.Dataset) -> xr.Dataset:
     saved = result.copy(deep=True)
     for name in saved.data_vars:
@@ -513,6 +539,39 @@ def _netcdf_safe_correction_result(result: xr.Dataset) -> xr.Dataset:
         if isinstance(value, (bool, np.bool_)):
             saved.attrs[key] = int(value)
     return saved
+
+
+def _restore_netcdf_safe_correction_result(result: xr.Dataset) -> xr.Dataset:
+    restored = result.copy(deep=True)
+    for name in ("move_active_axis_mask", "move_jacobian_refined"):
+        if name in restored:
+            restored[name] = restored[name].astype(bool)
+    for key in (
+        "correction_applied",
+        "correction_converged",
+        "correction_history_completed",
+    ):
+        if key in restored.attrs:
+            restored.attrs[key] = bool(restored.attrs[key])
+    return restored
+
+
+def _latest_correction_history_group_name(path: Path) -> str | None:
+    with h5py.File(path, "r") as history_file:
+        latest_attr = history_file.attrs.get("latest_run_group")
+        if isinstance(latest_attr, bytes):
+            latest_attr = latest_attr.decode()
+        if isinstance(latest_attr, str) and latest_attr in history_file:
+            return latest_attr
+
+        run_ids = [
+            int(name.removeprefix("run_"))
+            for name in history_file.keys()
+            if name.startswith("run_") and name.removeprefix("run_").isdigit()
+        ]
+    if not run_ids:
+        return None
+    return _correction_history_group_name(max(run_ids))
 
 
 def _next_correction_history_run_id(path: Path) -> int:

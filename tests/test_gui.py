@@ -27,6 +27,10 @@ from merlin_track_position.tracking.calibration_core import (  # noqa: E402
     derive_axis_scale_from_jacobian,
     save_calibration_dataset,
 )
+from merlin_track_position.tracking.correct import (  # noqa: E402
+    correction_history_path,
+    save_correction_history_dataset,
+)
 from merlin_track_position.tracking.sample_calibration import (  # noqa: E402
     build_sample_calibration_dataset,
 )
@@ -522,6 +526,56 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                     self.assertEqual(
                         window.calibration_panel.calibration_warnings_text.toPlainText(),
                         "No correction warnings.",
+                    )
+                finally:
+                    window.close()
+
+    def test_loading_calibration_restores_latest_correction_result(self):
+        get_qapp()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "calibration.h5"
+            write_sample_calibration(path)
+            history_path = correction_history_path(path)
+            expected = correction_result(
+                converged=False,
+                moves=3,
+                residual=0.75,
+                warnings="residual increased",
+            ).assign_attrs(
+                {
+                    "calibration_path": str(path),
+                    "correction_history_path": str(history_path),
+                    "correction_history_completed": True,
+                    "correction_applied": True,
+                }
+            )
+            save_correction_history_dataset(expected, history_path, run_id=0)
+
+            with patched_main_window_runtime():
+                window = MainWindow()
+                try:
+                    with patch(
+                        "merlin_track_position.interface.main_window."
+                        "QtWidgets.QFileDialog.getOpenFileName",
+                        return_value=(str(path), ""),
+                    ):
+                        window._on_load_calibration_clicked()
+
+                    self.assertIsNotNone(window._last_correction_result)
+                    assert window._last_correction_result is not None
+                    self.assertEqual(
+                        window._last_correction_result.attrs[
+                            "correction_history_path"
+                        ],
+                        str(history_path),
+                    )
+                    self.assertIn(
+                        "Correction did not converge after 3 move(s)",
+                        window.calibration_panel.calibration_status_label.text(),
+                    )
+                    self.assertEqual(
+                        window.calibration_panel.calibration_warnings_text.toPlainText(),
+                        "residual increased",
                     )
                 finally:
                     window.close()

@@ -43,6 +43,7 @@ from merlin_track_position.tracking.calibration_core import (
     save_calibration_dataset,
     validate_visual_calibration_dataset,
 )
+from merlin_track_position.tracking.correct import load_latest_correction_history_dataset
 
 __all__ = ("CalibrationStartDialog", "MainWindow")
 
@@ -606,6 +607,7 @@ class MainWindow(_MainWindowGUI):
         self._calibration_path = path
         self._set_roi_editing_enabled(False)
         self.calibration_panel.show_loaded_calibration(calibration, path.name)
+        self._restore_latest_correction_result(path)
 
     @QtCore.Slot()
     def _on_save_calibration_clicked(self) -> None:
@@ -807,6 +809,7 @@ class MainWindow(_MainWindowGUI):
         self._apply_calibration_roi_metadata(calibration, persist=False)
         self._calibration = calibration
         self._calibration_path = calibration_path
+        self._last_correction_result = None
         self._set_roi_editing_enabled(False)
         display_name = (
             self._calibration_path.name
@@ -892,9 +895,25 @@ class MainWindow(_MainWindowGUI):
         )
         self.calibration_panel.show_loaded_calibration(self._calibration, display_name)
 
+    def _restore_latest_correction_result(self, calibration_path: Path) -> None:
+        try:
+            result = load_latest_correction_history_dataset(calibration_path)
+        except Exception:
+            logger.exception(
+                "Could not load correction history for %s",
+                calibration_path,
+            )
+            self._last_correction_result = None
+            return
+
+        self._last_correction_result = result
+        if result is not None:
+            self.calibration_panel.show_correction_result(result)
+
     def _clear_loaded_calibration(self) -> None:
         self._calibration = None
         self._calibration_path = None
+        self._last_correction_result = None
         self._restore_calibration_idle_state()
 
     def _get_roi_geometry(self, camera: str) -> RoiGeometry:
