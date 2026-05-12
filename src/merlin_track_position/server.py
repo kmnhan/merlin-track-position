@@ -32,7 +32,11 @@ class MotorServer(QtCore.QThread):
             if success:
                 self._ret_val = ("OK", msg)
             else:
-                self._ret_val = ("ERROR", msg)
+                self._ret_val = (
+                    "ERROR",
+                    msg
+                    + " This will shut down the motor subsystem, and it will need to be restarted by clicking on the indicator box in the right panel.",
+                )
             self._cv.wakeAll()
 
     def run(self) -> None:

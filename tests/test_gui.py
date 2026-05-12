@@ -14,6 +14,7 @@ from merlin_track_position.interface.calibration_panel import (  # noqa: E402
     CalibrationPanel,
     _calibration_summary,
 )
+import merlin_track_position.interface.main_window as main_window  # noqa: E402
 from merlin_track_position.interface.main_window import (  # noqa: E402
     CalibrationStartDialog,
     MainWindow,
@@ -27,6 +28,7 @@ from merlin_track_position.tracking.calibration_core import (  # noqa: E402
     derive_axis_scale_from_jacobian,
     save_calibration_dataset,
 )
+from merlin_track_position.instruments import parse_config  # noqa: E402
 from merlin_track_position.tracking.correct import (  # noqa: E402
     correction_history_path,
     save_correction_history_dataset,
@@ -90,6 +92,7 @@ class FakeMotorServer(QtCore.QObject):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.result_calls = []
 
     def start(self):
         pass
@@ -101,7 +104,7 @@ class FakeMotorServer(QtCore.QObject):
         pass
 
     def set_result(self, success, message):
-        pass
+        self.result_calls.append((bool(success), str(message)))
 
 
 class FakeCorrectionThread(QtCore.QObject):
@@ -572,6 +575,106 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                 finally:
                     window.close()
 
+    def test_move_detected_starts_correction_without_immediate_server_reply(self):
+        get_qapp()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "calibration.h5"
+            calibration = write_sample_calibration(path)
+            with patched_main_window_runtime():
+                window = MainWindow()
+                try:
+                    window._on_new_calibration_ready(calibration)
+
+                    window._on_move_detected(7)
+
+                    thread = window._correction_thread
+                    self.assertTrue(thread.started)
+                    self.assertIs(thread.calibration, window._calibration)
+                    self.assertEqual(thread.calibration_path, path)
+                    self.assertIsNotNone(thread.camera_pair)
+                    self.assertEqual(window._server.result_calls, [])
+                    self.assertTrue(window._server_correction_pending)
+                    self.assertEqual(window._server_correction_target, 7)
+                    self.assertFalse(
+                        window.calibration_panel.correct_sample_button.isEnabled()
+                    )
+                    self.assertFalse(
+                        window.calibration_panel.new_calibration_button.isEnabled()
+                    )
+                finally:
+                    window.close()
+
+    def test_server_triggered_correction_success_replies_ok_after_result(self):
+        get_qapp()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "calibration.h5"
+            calibration = write_sample_calibration(path)
+            result = correction_result(converged=False, moves=3, residual=0.5)
+            with patched_main_window_runtime():
+                window = MainWindow()
+                try:
+                    window._on_new_calibration_ready(calibration)
+                    window._on_move_detected(8)
+
+                    window._correction_thread.running = False
+                    window._on_correction_ready(result)
+
+                    self.assertFalse(window._server_correction_pending)
+                    self.assertIsNone(window._server_correction_target)
+                    self.assertEqual(len(window._server.result_calls), 1)
+                    success, message = window._server.result_calls[0]
+                    self.assertTrue(success)
+                    self.assertIn("did not converge after 3 move(s)", message)
+                finally:
+                    window.close()
+
+    def test_server_triggered_correction_failure_replies_error(self):
+        get_qapp()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            calibration = write_sample_calibration(Path(tmpdir) / "calibration.h5")
+            with patched_main_window_runtime():
+                window = MainWindow()
+                try:
+                    window._on_new_calibration_ready(calibration)
+                    window._on_move_detected(9)
+
+                    window._correction_thread.running = False
+                    with patch(
+                        "merlin_track_position.interface.main_window.QtWidgets.QMessageBox.critical"
+                    ) as critical:
+                        window._on_correction_failed("boom")
+
+                    self.assertFalse(window._server_correction_pending)
+                    self.assertIsNone(window._server_correction_target)
+                    self.assertEqual(window._server.result_calls, [(False, "boom")])
+                    critical.assert_called_once()
+                finally:
+                    window.close()
+
+    def test_move_detected_unavailable_returns_ok_and_warns_user(self):
+        get_qapp()
+        with patched_main_window_runtime():
+            window = MainWindow()
+            try:
+                with (
+                    patch.object(window, "_raise_for_user_attention") as attention,
+                    patch(
+                        "merlin_track_position.interface.main_window.QtWidgets.QMessageBox.warning"
+                    ) as warning,
+                ):
+                    window._on_move_detected(10)
+
+                self.assertFalse(window._correction_thread.started)
+                self.assertFalse(window._server_correction_pending)
+                self.assertEqual(len(window._server.result_calls), 1)
+                success, message = window._server.result_calls[0]
+                self.assertTrue(success)
+                self.assertIn("requires a loaded calibration", message)
+                attention.assert_called_once()
+                warning.assert_called_once()
+            finally:
+                window.close()
+
     def test_correction_success_stores_result_reloads_calibration_and_reports_status(
         self,
     ):
@@ -687,6 +790,69 @@ class CalibrationStartDialogTests(unittest.TestCase):
             dialog.findChild(QtWidgets.QLineEdit, "calibration_output_path_edit")
         )
         self.assertTrue(str(dialog.output_path()).endswith(".h5"))
+
+    def test_dialog_uses_supplied_default_output_path(self):
+        get_qapp()
+        path = Path("/tmp/scan/calibration.h5")
+        dialog = CalibrationStartDialog(default_output_path=path)
+
+        self.assertEqual(dialog.output_path(), path)
+
+    def test_default_calibration_path_uses_scan_base_directory(self):
+        with patch.object(
+            main_window,
+            "get_base_file_dir",
+            return_value=Path("/tmp/current_scan"),
+        ):
+            self.assertEqual(
+                main_window._default_calibration_path(),
+                Path("/tmp/current_scan/calibration.h5"),
+            )
+
+    def test_default_calibration_path_falls_back_off_daq_pc(self):
+        with (
+            patch.object(
+                main_window,
+                "get_base_file_dir",
+                side_effect=FileNotFoundError("missing setup"),
+            ),
+            patch.object(main_window, "IS_DAQ_PC", False),
+        ):
+            self.assertEqual(
+                main_window._default_calibration_path(),
+                Path.home() / "calibration.h5",
+            )
+
+    def test_default_calibration_path_does_not_fall_back_on_daq_pc(self):
+        with (
+            patch.object(
+                main_window,
+                "get_base_file_dir",
+                side_effect=FileNotFoundError("missing setup"),
+            ),
+            patch.object(main_window, "IS_DAQ_PC", True),
+        ):
+            with self.assertRaises(FileNotFoundError):
+                main_window._default_calibration_path()
+
+
+class ParseConfigTests(unittest.TestCase):
+    def test_get_base_file_dir_returns_configured_path(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            setup_path = Path(tmpdir) / "Instrument Scan Setup.txt"
+            setup_path.write_text(
+                "<Path>"
+                "<Name>Data file base directory</Name>"
+                "<Val>/tmp/current_scan</Val>"
+                "</Path>",
+                encoding="iso-8859-1",
+            )
+
+            with patch.object(parse_config, "INSTR_SCAN_SETUP_PATH", setup_path):
+                self.assertEqual(
+                    parse_config.get_base_file_dir(),
+                    Path("/tmp/current_scan"),
+                )
 
 
 if __name__ == "__main__":

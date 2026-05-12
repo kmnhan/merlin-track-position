@@ -22,7 +22,9 @@ from merlin_track_position.constants import (
     IMAGE_HEIGHT_CAM1,
     IMAGE_WIDTH_CAM0,
     IMAGE_WIDTH_CAM1,
+    IS_DAQ_PC,
 )
+from merlin_track_position.instruments.parse_config import get_base_file_dir
 from merlin_track_position.instruments.cameras import (
     CallableCameraPlugin,
     CameraPairPlugin,
@@ -48,6 +50,29 @@ from merlin_track_position.tracking.correct import load_latest_correction_histor
 __all__ = ("CalibrationStartDialog", "MainWindow")
 
 logger = logging.getLogger("merlin_track_position.interface.main_window")
+DEFAULT_CALIBRATION_FILE_NAME = "calibration.h5"
+
+
+def _default_calibration_directory() -> Path:
+    try:
+        return get_base_file_dir().expanduser()
+    except Exception:
+        if not IS_DAQ_PC:
+            logger.info(
+                "Could not read scan base file directory; using home directory.",
+                exc_info=True,
+            )
+            return Path.home()
+        raise
+
+
+def _default_calibration_path() -> Path:
+    return _default_calibration_directory() / DEFAULT_CALIBRATION_FILE_NAME
+
+
+class _CorrectionUnavailable(RuntimeError):
+    """Expected state that prevents a correction run from starting."""
+
 
 CAMERA_IMAGE_SIZES: dict[str, tuple[int, int]] = {
     "cam0": (IMAGE_WIDTH_CAM0, IMAGE_HEIGHT_CAM0),
@@ -170,7 +195,11 @@ def _remove_roi_scale_handles(roi: pg.ROI) -> None:
 
 
 class CalibrationStartDialog(QtWidgets.QDialog):
-    def __init__(self, parent: QtWidgets.QWidget | None = None):
+    def __init__(
+        self,
+        parent: QtWidgets.QWidget | None = None,
+        default_output_path: Path | None = None,
+    ):
         super().__init__(parent)
         self.setWindowTitle("New Calibration")
 
@@ -194,7 +223,9 @@ class CalibrationStartDialog(QtWidgets.QDialog):
         path_row = QtWidgets.QHBoxLayout()
         self.path_edit = QtWidgets.QLineEdit()
         self.path_edit.setObjectName("calibration_output_path_edit")
-        self.path_edit.setText(str(Path.home() / "visual_jacobian_calibration.h5"))
+        if default_output_path is None:
+            default_output_path = Path.home() / DEFAULT_CALIBRATION_FILE_NAME
+        self.path_edit.setText(str(default_output_path))
         browse_button = QtWidgets.QPushButton("Browse...")
         browse_button.clicked.connect(self._browse_output_path)
         path_row.addWidget(self.path_edit, stretch=1)
@@ -382,6 +413,8 @@ class MainWindow(_MainWindowGUI):
         self._calibration_processing_started_at: float | None = None
         self._roi_editing_enabled = True
         self._last_correction_result: xr.Dataset | None = None
+        self._server_correction_pending = False
+        self._server_correction_target: int | None = None
         self._latest_images: tuple[np.ndarray, np.ndarray] | None = None
         self._latest_images_by_camera: dict[str, np.ndarray] = {}
         self._image_capture_locks = {
@@ -477,9 +510,98 @@ class MainWindow(_MainWindowGUI):
 
     @QtCore.Slot(int)
     def _on_move_detected(self, target: int) -> None:
-        # TODO: Estimate xyz displacement from both cameras and move x/y/z.
-        del target
-        self._server.set_result(True, "")
+        try:
+            self._start_correction()
+        except _CorrectionUnavailable as exc:
+            message = (
+                f"Move target {target} detected, but automatic correction did "
+                f"not start: {exc}"
+            )
+            logger.warning(message)
+            self._server.set_result(True, message)
+            self._raise_for_user_attention()
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Correction not started",
+                message,
+            )
+        except Exception as exc:
+            message = f"Could not start automatic correction for target {target}: {exc}"
+            logger.exception(message)
+            self._server.set_result(False, message)
+            self._raise_for_user_attention()
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Could not start correction",
+                message,
+            )
+        else:
+            self._server_correction_pending = True
+            self._server_correction_target = int(target)
+
+    def _raise_for_user_attention(self) -> None:
+        if self.isMinimized():
+            self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def _correction_unavailable_message(self) -> str | None:
+        if self._calibration is None:
+            return "Correction requires a loaded calibration."
+        if self._calibration_thread.isRunning():
+            return "Correction is unavailable while calibration is running."
+        if self._correction_thread.isRunning():
+            return "Correction is already in progress."
+        if self._calibration_path is None or not self._calibration_path.exists():
+            return "Correction requires a calibration file on disk."
+        return None
+
+    def _start_correction(self) -> None:
+        unavailable_message = self._correction_unavailable_message()
+        if unavailable_message is not None:
+            raise _CorrectionUnavailable(unavailable_message)
+        if self._calibration is None or self._calibration_path is None:
+            raise RuntimeError("correction state changed before startup")
+
+        camera_pair = self._camera_pair_for_current_rois()
+        self._correction_thread.configure(
+            self._calibration,
+            camera_pair,
+            self._calibration_path,
+        )
+
+        ui_marked_busy = False
+        try:
+            self._pause_image_auto_refresh_for_calibration()
+            ui_marked_busy = True
+            self._set_roi_editing_enabled(False)
+            self.calibration_panel.show_correction_in_progress()
+            self._correction_thread.start()
+        except Exception:
+            if ui_marked_busy:
+                self._restore_image_auto_refresh_after_calibration()
+                self._restore_calibration_idle_state()
+            raise
+
+    def _reply_to_pending_server_correction(
+        self,
+        success: bool,
+        message: str,
+    ) -> None:
+        if not self._server_correction_pending:
+            return
+        self._server_correction_pending = False
+        self._server_correction_target = None
+        self._server.set_result(success, message)
+
+    @staticmethod
+    def _correction_server_result_message(result: xr.Dataset) -> str:
+        converged = bool(result.attrs.get("correction_converged", False))
+        moves = int(
+            result.attrs.get("correction_iterations", result.sizes.get("move", 0))
+        )
+        status = "converged" if converged else "did not converge"
+        return f"Correction {status} after {moves} move(s)."
 
     def _set_roi_editing_enabled(self, enabled: bool) -> None:
         enabled = bool(enabled)
@@ -614,9 +736,16 @@ class MainWindow(_MainWindowGUI):
         if self._calibration is None or self._correction_thread.isRunning():
             return
 
-        default_path = (
-            self._calibration_path or Path.home() / "visual_jacobian_calibration.h5"
-        )
+        try:
+            default_path = self._calibration_path or _default_calibration_path()
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Could not choose calibration directory",
+                str(exc),
+            )
+            return
+
         file_name, _ = QtWidgets.QFileDialog.getSaveFileName(
             self,
             "Save calibration",
@@ -650,7 +779,17 @@ class MainWindow(_MainWindowGUI):
             self._clear_loaded_calibration()
             return
 
-        dialog = CalibrationStartDialog(self)
+        try:
+            default_output_path = _default_calibration_path()
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Could not choose calibration directory",
+                str(exc),
+            )
+            return
+
+        dialog = CalibrationStartDialog(self, default_output_path=default_output_path)
         if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
             return
 
@@ -683,18 +822,18 @@ class MainWindow(_MainWindowGUI):
 
     @QtCore.Slot()
     def _on_correct_sample_clicked(self) -> None:
-        if (
-            self._calibration is None
-            or self._calibration_thread.isRunning()
-            or self._correction_thread.isRunning()
-        ):
-            return
-        if self._calibration_path is None or not self._calibration_path.exists():
-            QtWidgets.QMessageBox.critical(
-                self,
-                "Could not start correction",
-                "Correction requires a calibration file on disk.",
-            )
+        unavailable_message = self._correction_unavailable_message()
+        if unavailable_message is not None:
+            if (
+                self._calibration is not None
+                and not self._calibration_thread.isRunning()
+                and not self._correction_thread.isRunning()
+            ):
+                QtWidgets.QMessageBox.critical(
+                    self,
+                    "Could not start correction",
+                    unavailable_message,
+                )
             return
 
         response = QtWidgets.QMessageBox.warning(
@@ -712,11 +851,12 @@ class MainWindow(_MainWindowGUI):
             return
 
         try:
-            camera_pair = self._camera_pair_for_current_rois()
-            self._correction_thread.configure(
-                self._calibration,
-                camera_pair,
-                self._calibration_path,
+            self._start_correction()
+        except _CorrectionUnavailable as exc:
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Could not start correction",
+                str(exc),
             )
         except Exception as exc:
             QtWidgets.QMessageBox.critical(
@@ -724,12 +864,6 @@ class MainWindow(_MainWindowGUI):
                 "Could not start correction",
                 str(exc),
             )
-            return
-
-        self._pause_image_auto_refresh_for_calibration()
-        self._set_roi_editing_enabled(False)
-        self.calibration_panel.show_correction_in_progress()
-        self._correction_thread.start()
 
     @QtCore.Slot(int, float, float, float, object, object)
     def _on_calibration_step(
@@ -833,8 +967,8 @@ class MainWindow(_MainWindowGUI):
 
     @QtCore.Slot(object)
     def _on_correction_ready(self, result: object) -> None:
-        self._restore_image_auto_refresh_after_calibration()
         try:
+            self._restore_image_auto_refresh_after_calibration()
             if not isinstance(result, xr.Dataset):
                 raise TypeError("correction thread did not return an xarray Dataset")
             self._last_correction_result = result
@@ -842,8 +976,19 @@ class MainWindow(_MainWindowGUI):
                 raise RuntimeError("correction finished without a calibration path")
             calibration = self._load_calibration_from_path(self._calibration_path)
             self._apply_calibration_roi_metadata(calibration, persist=False)
+
+            self._calibration = calibration
+            self._set_roi_editing_enabled(False)
+            display_name = (
+                self._calibration_path.name
+                if self._calibration_path is not None
+                else "current calibration"
+            )
+            self.calibration_panel.show_loaded_calibration(calibration, display_name)
+            self.calibration_panel.show_correction_result(result)
         except Exception as exc:
             self._restore_calibration_idle_state()
+            self._reply_to_pending_server_correction(False, str(exc))
             QtWidgets.QMessageBox.critical(
                 self,
                 "Could not use correction result",
@@ -851,18 +996,14 @@ class MainWindow(_MainWindowGUI):
             )
             return
 
-        self._calibration = calibration
-        self._set_roi_editing_enabled(False)
-        display_name = (
-            self._calibration_path.name
-            if self._calibration_path is not None
-            else "current calibration"
+        self._reply_to_pending_server_correction(
+            True,
+            self._correction_server_result_message(result),
         )
-        self.calibration_panel.show_loaded_calibration(calibration, display_name)
-        self.calibration_panel.show_correction_result(result)
 
     @QtCore.Slot(str)
     def _on_correction_failed(self, error_message: str) -> None:
+        self._reply_to_pending_server_correction(False, error_message)
         self._restore_image_auto_refresh_after_calibration()
         self._restore_calibration_idle_state()
         QtWidgets.QMessageBox.critical(
