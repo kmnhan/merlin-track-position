@@ -202,6 +202,53 @@ def correction_result(
     )
 
 
+def correction_result_with_moves() -> xr.Dataset:
+    return xr.Dataset(
+        data_vars={
+            "iteration_weighted_residual_px": (
+                ("iteration",),
+                np.asarray([1.0, 0.7, 0.25], dtype=float),
+            ),
+            "move_command_delta_mm": (
+                ("move", "command_axis"),
+                np.asarray(
+                    [
+                        [0.0015, -0.002, 0.0],
+                        [-0.0005, 0.0, 0.00325],
+                    ],
+                    dtype=float,
+                ),
+            ),
+            "move_pre_weighted_residual_px": (
+                ("move",),
+                np.asarray([1.0, 0.7], dtype=float),
+            ),
+            "move_post_weighted_residual_px": (
+                ("move",),
+                np.asarray([0.7, 0.25], dtype=float),
+            ),
+            "estimated_command_offset_mm": (
+                ("command_axis",),
+                np.asarray([0.004, -0.005, 0.006], dtype=float),
+            ),
+            "correction_cmd_mm": (
+                ("command_axis",),
+                np.asarray([0.00025, 0.0, -0.00075], dtype=float),
+            ),
+        },
+        coords={
+            "iteration": np.arange(3),
+            "move": np.arange(2),
+            "command_axis": list(COMMAND_AXES),
+        },
+        attrs={
+            "correction_converged": True,
+            "correction_iterations": 2,
+            "warnings": "",
+        },
+    )
+
+
 def write_sample_calibration(path: Path) -> xr.Dataset:
     calibration = build_sample_calibration_dataset(
         image_shape_cam0=(4, 5),
@@ -321,6 +368,26 @@ class CalibrationPanelTests(unittest.TestCase):
         self.assertFalse(panel.calibration_details_button.isEnabled())
         self.assertFalse(panel.correct_sample_button.isEnabled())
         self.assertFalse(panel.new_calibration_button.isEnabled())
+
+    def test_correction_result_displays_move_steps_in_microns(self):
+        get_qapp()
+        panel = CalibrationPanel()
+        result = correction_result_with_moves()
+
+        panel.show_correction_result(result)
+
+        table = panel.correction_steps_table
+        self.assertFalse(panel.correction_steps_group.isHidden())
+        self.assertEqual(table.rowCount(), 2)
+        self.assertEqual(table.item(0, 1).text(), "1.5")
+        self.assertEqual(table.item(0, 2).text(), "-2")
+        self.assertEqual(table.item(0, 3).text(), "0")
+        self.assertEqual(table.item(1, 1).text(), "-0.5")
+        self.assertEqual(table.item(1, 3).text(), "3.25")
+        self.assertIn(
+            "Applied total: x=1 um, y=-2 um, z=3.25 um.",
+            panel.correction_steps_summary_label.text(),
+        )
 
 
 class MainWindowCalibrationStateTests(unittest.TestCase):

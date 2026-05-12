@@ -23,6 +23,14 @@ RESIDUAL_PROJECTIONS: tuple[tuple[str, str, int, int], ...] = (
     ("x", "z", 0, 2),
     ("y", "z", 1, 2),
 )
+CORRECTION_STEP_HEADERS: tuple[str, ...] = (
+    "move",
+    "x_um",
+    "y_um",
+    "z_um",
+    "pre_residual_px",
+    "post_residual_px",
+)
 
 
 def _tooltip_html(
@@ -203,6 +211,47 @@ def _format_metric_value(value: object) -> str:
     if values.ndim == 0 or values.size == 1:
         return _format_number(values.reshape(-1)[0])
     return "(" + ", ".join(_format_number(item) for item in values.reshape(-1)) + ")"
+
+
+def _format_axis_triplet_um(values_mm: object) -> str:
+    try:
+        values = np.asarray(values_mm, dtype=float).reshape(-1)
+    except (TypeError, ValueError):
+        return "n/a"
+    if values.size != len(COMMAND_AXES):
+        return "n/a"
+    return ", ".join(
+        f"{axis}={_format_number(1000.0 * value)} um"
+        for axis, value in zip(COMMAND_AXES, values, strict=True)
+    )
+
+
+def _correction_move_delta_mm(result: xr.Dataset) -> np.ndarray:
+    if "move_command_delta_mm" not in result:
+        return np.empty((0, len(COMMAND_AXES)), dtype=float)
+
+    values = np.asarray(result["move_command_delta_mm"].values, dtype=float)
+    if values.ndim != 2 or values.shape[1] != len(COMMAND_AXES):
+        return np.empty((0, len(COMMAND_AXES)), dtype=float)
+    return values
+
+
+def _correction_move_residuals(
+    result: xr.Dataset,
+    name: str,
+    move_count: int,
+) -> np.ndarray:
+    if name not in result:
+        return np.full(move_count, math.nan, dtype=float)
+    values = np.asarray(result[name].values, dtype=float).reshape(-1)
+    if values.size < move_count:
+        return np.pad(
+            values,
+            (0, move_count - values.size),
+            mode="constant",
+            constant_values=math.nan,
+        )
+    return values[:move_count]
 
 
 def _format_duration(seconds: float | None) -> str:
@@ -479,6 +528,35 @@ class CalibrationPanel(QtWidgets.QWidget):
         right_column.addWidget(warnings_group)
         right_column.addWidget(self.repeatability_group)
 
+        self.correction_steps_group = QtWidgets.QGroupBox("Correction Steps")
+        correction_steps_layout = QtWidgets.QVBoxLayout(self.correction_steps_group)
+        self.correction_steps_summary_label = QtWidgets.QLabel()
+        self.correction_steps_summary_label.setWordWrap(True)
+        self.correction_steps_summary_label.setTextInteractionFlags(
+            QtCore.Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        correction_steps_layout.addWidget(self.correction_steps_summary_label)
+
+        self.correction_steps_table = QtWidgets.QTableWidget(
+            0,
+            len(CORRECTION_STEP_HEADERS),
+        )
+        self.correction_steps_table.setObjectName("correction_steps_table")
+        self.correction_steps_table.setHorizontalHeaderLabels(CORRECTION_STEP_HEADERS)
+        self.correction_steps_table.setEditTriggers(
+            QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers
+        )
+        self.correction_steps_table.setSelectionBehavior(
+            QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows
+        )
+        self.correction_steps_table.horizontalHeader().setSectionResizeMode(
+            QtWidgets.QHeaderView.ResizeMode.ResizeToContents
+        )
+        self.correction_steps_table.verticalHeader().setVisible(False)
+        self.correction_steps_table.setMaximumHeight(180)
+        correction_steps_layout.addWidget(self.correction_steps_table)
+        right_column.addWidget(self.correction_steps_group)
+
         self.residual_graphics_layout = pg.GraphicsLayoutWidget()
         self.residual_graphics_layout.setObjectName("residual_projections_layout")
         self.residual_graphics_layout.setMinimumHeight(240)
@@ -518,6 +596,7 @@ class CalibrationPanel(QtWidgets.QWidget):
         for label in self.repeatability_labels.values():
             label.setText("n/a")
         self.repeatability_group.setVisible(False)
+        self._clear_correction_steps()
         for residual_plot in self.residual_plots.values():
             residual_plot.clear()
 
@@ -623,7 +702,68 @@ class CalibrationPanel(QtWidgets.QWidget):
             else:
                 label.setText(_format_number(repeatability[key]))
 
+        self._clear_correction_steps()
         self._plot_residuals(calibration)
+
+    def _clear_correction_steps(self) -> None:
+        self.correction_steps_summary_label.setText("No correction result loaded.")
+        self.correction_steps_table.setRowCount(0)
+        self.correction_steps_group.setVisible(False)
+
+    def _show_correction_steps(self, result: xr.Dataset) -> None:
+        move_delta = _correction_move_delta_mm(result)
+        pre_residual = _correction_move_residuals(
+            result,
+            "move_pre_weighted_residual_px",
+            move_delta.shape[0],
+        )
+        post_residual = _correction_move_residuals(
+            result,
+            "move_post_weighted_residual_px",
+            move_delta.shape[0],
+        )
+
+        self.correction_steps_table.setRowCount(move_delta.shape[0])
+        for row, delta_mm in enumerate(move_delta):
+            values = (
+                str(row + 1),
+                _format_number(1000.0 * delta_mm[0]),
+                _format_number(1000.0 * delta_mm[1]),
+                _format_number(1000.0 * delta_mm[2]),
+                _format_number(pre_residual[row]),
+                _format_number(post_residual[row]),
+            )
+            for column, value in enumerate(values):
+                item = QtWidgets.QTableWidgetItem(value)
+                if column > 0:
+                    item.setTextAlignment(
+                        QtCore.Qt.AlignmentFlag.AlignRight
+                        | QtCore.Qt.AlignmentFlag.AlignVCenter
+                    )
+                self.correction_steps_table.setItem(row, column, item)
+
+        summary_lines: list[str] = []
+        if move_delta.size:
+            summary_lines.append(
+                "Applied total: "
+                f"{_format_axis_triplet_um(np.sum(move_delta, axis=0))}."
+            )
+        else:
+            summary_lines.append("No correction moves were applied.")
+
+        if "estimated_command_offset_mm" in result:
+            summary_lines.append(
+                "Estimated command offset: "
+                f"{_format_axis_triplet_um(result['estimated_command_offset_mm'].values)}."
+            )
+        if "correction_cmd_mm" in result:
+            summary_lines.append(
+                "Next correction: "
+                f"{_format_axis_triplet_um(result['correction_cmd_mm'].values)}."
+            )
+
+        self.correction_steps_summary_label.setText("\n".join(summary_lines))
+        self.correction_steps_group.setVisible(True)
 
     def show_saved_calibration(self, display_name: str) -> None:
         self.calibration_status_label.setText(
@@ -639,6 +779,7 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.new_calibration_button.setText("Clear calibration")
         self.calibration_progress_bar.setVisible(True)
         self.calibration_progress_bar.setRange(0, 0)
+        self._clear_correction_steps()
         self.calibration_status_label.setText("Correction in progress...")
 
     def show_correction_result(self, result: xr.Dataset) -> None:
@@ -667,6 +808,7 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.calibration_warnings_text.setPlainText(
             "\n".join(warning_lines) if warning_lines else "No correction warnings."
         )
+        self._show_correction_steps(result)
 
     def build_details_dialog(
         self,
