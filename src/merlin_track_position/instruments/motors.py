@@ -118,26 +118,52 @@ def _wait_until_move_complete(
             goals,
             stale_readback_deadbands,
         )
-        if _motor_statuses_all_set(status, BCSz.MotorStatus.MOVE_COMPLETE):
-            time.sleep(0.25)
-
-            # Get the final positions one more time just to be extra careful
-            positions = _get_positions(bcs_server, motor_aliases)
-            logger.info(
-                "Motor move complete: motor_aliases=%s, positions=%s, elapsed_s=%.1f",
-                motor_aliases,
-                positions,
-                time.monotonic() - started_at,
-            )
-            return positions
-        if _motor_statuses_all_set(
-            status,
-            BCSz.MotorStatus.RAW_MOVE_COMPLETE,
-        ) and _positions_within_deadband(
+        position_at_goal = _positions_within_deadband(
             positions,
             goals,
             stale_readback_deadbands,
-        ):
+        )
+        position_at_start = (
+            start_positions is not None
+            and _positions_within_deadband(
+                positions,
+                start_positions,
+                stale_readback_deadbands,
+            )
+        )
+        start_at_goal = (
+            start_positions is not None
+            and _positions_within_deadband(
+                start_positions,
+                goals,
+                stale_readback_deadbands,
+            )
+        )
+        if _motor_statuses_all_set(status, BCSz.MotorStatus.MOVE_COMPLETE):
+            move_complete_is_current = goal_latched and (
+                position_at_goal
+                or start_positions is None
+                or start_at_goal
+                or not position_at_start
+            )
+            if move_complete_is_current:
+                time.sleep(0.25)
+
+                # Get the final positions one more time just to be extra careful
+                positions = _get_positions(bcs_server, motor_aliases)
+                logger.info(
+                    "Motor move complete: motor_aliases=%s, positions=%s, "
+                    "goal_readbacks=%s, elapsed_s=%.1f",
+                    motor_aliases,
+                    positions,
+                    goal_readbacks,
+                    time.monotonic() - started_at,
+                )
+                return positions
+        if _motor_statuses_all_set(
+            status,
+            BCSz.MotorStatus.RAW_MOVE_COMPLETE,
+        ) and position_at_goal:
             logger.info(
                 "Motor move accepted by raw-complete position readback: "
                 "motor_aliases=%s, positions=%s, goals=%s, "
@@ -156,12 +182,11 @@ def _wait_until_move_complete(
         if (
             start_positions is not None
             and elapsed_s >= stale_readback_delay_s
-            and _motor_statuses_all_set(status, BCSz.MotorStatus.RAW_MOVE_COMPLETE)
-            and _positions_within_deadband(
-                positions,
-                start_positions,
-                stale_readback_deadbands,
+            and (
+                _motor_statuses_all_set(status, BCSz.MotorStatus.RAW_MOVE_COMPLETE)
+                or _motor_statuses_all_set(status, BCSz.MotorStatus.MOVE_COMPLETE)
             )
+            and position_at_start
         ):
             stall_reason = (
                 "latched_but_position_did_not_move"
@@ -177,11 +202,7 @@ def _wait_until_move_complete(
                 f"stale_readback_deadbands={stale_readback_deadbands}, "
                 f"status={status}, elapsed_s={elapsed_s:.1f}"
             )
-        if elapsed_s >= stale_readback_delay_s and _positions_within_deadband(
-            positions,
-            goals,
-            stale_readback_deadbands,
-        ):
+        if elapsed_s >= stale_readback_delay_s and position_at_goal:
             logger.info(
                 "Motor move accepted by stale-status position readback: "
                 "motor_aliases=%s, positions=%s, goals=%s, "

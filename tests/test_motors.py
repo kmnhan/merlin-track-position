@@ -236,6 +236,39 @@ class MoveMotorsAndWaitTests(unittest.TestCase):
         self.assertEqual(positions, (9.5, 2.5))
         self.assertEqual(len(server.move_calls), 1)
 
+    def test_stale_move_complete_before_goal_latch_is_not_accepted(self):
+        server = FakeBCSServer(
+            [(1.0,)],
+            get_motor_responses=[
+                _get_motor_response((0.0,), goals=(0.0,)),
+                _get_motor_response((0.0,), goals=(0.0,)),
+                _get_motor_response((1.0,), goals=(1.0,)),
+                _get_motor_response((1.0,), goals=(1.0,)),
+            ],
+        )
+
+        with (
+            patch("merlin_track_position.instruments.motors.time.sleep") as sleep,
+            patch(
+                "merlin_track_position.instruments.motors.time.monotonic",
+                side_effect=[0.0, 0.0, 0.1, 0.2],
+            ),
+        ):
+            positions = _move_motors_and_wait(
+                server,
+                ("x",),
+                (1.0,),
+                max_retries=0,
+                backlash_correction={},
+            )
+
+        self.assertEqual(positions, (1.0,))
+        self.assertEqual(len(server.move_calls), 1)
+        self.assertEqual(
+            sleep.call_args_list,
+            [call(0.25), call(0.25), call(0.25)],
+        )
+
     def test_motor_timing_matches_bcs_example(self):
         server = FakeBCSServer(
             [(1.0,)],
