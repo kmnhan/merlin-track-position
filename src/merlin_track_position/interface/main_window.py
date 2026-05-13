@@ -585,7 +585,15 @@ class MainWindow(_MainWindowGUI):
     def _on_move_detected(self, target: int) -> None:
         logger.info("Move detected by motor server: target=%d", target)
         try:
-            self._start_correction()
+            current_motor_backend = getattr(
+                self._server,
+                "current_motor_backend",
+                None,
+            )
+            motor_backend = (
+                current_motor_backend() if callable(current_motor_backend) else None
+            )
+            self._start_correction(motor_backend=motor_backend)
         except _CorrectionUnavailable as exc:
             message = (
                 f"Move target {target} detected, but automatic correction did "
@@ -634,7 +642,7 @@ class MainWindow(_MainWindowGUI):
             return "Correction requires a calibration file on disk."
         return None
 
-    def _start_correction(self) -> None:
+    def _start_correction(self, *, motor_backend: object | None = None) -> None:
         unavailable_message = self._correction_unavailable_message()
         if unavailable_message is not None:
             raise _CorrectionUnavailable(unavailable_message)
@@ -647,6 +655,7 @@ class MainWindow(_MainWindowGUI):
             self._calibration,
             camera_pair,
             self._calibration_path,
+            motor_backend=motor_backend,
         )
 
         ui_marked_busy = False

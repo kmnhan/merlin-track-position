@@ -4,7 +4,7 @@ import logging
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, Protocol
 
 import h5py
 import numpy as np
@@ -64,6 +64,44 @@ class CorrectionFeedback(NamedTuple):
     parallel_px: float
 
 
+class CorrectionMotorBackend(Protocol):
+    def get_positions(self, motor_aliases: Sequence[str]) -> tuple[float, ...]:
+        """Return commanded motor positions in the order requested."""
+
+    def move_motors_and_wait(
+        self,
+        motor_aliases: Sequence[str],
+        goals: Sequence[float],
+        *,
+        max_retries: int = 4,
+        backlash_correction: dict[str, float] | None = None,
+        move_timeout_s: float = 60.0,
+    ) -> tuple[float, ...]:
+        """Move motors and return final positions in the order requested."""
+
+
+class DirectBCSMotorBackend:
+    def get_positions(self, motor_aliases: Sequence[str]) -> tuple[float, ...]:
+        return get_positions(motor_aliases)
+
+    def move_motors_and_wait(
+        self,
+        motor_aliases: Sequence[str],
+        goals: Sequence[float],
+        *,
+        max_retries: int = 4,
+        backlash_correction: dict[str, float] | None = None,
+        move_timeout_s: float = 60.0,
+    ) -> tuple[float, ...]:
+        return move_motors_and_wait(
+            motor_aliases,
+            goals,
+            max_retries=max_retries,
+            backlash_correction=backlash_correction,
+            move_timeout_s=move_timeout_s,
+        )
+
+
 def do_correction(
     calibration: xr.Dataset | str | Path,
     camera_pair: CameraPairPlugin | None = None,
@@ -92,6 +130,7 @@ def do_correction(
     max_moves: int = constants.DEFAULT_CORRECTION_MAX_MOVES,
     weights: Sequence[float] | np.ndarray | None = None,
     progress_callback: Callable[[xr.Dataset], None] | None = None,
+    motor_backend: CorrectionMotorBackend | None = None,
     **shift_kwargs: Any,
 ) -> xr.Dataset:
     """Run guarded closed-loop visual-servo correction in commanded-mm space.
@@ -109,6 +148,8 @@ def do_correction(
     capture_count = normalize_capture_count(capture_count)
     if camera_pair is None:
         camera_pair = default_camera_pair()
+    if motor_backend is None:
+        motor_backend = DirectBCSMotorBackend()
 
     pixel_tolerance_px = float(pixel_tolerance_px)
     current_gain = float(gain)
@@ -174,7 +215,7 @@ def do_correction(
     )
     logger.info("Reading initial commanded x/y/z positions.")
     commanded_position_mm = np.asarray(
-        get_positions(COMMAND_AXES),
+        motor_backend.get_positions(COMMAND_AXES),
         dtype=np.float64,
     )
     if commanded_position_mm.shape != (len(COMMAND_AXES),):
@@ -411,7 +452,7 @@ def do_correction(
             active_axes,
             active_requested_position_mm,
         )
-        move_motors_and_wait(
+        motor_backend.move_motors_and_wait(
             active_axes,
             active_requested_position_mm,
             max_retries=max_retries,
@@ -421,7 +462,7 @@ def do_correction(
         )
         logger.info("Correction motor move returned; reading final x/y/z positions.")
         final_readback_mm = np.asarray(
-            get_positions(COMMAND_AXES),
+            motor_backend.get_positions(COMMAND_AXES),
             dtype=np.float64,
         )
         if final_readback_mm.shape != (len(COMMAND_AXES),):

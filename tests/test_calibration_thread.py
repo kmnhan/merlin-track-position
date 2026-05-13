@@ -177,9 +177,15 @@ class CorrectionThreadTests(unittest.TestCase):
             *,
             calibration_path,
             progress_callback,
+            motor_backend,
         ):
             calls.append(
-                (passed_calibration, passed_camera_pair, Path(calibration_path))
+                (
+                    passed_calibration,
+                    passed_camera_pair,
+                    Path(calibration_path),
+                    motor_backend,
+                )
             )
             progress_callback(progress)
             return result
@@ -203,7 +209,7 @@ class CorrectionThreadTests(unittest.TestCase):
             ):
                 thread.run()
 
-        self.assertEqual(calls, [(calibration, camera_pair, path)])
+        self.assertEqual(calls, [(calibration, camera_pair, path, None)])
         self.assertEqual(progress_results, [progress])
         self.assertEqual(ready, [result])
         self.assertEqual(failed, [])

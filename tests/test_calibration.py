@@ -676,7 +676,7 @@ class CorrectionTests(unittest.TestCase):
                 calibration_dataset()["visual_jacobian_px_per_cmd_mm"].values,
                 shift_dataset(p0),
                 calibration_dataset()["axis_scale_cmd_mm"].values,
-                gain=0.3,
+                gain=constants.DEFAULT_CORRECTION_GAIN,
                 damping_mu=constants.DEFAULT_CORRECTION_DAMPING_MU,
             )
             hardware_patches = self.patch_hardware(
@@ -698,6 +698,85 @@ class CorrectionTests(unittest.TestCase):
         np.testing.assert_allclose(
             np.asarray(requested, dtype=float),
             np.array([10.0, 20.0, 30.0]) + expected_delta,
+        )
+
+    def test_correction_can_delegate_iterative_moves_to_motor_backend(self):
+        class FakeMotorBackend:
+            def __init__(self):
+                self.positions = np.array([10.0, 20.0, 30.0], dtype=float)
+                self.moves = []
+
+            def get_positions(self, motor_aliases):
+                events.append(("get", tuple(motor_aliases)))
+                return tuple(
+                    self.positions[COMMAND_AXES.index(axis)] for axis in motor_aliases
+                )
+
+            def move_motors_and_wait(
+                self,
+                motor_aliases,
+                goals,
+                *,
+                max_retries=4,
+                backlash_correction=None,
+                move_timeout_s=60.0,
+            ):
+                events.append(("move", tuple(motor_aliases)))
+                self.moves.append((tuple(motor_aliases), tuple(goals)))
+                for axis, goal in zip(motor_aliases, goals, strict=True):
+                    self.positions[COMMAND_AXES.index(axis)] = float(goal)
+                return tuple(goals)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self.save_calibration(tmpdir)
+            measurements = iter(
+                [
+                    shift_dataset(x_shift(300.0)),
+                    shift_dataset(x_shift(100.0)),
+                    shift_dataset(x_shift(0.0)),
+                ]
+            )
+            events = []
+            backend = FakeMotorBackend()
+
+            def fake_measure_image_error(*args, **kwargs):
+                events.append(("measure", None))
+                return next(measurements)
+
+            with (
+                patch(
+                    "merlin_track_position.tracking.correct.get_positions",
+                    side_effect=AssertionError("direct BCS get should not be used"),
+                ),
+                patch(
+                    "merlin_track_position.tracking.correct.move_motors_and_wait",
+                    side_effect=AssertionError("direct BCS move should not be used"),
+                ),
+                patch(
+                    "merlin_track_position.tracking.correct.capture_image_stack",
+                    return_value=(
+                        np.zeros((1, 4, 5), dtype=float),
+                        np.zeros((1, 6, 7), dtype=float),
+                    ),
+                ),
+                patch(
+                    "merlin_track_position.tracking.correct.measure_image_error",
+                    side_effect=fake_measure_image_error,
+                ),
+            ):
+                result = do_correction(
+                    path,
+                    capture_count=1,
+                    max_moves=2,
+                    motor_backend=backend,
+                )
+
+        self.assertTrue(result.attrs["correction_converged"])
+        self.assertEqual(len(backend.moves), 2)
+        self.assertEqual(events[0], ("get", tuple(COMMAND_AXES)))
+        self.assertEqual(
+            [event[0] for event in events],
+            ["get", "measure", "move", "get", "measure", "move", "get", "measure"],
         )
 
     def test_normalized_step_limit_caps_largest_axis_component(self):
@@ -761,7 +840,7 @@ class CorrectionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = self.save_calibration(tmpdir)
             calibration = calibration_dataset()
-            offset_mm = np.array([0.0, 0.020, 0.0], dtype=float)
+            offset_mm = np.array([0.0, 0.016, 0.0], dtype=float)
             p0 = (
                 calibration["visual_jacobian_px_per_cmd_mm"].values.reshape(
                     len(CAMERAS) * len(PIXEL_AXES), len(COMMAND_AXES)
@@ -773,7 +852,7 @@ class CorrectionTests(unittest.TestCase):
                 calibration["visual_jacobian_px_per_cmd_mm"].values,
                 shift_dataset(p0),
                 calibration["axis_scale_cmd_mm"].values,
-                gain=0.3,
+                gain=constants.DEFAULT_CORRECTION_GAIN,
                 damping_mu=constants.DEFAULT_CORRECTION_DAMPING_MU,
             )
             self.assertLess(
@@ -831,6 +910,7 @@ class CorrectionTests(unittest.TestCase):
                     path,
                     capture_count=1,
                     min_axis_predicted_shift_px=0.0,
+                    min_total_predicted_shift_px=0.5,
                     max_moves=1,
                 )
 
@@ -893,7 +973,7 @@ class CorrectionTests(unittest.TestCase):
                 calibration["visual_jacobian_px_per_cmd_mm"].values,
                 shift_dataset(p0),
                 calibration["axis_scale_cmd_mm"].values,
-                gain=0.3,
+                gain=constants.DEFAULT_CORRECTION_GAIN,
                 damping_mu=constants.DEFAULT_CORRECTION_DAMPING_MU,
             )
             self.assertLess(
@@ -1321,7 +1401,7 @@ class CorrectionTests(unittest.TestCase):
                 calibration["visual_jacobian_px_per_cmd_mm"].values,
                 shift_dataset(p0),
                 calibration["axis_scale_cmd_mm"].values,
-                gain=0.3,
+                gain=constants.DEFAULT_CORRECTION_GAIN,
                 damping_mu=constants.DEFAULT_CORRECTION_DAMPING_MU,
             )
             predicted_delta = (
@@ -1348,7 +1428,10 @@ class CorrectionTests(unittest.TestCase):
             reloaded = load_calibration_dataset(path)
 
         self.assertFalse(bool(result["move_jacobian_refined"].values[0]))
-        self.assertAlmostEqual(float(result.attrs["correction_final_gain"]), 0.15)
+        self.assertAlmostEqual(
+            float(result.attrs["correction_final_gain"]),
+            constants.DEFAULT_CORRECTION_GAIN / 2.0,
+        )
         self.assertAlmostEqual(float(result.attrs["correction_final_damping_mu"]), 2.0)
         self.assertEqual(int(reloaded.attrs["jacobian_refinement_count"]), 0)
 

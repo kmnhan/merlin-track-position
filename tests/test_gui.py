@@ -93,6 +93,7 @@ class FakeMotorServer(QtCore.QObject):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.result_calls = []
+        self.motor_backend = None
 
     def start(self):
         pass
@@ -106,6 +107,9 @@ class FakeMotorServer(QtCore.QObject):
     def set_result(self, success, message):
         self.result_calls.append((bool(success), str(message)))
 
+    def current_motor_backend(self):
+        return self.motor_backend
+
 
 class FakeCorrectionThread(QtCore.QObject):
     sigCorrectionProgress = QtCore.Signal(object)
@@ -117,13 +121,21 @@ class FakeCorrectionThread(QtCore.QObject):
         self.calibration = None
         self.camera_pair = None
         self.calibration_path = None
+        self.motor_backend = None
         self.started = False
         self.running = False
 
-    def configure(self, calibration, camera_pair, calibration_path):
+    def configure(
+        self,
+        calibration,
+        camera_pair,
+        calibration_path,
+        motor_backend=None,
+    ):
         self.calibration = calibration
         self.camera_pair = camera_pair
         self.calibration_path = Path(calibration_path)
+        self.motor_backend = motor_backend
 
     def start(self):
         self.started = True
@@ -651,9 +663,11 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "calibration.h5"
             calibration = write_sample_calibration(path)
+            motor_backend = object()
             with patched_main_window_runtime():
                 window = MainWindow()
                 try:
+                    window._server.motor_backend = motor_backend
                     window._on_new_calibration_ready(calibration)
 
                     window._on_move_detected(7)
@@ -662,6 +676,7 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                     self.assertTrue(thread.started)
                     self.assertIs(thread.calibration, window._calibration)
                     self.assertEqual(thread.calibration_path, path)
+                    self.assertIs(thread.motor_backend, motor_backend)
                     self.assertIsNotNone(thread.camera_pair)
                     self.assertEqual(window._server.result_calls, [])
                     self.assertTrue(window._server_correction_pending)
