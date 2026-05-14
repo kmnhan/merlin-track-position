@@ -1027,11 +1027,32 @@ class MainWindow(_MainWindowGUI):
             else _roi_geometries_from_calibration_metadata(self._calibration)
         )
         if roi_geometries is not None and camera in roi_geometries:
-            x, y, width, height = roi_geometries[camera]
-            return QtCore.QRectF(x, y, width, height)
+            return self._roi_crop_image_rect(camera, roi_geometries[camera])
 
         height, width = image.shape[:2]
         return QtCore.QRectF(0.0, 0.0, float(width), float(height))
+
+    @staticmethod
+    def _roi_crop_image_rect(
+        camera: str,
+        geometry: RoiGeometry,
+    ) -> QtCore.QRectF:
+        image_width, image_height = CAMERA_IMAGE_SIZES[camera]
+        x, y, width, height = _clamp_roi_geometry(
+            geometry,
+            image_width,
+            image_height,
+        )
+        x0 = min(max(int(math.floor(x)), 0), image_width - 1)
+        y0 = min(max(int(math.floor(y)), 0), image_height - 1)
+        x1 = min(max(int(math.ceil(x + width)), x0 + 1), image_width)
+        y1 = min(max(int(math.ceil(y + height)), y0 + 1), image_height)
+        return QtCore.QRectF(
+            float(x0),
+            float(y0),
+            float(x1 - x0),
+            float(y1 - y0),
+        )
 
     def _pause_image_auto_refresh_for_calibration(self) -> None:
         self._image_auto_refresh_checked_before_calibration = (

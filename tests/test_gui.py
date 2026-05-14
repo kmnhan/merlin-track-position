@@ -664,13 +664,13 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
         get_qapp()
         metadata = _roi_metadata_from_geometries(
             {
-                "cam0": (10.0, 12.0, 30.0, 32.0),
-                "cam1": (14.0, 16.0, 34.0, 36.0),
+                "cam0": (10.2, 12.4, 5.0, 4.0),
+                "cam1": (14.7, 16.1, 7.0, 6.0),
             }
         )
         calibration = build_sample_calibration_dataset(
-            image_shape_cam0=(4, 5),
-            image_shape_cam1=(6, 7),
+            image_shape_cam0=(5, 6),
+            image_shape_cam1=(7, 8),
         ).assign_attrs({"calibration_path": "/tmp/calibration.h5"} | metadata)
         current_cam0 = full_camera_image("cam0", 3.0)
         current_cam1 = full_camera_image("cam1", 4.0)
@@ -696,12 +696,12 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                 assert_rect_close(
                     self,
                     image_parent_rect(window, "cam0"),
-                    (10.0, 12.0, 30.0, 32.0),
+                    (10.0, 12.0, 6.0, 5.0),
                 )
                 assert_rect_close(
                     self,
                     image_parent_rect(window, "cam1"),
-                    (14.0, 16.0, 34.0, 36.0),
+                    (14.0, 16.0, 8.0, 7.0),
                 )
 
                 window._on_image_capture_ready("cam0", refreshed_cam0)
