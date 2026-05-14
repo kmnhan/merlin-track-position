@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, NamedTuple, Protocol
@@ -23,6 +25,7 @@ from merlin_track_position.instruments.motors import get_positions, move_motors_
 from merlin_track_position.tracking.calibration_core import (
     CAMERAS,
     COMMAND_AXES,
+    OBSERVATION_AXES,
     PIXEL_AXES,
     estimate_command_offset,
     load_calibration_dataset,
@@ -62,6 +65,13 @@ class CorrectionFeedback(NamedTuple):
     measured_weighted_response_px: float
     alpha: float
     parallel_px: float
+
+
+@dataclass(frozen=True)
+class CorrectionState:
+    commanded_position_mm: np.ndarray
+    measurement: xr.Dataset
+    residual_px: float
 
 
 class CorrectionMotorBackend(Protocol):
@@ -110,6 +120,9 @@ def do_correction(
     max_retries: int = 4,
     capture_count: int = constants.DEFAULT_CAPTURE_COUNT,
     pixel_tolerance_px: float = constants.DEFAULT_CORRECTION_PIXEL_TOLERANCE_PX,
+    target_residual_px: float | None = None,
+    min_verified_improvement_px: float = 0.03,
+    max_duration_s: float = 120.0,
     gain: float = constants.DEFAULT_CORRECTION_GAIN,
     min_gain: float = constants.DEFAULT_CORRECTION_MIN_GAIN,
     damping_mu: float = constants.DEFAULT_CORRECTION_DAMPING_MU,
@@ -128,6 +141,10 @@ def do_correction(
     ),
     min_command_norm_mm: float = constants.DEFAULT_CORRECTION_MIN_COMMAND_NORM_MM,
     max_moves: int = constants.DEFAULT_CORRECTION_MAX_MOVES,
+    local_probe_mode: str = "fallback",
+    local_probe_target_response_px: float = 1.0,
+    return_to_best_on_failure: bool = True,
+    verify_return_to_best: bool = True,
     weights: Sequence[float] | np.ndarray | None = None,
     progress_callback: Callable[[xr.Dataset], None] | None = None,
     motor_backend: CorrectionMotorBackend | None = None,
@@ -152,6 +169,13 @@ def do_correction(
         motor_backend = DirectBCSMotorBackend()
 
     pixel_tolerance_px = float(pixel_tolerance_px)
+    if not np.isfinite(pixel_tolerance_px) or pixel_tolerance_px < 0.0:
+        raise ValueError("pixel_tolerance_px must be finite and non-negative")
+    if target_residual_px is None:
+        target_residual_px = pixel_tolerance_px
+    target_residual_px = float(target_residual_px)
+    min_verified_improvement_px = float(min_verified_improvement_px)
+    max_duration_s = float(max_duration_s)
     current_gain = float(gain)
     min_gain = float(min_gain)
     current_mu = float(damping_mu)
@@ -159,9 +183,22 @@ def do_correction(
     min_feedback_alpha = float(min_feedback_alpha)
     min_feedback_parallel_shift_px = float(min_feedback_parallel_shift_px)
     min_command_norm_mm = float(min_command_norm_mm)
+    local_probe_target_response_px = float(local_probe_target_response_px)
     max_moves = int(max_moves)
-    if not np.isfinite(pixel_tolerance_px) or pixel_tolerance_px < 0.0:
-        raise ValueError("pixel_tolerance_px must be finite and non-negative")
+    local_probe_mode = str(local_probe_mode).strip().lower()
+    return_to_best_on_failure = bool(return_to_best_on_failure)
+    verify_return_to_best = bool(verify_return_to_best)
+    if not np.isfinite(target_residual_px) or target_residual_px < 0.0:
+        raise ValueError("target_residual_px must be finite and non-negative")
+    if (
+        not np.isfinite(min_verified_improvement_px)
+        or min_verified_improvement_px < 0.0
+    ):
+        raise ValueError(
+            "min_verified_improvement_px must be finite and non-negative"
+        )
+    if not np.isfinite(max_duration_s) or max_duration_s < 0.0:
+        raise ValueError("max_duration_s must be finite and non-negative")
     if not np.isfinite(current_gain) or current_gain <= 0.0:
         raise ValueError("gain must be finite and positive")
     if not np.isfinite(min_gain) or min_gain <= 0.0:
@@ -188,15 +225,25 @@ def do_correction(
         )
     if not np.isfinite(min_command_norm_mm) or min_command_norm_mm < 0.0:
         raise ValueError("min_command_norm_mm must be finite and non-negative")
+    if (
+        not np.isfinite(local_probe_target_response_px)
+        or local_probe_target_response_px <= 0.0
+    ):
+        raise ValueError("local_probe_target_response_px must be finite and positive")
     if max_moves < 0:
         raise ValueError("max_moves must be >= 0")
+    if local_probe_mode not in {"off", "fallback", "always"}:
+        raise ValueError("local_probe_mode must be 'off', 'fallback', or 'always'")
     logger.info(
-        "Correction parameters: capture_count=%d, pixel_tolerance_px=%g, "
-        "gain=%g, min_gain=%g, damping_mu=%g, "
-        "min_total_predicted_shift_px=%g, min_feedback_alpha=%g, "
-        "min_feedback_parallel_shift_px=%g, max_moves=%d",
+        "Correction parameters: capture_count=%d, target_residual_px=%g, "
+        "min_verified_improvement_px=%g, max_duration_s=%g, gain=%g, "
+        "min_gain=%g, damping_mu=%g, min_total_predicted_shift_px=%g, "
+        "min_feedback_alpha=%g, min_feedback_parallel_shift_px=%g, "
+        "max_moves=%d, local_probe_mode=%s",
         capture_count,
-        pixel_tolerance_px,
+        target_residual_px,
+        min_verified_improvement_px,
+        max_duration_s,
         current_gain,
         min_gain,
         current_mu,
@@ -204,30 +251,34 @@ def do_correction(
         min_feedback_alpha,
         min_feedback_parallel_shift_px,
         max_moves,
+        local_probe_mode,
     )
 
     reference_cam0 = np.asarray(calibration["reference_cam0"].values)
     reference_cam1 = np.asarray(calibration["reference_cam1"].values)
     axis_scale = np.asarray(calibration["axis_scale_cmd_mm"].values, dtype=np.float64)
-    jacobian = np.asarray(
+    calibration_jacobian = np.asarray(
         calibration["visual_jacobian_px_per_cmd_mm"].values,
         dtype=np.float64,
     )
+    working_jacobian = calibration_jacobian.copy()
+    latest_local_jacobian: np.ndarray | None = None
+    correction_started_monotonic = time.monotonic()
+
     logger.info("Reading initial commanded x/y/z positions.")
-    commanded_position_mm = np.asarray(
+    initial_commanded_position_mm = np.asarray(
         motor_backend.get_positions(COMMAND_AXES),
         dtype=np.float64,
     )
-    if commanded_position_mm.shape != (len(COMMAND_AXES),):
+    if initial_commanded_position_mm.shape != (len(COMMAND_AXES),):
         raise ValueError("initial command position readback must have x/y/z values")
-    logger.info("Initial commanded positions: %s", commanded_position_mm.tolist())
-    initial_commanded_position_mm = commanded_position_mm.copy()
+    logger.info("Initial commanded positions: %s", initial_commanded_position_mm.tolist())
     correction_log_path = correction_history_path(resolved_path)
     correction_run_id = _next_correction_history_run_id(correction_log_path)
     correction_started_at_utc = datetime.now(UTC).isoformat()
 
     logger.info("Capturing initial correction measurement.")
-    measurement = _capture_measurement(
+    initial_measurement = _capture_measurement(
         calibration,
         camera_pair,
         reference_cam0,
@@ -235,11 +286,22 @@ def do_correction(
         capture_count,
         **shift_kwargs,
     )
-    residual = weighted_pixel_residual(measurement, weights=weights)
-    logger.info("Initial weighted residual: %.6g px", residual)
+    initial_residual = weighted_pixel_residual(initial_measurement, weights=weights)
+    logger.info("Initial weighted residual: %.6g px", initial_residual)
 
-    iteration_shift_px = [np.asarray(measurement["shift_px"].values, dtype=np.float64)]
-    iteration_weighted_residuals = [residual]
+    current_state = CorrectionState(
+        commanded_position_mm=initial_commanded_position_mm.copy(),
+        measurement=initial_measurement,
+        residual_px=float(initial_residual),
+    )
+    best_state = current_state
+    converged = current_state.residual_px <= target_residual_px
+    stop_reason = "target_residual_reached" if converged else ""
+    returned_to_best = False
+    return_to_best_verified = False
+
+    iteration_shift_px = [_measurement_shift_px(current_state.measurement)]
+    iteration_weighted_residuals = [current_state.residual_px]
     move_command_delta_mm: list[np.ndarray] = []
     move_requested_position_mm: list[np.ndarray] = []
     move_final_readback_position_mm: list[np.ndarray] = []
@@ -259,29 +321,43 @@ def do_correction(
     move_max_normalized_component: list[float] = []
     move_active_axis_mask: list[np.ndarray] = []
     move_jacobian_refined: list[bool] = []
+    move_kind: list[str] = []
+    move_accepted: list[bool] = []
+    move_is_best_after: list[bool] = []
+    move_verified_residuals: list[float] = []
+    move_local_probe_jacobian: list[np.ndarray | None] = []
     warnings: list[str] = [
         line.strip()
-        for line in str(measurement.attrs.get("warnings", "")).splitlines()
+        for line in str(current_state.measurement.attrs.get("warnings", "")).splitlines()
         if line.strip()
     ]
 
-    move_count = 0
-    converged = residual <= pixel_tolerance_px
+    def move_count() -> int:
+        return len(move_command_delta_mm)
+
+    def duration_exhausted() -> bool:
+        return (time.monotonic() - correction_started_monotonic) >= max_duration_s
+
+    def move_budget_exhausted() -> bool:
+        return move_count() >= max_moves
+
+    def should_try_local_probe() -> bool:
+        return local_probe_mode in {"fallback", "always"}
 
     def build_result(completed: bool) -> xr.Dataset:
         return _build_correction_result(
-            measurement=measurement,
-            jacobian=jacobian,
+            measurement=current_state.measurement,
+            jacobian=working_jacobian,
             axis_scale=axis_scale,
             estimated_offset=estimate_command_offset(
-                jacobian,
-                measurement,
+                working_jacobian,
+                current_state.measurement,
                 weights=weights,
             ),
             next_correction=_reported_next_correction(
                 converged=converged,
-                jacobian=jacobian,
-                measurement=measurement,
+                jacobian=working_jacobian,
+                measurement=current_state.measurement,
                 axis_scale=axis_scale,
                 gain=current_gain,
                 damping_mu=current_mu,
@@ -312,14 +388,22 @@ def do_correction(
             move_max_normalized_component=move_max_normalized_component,
             move_active_axis_mask=move_active_axis_mask,
             move_jacobian_refined=move_jacobian_refined,
+            move_kind=move_kind,
+            move_accepted=move_accepted,
+            move_is_best_after=move_is_best_after,
+            move_verified_residuals=move_verified_residuals,
+            move_local_probe_jacobian=move_local_probe_jacobian,
             calibration_path=resolved_path,
             correction_history_path=correction_log_path,
             correction_run_id=correction_run_id,
             correction_started_at_utc=correction_started_at_utc,
             correction_history_completed=completed,
             converged=converged,
-            move_count=move_count,
+            move_count=move_count(),
             pixel_tolerance_px=pixel_tolerance_px,
+            target_residual_px=target_residual_px,
+            min_verified_improvement_px=min_verified_improvement_px,
+            max_duration_s=max_duration_s,
             gain=gain,
             min_gain=min_gain,
             damping_mu=damping_mu,
@@ -333,7 +417,15 @@ def do_correction(
             min_command_norm_mm=min_command_norm_mm,
             max_moves=max_moves,
             initial_commanded_position_mm=initial_commanded_position_mm,
-            commanded_position_mm=commanded_position_mm,
+            commanded_position_mm=current_state.commanded_position_mm,
+            best_commanded_position_mm=best_state.commanded_position_mm,
+            best_verified_residual_px=best_state.residual_px,
+            final_verified_residual_px=current_state.residual_px,
+            local_probe_mode=local_probe_mode,
+            local_probe_target_response_px=local_probe_target_response_px,
+            returned_to_best=returned_to_best,
+            return_to_best_verified=return_to_best_verified,
+            correction_stop_reason=stop_reason,
             warnings=warnings,
         )
 
@@ -359,96 +451,35 @@ def do_correction(
         logger.info("Saved correction progress: completed=%s", completed)
         return progress
 
-    # Publish the initial measurement and planned correction before any motor move.
-    save_progress(completed=False)
+    def record_verified_move(
+        *,
+        kind: str,
+        requested_position_mm: np.ndarray,
+        jacobian_before: np.ndarray,
+        predicted_delta_px: np.ndarray,
+        normalized_component: np.ndarray,
+        gain_used: float,
+        mu_used: float,
+        local_jacobian_for_log: np.ndarray | None,
+        allow_over_budget: bool = False,
+    ) -> CorrectionFeedback | None:
+        nonlocal current_state, best_state, returned_to_best, return_to_best_verified
 
-    while not converged and move_count < max_moves:
-        logger.info(
-            "Correction iteration %d starting: residual=%.6g px, gain=%g, mu=%g",
-            move_count + 1,
-            residual,
-            current_gain,
-            current_mu,
-        )
-        gain_used = float(current_gain)
-        mu_used = float(current_mu)
-        jacobian_before = jacobian.copy()
-        estimated_offset_mm = estimate_command_offset(
-            jacobian,
-            measurement,
-            weights=weights,
-        )
-        raw_correction_cmd_mm = solve_damped_command_correction(
-            jacobian,
-            measurement,
-            axis_scale,
-            gain=gain_used,
-            damping_mu=mu_used,
-            max_normalized_step=max_normalized_step,
-            min_axis_predicted_shift_px=min_axis_predicted_shift_px,
-            weights=weights,
-        )
-        correction_cmd_mm = _zero_deadband_axis_corrections(
-            raw_correction_cmd_mm,
-            reference_cmd_mm=estimated_offset_mm,
-        )
-        correction_norm_mm = float(np.linalg.norm(correction_cmd_mm))
-        active_indices = _active_correction_indices(correction_cmd_mm)
-        logger.info(
-            "Computed correction command: estimated_offset_mm=%s, raw_delta_mm=%s, "
-            "delta_mm=%s, norm_mm=%.6g, active_axes=%s",
-            estimated_offset_mm.tolist(),
-            raw_correction_cmd_mm.tolist(),
-            correction_cmd_mm.tolist(),
-            correction_norm_mm,
-            tuple(COMMAND_AXES[index] for index in active_indices),
-        )
-        if correction_norm_mm <= min_command_norm_mm or not active_indices:
-            warnings.append(
-                _correction_stop_warning(
-                    raw_correction_cmd_mm=raw_correction_cmd_mm,
-                    correction_cmd_mm=correction_cmd_mm,
-                    estimated_offset_mm=estimated_offset_mm,
-                    min_command_norm_mm=min_command_norm_mm,
-                )
-            )
-            logger.info(
-                "Stopping correction before move: %s",
-                warnings[-1],
-            )
-            break
-
-        predicted_delta_px = (
-            jacobian_before.reshape(len(CAMERAS) * len(PIXEL_AXES), len(COMMAND_AXES))
-            @ correction_cmd_mm
-        ).reshape(len(CAMERAS), len(PIXEL_AXES))
-        predicted_weighted_response_px = _weighted_shift_norm(
-            predicted_delta_px,
-            weights=weights,
-        )
-        if predicted_weighted_response_px < min_total_predicted_shift_px:
-            warnings.append(
-                _below_observable_feedback_warning(
-                    predicted_weighted_response_px=predicted_weighted_response_px,
-                    min_total_predicted_shift_px=min_total_predicted_shift_px,
-                )
-            )
-            logger.info(
-                "Stopping correction before move because predicted response "
-                "%.6g px is below observable feedback threshold %.6g px.",
-                predicted_weighted_response_px,
-                min_total_predicted_shift_px,
-            )
-            break
-
-        normalized_component = correction_cmd_mm / axis_scale
-        requested_position_mm = commanded_position_mm + correction_cmd_mm
+        if not allow_over_budget and (move_budget_exhausted() or duration_exhausted()):
+            return None
+        pre_state = current_state
+        command_delta_mm = requested_position_mm - pre_state.commanded_position_mm
+        active_indices = _active_correction_indices(command_delta_mm)
+        if not active_indices:
+            return None
         active_axes = tuple(COMMAND_AXES[index] for index in active_indices)
         active_requested_position_mm = tuple(
             float(requested_position_mm[index]) for index in active_indices
         )
         logger.info(
-            "Moving correction axes: active_axes=%s, requested_position_mm=%s",
+            "Moving correction axes: kind=%s, active_axes=%s, "
+            "requested_position_mm=%s",
+            kind,
             active_axes,
             active_requested_position_mm,
         )
@@ -456,8 +487,6 @@ def do_correction(
             active_axes,
             active_requested_position_mm,
             max_retries=max_retries,
-            # Correction moves are already closed-loop and can be micron-scale.
-            # Do not expand a small correction into a large backlash pre-position.
             backlash_correction={},
         )
         logger.info("Correction motor move returned; reading final x/y/z positions.")
@@ -468,7 +497,6 @@ def do_correction(
         if final_readback_mm.shape != (len(COMMAND_AXES),):
             raise ValueError("final command position readback must have x/y/z values")
         logger.info("Final readback positions: %s", final_readback_mm.tolist())
-        commanded_position_mm = requested_position_mm
 
         logger.info("Capturing post-move correction measurement.")
         after_measurement = _capture_measurement(
@@ -480,16 +508,10 @@ def do_correction(
             **shift_kwargs,
         )
         after_residual = weighted_pixel_residual(after_measurement, weights=weights)
-        decreased = bool(after_residual < residual)
-        logger.info(
-            "Post-move weighted residual: %.6g px; decreased=%s",
-            after_residual,
-            decreased,
+        measured_delta_px = (
+            _measurement_shift_px(after_measurement)
+            - _measurement_shift_px(pre_state.measurement)
         )
-        jacobian_refined = False
-        measured_delta_px = np.asarray(
-            after_measurement["shift_px"].values, dtype=np.float64
-        ) - np.asarray(measurement["shift_px"].values, dtype=np.float64)
         feedback = _correction_feedback_metrics(
             predicted_delta_px,
             measured_delta_px,
@@ -501,76 +523,24 @@ def do_correction(
             min_feedback_alpha=min_feedback_alpha,
             min_feedback_parallel_shift_px=min_feedback_parallel_shift_px,
         )
-        stop_after_invalid_feedback = not feedback_valid and after_residual > (
-            pixel_tolerance_px
+        accepted = bool(after_residual < pre_state.residual_px)
+        new_state = CorrectionState(
+            commanded_position_mm=final_readback_mm.copy(),
+            measurement=after_measurement,
+            residual_px=float(after_residual),
         )
-        logger.info(
-            "Post-move feedback metrics: predicted_response=%.6g px, "
-            "measured_response=%.6g px, alpha=%.6g, parallel=%.6g px, "
-            "valid=%s",
-            feedback.predicted_weighted_response_px,
-            feedback.measured_weighted_response_px,
-            feedback.alpha,
-            feedback.parallel_px,
-            feedback_valid,
-        )
-        if feedback_valid and decreased:
-            try:
-                logger.info("Attempting Jacobian refinement from accepted move.")
-                refinement_delta, refinement_measured = (
-                    _jacobian_refinement_observations(
-                        correction_log_path,
-                        move_command_delta_mm,
-                        move_measured_delta_px,
-                        move_jacobian_refined,
-                        correction_cmd_mm,
-                        measured_delta_px,
-                        exclude_run_id=correction_run_id,
-                    )
-                )
-                calibration = refine_visual_jacobian_from_observations(
-                    calibration,
-                    refinement_delta,
-                    refinement_measured,
-                    save_path=resolved_path,
-                )
-            except ValueError as exc:
-                warnings.append(f"skipped Jacobian refinement: {exc}")
-                logger.info("Skipped Jacobian refinement: %s", exc)
-            else:
-                jacobian = np.asarray(
-                    calibration["visual_jacobian_px_per_cmd_mm"].values,
-                    dtype=np.float64,
-                )
-                jacobian_refined = True
-                logger.info("Jacobian refinement accepted and saved.")
-        elif feedback_valid:
-            current_gain = max(min_gain, 0.5 * current_gain)
-            current_mu = 2.0 * current_mu if current_mu > 0.0 else 1e-12
-            logger.info(
-                "Residual did not decrease; reducing gain to %g and increasing "
-                "mu to %g.",
-                current_gain,
-                current_mu,
-            )
-        elif stop_after_invalid_feedback:
-            warnings.append(
-                _invalid_feedback_warning(
-                    feedback,
-                    min_feedback_alpha=min_feedback_alpha,
-                    min_feedback_parallel_shift_px=min_feedback_parallel_shift_px,
-                )
-            )
-            logger.info("Stopping correction after invalid image feedback.")
+        is_best_after = bool(after_residual < best_state.residual_px)
+        if is_best_after:
+            best_state = new_state
 
-        move_command_delta_mm.append(correction_cmd_mm)
+        move_command_delta_mm.append(command_delta_mm.copy())
         move_requested_position_mm.append(requested_position_mm.copy())
-        move_final_readback_position_mm.append(final_readback_mm)
-        move_gain.append(gain_used)
-        move_damping_mu.append(mu_used)
-        move_pre_weighted_residuals.append(float(residual))
+        move_final_readback_position_mm.append(final_readback_mm.copy())
+        move_gain.append(float(gain_used))
+        move_damping_mu.append(float(mu_used))
+        move_pre_weighted_residuals.append(float(pre_state.residual_px))
         move_post_weighted_residuals.append(float(after_residual))
-        move_predicted_delta_px.append(predicted_delta_px)
+        move_predicted_delta_px.append(predicted_delta_px.copy())
         move_measured_delta_px.append(measured_delta_px)
         move_predicted_weighted_response_px.append(
             feedback.predicted_weighted_response_px
@@ -581,55 +551,348 @@ def do_correction(
         move_feedback_alpha.append(feedback.alpha)
         move_feedback_parallel_px.append(feedback.parallel_px)
         move_feedback_valid.append(feedback_valid)
-        move_jacobian_before.append(jacobian_before)
-        move_jacobian_after.append(jacobian.copy())
+        move_jacobian_before.append(jacobian_before.copy())
+        move_jacobian_after.append(working_jacobian.copy())
         move_max_normalized_component.append(
             float(np.max(np.abs(normalized_component)))
         )
         active_axis_mask = np.zeros(len(COMMAND_AXES), dtype=bool)
         active_axis_mask[list(active_indices)] = True
         move_active_axis_mask.append(active_axis_mask)
-        move_jacobian_refined.append(jacobian_refined)
-
-        measurement = after_measurement
-        residual = after_residual
-        iteration_shift_px.append(
-            np.asarray(measurement["shift_px"].values, dtype=np.float64)
+        move_jacobian_refined.append(False)
+        move_kind.append(kind)
+        move_accepted.append(accepted)
+        move_is_best_after.append(is_best_after)
+        move_verified_residuals.append(float(after_residual))
+        move_local_probe_jacobian.append(
+            None if local_jacobian_for_log is None else local_jacobian_for_log.copy()
         )
-        iteration_weighted_residuals.append(float(residual))
+
+        current_state = new_state
+        iteration_shift_px.append(_measurement_shift_px(current_state.measurement))
+        iteration_weighted_residuals.append(float(current_state.residual_px))
         warnings.extend(
             line.strip()
-            for line in str(measurement.attrs.get("warnings", "")).splitlines()
+            for line in str(current_state.measurement.attrs.get("warnings", "")).splitlines()
             if line.strip()
         )
-        move_count += 1
-        converged = residual <= pixel_tolerance_px
+        if kind == "return_best":
+            returned_to_best = True
+            return_to_best_verified = True
         logger.info(
-            "Correction iteration %d complete: residual=%.6g px, converged=%s",
-            move_count,
-            residual,
-            converged,
+            "Verified correction move: kind=%s, residual %.6g -> %.6g px, "
+            "accepted=%s, best=%s, feedback_valid=%s",
+            kind,
+            pre_state.residual_px,
+            current_state.residual_px,
+            accepted,
+            is_best_after,
+            feedback_valid,
         )
         save_progress(completed=False)
-        if stop_after_invalid_feedback:
+        return feedback
+
+    def command_return_to_state(target_state: CorrectionState) -> bool:
+        requested_position = target_state.commanded_position_mm.copy()
+        delta = requested_position - current_state.commanded_position_mm
+        if not _active_correction_indices(delta):
+            return False
+        predicted_delta_px = _predict_shift_delta(working_jacobian, delta)
+        normalized = _normalized_component(delta, axis_scale)
+        return (
+            record_verified_move(
+                kind="return_best",
+                requested_position_mm=requested_position,
+                jacobian_before=working_jacobian,
+                predicted_delta_px=predicted_delta_px,
+                normalized_component=normalized,
+                gain_used=np.nan,
+                mu_used=np.nan,
+                local_jacobian_for_log=latest_local_jacobian,
+                allow_over_budget=True,
+            )
+            is not None
+        )
+
+    def run_local_probe() -> bool:
+        nonlocal working_jacobian, latest_local_jacobian, stop_reason
+
+        if move_budget_exhausted() or duration_exhausted():
+            return False
+        if (
+            return_to_best_on_failure
+            and best_state.residual_px + min_verified_improvement_px
+            < current_state.residual_px
+        ):
+            command_return_to_state(best_state)
+            if move_budget_exhausted() or duration_exhausted():
+                return False
+
+        local_observation = working_jacobian.reshape(
+            len(OBSERVATION_AXES),
+            len(COMMAND_AXES),
+        ).copy()
+        measured_columns = np.zeros(len(COMMAND_AXES), dtype=bool)
+        base_state = current_state
+        for axis_index, axis in enumerate(COMMAND_AXES):
+            if move_budget_exhausted() or duration_exhausted():
+                break
+            probe_step_mm = _local_probe_step_mm(
+                calibration_jacobian,
+                axis_index,
+                local_probe_target_response_px,
+            )
+            requested_position = base_state.commanded_position_mm.copy()
+            requested_position[axis_index] += probe_step_mm
+            command_delta = requested_position - current_state.commanded_position_mm
+            predicted_delta_px = _predict_shift_delta(working_jacobian, command_delta)
+            feedback = record_verified_move(
+                kind="probe",
+                requested_position_mm=requested_position,
+                jacobian_before=working_jacobian,
+                predicted_delta_px=predicted_delta_px,
+                normalized_component=_normalized_component(command_delta, axis_scale),
+                gain_used=np.nan,
+                mu_used=np.nan,
+                local_jacobian_for_log=latest_local_jacobian,
+            )
+            if feedback is None:
+                break
+            probe_shift_delta = (
+                _measurement_shift_px(current_state.measurement)
+                - _measurement_shift_px(base_state.measurement)
+            )
+            local_observation[:, axis_index] = (
+                probe_shift_delta.reshape(-1) / probe_step_mm
+            )
+            measured_columns[axis_index] = True
+
+            if move_budget_exhausted() or duration_exhausted():
+                break
+            if _active_correction_indices(
+                base_state.commanded_position_mm - current_state.commanded_position_mm
+            ):
+                return_delta = (
+                    base_state.commanded_position_mm - current_state.commanded_position_mm
+                )
+                record_verified_move(
+                    kind="probe",
+                    requested_position_mm=base_state.commanded_position_mm.copy(),
+                    jacobian_before=working_jacobian,
+                    predicted_delta_px=_predict_shift_delta(
+                        working_jacobian,
+                        return_delta,
+                    ),
+                    normalized_component=_normalized_component(
+                        return_delta,
+                        axis_scale,
+                    ),
+                    gain_used=np.nan,
+                    mu_used=np.nan,
+                    local_jacobian_for_log=latest_local_jacobian,
+                )
+                base_state = current_state
+
+        if not np.any(measured_columns):
+            stop_reason = "local_probe_unavailable"
+            return False
+        latest_local_jacobian = local_observation.reshape(
+            len(CAMERAS),
+            len(PIXEL_AXES),
+            len(COMMAND_AXES),
+        )
+        working_jacobian = latest_local_jacobian.copy()
+        logger.info(
+            "Local probe updated working Jacobian from %d measured column(s).",
+            int(np.count_nonzero(measured_columns)),
+        )
+        return True
+
+    # Publish the initial measurement and planned correction before any motor move.
+    save_progress(completed=False)
+
+    poor_model_streak = 0
+    local_probe_ran = False
+    if local_probe_mode == "always" and not converged:
+        local_probe_ran = run_local_probe()
+
+    while not converged:
+        if move_budget_exhausted():
+            stop_reason = "max_moves_exhausted"
+            break
+        if duration_exhausted():
+            stop_reason = "max_duration_exhausted"
             break
 
-    if not converged:
-        warnings.append(
-            "correction did not converge within "
-            f"{max_moves} move(s); final residual {residual:.4g} px exceeds "
-            f"{pixel_tolerance_px:.4g} px"
-        )
         logger.info(
-            "Correction finished without convergence: moves=%d, residual=%.6g px",
-            move_count,
-            residual,
+            "Correction iteration %d starting: residual=%.6g px, gain=%g, mu=%g",
+            move_count() + 1,
+            current_state.residual_px,
+            current_gain,
+            current_mu,
+        )
+        gain_used = float(current_gain)
+        mu_used = float(current_mu)
+        jacobian_before = working_jacobian.copy()
+        estimated_offset_mm = estimate_command_offset(
+            working_jacobian,
+            current_state.measurement,
+            weights=weights,
+        )
+        correction_cmd_mm = solve_damped_command_correction(
+            working_jacobian,
+            current_state.measurement,
+            axis_scale,
+            gain=gain_used,
+            damping_mu=mu_used,
+            max_normalized_step=max_normalized_step,
+            min_axis_predicted_shift_px=min_axis_predicted_shift_px,
+            weights=weights,
+        )
+        correction_norm_mm = float(np.linalg.norm(correction_cmd_mm))
+        active_indices = _active_correction_indices(correction_cmd_mm)
+        logger.info(
+            "Computed correction command: estimated_offset_mm=%s, "
+            "delta_mm=%s, norm_mm=%.6g, active_axes=%s",
+            estimated_offset_mm.tolist(),
+            correction_cmd_mm.tolist(),
+            correction_norm_mm,
+            tuple(COMMAND_AXES[index] for index in active_indices),
+        )
+        if correction_norm_mm <= min_command_norm_mm or not active_indices:
+            if should_try_local_probe() and not local_probe_ran:
+                local_probe_ran = run_local_probe()
+                if local_probe_ran:
+                    continue
+            stop_reason = "no_active_correction"
+            warnings.append(
+                _correction_stop_warning(
+                    raw_correction_cmd_mm=correction_cmd_mm,
+                    correction_cmd_mm=correction_cmd_mm,
+                    estimated_offset_mm=estimated_offset_mm,
+                    min_command_norm_mm=min_command_norm_mm,
+                )
+            )
+            break
+
+        predicted_delta_px = _predict_shift_delta(jacobian_before, correction_cmd_mm)
+        predicted_weighted_response_px = _weighted_shift_norm(
+            predicted_delta_px,
+            weights=weights,
+        )
+        if predicted_weighted_response_px < min_total_predicted_shift_px:
+            if should_try_local_probe() and not local_probe_ran:
+                local_probe_ran = run_local_probe()
+                if local_probe_ran:
+                    continue
+            stop_reason = "predicted_response_too_small"
+            warnings.append(
+                _below_observable_feedback_warning(
+                    predicted_weighted_response_px=predicted_weighted_response_px,
+                    min_total_predicted_shift_px=min_total_predicted_shift_px,
+                )
+            )
+            break
+
+        pre_residual = current_state.residual_px
+        feedback = record_verified_move(
+            kind="trial",
+            requested_position_mm=(
+                current_state.commanded_position_mm + correction_cmd_mm
+            ),
+            jacobian_before=jacobian_before,
+            predicted_delta_px=predicted_delta_px,
+            normalized_component=_normalized_component(correction_cmd_mm, axis_scale),
+            gain_used=gain_used,
+            mu_used=mu_used,
+            local_jacobian_for_log=latest_local_jacobian,
+        )
+        if feedback is None:
+            stop_reason = "move_not_available"
+            break
+
+        converged = current_state.residual_px <= target_residual_px
+        if converged:
+            stop_reason = "target_residual_reached"
+            break
+
+        improvement = pre_residual - current_state.residual_px
+        weak_improvement = improvement < min_verified_improvement_px
+        feedback_valid = _correction_feedback_is_valid(
+            feedback,
+            min_total_predicted_shift_px=min_total_predicted_shift_px,
+            min_feedback_alpha=min_feedback_alpha,
+            min_feedback_parallel_shift_px=min_feedback_parallel_shift_px,
+        )
+        if weak_improvement or not feedback_valid:
+            poor_model_streak += 1
+        else:
+            poor_model_streak = 0
+        if weak_improvement or not feedback_valid:
+            current_gain = max(min_gain, 0.5 * current_gain)
+            current_mu = 2.0 * current_mu if current_mu > 0.0 else 1e-12
+            logger.info(
+                "Verified improvement was weak or invalid; reducing gain to %g "
+                "and increasing mu to %g.",
+                current_gain,
+                current_mu,
+            )
+        if (weak_improvement or not feedback_valid) and poor_model_streak >= 2:
+            if should_try_local_probe() and not local_probe_ran:
+                local_probe_ran = run_local_probe()
+                if local_probe_ran:
+                    poor_model_streak = 0
+                    continue
+            stop_reason = "no_verified_improvement"
+            break
+
+    converged = current_state.residual_px <= target_residual_px
+    if (
+        not converged
+        and return_to_best_on_failure
+        and verify_return_to_best
+        and best_state.residual_px + min_verified_improvement_px
+        < current_state.residual_px
+    ):
+        logger.info(
+            "Returning to best verified correction state: current=%.6g px, best=%.6g px",
+            current_state.residual_px,
+            best_state.residual_px,
+        )
+        command_return_to_state(best_state)
+        converged = current_state.residual_px <= target_residual_px
+        if not converged and current_state.residual_px > (
+            best_state.residual_px + min_verified_improvement_px
+        ):
+            warnings.append(
+                "return to best verified motor coordinates did not reproduce the "
+                "historical best image residual; final verified residual is "
+                f"{current_state.residual_px:.4g} px"
+            )
+        if stop_reason == "":
+            stop_reason = "returned_to_best"
+
+    if converged:
+        stop_reason = "target_residual_reached"
+        logger.info(
+            "Correction converged: moves=%d, final residual=%.6g px",
+            move_count(),
+            current_state.residual_px,
         )
     else:
+        if stop_reason == "":
+            stop_reason = "best_effort_not_converged"
+        warnings.append(
+            "correction best effort did not converge; final verified residual "
+            f"{current_state.residual_px:.4g} px exceeds target "
+            f"{target_residual_px:.4g} px after {move_count()} move(s)"
+        )
         logger.info(
-            "Correction converged: moves=%d, residual=%.6g px",
-            move_count,
-            residual,
+            "Correction finished without convergence: moves=%d, "
+            "final residual=%.6g px, reason=%s",
+            move_count(),
+            current_state.residual_px,
+            stop_reason,
         )
 
     return save_progress(completed=True)
@@ -1003,6 +1266,8 @@ def _restore_netcdf_safe_correction_result(result: xr.Dataset) -> xr.Dataset:
         "move_active_axis_mask",
         "move_jacobian_refined",
         "move_feedback_valid",
+        "move_accepted",
+        "move_is_best_after",
     ):
         if name in restored:
             restored[name] = restored[name].astype(bool)
@@ -1010,6 +1275,8 @@ def _restore_netcdf_safe_correction_result(result: xr.Dataset) -> xr.Dataset:
         "correction_applied",
         "correction_converged",
         "correction_history_completed",
+        "returned_to_best",
+        "return_to_best_verified",
     ):
         if key in restored.attrs:
             restored.attrs[key] = bool(restored.attrs[key])
@@ -1198,6 +1465,53 @@ def _weighted_shift_norm(
     return float(np.sqrt(max(float(values @ (weight_values * values)), 0.0)))
 
 
+def _measurement_shift_px(measurement: xr.Dataset) -> np.ndarray:
+    return np.asarray(measurement["shift_px"].values, dtype=np.float64)
+
+
+def _predict_shift_delta(jacobian: np.ndarray, command_delta_mm: np.ndarray) -> np.ndarray:
+    return (
+        np.asarray(jacobian, dtype=np.float64).reshape(
+            len(CAMERAS) * len(PIXEL_AXES),
+            len(COMMAND_AXES),
+        )
+        @ np.asarray(command_delta_mm, dtype=np.float64)
+    ).reshape(len(CAMERAS), len(PIXEL_AXES))
+
+
+def _normalized_component(
+    command_delta_mm: np.ndarray,
+    axis_scale_cmd_mm: np.ndarray,
+) -> np.ndarray:
+    axis_scale = np.asarray(axis_scale_cmd_mm, dtype=np.float64)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        normalized = np.asarray(command_delta_mm, dtype=np.float64) / axis_scale
+    normalized[~np.isfinite(normalized)] = np.nan
+    return normalized
+
+
+def _local_probe_step_mm(
+    calibration_jacobian: np.ndarray,
+    axis_index: int,
+    target_response_px: float,
+) -> float:
+    observation = np.asarray(calibration_jacobian, dtype=np.float64).reshape(
+        len(CAMERAS) * len(PIXEL_AXES),
+        len(COMMAND_AXES),
+    )
+    sensitivity = float(np.linalg.norm(observation[:, axis_index]))
+    axis = COMMAND_AXES[axis_index]
+    if not np.isfinite(sensitivity) or sensitivity <= 0.0:
+        nominal = constants.DEFAULT_VISUAL_CALIBRATION_STEP_MM_BY_AXIS[axis]
+    else:
+        nominal = float(target_response_px) / sensitivity
+    minimum = 2.0 * _correction_command_deadband(axis)
+    maximum = 0.25 * constants.DEFAULT_VISUAL_CALIBRATION_STEP_MM_BY_AXIS[axis]
+    if maximum < minimum:
+        maximum = minimum
+    return float(np.clip(nominal, minimum, maximum))
+
+
 def _shift_to_observation_vector(values: np.ndarray) -> np.ndarray:
     array = np.asarray(values, dtype=np.float64)
     if array.shape != (len(CAMERAS), len(PIXEL_AXES)):
@@ -1265,23 +1579,15 @@ def _reported_next_correction(
 ) -> np.ndarray:
     if converged:
         return np.zeros(len(COMMAND_AXES), dtype=np.float64)
-    estimated_offset = estimate_command_offset(
+    return solve_damped_command_correction(
         jacobian,
         measurement,
+        axis_scale,
+        gain=gain,
+        damping_mu=damping_mu,
+        max_normalized_step=max_normalized_step,
+        min_axis_predicted_shift_px=min_axis_predicted_shift_px,
         weights=weights,
-    )
-    return _zero_deadband_axis_corrections(
-        solve_damped_command_correction(
-            jacobian,
-            measurement,
-            axis_scale,
-            gain=gain,
-            damping_mu=damping_mu,
-            max_normalized_step=max_normalized_step,
-            min_axis_predicted_shift_px=min_axis_predicted_shift_px,
-            weights=weights,
-        ),
-        reference_cmd_mm=estimated_offset,
     )
 
 
@@ -1313,6 +1619,11 @@ def _build_correction_result(
     move_max_normalized_component: Sequence[float],
     move_active_axis_mask: Sequence[np.ndarray],
     move_jacobian_refined: Sequence[bool],
+    move_kind: Sequence[str],
+    move_accepted: Sequence[bool],
+    move_is_best_after: Sequence[bool],
+    move_verified_residuals: Sequence[float],
+    move_local_probe_jacobian: Sequence[np.ndarray | None],
     calibration_path: Path,
     correction_history_path: Path,
     correction_run_id: int,
@@ -1321,6 +1632,9 @@ def _build_correction_result(
     converged: bool,
     move_count: int,
     pixel_tolerance_px: float,
+    target_residual_px: float,
+    min_verified_improvement_px: float,
+    max_duration_s: float,
     gain: float,
     min_gain: float,
     damping_mu: float,
@@ -1335,6 +1649,14 @@ def _build_correction_result(
     max_moves: int,
     initial_commanded_position_mm: np.ndarray,
     commanded_position_mm: np.ndarray,
+    best_commanded_position_mm: np.ndarray,
+    best_verified_residual_px: float,
+    final_verified_residual_px: float,
+    local_probe_mode: str,
+    local_probe_target_response_px: float,
+    returned_to_best: bool,
+    return_to_best_verified: bool,
+    correction_stop_reason: str,
     warnings: Sequence[str],
 ) -> xr.Dataset:
     result = measurement.assign(
@@ -1467,6 +1789,33 @@ def _build_correction_result(
                 ("move",),
                 np.asarray(move_jacobian_refined, dtype=bool),
             ),
+            "move_kind": (
+                ("move",),
+                np.asarray(move_kind, dtype="U16"),
+            ),
+            "move_accepted": (
+                ("move",),
+                np.asarray(move_accepted, dtype=bool),
+            ),
+            "move_is_best_after": (
+                ("move",),
+                np.asarray(move_is_best_after, dtype=bool),
+            ),
+            "move_verified_residual_px": (
+                ("move",),
+                np.asarray(move_verified_residuals, dtype=np.float64),
+                {"units": "px"},
+            ),
+            "local_probe_jacobian_px_per_cmd_mm": (
+                ("move", "camera", "pixel_axis", "command_axis"),
+                _stack_optional_jacobian_or_empty(move_local_probe_jacobian),
+                {"units": "px/commanded-mm"},
+            ),
+            "best_commanded_position_mm": (
+                ("command_axis",),
+                best_commanded_position_mm,
+                {"units": "commanded-mm"},
+            ),
         }
     ).assign_coords(
         command_axis=list(COMMAND_AXES),
@@ -1486,6 +1835,9 @@ def _build_correction_result(
             "correction_converged": bool(converged),
             "correction_iterations": int(move_count),
             "pixel_tolerance_px": float(pixel_tolerance_px),
+            "target_residual_px": float(target_residual_px),
+            "min_verified_improvement_px": float(min_verified_improvement_px),
+            "max_correction_duration_s": float(max_duration_s),
             "correction_gain": float(gain),
             "correction_min_gain": float(min_gain),
             "correction_damping_mu": float(damping_mu),
@@ -1505,6 +1857,13 @@ def _build_correction_result(
             "correction_min_command_norm_mm": float(min_command_norm_mm),
             "max_correction_moves": int(max_moves),
             "correction_applied": move_count > 0,
+            "best_verified_residual_px": float(best_verified_residual_px),
+            "final_verified_residual_px": float(final_verified_residual_px),
+            "local_probe_mode": str(local_probe_mode),
+            "local_probe_target_response_px": float(local_probe_target_response_px),
+            "returned_to_best": bool(returned_to_best),
+            "return_to_best_verified": bool(return_to_best_verified),
+            "correction_stop_reason": str(correction_stop_reason),
             "warnings": "\n".join(tuple(dict.fromkeys(warnings))),
         }
     )
@@ -1577,6 +1936,26 @@ def _stack_jacobian_or_empty(rows: Sequence[np.ndarray]) -> np.ndarray:
             dtype=np.float64,
         )
     return np.stack(rows, axis=0).astype(np.float64, copy=False)
+
+
+def _stack_optional_jacobian_or_empty(rows: Sequence[np.ndarray | None]) -> np.ndarray:
+    if not rows:
+        return np.empty(
+            (0, len(CAMERAS), len(PIXEL_AXES), len(COMMAND_AXES)),
+            dtype=np.float64,
+        )
+    nan_row = np.full(
+        (len(CAMERAS), len(PIXEL_AXES), len(COMMAND_AXES)),
+        np.nan,
+        dtype=np.float64,
+    )
+    return np.stack(
+        [
+            nan_row if row is None else np.asarray(row, dtype=np.float64)
+            for row in rows
+        ],
+        axis=0,
+    )
 
 
 def _zero_deadband_axis_corrections(
