@@ -43,9 +43,9 @@ MOTOR_STALE_READBACK_DELAY_S: float = 10.0
 # Correction offset pruning thresholds. Values are in commanded mm and are applied
 # to estimated command offsets before sending gain-scaled correction components.
 CORRECTION_COMMAND_DEADBAND_MM_BY_AXIS: dict[str, float] = {
-    "x": 0.005,
-    "y": 0.01,
-    "z": 0.005,
+    "x": 0.003,
+    "y": 0.003,
+    "z": 0.003,
 }
 
 # Default number of image pairs captured at each calibration/correction position.
