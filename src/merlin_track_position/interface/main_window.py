@@ -38,6 +38,7 @@ from merlin_track_position.instruments.framegrab import get_framegrabber_image
 from merlin_track_position.interface.calibration_panel import CalibrationPanel
 from merlin_track_position.interface.calibration_thread import CalibrationThread
 from merlin_track_position.interface.correction_thread import CorrectionThread
+from merlin_track_position.interface.detection_thread import DetectShiftThread
 from merlin_track_position.server import MotorServer
 from merlin_track_position.tracking.calibrate import visual_calibration_probe_count
 from merlin_track_position.tracking.calibration_core import (
@@ -417,6 +418,7 @@ class MainWindow(_MainWindowGUI):
         self._calibration_path: Path | None = None
         self._calibration_thread = CalibrationThread(self)
         self._correction_thread = CorrectionThread(self)
+        self._detect_shift_thread = DetectShiftThread(self)
         self._calibration_total_steps = 0
         self._calibration_started_at: float | None = None
         self._calibration_processing_started_at: float | None = None
@@ -484,6 +486,9 @@ class MainWindow(_MainWindowGUI):
         self.calibration_panel.correct_sample_button.clicked.connect(
             self._on_correct_sample_clicked
         )
+        self.calibration_panel.detect_shift_button.clicked.connect(
+            self._on_detect_shift_clicked
+        )
         self.calibration_panel.new_calibration_button.clicked.connect(
             self._on_new_calibration_clicked
         )
@@ -502,6 +507,12 @@ class MainWindow(_MainWindowGUI):
         )
         self._correction_thread.sigCorrectionReady.connect(self._on_correction_ready)
         self._correction_thread.sigCorrectionFailed.connect(self._on_correction_failed)
+        self._detect_shift_thread.sigDetectionReady.connect(
+            self._on_detect_shift_ready
+        )
+        self._detect_shift_thread.sigDetectionFailed.connect(
+            self._on_detect_shift_failed
+        )
         self.image_auto_refresh_checkbox.toggled.connect(
             self._on_image_auto_refresh_toggled
         )
@@ -638,8 +649,21 @@ class MainWindow(_MainWindowGUI):
             return "Correction is unavailable while calibration is running."
         if self._correction_thread.isRunning():
             return "Correction is already in progress."
+        if self._detect_shift_thread.isRunning():
+            return "Correction is unavailable while shift detection is running."
         if self._calibration_path is None or not self._calibration_path.exists():
             return "Correction requires a calibration file on disk."
+        return None
+
+    def _detection_unavailable_message(self) -> str | None:
+        if self._calibration is None:
+            return "Shift detection requires a loaded calibration."
+        if self._calibration_thread.isRunning():
+            return "Shift detection is unavailable while calibration is running."
+        if self._correction_thread.isRunning():
+            return "Shift detection is unavailable while correction is running."
+        if self._detect_shift_thread.isRunning():
+            return "Shift detection is already in progress."
         return None
 
     def _start_correction(self, *, motor_backend: object | None = None) -> None:
@@ -792,7 +816,7 @@ class MainWindow(_MainWindowGUI):
 
     @QtCore.Slot()
     def _on_load_calibration_clicked(self) -> None:
-        if self._correction_thread.isRunning():
+        if self._correction_thread.isRunning() or self._detect_shift_thread.isRunning():
             return
 
         self._flush_pending_persistence()
@@ -826,7 +850,11 @@ class MainWindow(_MainWindowGUI):
 
     @QtCore.Slot()
     def _on_save_calibration_clicked(self) -> None:
-        if self._calibration is None or self._correction_thread.isRunning():
+        if (
+            self._calibration is None
+            or self._correction_thread.isRunning()
+            or self._detect_shift_thread.isRunning()
+        ):
             return
 
         try:
@@ -880,7 +908,11 @@ class MainWindow(_MainWindowGUI):
 
     @QtCore.Slot()
     def _on_new_calibration_clicked(self) -> None:
-        if self._calibration_thread.isRunning() or self._correction_thread.isRunning():
+        if (
+            self._calibration_thread.isRunning()
+            or self._correction_thread.isRunning()
+            or self._detect_shift_thread.isRunning()
+        ):
             return
         if self._calibration is not None:
             self._clear_loaded_calibration()
@@ -971,6 +1003,42 @@ class MainWindow(_MainWindowGUI):
                 "Could not start correction",
                 str(exc),
             )
+
+    @QtCore.Slot()
+    def _on_detect_shift_clicked(self) -> None:
+        unavailable_message = self._detection_unavailable_message()
+        if unavailable_message is not None:
+            if (
+                self._calibration is not None
+                and not self._calibration_thread.isRunning()
+                and not self._correction_thread.isRunning()
+                and not self._detect_shift_thread.isRunning()
+            ):
+                QtWidgets.QMessageBox.critical(
+                    self,
+                    "Could not detect shift",
+                    unavailable_message,
+                )
+            return
+
+        if self._calibration is None:
+            return
+
+        camera_pair = self._camera_pair_for_current_rois()
+        try:
+            self._detect_shift_thread.configure(self._calibration, camera_pair)
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Could not detect shift",
+                str(exc),
+            )
+            return
+
+        self._pause_image_auto_refresh_for_calibration()
+        self._set_roi_editing_enabled(False)
+        self.calibration_panel.show_detection_in_progress()
+        self._detect_shift_thread.start()
 
     @QtCore.Slot(int, float, float, float, object, object)
     def _on_calibration_step(
@@ -1138,9 +1206,44 @@ class MainWindow(_MainWindowGUI):
             error_message,
         )
 
+    @QtCore.Slot(object)
+    def _on_detect_shift_ready(self, result: object) -> None:
+        logger.info("Shift detection ready signal received.")
+        try:
+            self._restore_image_auto_refresh_after_calibration()
+            if not isinstance(result, xr.Dataset):
+                raise TypeError("shift detection thread did not return an xarray Dataset")
+            self._set_roi_editing_enabled(False)
+            self.calibration_panel.show_detection_result(result)
+        except Exception as exc:
+            self._restore_calibration_idle_state()
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Could not use shift detection result",
+                str(exc),
+            )
+            return
+
+        logger.info("Shift detection result applied to GUI.")
+
+    @QtCore.Slot(str)
+    def _on_detect_shift_failed(self, error_message: str) -> None:
+        logger.error("Shift detection failed signal received: %s", error_message)
+        self._restore_image_auto_refresh_after_calibration()
+        self._restore_calibration_idle_state()
+        QtWidgets.QMessageBox.critical(
+            self,
+            "Could not detect shift",
+            error_message,
+        )
+
     @QtCore.Slot()
     def _on_calibration_details_clicked(self) -> None:
-        if self._calibration is None or self._correction_thread.isRunning():
+        if (
+            self._calibration is None
+            or self._correction_thread.isRunning()
+            or self._detect_shift_thread.isRunning()
+        ):
             return
 
         self.calibration_panel.build_details_dialog(self._calibration).exec()
@@ -1262,6 +1365,9 @@ class MainWindow(_MainWindowGUI):
 
         self._correction_thread.stop()
         self._correction_thread.wait()
+
+        self._detect_shift_thread.stop()
+        self._detect_shift_thread.wait()
 
         close_basler_camera()
 

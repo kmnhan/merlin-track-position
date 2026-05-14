@@ -14,6 +14,7 @@ from merlin_track_position.instruments.cameras import (
 )
 from merlin_track_position.interface.calibration_thread import CalibrationThread
 from merlin_track_position.interface.correction_thread import CorrectionThread
+from merlin_track_position.interface.detection_thread import DetectShiftThread
 from merlin_track_position.tracking.sample_calibration import (
     build_sample_calibration_dataset,
 )
@@ -239,6 +240,71 @@ class CorrectionThreadTests(unittest.TestCase):
                 side_effect=RuntimeError("boom"),
             ):
                 thread.run()
+
+        self.assertEqual(ready, [])
+        self.assertEqual(failed, ["boom"])
+
+
+class DetectShiftThreadTests(unittest.TestCase):
+    def test_run_calls_detect_shift_and_emits_ready(self):
+        get_qapp()
+        image_cam0 = np.arange(4 * 5, dtype=float).reshape(4, 5)
+        image_cam1 = np.arange(6 * 7, dtype=float).reshape(6, 7)
+        camera_pair = CameraPairPlugin(
+            CallableCameraPlugin("cam0", lambda: image_cam0),
+            CallableCameraPlugin("cam1", lambda: image_cam1),
+        )
+        calibration = build_sample_calibration_dataset(
+            image_shape_cam0=(4, 5),
+            image_shape_cam1=(6, 7),
+        )
+        result = xr.Dataset(attrs={"warnings": ""})
+        calls = []
+
+        def fake_detect_shift(passed_calibration, passed_camera_pair):
+            calls.append((passed_calibration, passed_camera_pair))
+            return result
+
+        thread = DetectShiftThread()
+        ready = []
+        failed = []
+        thread.sigDetectionReady.connect(lambda value: ready.append(value))
+        thread.sigDetectionFailed.connect(lambda message: failed.append(message))
+
+        thread.configure(calibration, camera_pair)
+        with patch(
+            "merlin_track_position.interface.detection_thread.detect_shift",
+            side_effect=fake_detect_shift,
+        ):
+            thread.run()
+
+        self.assertEqual(calls, [(calibration, camera_pair)])
+        self.assertEqual(ready, [result])
+        self.assertEqual(failed, [])
+
+    def test_run_emits_failure_when_detect_shift_raises(self):
+        get_qapp()
+        thread = DetectShiftThread()
+        ready = []
+        failed = []
+        thread.sigDetectionReady.connect(lambda value: ready.append(value))
+        thread.sigDetectionFailed.connect(lambda message: failed.append(message))
+        thread.configure(
+            build_sample_calibration_dataset(
+                image_shape_cam0=(4, 5),
+                image_shape_cam1=(6, 7),
+            ),
+            CameraPairPlugin(
+                CallableCameraPlugin("cam0", lambda: np.zeros((2, 2))),
+                CallableCameraPlugin("cam1", lambda: np.zeros((2, 2))),
+            ),
+        )
+
+        with patch(
+            "merlin_track_position.interface.detection_thread.detect_shift",
+            side_effect=RuntimeError("boom"),
+        ):
+            thread.run()
 
         self.assertEqual(ready, [])
         self.assertEqual(failed, ["boom"])

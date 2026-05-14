@@ -151,6 +151,39 @@ class FakeCorrectionThread(QtCore.QObject):
         pass
 
 
+class FakeDetectShiftThread(QtCore.QObject):
+    sigDetectionReady = QtCore.Signal(object)
+    sigDetectionFailed = QtCore.Signal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.calibration = None
+        self.camera_pair = None
+        self.started = False
+        self.running = False
+
+    def configure(
+        self,
+        calibration,
+        camera_pair,
+    ):
+        self.calibration = calibration
+        self.camera_pair = camera_pair
+
+    def start(self):
+        self.started = True
+        self.running = True
+
+    def isRunning(self):
+        return self.running
+
+    def stop(self):
+        self.running = False
+
+    def wait(self):
+        pass
+
+
 @contextmanager
 def patched_main_window_runtime(settings=None):
     settings = settings or FakeSettings()
@@ -170,6 +203,10 @@ def patched_main_window_runtime(settings=None):
         patch(
             "merlin_track_position.interface.main_window.CorrectionThread",
             FakeCorrectionThread,
+        ),
+        patch(
+            "merlin_track_position.interface.main_window.DetectShiftThread",
+            FakeDetectShiftThread,
         ),
         patch("merlin_track_position.interface.main_window.close_basler_camera"),
     ):
@@ -293,6 +330,30 @@ def correction_result_before_first_move() -> xr.Dataset:
     )
 
 
+def detection_result(
+    *,
+    offsets_mm=(0.004, -0.005, 0.006),
+    residual: float = 1.25,
+    warnings: str = "",
+) -> xr.Dataset:
+    offsets = np.asarray(offsets_mm, dtype=float)
+    return xr.Dataset(
+        data_vars={
+            "estimated_command_offset_mm": (
+                ("command_axis",),
+                offsets,
+            ),
+            "detected_shift_um": (
+                ("command_axis",),
+                1000.0 * offsets,
+            ),
+            "weighted_residual_px": ((), float(residual)),
+        },
+        coords={"command_axis": list(COMMAND_AXES)},
+        attrs={"warnings": warnings},
+    )
+
+
 def write_sample_calibration(path: Path) -> xr.Dataset:
     calibration = build_sample_calibration_dataset(
         image_shape_cam0=(4, 5),
@@ -387,6 +448,9 @@ class CalibrationPanelTests(unittest.TestCase):
         self.assertIn("test.h5", panel.calibration_status_label.text())
         self.assertEqual(panel.new_calibration_button.text(), "Clear calibration")
         self.assertTrue(panel.correct_sample_button.isEnabled())
+        self.assertEqual(panel.correct_sample_button.text(), "Correct sample")
+        self.assertTrue(panel.detect_shift_button.isEnabled())
+        self.assertEqual(panel.detect_shift_button.text(), "Detect shift")
         self.assertNotEqual(panel.metric_labels["axis_scale_cmd_mm"].text(), "n/a")
         self.assertEqual(tabs.tabText(0), "Matrices")
         self.assertEqual(tabs.tabText(1), "Axes")
@@ -402,6 +466,7 @@ class CalibrationPanelTests(unittest.TestCase):
         panel.reset()
         self.assertEqual(panel.new_calibration_button.text(), "New calibration")
         self.assertFalse(panel.correct_sample_button.isEnabled())
+        self.assertFalse(panel.detect_shift_button.isEnabled())
 
         panel.show_loaded_calibration(calibration, "test.h5")
         panel.show_correction_in_progress()
@@ -410,6 +475,7 @@ class CalibrationPanelTests(unittest.TestCase):
         self.assertFalse(panel.save_calibration_button.isEnabled())
         self.assertFalse(panel.calibration_details_button.isEnabled())
         self.assertFalse(panel.correct_sample_button.isEnabled())
+        self.assertFalse(panel.detect_shift_button.isEnabled())
         self.assertFalse(panel.new_calibration_button.isEnabled())
         self.assertFalse(panel.correction_steps_group.isHidden())
         self.assertEqual(panel.correction_steps_table.rowCount(), 0)
@@ -474,6 +540,28 @@ class CalibrationPanelTests(unittest.TestCase):
             panel.correction_steps_summary_label.text(),
         )
 
+    def test_detection_result_displays_signed_shift_in_microns(self):
+        get_qapp()
+        panel = CalibrationPanel()
+        result = detection_result(warnings="registration warning")
+
+        panel.show_detection_result(result)
+
+        self.assertIn(
+            "Detected shift: x=4 um, y=-5 um, z=6 um.",
+            panel.calibration_status_label.text(),
+        )
+        self.assertIn(
+            "Weighted residual 1.25 px.",
+            panel.calibration_status_label.text(),
+        )
+        self.assertTrue(panel.correct_sample_button.isEnabled())
+        self.assertTrue(panel.detect_shift_button.isEnabled())
+        self.assertEqual(
+            panel.calibration_warnings_text.toPlainText(),
+            "registration warning",
+        )
+
 
 class MainWindowCalibrationStateTests(unittest.TestCase):
     def test_fresh_window_has_editable_roi_and_new_calibration_button(self):
@@ -487,6 +575,17 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                 )
                 self.assertFalse(
                     window.calibration_panel.correct_sample_button.isEnabled()
+                )
+                self.assertEqual(
+                    window.calibration_panel.correct_sample_button.text(),
+                    "Correct sample",
+                )
+                self.assertFalse(
+                    window.calibration_panel.detect_shift_button.isEnabled()
+                )
+                self.assertEqual(
+                    window.calibration_panel.detect_shift_button.text(),
+                    "Detect shift",
                 )
                 self.assertTrue(roi_handles_visible(window))
                 self.assertTrue(roi_editing_enabled(window))
@@ -512,6 +611,9 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                 self.assertTrue(
                     window.calibration_panel.correct_sample_button.isEnabled()
                 )
+                self.assertTrue(
+                    window.calibration_panel.detect_shift_button.isEnabled()
+                )
                 self.assertFalse(roi_handles_visible(window))
                 self.assertFalse(roi_editing_enabled(window))
 
@@ -530,6 +632,9 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                 )
                 self.assertFalse(
                     window.calibration_panel.correct_sample_button.isEnabled()
+                )
+                self.assertFalse(
+                    window.calibration_panel.detect_shift_button.isEnabled()
                 )
                 self.assertTrue(roi_handles_visible(window))
                 self.assertTrue(roi_editing_enabled(window))
@@ -654,6 +759,74 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                     )
                     self.assertFalse(
                         window.calibration_panel.new_calibration_button.isEnabled()
+                    )
+                finally:
+                    window.close()
+
+    def test_detect_shift_starts_thread_and_disables_actions(self):
+        get_qapp()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "calibration.h5"
+            calibration = write_sample_calibration(path)
+            with patched_main_window_runtime():
+                window = MainWindow()
+                try:
+                    window._on_new_calibration_ready(calibration)
+
+                    window._on_detect_shift_clicked()
+
+                    thread = window._detect_shift_thread
+                    self.assertTrue(thread.started)
+                    self.assertIs(thread.calibration, window._calibration)
+                    self.assertIsNotNone(thread.camera_pair)
+                    self.assertIsNone(window._last_correction_result)
+                    self.assertFalse(window._server_correction_pending)
+                    self.assertIn(
+                        "Detecting shift",
+                        window.calibration_panel.calibration_status_label.text(),
+                    )
+                    self.assertFalse(
+                        window.calibration_panel.correct_sample_button.isEnabled()
+                    )
+                    self.assertFalse(
+                        window.calibration_panel.detect_shift_button.isEnabled()
+                    )
+                    self.assertFalse(
+                        window.calibration_panel.new_calibration_button.isEnabled()
+                    )
+                finally:
+                    window.close()
+
+    def test_detect_shift_result_preserves_correction_and_calibration_state(self):
+        get_qapp()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "calibration.h5"
+            calibration = write_sample_calibration(path)
+            previous_correction = correction_result(converged=False)
+            result = detection_result()
+            with patched_main_window_runtime():
+                window = MainWindow()
+                try:
+                    window._on_new_calibration_ready(calibration)
+                    original_calibration = window._calibration
+                    window._last_correction_result = previous_correction
+                    window.calibration_panel.show_detection_in_progress()
+
+                    window._on_detect_shift_ready(result)
+
+                    self.assertIs(window._calibration, original_calibration)
+                    self.assertIs(window._last_correction_result, previous_correction)
+                    self.assertEqual(window._server.result_calls, [])
+                    self.assertFalse(correction_history_path(path).exists())
+                    self.assertIn(
+                        "Detected shift: x=4 um, y=-5 um, z=6 um.",
+                        window.calibration_panel.calibration_status_label.text(),
+                    )
+                    self.assertTrue(
+                        window.calibration_panel.correct_sample_button.isEnabled()
+                    )
+                    self.assertTrue(
+                        window.calibration_panel.detect_shift_button.isEnabled()
                     )
                 finally:
                     window.close()

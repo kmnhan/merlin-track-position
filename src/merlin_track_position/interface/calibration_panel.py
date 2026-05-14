@@ -471,12 +471,15 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.calibration_details_button = QtWidgets.QPushButton("Details...")
         self.correct_sample_button = QtWidgets.QPushButton("Correct sample")
         self.correct_sample_button.setEnabled(False)
+        self.detect_shift_button = QtWidgets.QPushButton("Detect shift")
+        self.detect_shift_button.setEnabled(False)
         self.new_calibration_button = QtWidgets.QPushButton("New calibration")
         self.new_calibration_button.setEnabled(False)
         calibration_button_layout.addWidget(self.load_calibration_button)
         calibration_button_layout.addWidget(self.save_calibration_button)
         calibration_button_layout.addWidget(self.calibration_details_button)
         calibration_button_layout.addWidget(self.correct_sample_button)
+        calibration_button_layout.addWidget(self.detect_shift_button)
         calibration_button_layout.addWidget(self.new_calibration_button)
         calibration_layout.addLayout(calibration_button_layout)
 
@@ -588,6 +591,7 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.save_calibration_button.setEnabled(False)
         self.calibration_details_button.setEnabled(False)
         self.correct_sample_button.setEnabled(False)
+        self.detect_shift_button.setEnabled(False)
         self.new_calibration_button.setEnabled(True)
         self.new_calibration_button.setText("New calibration")
         self.calibration_status_label.setText("No calibration loaded.")
@@ -609,6 +613,7 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.save_calibration_button.setEnabled(False)
         self.calibration_details_button.setEnabled(False)
         self.correct_sample_button.setEnabled(False)
+        self.detect_shift_button.setEnabled(False)
         self.new_calibration_button.setEnabled(False)
         self.new_calibration_button.setText("New calibration")
         self.calibration_status_label.setText("New calibration in progress...")
@@ -673,6 +678,7 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.save_calibration_button.setEnabled(True)
         self.calibration_details_button.setEnabled(True)
         self.correct_sample_button.setEnabled(True)
+        self.detect_shift_button.setEnabled(True)
         self.new_calibration_button.setEnabled(True)
         self.new_calibration_button.setText("Clear calibration")
         self.calibration_progress_bar.setVisible(False)
@@ -781,6 +787,7 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.save_calibration_button.setEnabled(False)
         self.calibration_details_button.setEnabled(False)
         self.correct_sample_button.setEnabled(False)
+        self.detect_shift_button.setEnabled(False)
         self.new_calibration_button.setEnabled(False)
         self.new_calibration_button.setText("Clear calibration")
         self.calibration_progress_bar.setVisible(True)
@@ -852,6 +859,56 @@ class CalibrationPanel(QtWidgets.QWidget):
             "\n".join(warning_lines) if warning_lines else "No correction warnings."
         )
         self._show_correction_steps(result)
+
+    def show_detection_in_progress(self) -> None:
+        self.load_calibration_button.setEnabled(False)
+        self.save_calibration_button.setEnabled(False)
+        self.calibration_details_button.setEnabled(False)
+        self.correct_sample_button.setEnabled(False)
+        self.detect_shift_button.setEnabled(False)
+        self.new_calibration_button.setEnabled(False)
+        self.new_calibration_button.setText("Clear calibration")
+        self.calibration_progress_bar.setVisible(True)
+        self.calibration_progress_bar.setRange(0, 0)
+        self.calibration_status_label.setText("Detecting shift...")
+
+    def show_detection_result(self, result: xr.Dataset) -> None:
+        self.load_calibration_button.setEnabled(True)
+        self.save_calibration_button.setEnabled(True)
+        self.calibration_details_button.setEnabled(True)
+        self.correct_sample_button.setEnabled(True)
+        self.detect_shift_button.setEnabled(True)
+        self.new_calibration_button.setEnabled(True)
+        self.new_calibration_button.setText("Clear calibration")
+        self.calibration_progress_bar.setVisible(False)
+
+        residual = math.nan
+        if "weighted_residual_px" in result:
+            residual = float(result["weighted_residual_px"].values)
+
+        if "estimated_command_offset_mm" in result:
+            offset_text = _format_axis_triplet_um(
+                result["estimated_command_offset_mm"].values
+            )
+        elif "detected_shift_um" in result:
+            values_um = np.asarray(result["detected_shift_um"].values, dtype=float)
+            offset_text = _format_axis_triplet_um(values_um / 1000.0)
+        else:
+            offset_text = "x=n/a um, y=n/a um, z=n/a um"
+
+        self.calibration_status_label.setText(
+            f"Detected shift: {offset_text}. "
+            f"Weighted residual {_format_number(residual)} px."
+        )
+
+        warning_lines = [
+            line.strip()
+            for line in str(result.attrs.get("warnings", "")).splitlines()
+            if line.strip()
+        ]
+        self.calibration_warnings_text.setPlainText(
+            "\n".join(warning_lines) if warning_lines else "No detection warnings."
+        )
 
     def build_details_dialog(
         self,

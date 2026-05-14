@@ -130,13 +130,13 @@ class TrackShiftMotorBackend:
         if not axes:
             return ()
 
-        targets_mm: dict[str, float] = {}
+        active_targets_mm: dict[str, float] = {}
         for axis, goal in zip(axes, goals, strict=True):
             if axis not in _XYZ_AXES:
                 raise ValueError(f"unsupported Track Shift correction axis: {axis!r}")
             if not math.isfinite(goal):
                 raise ValueError(f"target for axis {axis!r} must be finite")
-            targets_mm[axis] = goal
+            active_targets_mm[axis] = goal
 
         timeout_ms = max(1, int(round(float(move_timeout_s) * 1000.0)))
         if self._default_move_timeout_ms > 0:
@@ -151,6 +151,8 @@ class TrackShiftMotorBackend:
             self._pending_axes = axes
             self._pending_result = _UNSET
 
+        targets_mm = dict(self._positions_mm)
+        targets_mm.update(active_targets_mm)
         payload = {
             "session_id": self.session_id,
             "move_id": move_id,
@@ -165,7 +167,7 @@ class TrackShiftMotorBackend:
             self.session_id,
             move_id,
             axes,
-            targets_mm,
+            active_targets_mm,
             timeout_ms,
         )
         try:

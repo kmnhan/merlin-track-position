@@ -45,7 +45,10 @@ class TrackShiftMotorBackendTests(unittest.TestCase):
         self.assertEqual(requests[0]["session_id"], "session-1")
         self.assertEqual(requests[0]["move_id"], 1)
         self.assertEqual(requests[0]["axes"], ["x", "z"])
-        self.assertEqual(requests[0]["targets_mm"], {"x": 0.5, "z": -1.25})
+        self.assertEqual(
+            requests[0]["targets_mm"],
+            {"x": 0.5, "y": 2.0, "z": -1.25},
+        )
         self.assertEqual(requests[0]["timeout_ms"], 60_000)
         self.assertEqual(requests[0]["max_retries"], 2)
         self.assertEqual(backend.get_positions(("x", "y", "z")), (0.5, 2.0, -1.25))
@@ -112,7 +115,10 @@ class MotorServerDialogueTests(unittest.TestCase):
             self.assertEqual(decoded_payload["session_id"], "session-1")
             self.assertEqual(decoded_payload["move_id"], 1)
             self.assertEqual(decoded_payload["axes"], ["x"])
-            self.assertEqual(decoded_payload["targets_mm"], {"x": 0.25})
+            self.assertEqual(
+                decoded_payload["targets_mm"],
+                {"x": 0.25, "y": 2.0, "z": -0.3},
+            )
 
             response = server._handle_request(
                 {
@@ -131,4 +137,3 @@ class MotorServerDialogueTests(unittest.TestCase):
             self.assertEqual(move_result, [(0.25,)])
         finally:
             server.stop()
-

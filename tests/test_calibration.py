@@ -33,6 +33,7 @@ from merlin_track_position.tracking.correct import (
     flush_pending_correction_history_datasets,
     load_latest_correction_history_dataset,
 )
+from merlin_track_position.tracking.detect import detect_shift
 from merlin_track_position.tracking.persistence import pending_entry_count
 
 
@@ -160,6 +161,51 @@ def calibration_dataset(jacobian=None):
     )
     validate_visual_calibration_dataset(dataset)
     return dataset
+
+
+class ShiftDetectionTests(unittest.TestCase):
+    def test_detect_shift_reports_signed_offset_without_history_or_mutation(self):
+        offset_mm = np.asarray([0.004, -0.005, 0.006], dtype=float)
+        calibration = calibration_dataset()
+        shift = measured_from_jacobian(
+            offset_mm.reshape(1, len(COMMAND_AXES)),
+            calibration["visual_jacobian_px_per_cmd_mm"].values,
+        )[0]
+        measurement = shift_dataset(shift).assign_attrs(
+            {"warnings": "registration warning"}
+        )
+        attrs_before = dict(calibration.attrs)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "calibration.h5"
+            calibration = calibration.assign_attrs({"calibration_path": str(path)})
+            attrs_before |= {"calibration_path": str(path)}
+
+            with patch(
+                "merlin_track_position.tracking.detect._capture_measurement",
+                return_value=measurement,
+            ) as capture:
+                result = detect_shift(calibration, object(), capture_count=1)
+
+            capture.assert_called_once()
+            self.assertEqual(capture.call_args.args[4], 1)
+            np.testing.assert_allclose(
+                result["estimated_command_offset_mm"].values,
+                offset_mm,
+                atol=1e-12,
+            )
+            np.testing.assert_allclose(
+                result["detected_shift_um"].values,
+                1000.0 * offset_mm,
+                atol=1e-9,
+            )
+            self.assertAlmostEqual(
+                float(result["weighted_residual_px"].values),
+                weighted_pixel_residual(measurement),
+            )
+            self.assertEqual(result.attrs["warnings"], "registration warning")
+            self.assertEqual(dict(calibration.attrs), attrs_before)
+            self.assertFalse(correction_history_path(path).exists())
 
 
 class VisualCalibrationTests(unittest.TestCase):

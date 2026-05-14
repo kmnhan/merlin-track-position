@@ -117,12 +117,15 @@ def _move_payload(
     move_id: int,
     move: Move,
     max_retries: int,
+    current_positions_mm: dict[str, float],
 ) -> dict[str, Any]:
+    targets_mm = {axis: float(current_positions_mm.get(axis, 0.0)) for axis in XYZ_AXES}
+    targets_mm.update(move.targets_mm)
     return {
         "session_id": session_id,
         "move_id": move_id,
         "axes": list(move.axes),
-        "targets_mm": dict(move.targets_mm),
+        "targets_mm": targets_mm,
         "timeout_ms": move.timeout_ms,
         "max_retries": max_retries,
     }
@@ -195,6 +198,7 @@ def run_server(args: argparse.Namespace) -> int:
     session_id = args.session_id or uuid.uuid4().hex
     next_move_index = 0
     awaiting_move_id: int | None = None
+    current_positions_mm = {axis: 0.0 for axis in XYZ_AXES}
 
     try:
         while True:
@@ -211,6 +215,13 @@ def run_server(args: argparse.Namespace) -> int:
             command = str(request.get("command", "")).upper()
             if command in ("", "START"):
                 session_id = str(request.get("session_id") or session_id)
+                positions = request.get("positions_mm")
+                if isinstance(positions, dict):
+                    for axis in XYZ_AXES:
+                        try:
+                            current_positions_mm[axis] = float(positions.get(axis, 0.0))
+                        except Exception:
+                            current_positions_mm[axis] = 0.0
                 next_move_index = 0
                 awaiting_move_id = None
                 print(f"START target={request.get('target')!r}")
@@ -226,6 +237,7 @@ def run_server(args: argparse.Namespace) -> int:
                     move_id=move_id,
                     move=moves[next_move_index],
                     max_retries=args.max_retries,
+                    current_positions_mm=current_positions_mm,
                 )
                 next_move_index += 1
                 _send(socket, "MOVE", payload)
@@ -243,6 +255,15 @@ def run_server(args: argparse.Namespace) -> int:
                 )
                 ok = bool(request.get("ok", False))
                 print(f"MOVE_RESULT ok={ok!r} message={request.get('message')!r}")
+                positions = request.get("positions_mm")
+                if isinstance(positions, dict):
+                    for axis in XYZ_AXES:
+                        try:
+                            current_positions_mm[axis] = float(
+                                positions.get(axis, current_positions_mm[axis])
+                            )
+                        except Exception:
+                            pass
 
                 if not ok:
                     _send(
@@ -266,6 +287,7 @@ def run_server(args: argparse.Namespace) -> int:
                     move_id=move_id,
                     move=moves[next_move_index],
                     max_retries=args.max_retries,
+                    current_positions_mm=current_positions_mm,
                 )
                 next_move_index += 1
                 _send(socket, "MOVE", payload)
