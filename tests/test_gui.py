@@ -288,14 +288,6 @@ def correction_result_with_moves() -> xr.Dataset:
                 ("command_axis",),
                 np.asarray([0.00025, 0.0, -0.00075], dtype=float),
             ),
-            "move_kind": (
-                ("move",),
-                np.asarray(["trial", "probe"]),
-            ),
-            "move_accepted": (
-                ("move",),
-                np.asarray([True, False], dtype=bool),
-            ),
         },
         coords={
             "iteration": np.arange(3),
@@ -538,21 +530,13 @@ class CalibrationPanelTests(unittest.TestCase):
         table = panel.correction_steps_table
         self.assertFalse(panel.correction_steps_group.isHidden())
         self.assertEqual(table.rowCount(), 2)
-        self.assertEqual(table.item(0, 1).text(), "trial")
-        self.assertEqual(table.item(0, 2).text(), "1.5")
-        self.assertEqual(table.item(0, 3).text(), "-2")
-        self.assertEqual(table.item(0, 4).text(), "0")
-        self.assertEqual(table.item(0, 7).text(), "yes")
-        self.assertEqual(table.item(1, 1).text(), "probe")
-        self.assertEqual(table.item(1, 2).text(), "-0.5")
-        self.assertEqual(table.item(1, 4).text(), "3.25")
-        self.assertEqual(table.item(1, 7).text(), "no")
+        self.assertEqual(table.item(0, 1).text(), "1.5")
+        self.assertEqual(table.item(0, 2).text(), "-2")
+        self.assertEqual(table.item(0, 3).text(), "0")
+        self.assertEqual(table.item(1, 1).text(), "-0.5")
+        self.assertEqual(table.item(1, 3).text(), "3.25")
         self.assertIn(
-            "Accepted trial total: x=1.5 um, y=-2 um, z=0 um.",
-            panel.correction_steps_summary_label.text(),
-        )
-        self.assertIn(
-            "Move mix: 1 trial, 1 probe, 0 return_best.",
+            "Applied total: x=1 um, y=-2 um, z=3.25 um.",
             panel.correction_steps_summary_label.text(),
         )
 
@@ -1013,7 +997,7 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                         2,
                     )
                     self.assertIn(
-                        "Accepted trial total: x=1.5 um, y=-2 um, z=0 um.",
+                        "Applied total: x=1 um, y=-2 um, z=3.25 um.",
                         window.calibration_panel.correction_steps_summary_label.text(),
                     )
                 finally:
@@ -1057,7 +1041,7 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                         str(history_path),
                     )
                     self.assertIn(
-                        "Correction best effort did not converge after 3 move(s)",
+                        "Correction did not converge after 3 move(s)",
                         window.calibration_panel.calibration_status_label.text(),
                     )
                     self.assertEqual(

@@ -249,7 +249,7 @@ $$
 $$
 
 where `tol` is `DEFAULT_CORRECTION_PIXEL_TOLERANCE_PX`, with a default value
-of `0.10 px`.
+of `0.5 px`.
 
 This is the only correction residual recorded in the iteration history:
 
@@ -294,19 +294,19 @@ $$
 The default numerical parameters are:
 
 ```text
-lambda = DEFAULT_CORRECTION_GAIN = 0.6
+lambda = DEFAULT_CORRECTION_GAIN = 0.3
 lambda_min = DEFAULT_CORRECTION_MIN_GAIN = 0.15
 mu = DEFAULT_CORRECTION_DAMPING_MU = 1.0
 max |Delta q_j| = DEFAULT_CORRECTION_MAX_NORMALIZED_STEP = 0.5
 min per-axis predicted response =
-    DEFAULT_CORRECTION_MIN_AXIS_PREDICTED_SHIFT_PX = 0.04 px
+    DEFAULT_CORRECTION_MIN_AXIS_PREDICTED_SHIFT_PX = 0.15 px
 min total predicted response =
-    DEFAULT_CORRECTION_MIN_TOTAL_PREDICTED_SHIFT_PX = 0.10 px
+    DEFAULT_CORRECTION_MIN_TOTAL_PREDICTED_SHIFT_PX = 0.30 px
 min feedback alpha = DEFAULT_CORRECTION_MIN_FEEDBACK_ALPHA = 0.25
 min feedback parallel response =
     DEFAULT_CORRECTION_MIN_FEEDBACK_PARALLEL_SHIFT_PX = 0.15 px
 min command norm = DEFAULT_CORRECTION_MIN_COMMAND_NORM_MM = 1e-9 mm
-max_moves = DEFAULT_CORRECTION_MAX_MOVES = 30
+max_moves = DEFAULT_CORRECTION_MAX_MOVES = 12
 ```
 
 Before a motor command is issued, two safeguards are applied to the
@@ -327,9 +327,10 @@ $$
 \texttt{DEFAULT\_CORRECTION\_MIN\_AXIS\_PREDICTED\_SHIFT\_PX}.
 $$
 
-Estimated command offsets remain diagnostics. They are no longer used as an
-early convergence criterion, and correction does not stop only because an
-estimated x/y/z offset is inside a command deadband.
+Components are also set to zero when the corresponding estimated command
+offset is at or below the configured correction deadband. If the remaining
+command vector is effectively zero, correction stops before issuing another
+motor command and reports non-convergence with a warning.
 
 ### Image-Response Observability
 
@@ -352,8 +353,9 @@ $$
 
 If \(r_{\mathrm{pred}}\) is below
 `DEFAULT_CORRECTION_MIN_TOTAL_PREDICTED_SHIFT_PX`, the move is not observable
-enough to provide useful feedback. In fallback mode the controller switches to
-local probe moves instead of treating the stale global model as authoritative.
+enough to provide useful feedback. Correction stops before issuing the motor
+command, rather than treating a below-noise image change as evidence about the
+motor direction or Jacobian.
 
 After a commanded move and one post-move image capture, the measured image
 change is
@@ -399,9 +401,9 @@ alpha >= DEFAULT_CORRECTION_MIN_FEEDBACK_ALPHA
 r_parallel >= DEFAULT_CORRECTION_MIN_FEEDBACK_PARALLEL_SHIFT_PX
 ```
 
-Invalid or weak feedback is recorded in the correction history. The controller
-reduces gain, increases damping, and can switch to local probing before making
-further correction attempts.
+Invalid feedback is recorded in the correction history, but it is not used for
+Jacobian refinement and it does not cause the loop to keep stacking additional
+correction moves on top of an unobservable or anti-aligned image response.
 
 The absolute BCS-mm target sent to the motors is
 
@@ -412,39 +414,40 @@ $$
 $$
 
 The internal `commanded_position_mm` state is initialized from the BCS `x`,
-`y`, and `z` values. After every physical move, Python reads back x/y/z,
-captures a new image, and treats only that verified image measurement as the
-new correction state.
+`y`, and `z` values and is subsequently advanced to each requested absolute
+target. Post-move readback is not used as the command-state anchor.
 
 ### Correction Loop
 
 The closed-loop correction algorithm proceeds as follows:
 
 1. load and validate a saved calibration dataset;
-2. require a real calibration file path, because correction history is
-   persisted next to it;
+2. require a real calibration file path, because accepted Jacobian refinements
+   are persisted to disk;
 3. capture images and compute `shift_px`;
 4. compute
    $\rho_k = \sqrt{\mathbf p_k^\mathsf T W \mathbf p_k}$;
-5. stop only if the verified residual is at or below the `0.10 px` target;
+5. stop immediately if $\rho_k$ is at or below the pixel tolerance;
 6. compute the damped normalized command correction;
 7. apply the normalized-step cap and suppress low-impact axis components;
-8. switch to local probing, when enabled, if the remaining command vector is
-   unusable or the predicted total image response is below the observable
+8. stop before motion if the remaining command vector is below the minimum
+   command norm or the predicted total image response is below the observable
    feedback threshold;
 9. send absolute BCS-mm targets only for axes with nonzero correction components;
-10. re-image after every trial, probe, and return-to-best move;
-11. keep the best verified image state seen during the correction action;
-12. if feedback is weak or anti-aligned, halve the gain down to
-    `DEFAULT_CORRECTION_MIN_GAIN`, double `mu`, and retry or probe locally;
-13. if finishing from a worse state, command a return to the best verified motor
-    coordinates and re-image again because backlash can make the same command
-    land differently;
+10. re-image once and compute the new residual plus feedback innovation
+    diagnostics;
+11. if feedback is valid and the residual decreased, refit the visual Jacobian
+    from the calibration probes plus accepted correction observations and save
+    the refined calibration dataset to disk;
+12. if feedback is valid but the residual increased or stayed flat, skip the
+    Jacobian update, halve the gain down to `DEFAULT_CORRECTION_MIN_GAIN`,
+    double `mu`, and continue from the newly measured image state;
+13. if feedback is invalid, record the move diagnostics and stop unless the
+    new residual is already within tolerance;
 14. save the correction result into the sibling correction-history file.
 
-The final state is always a freshly imaged state. If a return-to-best move does
-not reproduce the historical best residual, the new verified residual is the
-authoritative final result.
+No rollback is performed after a residual-increasing move. The image
+measurement acquired after that move defines the next closed-loop state.
 
 If convergence is not reached after `max_moves`, correction returns a dataset
 with
@@ -456,7 +459,7 @@ correction_converged = False
 and an associated warning. Lack of convergence after motion is therefore
 reported as data rather than raised as an exception.
 
-### Local Probe Fallback
+### Jacobian Refinement
 
 After a move, the measured image change is
 
@@ -466,25 +469,49 @@ $$
 \mathbf p_{k+1} - \mathbf p_k.
 $$
 
-Local probe fallback uses small verified x/y/z moves to estimate a current
-local response:
+Accepted correction moves are treated as additional observations of the same
+linear model used during calibration:
 
 $$
 \Delta \mathbf p_i \approx J \Delta \mathbf a_i.
 $$
 
-Each measured probe column approximates
+The refined Jacobian is not overwritten from one correction move. It is refit
+by pooling the original calibration probes with all accepted correction
+observations:
 
 $$
-J_{:,j}
-\approx
-\frac{\Delta \mathbf p_{\mathrm{meas}}}{\Delta a_j},
+\widehat{J}
+=
+\arg\min_J
+\sum_i
+\rho
+\left(
+\left\|
+\Delta \mathbf p_i - J\Delta \mathbf a_i
+\right\|_2
+\right),
 $$
 
-with every probe and probe-return move followed by a fresh image capture. The
-local Jacobian is used for the current correction action and written into the
-correction history. Normal correction actions do not rewrite
-`visual_jacobian_px_per_cmd_mm` or increment `jacobian_refinement_count`.
+where the first rows are the large calibration probes and later rows are
+closed-loop correction moves. The estimate is obtained with the same
+Huber-style iteratively reweighted least-squares procedure used during
+calibration.
+
+This weighting is important for small corrections. In the pooled least-squares
+normal equation, an observation contributes through
+$\Delta\mathbf a_i\Delta\mathbf a_i^\mathsf T$. A 5 micron correction therefore
+has approximately $(0.005/0.5)^2 = 10^{-4}$ the Jacobian leverage of a 0.5 mm
+calibration probe, preventing a single small move from dominating a Jacobian
+column.
+
+Refinement is only attempted when the post-move feedback is valid and the
+weighted image residual decreased. If the refit is rank-deficient, poorly
+conditioned, or otherwise invalid, it is skipped and the warning is recorded.
+Accepted refinements update
+`visual_jacobian_px_per_cmd_mm`, increment `jacobian_refinement_count`, mark
+`jacobian_refined = "true"`, validate the dataset, and save it back to the
+calibration file path.
 
 ### Dataset Schema
 
@@ -542,12 +569,6 @@ move_damping_mu(move)
 move_max_normalized_component(move)
 move_active_axis_mask(move, command_axis)
 move_jacobian_refined(move)
-move_kind(move)
-move_accepted(move)
-move_is_best_after(move)
-move_verified_residual_px(move)
-local_probe_jacobian_px_per_cmd_mm(move, camera, pixel_axis, command_axis)
-best_commanded_position_mm(command_axis)
 ```
 
 The correction result keeps per-move diagnostic state because that dataset is
@@ -556,9 +577,9 @@ also used as the on-disk correction log. For a calibration file such as
 `calibration_corrections.h5`. Each correction run is written to an HDF5 group
 named `run_000000`, `run_000001`, and so on. During an active correction, the
 active run group is rewritten after every completed motor move, so the file
-contains the latest available residual trace, verified trial/probe/return
-moves, measured image response, feedback diagnostics, and any local probe
-Jacobian used by that correction action.
+contains the latest available residual trace, move commands, measured image
+response, and Jacobian before/after any accepted pooled least-squares
+refinement.
 
 At result assembly, the reported command offset is computed from the final image
 residual as
@@ -655,9 +676,9 @@ computed on demand by the GUI and correction code.
 
 Saved calibration attributes include `warnings`, initial motor context
 (`initial_x_mm`, `initial_y_mm`, `initial_z_mm`, `polar`, `tilt`), and GUI ROI
-bounds (`roi_cam0_*`, `roi_cam1_*`) when created from the GUI. Normal
-correction actions write correction history but do not rewrite the saved
-calibration Jacobian.
+bounds (`roi_cam0_*`, `roi_cam1_*`) when created from the GUI. Accepted
+closed-loop pooled least-squares refinements rewrite the calibration file so the
+refined Jacobian persists across correction runs.
 
 ## Hardware Notes
 

@@ -26,13 +26,11 @@ RESIDUAL_PROJECTIONS: tuple[tuple[str, str, int, int], ...] = (
 )
 CORRECTION_STEP_HEADERS: tuple[str, ...] = (
     "move",
-    "kind",
     "x_um",
     "y_um",
     "z_um",
     "pre_residual_px",
     "post_residual_px",
-    "accepted",
 )
 
 
@@ -239,33 +237,6 @@ def _correction_move_residuals(
             mode="constant",
             constant_values=math.nan,
         )
-    return values[:move_count]
-
-
-def _correction_move_strings(
-    result: xr.Dataset,
-    name: str,
-    move_count: int,
-    fallback: str,
-) -> list[str]:
-    if name not in result:
-        return [fallback] * move_count
-    values = [str(value) for value in np.asarray(result[name].values).reshape(-1)]
-    if len(values) < move_count:
-        values.extend([fallback] * (move_count - len(values)))
-    return values[:move_count]
-
-
-def _correction_move_flags(
-    result: xr.Dataset,
-    name: str,
-    move_count: int,
-) -> np.ndarray:
-    if name not in result:
-        return np.zeros(move_count, dtype=bool)
-    values = np.asarray(result[name].values, dtype=bool).reshape(-1)
-    if values.size < move_count:
-        return np.pad(values, (0, move_count - values.size), constant_values=False)
     return values[:move_count]
 
 
@@ -763,35 +734,20 @@ class CalibrationPanel(QtWidgets.QWidget):
             "move_post_weighted_residual_px",
             move_delta.shape[0],
         )
-        move_kind = _correction_move_strings(
-            result,
-            "move_kind",
-            move_delta.shape[0],
-            "trial",
-        )
-        move_accepted = _correction_move_flags(
-            result,
-            "move_accepted",
-            move_delta.shape[0],
-        )
-        if "move_accepted" not in result:
-            move_accepted = post_residual < pre_residual
 
         self.correction_steps_table.setRowCount(move_delta.shape[0])
         for row, delta_mm in enumerate(move_delta):
             values = (
                 str(row + 1),
-                move_kind[row],
                 _format_number(1000.0 * delta_mm[0]),
                 _format_number(1000.0 * delta_mm[1]),
                 _format_number(1000.0 * delta_mm[2]),
                 _format_number(pre_residual[row]),
                 _format_number(post_residual[row]),
-                "yes" if move_accepted[row] else "no",
             )
             for column, value in enumerate(values):
                 item = QtWidgets.QTableWidgetItem(value)
-                if column not in (0, 1, len(values) - 1):
+                if column > 0:
                     item.setTextAlignment(
                         QtCore.Qt.AlignmentFlag.AlignRight
                         | QtCore.Qt.AlignmentFlag.AlignVCenter
@@ -800,17 +756,8 @@ class CalibrationPanel(QtWidgets.QWidget):
 
         summary_lines: list[str] = []
         if move_delta.size:
-            trial_mask = np.asarray([kind == "trial" for kind in move_kind], dtype=bool)
-            accepted_trial_mask = trial_mask & move_accepted
-            probe_count = int(np.count_nonzero(np.asarray(move_kind) == "probe"))
-            return_count = int(np.count_nonzero(np.asarray(move_kind) == "return_best"))
             summary_lines.append(
-                "Accepted trial total: "
-                f"{_format_axis_triplet_um(np.sum(move_delta[accepted_trial_mask], axis=0))}."
-            )
-            summary_lines.append(
-                f"Move mix: {int(np.count_nonzero(trial_mask))} trial, "
-                f"{probe_count} probe, {return_count} return_best."
+                f"Applied total: {_format_axis_triplet_um(np.sum(move_delta, axis=0))}."
             )
         else:
             if in_progress:
@@ -828,15 +775,6 @@ class CalibrationPanel(QtWidgets.QWidget):
                 "Next correction: "
                 f"{_format_axis_triplet_um(result['correction_cmd_mm'].values)}."
             )
-        if "final_verified_residual_px" in result.attrs:
-            summary_lines.append(
-                "Final verified residual: "
-                f"{_format_number(float(result.attrs['final_verified_residual_px']))} px."
-            )
-        if bool(result.attrs.get("returned_to_best", False)):
-            verified = bool(result.attrs.get("return_to_best_verified", False))
-            suffix = "verified" if verified else "not verified"
-            summary_lines.append(f"Return to best: {suffix}.")
 
         self.correction_steps_summary_label.setText("\n".join(summary_lines))
         self.correction_steps_group.setVisible(True)
@@ -905,7 +843,7 @@ class CalibrationPanel(QtWidgets.QWidget):
             if residual_values.size:
                 residual = float(residual_values[-1])
 
-        status = "converged" if converged else "best effort did not converge"
+        status = "converged" if converged else "did not converge"
         self.calibration_status_label.setText(
             "Correction "
             f"{status} after {moves} move(s); final residual "
