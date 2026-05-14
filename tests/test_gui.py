@@ -232,6 +232,22 @@ def roi_editing_enabled(window):
     return all(roi.translatable for roi in window.image_rois.values())
 
 
+def full_camera_image(camera, value):
+    image_width, image_height = main_window.CAMERA_IMAGE_SIZES[camera]
+    return np.full((image_height, image_width), value, dtype=np.float32)
+
+
+def image_parent_rect(window, camera):
+    image_item = window.image_items[camera]
+    return image_item.mapRectToParent(image_item.boundingRect())
+
+
+def assert_rect_close(testcase, rect, expected):
+    actual = (rect.x(), rect.y(), rect.width(), rect.height())
+    for actual_value, expected_value in zip(actual, expected, strict=True):
+        testcase.assertAlmostEqual(actual_value, expected_value)
+
+
 def correction_result(
     *,
     converged: bool = True,
@@ -580,6 +596,7 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                 self.assertFalse(
                     window.calibration_panel.detect_shift_button.isEnabled()
                 )
+                self.assertFalse(window.show_reference_images_button.isEnabled())
                 self.assertTrue(roi_handles_visible(window))
                 self.assertTrue(roi_editing_enabled(window))
             finally:
@@ -609,6 +626,7 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                 self.assertTrue(
                     window.calibration_panel.detect_shift_button.isEnabled()
                 )
+                self.assertTrue(window.show_reference_images_button.isEnabled())
                 self.assertFalse(roi_handles_visible(window))
                 self.assertFalse(roi_editing_enabled(window))
 
@@ -636,8 +654,78 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                 self.assertFalse(
                     window.calibration_panel.detect_shift_button.isEnabled()
                 )
+                self.assertFalse(window.show_reference_images_button.isEnabled())
                 self.assertTrue(roi_handles_visible(window))
                 self.assertTrue(roi_editing_enabled(window))
+            finally:
+                window.close()
+
+    def test_reference_button_shows_calibration_images_until_released(self):
+        get_qapp()
+        metadata = _roi_metadata_from_geometries(
+            {
+                "cam0": (10.0, 12.0, 30.0, 32.0),
+                "cam1": (14.0, 16.0, 34.0, 36.0),
+            }
+        )
+        calibration = build_sample_calibration_dataset(
+            image_shape_cam0=(4, 5),
+            image_shape_cam1=(6, 7),
+        ).assign_attrs({"calibration_path": "/tmp/calibration.h5"} | metadata)
+        current_cam0 = full_camera_image("cam0", 3.0)
+        current_cam1 = full_camera_image("cam1", 4.0)
+        refreshed_cam0 = full_camera_image("cam0", 5.0)
+
+        with patched_main_window_runtime():
+            window = MainWindow()
+            try:
+                window._on_image_capture_ready("cam0", current_cam0)
+                window._on_image_capture_ready("cam1", current_cam1)
+                window._on_new_calibration_ready(calibration)
+
+                window.show_reference_images_button.pressed.emit()
+
+                np.testing.assert_array_equal(
+                    window.image_items["cam0"].image,
+                    calibration["reference_cam0"].values,
+                )
+                np.testing.assert_array_equal(
+                    window.image_items["cam1"].image,
+                    calibration["reference_cam1"].values,
+                )
+                assert_rect_close(
+                    self,
+                    image_parent_rect(window, "cam0"),
+                    (10.0, 12.0, 30.0, 32.0),
+                )
+                assert_rect_close(
+                    self,
+                    image_parent_rect(window, "cam1"),
+                    (14.0, 16.0, 34.0, 36.0),
+                )
+
+                window._on_image_capture_ready("cam0", refreshed_cam0)
+                np.testing.assert_array_equal(
+                    window.image_items["cam0"].image,
+                    calibration["reference_cam0"].values,
+                )
+
+                window.show_reference_images_button.released.emit()
+
+                np.testing.assert_array_equal(
+                    window.image_items["cam0"].image,
+                    refreshed_cam0,
+                )
+                np.testing.assert_array_equal(
+                    window.image_items["cam1"].image,
+                    current_cam1,
+                )
+                image_width, image_height = main_window.CAMERA_IMAGE_SIZES["cam0"]
+                assert_rect_close(
+                    self,
+                    image_parent_rect(window, "cam0"),
+                    (0.0, 0.0, float(image_width), float(image_height)),
+                )
             finally:
                 window.close()
 

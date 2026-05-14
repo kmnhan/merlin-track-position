@@ -358,10 +358,17 @@ class _MainWindowGUI(QtWidgets.QMainWindow):
         image_layout = QtWidgets.QVBoxLayout(image_widget)
         image_layout.setContentsMargins(0, 0, 0, 0)
 
+        image_controls_layout = QtWidgets.QHBoxLayout()
         self.image_auto_refresh_checkbox = QtWidgets.QCheckBox("Update images")
         self.image_auto_refresh_checkbox.setObjectName("image_auto_refresh_checkbox")
         self.image_auto_refresh_checkbox.setChecked(True)
-        image_layout.addWidget(self.image_auto_refresh_checkbox)
+        image_controls_layout.addWidget(self.image_auto_refresh_checkbox)
+        self.show_reference_images_button = QtWidgets.QPushButton("Reference")
+        self.show_reference_images_button.setObjectName("show_reference_images_button")
+        self.show_reference_images_button.setEnabled(False)
+        image_controls_layout.addWidget(self.show_reference_images_button)
+        image_controls_layout.addStretch(1)
+        image_layout.addLayout(image_controls_layout)
 
         self.image_graphics_layout = pg.GraphicsLayoutWidget()
         image_layout.addWidget(self.image_graphics_layout)
@@ -439,6 +446,11 @@ class MainWindow(_MainWindowGUI):
         self._server_correction_target: int | None = None
         self._latest_images: tuple[np.ndarray, np.ndarray] | None = None
         self._latest_images_by_camera: dict[str, np.ndarray] = {}
+        self._reference_preview_active = False
+        self._reference_preview_restore_state: dict[
+            str,
+            tuple[np.ndarray, QtCore.QRectF],
+        ] = {}
         self._image_capture_locks = {
             "cam0": threading.Lock(),
             "cam1": threading.Lock(),
@@ -536,7 +548,14 @@ class MainWindow(_MainWindowGUI):
         self.image_auto_refresh_checkbox.toggled.connect(
             self._on_image_auto_refresh_toggled
         )
+        self.show_reference_images_button.pressed.connect(
+            self._on_show_reference_images_pressed
+        )
+        self.show_reference_images_button.released.connect(
+            self._on_show_reference_images_released
+        )
         self.calibration_panel.reset()
+        self._set_reference_preview_button_enabled(False)
         self._set_roi_editing_enabled(True)
 
         self._server = MotorServer(self)
@@ -862,7 +881,8 @@ class MainWindow(_MainWindowGUI):
                 self._latest_images_by_camera["cam0"],
                 self._latest_images_by_camera["cam1"],
             )
-        self.image_items[camera].setImage(image)
+        if not self._reference_preview_active:
+            self._show_current_image(camera, image)
 
     @QtCore.Slot(str, str)
     def _on_image_capture_failed(self, camera: str, error_message: str) -> None:
@@ -871,6 +891,23 @@ class MainWindow(_MainWindowGUI):
     @QtCore.Slot(bool)
     def _on_image_auto_refresh_toggled(self, enabled: bool) -> None:
         self._set_image_refresh_enabled(enabled)
+
+    @QtCore.Slot()
+    def _on_show_reference_images_pressed(self) -> None:
+        if self._calibration is None:
+            return
+        self._reference_preview_active = True
+        self._reference_preview_restore_state = self._current_image_item_state()
+        for camera in CAMERA_IMAGE_SIZES:
+            self._show_reference_image(camera)
+
+    @QtCore.Slot()
+    def _on_show_reference_images_released(self) -> None:
+        if not self._reference_preview_active:
+            return
+        self._reference_preview_active = False
+        self._restore_latest_current_images()
+        self._reference_preview_restore_state = {}
 
     @QtCore.Slot(bool)
     def _on_auto_correction_toggled(self, enabled: bool) -> None:
@@ -916,12 +953,93 @@ class MainWindow(_MainWindowGUI):
         for thread in self._image_refresh_threads.values():
             thread.set_enabled(enabled)
 
+    def _set_reference_preview_button_enabled(self, enabled: bool) -> None:
+        enabled = bool(enabled)
+        self.show_reference_images_button.setEnabled(enabled)
+        if not enabled and self._reference_preview_active:
+            self._reference_preview_active = False
+            self._restore_latest_current_images()
+            self._reference_preview_restore_state = {}
+
+    def _show_current_image(self, camera: str, image: object) -> None:
+        self._set_camera_image(camera, image, self._full_image_rect(camera))
+
+    def _show_reference_image(self, camera: str) -> None:
+        if self._calibration is None:
+            return
+        reference_name = f"reference_{camera}"
+        if reference_name not in self._calibration:
+            logger.warning("Calibration is missing %s.", reference_name)
+            return
+        image = np.asarray(self._calibration[reference_name].values)
+        self._set_camera_image(
+            camera,
+            image,
+            self._reference_image_rect(camera, image),
+        )
+
+    def _restore_latest_current_images(self) -> None:
+        for camera in CAMERA_IMAGE_SIZES:
+            if camera in self._latest_images_by_camera:
+                image = self._latest_images_by_camera[camera]
+                self._show_current_image(camera, image)
+            elif camera in self._reference_preview_restore_state:
+                image, rect = self._reference_preview_restore_state[camera]
+                self._set_camera_image(camera, image, rect)
+
+    def _set_camera_image(
+        self,
+        camera: str,
+        image: object,
+        rect: QtCore.QRectF,
+    ) -> None:
+        image_item = self.image_items[camera]
+        image_item.setImage(image)
+        image_item.setRect(rect)
+
+    def _current_image_item_state(self) -> dict[str, tuple[np.ndarray, QtCore.QRectF]]:
+        state: dict[str, tuple[np.ndarray, QtCore.QRectF]] = {}
+        for camera, image_item in self.image_items.items():
+            image = image_item.image
+            if image is None:
+                continue
+            rect = image_item.mapRectToParent(image_item.boundingRect())
+            state[camera] = (np.asarray(image).copy(), QtCore.QRectF(rect))
+        return state
+
+    @staticmethod
+    def _full_image_rect(camera: str) -> QtCore.QRectF:
+        image_width, image_height = CAMERA_IMAGE_SIZES[camera]
+        return QtCore.QRectF(0.0, 0.0, float(image_width), float(image_height))
+
+    def _reference_image_rect(
+        self,
+        camera: str,
+        image: np.ndarray,
+    ) -> QtCore.QRectF:
+        image_width, image_height = CAMERA_IMAGE_SIZES[camera]
+        if image.shape[:2] == (image_height, image_width):
+            return self._full_image_rect(camera)
+
+        roi_geometries = (
+            None
+            if self._calibration is None
+            else _roi_geometries_from_calibration_metadata(self._calibration)
+        )
+        if roi_geometries is not None and camera in roi_geometries:
+            x, y, width, height = roi_geometries[camera]
+            return QtCore.QRectF(x, y, width, height)
+
+        height, width = image.shape[:2]
+        return QtCore.QRectF(0.0, 0.0, float(width), float(height))
+
     def _pause_image_auto_refresh_for_calibration(self) -> None:
         self._image_auto_refresh_checked_before_calibration = (
             self.image_auto_refresh_checkbox.isChecked()
         )
         self._set_image_refresh_enabled(False)
         self.image_auto_refresh_checkbox.setEnabled(False)
+        self._set_reference_preview_button_enabled(False)
 
     def _restore_image_auto_refresh_after_calibration(self) -> None:
         restore_checked = self._image_auto_refresh_checked_before_calibration
@@ -968,6 +1086,7 @@ class MainWindow(_MainWindowGUI):
         self._set_roi_editing_enabled(False)
         self.calibration_panel.show_loaded_calibration(calibration, path.name)
         self._restore_latest_correction_result(path)
+        self._set_reference_preview_button_enabled(True)
         self._schedule_persistence_flush_if_needed()
 
     @QtCore.Slot()
@@ -1250,6 +1369,7 @@ class MainWindow(_MainWindowGUI):
             else "new calibration"
         )
         self.calibration_panel.show_loaded_calibration(calibration, display_name)
+        self._set_reference_preview_button_enabled(True)
         self._schedule_persistence_flush_if_needed()
 
     @QtCore.Slot(str)
@@ -1287,6 +1407,7 @@ class MainWindow(_MainWindowGUI):
             )
             self.calibration_panel.show_loaded_calibration(calibration, display_name)
             self.calibration_panel.show_correction_result(result)
+            self._set_reference_preview_button_enabled(True)
             self._flush_pending_persistence()
         except Exception as exc:
             self._restore_calibration_idle_state()
@@ -1337,6 +1458,7 @@ class MainWindow(_MainWindowGUI):
                 raise TypeError("shift detection thread did not return an xarray Dataset")
             self._set_roi_editing_enabled(False)
             self.calibration_panel.show_detection_result(result)
+            self._set_reference_preview_button_enabled(True)
         except Exception as exc:
             self._restore_calibration_idle_state()
             QtWidgets.QMessageBox.critical(
@@ -1376,6 +1498,7 @@ class MainWindow(_MainWindowGUI):
         self._calibration_total_steps = 0
         if self._calibration is None:
             self.calibration_panel.reset()
+            self._set_reference_preview_button_enabled(False)
             self._set_roi_editing_enabled(True)
             return
 
@@ -1386,6 +1509,7 @@ class MainWindow(_MainWindowGUI):
             else "current calibration"
         )
         self.calibration_panel.show_loaded_calibration(self._calibration, display_name)
+        self._set_reference_preview_button_enabled(True)
 
     def _restore_latest_correction_result(self, calibration_path: Path) -> None:
         try:
@@ -1407,6 +1531,7 @@ class MainWindow(_MainWindowGUI):
         self._calibration = None
         self._calibration_path = None
         self._last_correction_result = None
+        self._set_reference_preview_button_enabled(False)
         self._restore_calibration_idle_state()
 
     def _get_roi_geometry(self, camera: str) -> RoiGeometry:

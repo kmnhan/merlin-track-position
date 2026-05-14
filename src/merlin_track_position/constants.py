@@ -52,7 +52,7 @@ CORRECTION_COMMAND_DEADBAND_MM_BY_AXIS: dict[str, float] = {
 DEFAULT_CAPTURE_COUNT: int = 3
 
 # Default number of worker threads for calibration fitting.
-CALIBRATION_FIT_N_JOBS: int = 2
+CALIBRATION_FIT_N_JOBS: int = 1
 
 
 # Default commanded-mm probe steps for calibration.
