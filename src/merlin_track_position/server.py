@@ -21,6 +21,7 @@ _XYZ_AXES = ("x", "y", "z")
 _FINAL_STATUSES = {"OK", "ERROR"}
 _DEFAULT_XYZ_MOVE_TIMEOUT_MS = 60_000
 _MOVE_RESULT_TIMEOUT_MARGIN_S = 30.0
+_REQUEST_LOG_LIMIT = 500
 
 
 class TrackShiftProtocolError(RuntimeError):
@@ -65,6 +66,17 @@ def _coerce_axis_positions(
 
 def _json_payload(payload: Mapping[str, typing.Any]) -> str:
     return json.dumps(payload, separators=(",", ":"))
+
+
+def _decode_json_request(raw: str) -> typing.Any:
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as exc:
+        preview = raw[:_REQUEST_LOG_LIMIT]
+        raise TrackShiftProtocolError(
+            "invalid JSON request from LabVIEW: "
+            f"{exc}; length={len(raw)}; preview={preview!r}"
+        ) from exc
 
 
 class TrackShiftMotorBackend:
@@ -317,7 +329,7 @@ class MotorServer(QtCore.QThread):
                 if _socket in events and events[_socket] & zmq.POLLIN:
                     try:
                         raw: str = _socket.recv_string(flags=zmq.NOBLOCK)
-                        req = json.loads(raw)
+                        req = _decode_json_request(raw)
                         immediate_response = self._handle_request(req)
                         if immediate_response is None:
                             status, msg = self._wait_for_response()
