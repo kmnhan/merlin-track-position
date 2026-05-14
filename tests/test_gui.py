@@ -581,6 +581,19 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                     "Correct sample",
                 )
                 self.assertFalse(
+                    window.calibration_panel.auto_correction_checkbox.isEnabled()
+                )
+                self.assertFalse(
+                    window.calibration_panel.auto_correction_checkbox.isChecked()
+                )
+                self.assertFalse(
+                    window.calibration_panel.auto_correction_interval_spinbox.isEnabled()
+                )
+                self.assertEqual(
+                    window.calibration_panel.auto_correction_interval_spinbox.value(),
+                    5,
+                )
+                self.assertFalse(
                     window.calibration_panel.detect_shift_button.isEnabled()
                 )
                 self.assertEqual(
@@ -612,6 +625,12 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                     window.calibration_panel.correct_sample_button.isEnabled()
                 )
                 self.assertTrue(
+                    window.calibration_panel.auto_correction_checkbox.isEnabled()
+                )
+                self.assertTrue(
+                    window.calibration_panel.auto_correction_interval_spinbox.isEnabled()
+                )
+                self.assertTrue(
                     window.calibration_panel.detect_shift_button.isEnabled()
                 )
                 self.assertFalse(roi_handles_visible(window))
@@ -634,12 +653,173 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                     window.calibration_panel.correct_sample_button.isEnabled()
                 )
                 self.assertFalse(
+                    window.calibration_panel.auto_correction_checkbox.isEnabled()
+                )
+                self.assertFalse(
+                    window.calibration_panel.auto_correction_checkbox.isChecked()
+                )
+                self.assertFalse(
+                    window.calibration_panel.auto_correction_interval_spinbox.isEnabled()
+                )
+                self.assertFalse(
                     window.calibration_panel.detect_shift_button.isEnabled()
                 )
                 self.assertTrue(roi_handles_visible(window))
                 self.assertTrue(roi_editing_enabled(window))
             finally:
                 window.close()
+
+    def test_auto_correction_toggle_starts_and_stops_timer(self):
+        get_qapp()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            calibration = write_sample_calibration(Path(tmpdir) / "calibration.h5")
+            with patched_main_window_runtime():
+                window = MainWindow()
+                try:
+                    window._on_new_calibration_ready(calibration)
+                    window.calibration_panel.auto_correction_interval_spinbox.setValue(
+                        2
+                    )
+
+                    window.calibration_panel.auto_correction_checkbox.setChecked(True)
+
+                    self.assertTrue(window._auto_correction_timer.isActive())
+                    self.assertEqual(window._auto_correction_timer.interval(), 120000)
+
+                    window.calibration_panel.auto_correction_checkbox.setChecked(False)
+
+                    self.assertFalse(window._auto_correction_timer.isActive())
+                finally:
+                    window.close()
+
+    def test_auto_correction_interval_persists_and_updates_active_timer(self):
+        get_qapp()
+        settings = FakeSettings()
+        settings.values["auto_correction/interval_minutes"] = 3.0
+        with tempfile.TemporaryDirectory() as tmpdir:
+            calibration = write_sample_calibration(Path(tmpdir) / "calibration.h5")
+            with patched_main_window_runtime(settings):
+                window = MainWindow()
+                try:
+                    self.assertEqual(
+                        window.calibration_panel.auto_correction_interval_spinbox.value(),
+                        3,
+                    )
+
+                    window._on_new_calibration_ready(calibration)
+                    window.calibration_panel.auto_correction_checkbox.setChecked(True)
+                    window.calibration_panel.auto_correction_interval_spinbox.setValue(
+                        4
+                    )
+
+                    self.assertEqual(
+                        settings.values["auto_correction/interval_minutes"],
+                        4.0,
+                    )
+                    self.assertEqual(window._auto_correction_timer.interval(), 240000)
+                finally:
+                    window.close()
+
+    def test_auto_correction_timeout_starts_without_confirmation(self):
+        get_qapp()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "calibration.h5"
+            calibration = write_sample_calibration(path)
+            with patched_main_window_runtime():
+                window = MainWindow()
+                try:
+                    window._on_new_calibration_ready(calibration)
+                    window.calibration_panel.auto_correction_checkbox.setChecked(True)
+
+                    with patch(
+                        "merlin_track_position.interface.main_window.QtWidgets.QMessageBox.warning",
+                        side_effect=AssertionError("confirmation should be bypassed"),
+                    ):
+                        window._on_auto_correction_timeout()
+
+                    thread = window._correction_thread
+                    self.assertTrue(thread.started)
+                    self.assertIs(thread.calibration, window._calibration)
+                    self.assertEqual(thread.calibration_path, path)
+                    self.assertTrue(
+                        window.calibration_panel.auto_correction_checkbox.isEnabled()
+                    )
+                    self.assertTrue(
+                        window.calibration_panel.auto_correction_checkbox.isChecked()
+                    )
+                finally:
+                    window.close()
+
+    def test_auto_correction_timeout_skips_when_busy(self):
+        get_qapp()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            calibration = write_sample_calibration(Path(tmpdir) / "calibration.h5")
+            with patched_main_window_runtime():
+                window = MainWindow()
+                try:
+                    window._on_new_calibration_ready(calibration)
+                    window.calibration_panel.auto_correction_checkbox.setChecked(True)
+                    window._correction_thread.running = True
+
+                    window._on_auto_correction_timeout()
+
+                    self.assertFalse(window._correction_thread.started)
+                    self.assertTrue(
+                        window.calibration_panel.auto_correction_checkbox.isChecked()
+                    )
+                    self.assertTrue(window._auto_correction_timer.isActive())
+                finally:
+                    window.close()
+
+    def test_auto_correction_failure_leaves_toggle_enabled(self):
+        get_qapp()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            calibration = write_sample_calibration(Path(tmpdir) / "calibration.h5")
+            with patched_main_window_runtime():
+                window = MainWindow()
+                try:
+                    window._on_new_calibration_ready(calibration)
+                    window.calibration_panel.auto_correction_checkbox.setChecked(True)
+                    window._correction_thread.running = False
+                    with patch(
+                        "merlin_track_position.interface.main_window.QtWidgets.QMessageBox.critical"
+                    ):
+                        window._on_correction_failed("boom")
+
+                    self.assertTrue(
+                        window.calibration_panel.auto_correction_checkbox.isEnabled()
+                    )
+                    self.assertTrue(
+                        window.calibration_panel.auto_correction_checkbox.isChecked()
+                    )
+                    self.assertTrue(window._auto_correction_timer.isActive())
+                finally:
+                    window.close()
+
+    def test_clearing_calibration_stops_auto_correction(self):
+        get_qapp()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            calibration = write_sample_calibration(Path(tmpdir) / "calibration.h5")
+            with patched_main_window_runtime():
+                window = MainWindow()
+                try:
+                    window._on_new_calibration_ready(calibration)
+                    window.calibration_panel.auto_correction_checkbox.setChecked(True)
+
+                    window._on_new_calibration_clicked()
+
+                    self.assertFalse(window._auto_correction_timer.isActive())
+                    self.assertFalse(
+                        window.calibration_panel.auto_correction_checkbox.isChecked()
+                    )
+                    self.assertFalse(
+                        window.calibration_panel.auto_correction_checkbox.isEnabled()
+                    )
+                    self.assertFalse(
+                        window.calibration_panel.auto_correction_interval_spinbox.isEnabled()
+                    )
+                finally:
+                    window.close()
 
     def test_loaded_calibration_applies_roi_metadata_before_locking(self):
         get_qapp()

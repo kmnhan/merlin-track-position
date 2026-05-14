@@ -89,6 +89,9 @@ CAMERA_IMAGE_SIZES: dict[str, tuple[int, int]] = {
 }
 IMAGE_REFRESH_INTERVAL_MS = 400
 PERSISTENCE_FLUSH_INTERVAL_MS = 5000
+DEFAULT_AUTO_CORRECTION_INTERVAL_MINUTES = 5
+AUTO_CORRECTION_INTERVAL_SETTINGS_KEY = "auto_correction/interval_minutes"
+AUTO_CORRECTION_INTERVAL_MS_PER_MINUTE = 60_000
 ROI_SETTINGS_KEYS: dict[str, tuple[str, str, str, str]] = {
     camera: (
         f"roi/{camera}/x",
@@ -414,6 +417,9 @@ class MainWindow(_MainWindowGUI):
         super().__init__(parent)
 
         self._settings = QtCore.QSettings("merlin-track-position", "Track Positions")
+        self.calibration_panel.auto_correction_interval_spinbox.setValue(
+            self._stored_auto_correction_interval_minutes()
+        )
         self._calibration: xr.Dataset | None = None
         self._calibration_path: Path | None = None
         self._calibration_thread = CalibrationThread(self)
@@ -451,6 +457,9 @@ class MainWindow(_MainWindowGUI):
             thread.sigImageCaptureFailed.connect(self._on_image_capture_failed)
             thread.start()
         self._image_auto_refresh_checked_before_calibration: bool | None = None
+        self._auto_correction_timer = QtCore.QTimer(self)
+        self._auto_correction_timer.setSingleShot(False)
+        self._auto_correction_timer.timeout.connect(self._on_auto_correction_timeout)
 
         for camera, (image_width, image_height) in CAMERA_IMAGE_SIZES.items():
             default_roi_geometry = _default_roi_geometry(image_width, image_height)
@@ -485,6 +494,12 @@ class MainWindow(_MainWindowGUI):
         )
         self.calibration_panel.correct_sample_button.clicked.connect(
             self._on_correct_sample_clicked
+        )
+        self.calibration_panel.auto_correction_checkbox.toggled.connect(
+            self._on_auto_correction_toggled
+        )
+        self.calibration_panel.auto_correction_interval_spinbox.valueChanged.connect(
+            self._on_auto_correction_interval_changed
         )
         self.calibration_panel.detect_shift_button.clicked.connect(
             self._on_detect_shift_clicked
@@ -535,6 +550,43 @@ class MainWindow(_MainWindowGUI):
     @staticmethod
     def _load_calibration_from_path(path: Path) -> xr.Dataset:
         return load_calibration_dataset(path)
+
+    def _stored_auto_correction_interval_minutes(self) -> int:
+        spinbox = self.calibration_panel.auto_correction_interval_spinbox
+        value = self._settings.value(
+            AUTO_CORRECTION_INTERVAL_SETTINGS_KEY,
+            DEFAULT_AUTO_CORRECTION_INTERVAL_MINUTES,
+        )
+        try:
+            interval_minutes = int(float(value))
+        except (TypeError, ValueError):
+            interval_minutes = DEFAULT_AUTO_CORRECTION_INTERVAL_MINUTES
+        return min(max(interval_minutes, spinbox.minimum()), spinbox.maximum())
+
+    def _auto_correction_interval_ms(self) -> int:
+        return (
+            self.calibration_panel.auto_correction_interval_spinbox.value()
+            * AUTO_CORRECTION_INTERVAL_MS_PER_MINUTE
+        )
+
+    def _restart_auto_correction_timer(self) -> None:
+        if self._calibration is None:
+            self._stop_auto_correction(uncheck=True)
+            return
+        interval_ms = self._auto_correction_interval_ms()
+        self._auto_correction_timer.setInterval(interval_ms)
+        self._auto_correction_timer.start()
+        logger.info("Automatic timed correction enabled every %d ms.", interval_ms)
+
+    def _stop_auto_correction(self, *, uncheck: bool) -> None:
+        if hasattr(self, "_auto_correction_timer"):
+            self._auto_correction_timer.stop()
+        if uncheck:
+            checkbox = self.calibration_panel.auto_correction_checkbox
+            was_blocked = checkbox.blockSignals(True)
+            checkbox.setChecked(False)
+            checkbox.blockSignals(was_blocked)
+        logger.info("Automatic timed correction disabled.")
 
     def _calibration_after_correction_result(self, result: xr.Dataset) -> xr.Dataset:
         if self._calibration_path is None:
@@ -789,6 +841,46 @@ class MainWindow(_MainWindowGUI):
     @QtCore.Slot(bool)
     def _on_image_auto_refresh_toggled(self, enabled: bool) -> None:
         self._set_image_refresh_enabled(enabled)
+
+    @QtCore.Slot(bool)
+    def _on_auto_correction_toggled(self, enabled: bool) -> None:
+        if enabled:
+            if self._calibration is None:
+                logger.warning(
+                    "Automatic timed correction requested without a calibration."
+                )
+                self._stop_auto_correction(uncheck=True)
+                return
+            self._restart_auto_correction_timer()
+            return
+        self._stop_auto_correction(uncheck=False)
+
+    @QtCore.Slot(int)
+    def _on_auto_correction_interval_changed(self, interval_minutes: int) -> None:
+        interval_minutes = int(interval_minutes)
+        self._settings.setValue(
+            AUTO_CORRECTION_INTERVAL_SETTINGS_KEY,
+            interval_minutes,
+        )
+        self._settings.sync()
+        if self._auto_correction_timer.isActive():
+            self._restart_auto_correction_timer()
+
+    @QtCore.Slot()
+    def _on_auto_correction_timeout(self) -> None:
+        if not self.calibration_panel.auto_correction_checkbox.isChecked():
+            return
+        try:
+            self._start_correction()
+        except _CorrectionUnavailable as exc:
+            logger.info("Automatic timed correction skipped: %s", exc)
+        except Exception as exc:
+            logger.exception("Failed to start automatic timed correction.")
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Could not start automatic correction",
+                str(exc),
+            )
 
     def _set_image_refresh_enabled(self, enabled: bool) -> None:
         for thread in self._image_refresh_threads.values():
@@ -1281,6 +1373,7 @@ class MainWindow(_MainWindowGUI):
             self.calibration_panel.show_correction_result(result)
 
     def _clear_loaded_calibration(self) -> None:
+        self._stop_auto_correction(uncheck=True)
         self._calibration = None
         self._calibration_path = None
         self._last_correction_result = None
@@ -1352,6 +1445,9 @@ class MainWindow(_MainWindowGUI):
         return True
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        if hasattr(self, "_auto_correction_timer"):
+            self._auto_correction_timer.stop()
+
         if hasattr(self, "_persistence_flush_timer"):
             self._persistence_flush_timer.stop()
 
