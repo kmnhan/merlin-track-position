@@ -471,16 +471,19 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.calibration_details_button = QtWidgets.QPushButton("Details...")
         self.correct_sample_button = QtWidgets.QPushButton("Correct sample")
         self.correct_sample_button.setEnabled(False)
-        self.auto_correction_checkbox = QtWidgets.QCheckBox("Auto correct")
+        self.auto_correction_checkbox = QtWidgets.QCheckBox("Auto correct every:")
         self.auto_correction_checkbox.setObjectName("auto_correction_checkbox")
         self.auto_correction_checkbox.setEnabled(False)
-        self.auto_correction_interval_spinbox = QtWidgets.QSpinBox()
+        self.auto_correction_interval_spinbox = QtWidgets.QDoubleSpinBox()
         self.auto_correction_interval_spinbox.setObjectName(
             "auto_correction_interval_spinbox"
         )
-        self.auto_correction_interval_spinbox.setRange(1, 1440)
-        self.auto_correction_interval_spinbox.setValue(5)
-        self.auto_correction_interval_spinbox.setSuffix(" min")
+        self.auto_correction_interval_spinbox.setDecimals(3)
+        self.auto_correction_interval_spinbox.setRange(0.001, 86_400.0)
+        self.auto_correction_interval_spinbox.setSingleStep(0.001)
+        self.auto_correction_interval_spinbox.setAccelerated(True)
+        self.auto_correction_interval_spinbox.setValue(180.0)
+        self.auto_correction_interval_spinbox.setSuffix(" s")
         self.auto_correction_interval_spinbox.setEnabled(False)
         self.detect_shift_button = QtWidgets.QPushButton("Detect shift")
         self.detect_shift_button.setEnabled(False)
@@ -489,10 +492,6 @@ class CalibrationPanel(QtWidgets.QWidget):
         calibration_button_layout.addWidget(self.load_calibration_button)
         calibration_button_layout.addWidget(self.save_calibration_button)
         calibration_button_layout.addWidget(self.calibration_details_button)
-        calibration_button_layout.addWidget(self.correct_sample_button)
-        calibration_button_layout.addWidget(self.auto_correction_checkbox)
-        calibration_button_layout.addWidget(self.auto_correction_interval_spinbox)
-        calibration_button_layout.addWidget(self.detect_shift_button)
         calibration_button_layout.addWidget(self.new_calibration_button)
         calibration_layout.addLayout(calibration_button_layout)
 
@@ -596,6 +595,14 @@ class CalibrationPanel(QtWidgets.QWidget):
             residual_plot.setAspectLocked(True)
             self.residual_plots[f"{x_label}{y_label}"] = residual_plot
         calibration_layout.addWidget(self.residual_graphics_layout, stretch=1)
+
+        correction_button_layout = QtWidgets.QHBoxLayout()
+        correction_button_layout.addWidget(self.detect_shift_button)
+        correction_button_layout.addWidget(self.correct_sample_button)
+        correction_button_layout.addWidget(self.auto_correction_checkbox)
+        correction_button_layout.addWidget(self.auto_correction_interval_spinbox)
+        correction_button_layout.addStretch(1)
+        calibration_layout.addLayout(correction_button_layout)
 
         self.reset()
 

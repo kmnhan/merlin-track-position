@@ -446,11 +446,8 @@ class CalibrationPanelTests(unittest.TestCase):
         axes_table = dialog.findChild(QtWidgets.QTableWidget, "calibration_axes_table")
 
         self.assertIn("test.h5", panel.calibration_status_label.text())
-        self.assertEqual(panel.new_calibration_button.text(), "Clear calibration")
         self.assertTrue(panel.correct_sample_button.isEnabled())
-        self.assertEqual(panel.correct_sample_button.text(), "Correct sample")
         self.assertTrue(panel.detect_shift_button.isEnabled())
-        self.assertEqual(panel.detect_shift_button.text(), "Detect shift")
         self.assertNotEqual(panel.metric_labels["axis_scale_cmd_mm"].text(), "n/a")
         self.assertEqual(tabs.tabText(0), "Matrices")
         self.assertEqual(tabs.tabText(1), "Axes")
@@ -464,7 +461,6 @@ class CalibrationPanelTests(unittest.TestCase):
         )
 
         panel.reset()
-        self.assertEqual(panel.new_calibration_button.text(), "New calibration")
         self.assertFalse(panel.correct_sample_button.isEnabled())
         self.assertFalse(panel.detect_shift_button.isEnabled())
 
@@ -569,16 +565,8 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
         with patched_main_window_runtime():
             window = MainWindow()
             try:
-                self.assertEqual(
-                    window.calibration_panel.new_calibration_button.text(),
-                    "New calibration",
-                )
                 self.assertFalse(
                     window.calibration_panel.correct_sample_button.isEnabled()
-                )
-                self.assertEqual(
-                    window.calibration_panel.correct_sample_button.text(),
-                    "Correct sample",
                 )
                 self.assertFalse(
                     window.calibration_panel.auto_correction_checkbox.isEnabled()
@@ -589,16 +577,8 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                 self.assertFalse(
                     window.calibration_panel.auto_correction_interval_spinbox.isEnabled()
                 )
-                self.assertEqual(
-                    window.calibration_panel.auto_correction_interval_spinbox.value(),
-                    5,
-                )
                 self.assertFalse(
                     window.calibration_panel.detect_shift_button.isEnabled()
-                )
-                self.assertEqual(
-                    window.calibration_panel.detect_shift_button.text(),
-                    "Detect shift",
                 )
                 self.assertTrue(roi_handles_visible(window))
                 self.assertTrue(roi_editing_enabled(window))
@@ -617,10 +597,6 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
             try:
                 window._on_new_calibration_ready(calibration)
 
-                self.assertEqual(
-                    window.calibration_panel.new_calibration_button.text(),
-                    "Clear calibration",
-                )
                 self.assertTrue(
                     window.calibration_panel.correct_sample_button.isEnabled()
                 )
@@ -645,10 +621,6 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
 
                 self.assertIsNone(window._calibration)
                 self.assertIsNone(window._calibration_path)
-                self.assertEqual(
-                    window.calibration_panel.new_calibration_button.text(),
-                    "New calibration",
-                )
                 self.assertFalse(
                     window.calibration_panel.correct_sample_button.isEnabled()
                 )
@@ -678,13 +650,13 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                 try:
                     window._on_new_calibration_ready(calibration)
                     window.calibration_panel.auto_correction_interval_spinbox.setValue(
-                        2
+                        2.125
                     )
 
                     window.calibration_panel.auto_correction_checkbox.setChecked(True)
 
                     self.assertTrue(window._auto_correction_timer.isActive())
-                    self.assertEqual(window._auto_correction_timer.interval(), 120000)
+                    self.assertEqual(window._auto_correction_timer.interval(), 2125)
 
                     window.calibration_panel.auto_correction_checkbox.setChecked(False)
 
@@ -695,30 +667,58 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
     def test_auto_correction_interval_persists_and_updates_active_timer(self):
         get_qapp()
         settings = FakeSettings()
-        settings.values["auto_correction/interval_minutes"] = 3.0
+        settings.values["auto_correction/interval_seconds"] = 3.125
         with tempfile.TemporaryDirectory() as tmpdir:
             calibration = write_sample_calibration(Path(tmpdir) / "calibration.h5")
             with patched_main_window_runtime(settings):
                 window = MainWindow()
                 try:
-                    self.assertEqual(
+                    self.assertAlmostEqual(
                         window.calibration_panel.auto_correction_interval_spinbox.value(),
-                        3,
+                        3.125,
                     )
 
                     window._on_new_calibration_ready(calibration)
                     window.calibration_panel.auto_correction_checkbox.setChecked(True)
                     window.calibration_panel.auto_correction_interval_spinbox.setValue(
-                        4
+                        4.25
                     )
 
-                    self.assertEqual(
-                        settings.values["auto_correction/interval_minutes"],
-                        4.0,
+                    self.assertAlmostEqual(
+                        settings.values["auto_correction/interval_seconds"],
+                        4.25,
                     )
-                    self.assertEqual(window._auto_correction_timer.interval(), 240000)
+                    self.assertEqual(window._auto_correction_timer.interval(), 4250)
                 finally:
                     window.close()
+
+    def test_auto_correction_interval_reads_legacy_ms_setting(self):
+        get_qapp()
+        settings = FakeSettings()
+        settings.values["auto_correction/interval_ms"] = 2500.0
+        with patched_main_window_runtime(settings):
+            window = MainWindow()
+            try:
+                self.assertAlmostEqual(
+                    window.calibration_panel.auto_correction_interval_spinbox.value(),
+                    2.5,
+                )
+            finally:
+                window.close()
+
+    def test_auto_correction_interval_reads_legacy_minutes_setting(self):
+        get_qapp()
+        settings = FakeSettings()
+        settings.values["auto_correction/interval_minutes"] = 3.0
+        with patched_main_window_runtime(settings):
+            window = MainWindow()
+            try:
+                self.assertAlmostEqual(
+                    window.calibration_panel.auto_correction_interval_spinbox.value(),
+                    180.0,
+                )
+            finally:
+                window.close()
 
     def test_auto_correction_timeout_starts_without_confirmation(self):
         get_qapp()

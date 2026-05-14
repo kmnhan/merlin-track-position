@@ -89,8 +89,13 @@ CAMERA_IMAGE_SIZES: dict[str, tuple[int, int]] = {
 }
 IMAGE_REFRESH_INTERVAL_MS = 400
 PERSISTENCE_FLUSH_INTERVAL_MS = 5000
-DEFAULT_AUTO_CORRECTION_INTERVAL_MINUTES = 5
-AUTO_CORRECTION_INTERVAL_SETTINGS_KEY = "auto_correction/interval_minutes"
+DEFAULT_AUTO_CORRECTION_INTERVAL_SECONDS = 180.0
+AUTO_CORRECTION_INTERVAL_SETTINGS_KEY = "auto_correction/interval_seconds"
+LEGACY_AUTO_CORRECTION_INTERVAL_MS_SETTINGS_KEY = "auto_correction/interval_ms"
+LEGACY_AUTO_CORRECTION_INTERVAL_MINUTES_SETTINGS_KEY = (
+    "auto_correction/interval_minutes"
+)
+AUTO_CORRECTION_INTERVAL_MS_PER_SECOND = 1_000
 AUTO_CORRECTION_INTERVAL_MS_PER_MINUTE = 60_000
 ROI_SETTINGS_KEYS: dict[str, tuple[str, str, str, str]] = {
     camera: (
@@ -418,7 +423,7 @@ class MainWindow(_MainWindowGUI):
 
         self._settings = QtCore.QSettings("merlin-track-position", "Track Positions")
         self.calibration_panel.auto_correction_interval_spinbox.setValue(
-            self._stored_auto_correction_interval_minutes()
+            self._stored_auto_correction_interval_seconds()
         )
         self._calibration: xr.Dataset | None = None
         self._calibration_path: Path | None = None
@@ -551,22 +556,47 @@ class MainWindow(_MainWindowGUI):
     def _load_calibration_from_path(path: Path) -> xr.Dataset:
         return load_calibration_dataset(path)
 
-    def _stored_auto_correction_interval_minutes(self) -> int:
+    def _stored_auto_correction_interval_seconds(self) -> float:
         spinbox = self.calibration_panel.auto_correction_interval_spinbox
         value = self._settings.value(
             AUTO_CORRECTION_INTERVAL_SETTINGS_KEY,
-            DEFAULT_AUTO_CORRECTION_INTERVAL_MINUTES,
+            None,
         )
+        multiplier = 1.0
+        if value is None:
+            value = self._settings.value(
+                LEGACY_AUTO_CORRECTION_INTERVAL_MS_SETTINGS_KEY,
+                None,
+            )
+            if value is None:
+                default_interval_minutes = (
+                    DEFAULT_AUTO_CORRECTION_INTERVAL_SECONDS
+                    * AUTO_CORRECTION_INTERVAL_MS_PER_SECOND
+                    / AUTO_CORRECTION_INTERVAL_MS_PER_MINUTE
+                )
+                value = self._settings.value(
+                    LEGACY_AUTO_CORRECTION_INTERVAL_MINUTES_SETTINGS_KEY,
+                    default_interval_minutes,
+                )
+                multiplier = (
+                    AUTO_CORRECTION_INTERVAL_MS_PER_MINUTE
+                    / AUTO_CORRECTION_INTERVAL_MS_PER_SECOND
+                )
+            else:
+                multiplier = 1.0 / AUTO_CORRECTION_INTERVAL_MS_PER_SECOND
         try:
-            interval_minutes = int(float(value))
+            interval_seconds = round(float(value) * multiplier, 3)
         except (TypeError, ValueError):
-            interval_minutes = DEFAULT_AUTO_CORRECTION_INTERVAL_MINUTES
-        return min(max(interval_minutes, spinbox.minimum()), spinbox.maximum())
+            interval_seconds = DEFAULT_AUTO_CORRECTION_INTERVAL_SECONDS
+        return min(max(interval_seconds, spinbox.minimum()), spinbox.maximum())
 
     def _auto_correction_interval_ms(self) -> int:
-        return (
+        interval_seconds = (
             self.calibration_panel.auto_correction_interval_spinbox.value()
-            * AUTO_CORRECTION_INTERVAL_MS_PER_MINUTE
+        )
+        return max(
+            int(round(interval_seconds * AUTO_CORRECTION_INTERVAL_MS_PER_SECOND)),
+            1,
         )
 
     def _restart_auto_correction_timer(self) -> None:
@@ -855,12 +885,12 @@ class MainWindow(_MainWindowGUI):
             return
         self._stop_auto_correction(uncheck=False)
 
-    @QtCore.Slot(int)
-    def _on_auto_correction_interval_changed(self, interval_minutes: int) -> None:
-        interval_minutes = int(interval_minutes)
+    @QtCore.Slot(float)
+    def _on_auto_correction_interval_changed(self, interval_seconds: float) -> None:
+        interval_seconds = round(float(interval_seconds), 3)
         self._settings.setValue(
             AUTO_CORRECTION_INTERVAL_SETTINGS_KEY,
-            interval_minutes,
+            interval_seconds,
         )
         self._settings.sync()
         if self._auto_correction_timer.isActive():
