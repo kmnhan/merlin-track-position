@@ -195,7 +195,7 @@ and later correction runs reuse this saved scale.
 Let
 
 ```math
-S = \operatorname{diag}(s_x, s_y, s_z),
+S = \text{diag}(s_x, s_y, s_z),
 ```
 
 where
@@ -259,7 +259,7 @@ r_j = c_j h_j.
 The target response is the median response over axes:
 
 ```math
-r_\star = \operatorname{median}(r_x, r_y, r_z).
+r_\star = \text{median}(r_x, r_y, r_z).
 ```
 
 The unclamped command scale is
@@ -272,7 +272,7 @@ The saved correction scale is clamped to configured operational bounds:
 
 ```math
 s_j =
-\operatorname{clip}
+\text{clip}
 \left(
 s_j^{\mathrm{raw}},
 s_{j,\min},
