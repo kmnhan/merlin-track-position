@@ -58,7 +58,7 @@ METRIC_ROWS: tuple[tuple[str, str, str], ...] = (
         "Condition number",
         _tooltip_html(
             (
-                "<tt>np.linalg.cond(visual_jacobian)</tt> after reshaping "
+                "<tt>np.linalg.cond(px_per_cmd_mm)</tt> after reshaping "
                 "to the 4x3 observation matrix.",
             ),
             (
@@ -126,7 +126,7 @@ METRIC_ROWS: tuple[tuple[str, str, str], ...] = (
         _tooltip_html(
             (
                 "Pixel residuals are converted through "
-                "<tt>pinv(visual_jacobian)</tt> into commanded-mm coordinates.",
+                "<tt>pinv(px_per_cmd_mm)</tt> into commanded-mm coordinates.",
             ),
             ("This is a command-space fit-error diagnostic, not physical microns.",),
         ),
@@ -255,11 +255,11 @@ def _calibration_arrays(dataset: xr.Dataset) -> dict[str, np.ndarray]:
     validate_visual_calibration_dataset(dataset)
     command_delta = np.asarray(dataset["probe_command_delta_mm"].values, dtype=float)
     measured_shift = np.asarray(dataset["probe_measured_delta_px"].values, dtype=float)
-    visual_jacobian = np.asarray(
-        dataset["visual_jacobian_px_per_cmd_mm"].values,
+    px_per_cmd_mm = np.asarray(
+        dataset["px_per_cmd_mm"].values,
         dtype=float,
     )
-    jacobian_observation = visual_jacobian.reshape(
+    jacobian_observation = px_per_cmd_mm.reshape(
         len(OBSERVATION_AXES),
         len(COMMAND_AXES),
     )
@@ -285,7 +285,7 @@ def _calibration_arrays(dataset: xr.Dataset) -> dict[str, np.ndarray]:
     return {
         "command_delta": command_delta,
         "measured_shift": measured_shift,
-        "visual_jacobian": visual_jacobian,
+        "px_per_cmd_mm": px_per_cmd_mm,
         "jacobian_observation": jacobian_observation,
         "pixel_to_command": pixel_to_command,
         "predicted_shift": predicted_shift,
@@ -387,7 +387,7 @@ def _calibration_summary(dataset: xr.Dataset) -> dict[str, object]:
         axis_scale_bounds,
         axis_scale_target_response_px,
     ) = derive_axis_scale_from_jacobian(
-        arrays["visual_jacobian"],
+        arrays["px_per_cmd_mm"],
         command_delta,
     )
     return {
@@ -407,7 +407,7 @@ def _calibration_summary(dataset: xr.Dataset) -> dict[str, object]:
         "residual_max_cmd_mm": residual_max_cmd_mm,
         "readback_command_rms_mm": readback_command_rms_mm,
         "readback_command_max_mm": readback_command_max_mm,
-        "visual_jacobian": arrays["visual_jacobian"],
+        "px_per_cmd_mm": arrays["px_per_cmd_mm"],
         "pixel_to_command": arrays["pixel_to_command"],
         "warnings": warnings,
         "repeatability": repeatability,
@@ -961,10 +961,10 @@ class CalibrationPanel(QtWidgets.QWidget):
         matrices_layout = QtWidgets.QVBoxLayout(matrices_tab)
         for title, row_labels, column_labels, values in (
             (
-                "visual_jacobian_px_per_cmd_mm",
+                "px_per_cmd_mm",
                 OBSERVATION_AXES,
                 COMMAND_AXES,
-                np.asarray(summary["visual_jacobian"], dtype=float).reshape(
+                np.asarray(summary["px_per_cmd_mm"], dtype=float).reshape(
                     len(OBSERVATION_AXES),
                     len(COMMAND_AXES),
                 ),

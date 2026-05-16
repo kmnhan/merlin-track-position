@@ -31,7 +31,7 @@ from merlin_track_position.tracking.calibration_core import (
     lqr_projected_residual_from_design,
     measure_image_error,
     predict_lqr_kalman_state,
-    refine_visual_jacobian_from_observations,
+    refine_jacobian_from_observations,
     solve_damped_command_correction,
     solve_lqr_command_correction,
     solve_lqr_state_command_correction,
@@ -273,7 +273,7 @@ def do_correction(
     reference_cam1 = np.asarray(calibration["reference_cam1"].values)
     axis_scale = np.asarray(calibration["axis_scale_cmd_mm"].values, dtype=np.float64)
     jacobian = np.asarray(
-        calibration["visual_jacobian_px_per_cmd_mm"].values,
+        calibration["px_per_cmd_mm"].values,
         dtype=np.float64,
     )
     lqr_design: dict[str, Any] | None = None
@@ -762,7 +762,7 @@ def do_correction(
                         exclude_run_id=correction_run_id,
                     )
                 )
-                calibration = refine_visual_jacobian_from_observations(
+                calibration = refine_jacobian_from_observations(
                     calibration,
                     refinement_delta,
                     refinement_measured,
@@ -773,7 +773,7 @@ def do_correction(
                 logger.info("Skipped Jacobian refinement: %s", exc)
             else:
                 jacobian = np.asarray(
-                    calibration["visual_jacobian_px_per_cmd_mm"].values,
+                    calibration["px_per_cmd_mm"].values,
                     dtype=np.float64,
                 )
                 jacobian_refined = True
@@ -1866,7 +1866,7 @@ def _build_correction_result(
                 commanded_position_mm,
                 {"units": "commanded-mm"},
             ),
-            "visual_jacobian_px_per_cmd_mm": (
+            "px_per_cmd_mm": (
                 ("camera", "pixel_axis", "command_axis"),
                 jacobian,
                 {"units": "px/commanded-mm"},
@@ -1948,12 +1948,12 @@ def _build_correction_result(
                 ("move",),
                 np.asarray(move_feedback_valid, dtype=bool),
             ),
-            "move_visual_jacobian_before_px_per_cmd_mm": (
+            "move_px_per_cmd_mm_before": (
                 ("move", "camera", "pixel_axis", "command_axis"),
                 _stack_jacobian_or_empty(move_jacobian_before),
                 {"units": "px/commanded-mm"},
             ),
-            "move_visual_jacobian_after_px_per_cmd_mm": (
+            "move_px_per_cmd_mm_after": (
                 ("move", "camera", "pixel_axis", "command_axis"),
                 _stack_jacobian_or_empty(move_jacobian_after),
                 {"units": "px/commanded-mm"},

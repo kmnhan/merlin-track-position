@@ -25,9 +25,9 @@ from merlin_track_position.tracking.calibration_core import (
 )
 
 DEFAULT_SAMPLE_CALIBRATION_PATH = Path(
-    "/Users/khan/Downloads/visual_jacobian_calibration.h5"
+    "/Users/khan/Downloads/calibration.h5"
 )
-SAMPLE_VISUAL_JACOBIAN_PX_PER_CMD_MM = np.array(
+SAMPLE_PX_PER_CMD_MM = np.array(
     [
         [[270.0, -140.0, 70.0], [90.0, 310.0, -120.0]],
         [[-210.0, 180.0, 330.0], [240.0, 50.0, 160.0]],
@@ -44,7 +44,7 @@ def build_sample_calibration_dataset(
     """Build a deterministic commanded-mm calibration dataset."""
 
     command_delta = _sample_probe_deltas()
-    jacobian_observation = SAMPLE_VISUAL_JACOBIAN_PX_PER_CMD_MM.reshape(
+    jacobian_observation = SAMPLE_PX_PER_CMD_MM.reshape(
         len(OBSERVATION_AXES),
         len(COMMAND_AXES),
     )
@@ -54,7 +54,7 @@ def build_sample_calibration_dataset(
         len(PIXEL_AXES),
     )
     axis_scale, *_ = derive_axis_scale_from_jacobian(
-        SAMPLE_VISUAL_JACOBIAN_PX_PER_CMD_MM,
+        SAMPLE_PX_PER_CMD_MM,
         command_delta,
     )
 
@@ -78,9 +78,9 @@ def build_sample_calibration_dataset(
     }
     return xr.Dataset(
         data_vars={
-            "visual_jacobian_px_per_cmd_mm": (
+            "px_per_cmd_mm": (
                 ("camera", "pixel_axis", "command_axis"),
-                SAMPLE_VISUAL_JACOBIAN_PX_PER_CMD_MM,
+                SAMPLE_PX_PER_CMD_MM,
                 {"units": "px/commanded-mm"},
             ),
             "axis_scale_cmd_mm": (

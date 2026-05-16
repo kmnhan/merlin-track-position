@@ -412,7 +412,7 @@ class GUIHelperTests(unittest.TestCase):
 
 
 class CalibrationPanelTests(unittest.TestCase):
-    def test_summary_reports_visual_jacobian_metrics(self):
+    def test_summary_reports_px_per_cmd_mm_metrics(self):
         calibration = build_sample_calibration_dataset(
             image_shape_cam0=(4, 5),
             image_shape_cam1=(6, 7),
@@ -433,7 +433,7 @@ class CalibrationPanelTests(unittest.TestCase):
             _axis_scale_bounds,
             _target_response,
         ) = derive_axis_scale_from_jacobian(
-            calibration["visual_jacobian_px_per_cmd_mm"].values,
+            calibration["px_per_cmd_mm"].values,
             calibration["probe_command_delta_mm"].values,
         )
         np.testing.assert_allclose(
@@ -443,8 +443,8 @@ class CalibrationPanelTests(unittest.TestCase):
         self.assertEqual(summary["residual_rms_px"], 0.0)
         self.assertEqual(summary["residual_max_cmd_mm"], 0.0)
         np.testing.assert_allclose(
-            summary["visual_jacobian"],
-            calibration["visual_jacobian_px_per_cmd_mm"].values,
+            summary["px_per_cmd_mm"],
+            calibration["px_per_cmd_mm"].values,
         )
 
     def test_panel_loads_dataset_and_builds_details_dialog(self):

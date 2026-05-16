@@ -44,7 +44,7 @@ def detect_shift(
     reference_cam0 = np.asarray(calibration["reference_cam0"].values)
     reference_cam1 = np.asarray(calibration["reference_cam1"].values)
     jacobian = np.asarray(
-        calibration["visual_jacobian_px_per_cmd_mm"].values,
+        calibration["px_per_cmd_mm"].values,
         dtype=np.float64,
     )
     logger.info("Detecting shift without motor correction.")

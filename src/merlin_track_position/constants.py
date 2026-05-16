@@ -77,7 +77,7 @@ DEFAULT_VISUAL_CALIBRATION_REPEATS_PER_DIRECTION: int = 3
 DEFAULT_VISUAL_CALIBRATION_MIN_SHIFT_PX: float = 2.0
 
 # Calibration condition number threshold above which the fit is rejected.
-DEFAULT_VISUAL_JACOBIAN_CONDITION_WARNING: float = 100.0
+DEFAULT_JACOBIAN_CONDITION_WARNING: float = 100.0
 
 # Shared closed-loop correction defaults in command-mm visual-servo space.
 # Supported algorithms: "damped_wls" and "lqr".

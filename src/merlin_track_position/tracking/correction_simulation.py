@@ -108,8 +108,8 @@ def initial_offsets_from_correction_history(
     """Project correction-history initial image shifts into command-space microns."""
 
     calibration = load_calibration_dataset(calibration_path)
-    visual_jacobian = np.asarray(
-        calibration["visual_jacobian_px_per_cmd_mm"].values,
+    px_per_cmd_mm = np.asarray(
+        calibration["px_per_cmd_mm"].values,
         dtype=np.float64,
     )
     offsets: list[np.ndarray] = []
@@ -122,7 +122,7 @@ def initial_offsets_from_correction_history(
             if shifts.shape[0] == 0:
                 continue
             offset_mm = estimate_command_offset(
-                visual_jacobian,
+                px_per_cmd_mm,
                 np.asarray(shifts[0], dtype=np.float64),
                 weights=_weights_or_default(weights),
             )
@@ -366,11 +366,11 @@ def _simulate_correction(
     initial_um = _initial_offsets(initial_offsets_um, trials_per_offset)
     trial_count = initial_um.shape[0]
     algorithm_count = len(configs)
-    visual_jacobian = np.asarray(
-        calibration["visual_jacobian_px_per_cmd_mm"].values,
+    px_per_cmd_mm = np.asarray(
+        calibration["px_per_cmd_mm"].values,
         dtype=np.float64,
     )
-    jacobian_observation = visual_jacobian.reshape(
+    jacobian_observation = px_per_cmd_mm.reshape(
         len(CAMERAS) * len(PIXEL_AXES),
         len(COMMAND_AXES),
     )

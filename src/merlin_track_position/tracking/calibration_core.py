@@ -45,7 +45,7 @@ CaptureShiftResult = tuple[np.ndarray, tuple[str, ...]]
 IndexedCaptureShiftResult = tuple[int, int, int, np.ndarray, tuple[str, ...]]
 
 REQUIRED_CALIBRATION_VARIABLES: tuple[str, ...] = (
-    "visual_jacobian_px_per_cmd_mm",
+    "px_per_cmd_mm",
     "axis_scale_cmd_mm",
     "reference_cam0",
     "reference_cam1",
@@ -77,7 +77,7 @@ REDUNDANT_CALIBRATION_ATTRS: tuple[str, ...] = (
 )
 
 
-def fit_visual_jacobian_calibration(
+def fit_jacobian_calibration(
     *,
     reference_cam0: Any,
     reference_cam1: Any,
@@ -92,14 +92,14 @@ def fit_visual_jacobian_calibration(
     post_readback_position_mm: Sequence[Sequence[float]],
     min_shift_px: float = constants.DEFAULT_VISUAL_CALIBRATION_MIN_SHIFT_PX,
     condition_warning_threshold: float = (
-        constants.DEFAULT_VISUAL_JACOBIAN_CONDITION_WARNING
+        constants.DEFAULT_JACOBIAN_CONDITION_WARNING
     ),
     additional_context: dict[str, Any] | None = None,
     progress_callback: ProgressCallback | None = None,
     n_jobs: int | None = None,
     **shift_kwargs: Any,
 ) -> xr.Dataset:
-    """Fit a local visual Jacobian from commanded-mm motor probes.
+    """Fit a local Jacobian from commanded-mm motor probes.
 
     The fitted model is linear through the local command point:
 
@@ -108,7 +108,7 @@ def fit_visual_jacobian_calibration(
 
     if "reference_index" in shift_kwargs:
         raise TypeError(
-            "fit_visual_jacobian_calibration() got an unexpected keyword "
+            "fit_jacobian_calibration() got an unexpected keyword "
             "argument 'reference_index'"
         )
     n_jobs = _resolve_n_jobs(n_jobs)
@@ -212,8 +212,8 @@ def fit_visual_jacobian_calibration(
         raise ValueError("probe command deltas must span x/y/z command space")
 
     coef = _fit_robust_least_squares(command_delta, observation)
-    visual_jacobian = coef.T.reshape(len(CAMERAS), len(PIXEL_AXES), len(COMMAND_AXES))
-    jacobian_observation = visual_jacobian.reshape(
+    px_per_cmd_mm = coef.T.reshape(len(CAMERAS), len(PIXEL_AXES), len(COMMAND_AXES))
+    jacobian_observation = px_per_cmd_mm.reshape(
         len(OBSERVATION_AXES),
         len(COMMAND_AXES),
     )
@@ -223,7 +223,7 @@ def fit_visual_jacobian_calibration(
     calibration_rank = int(np.count_nonzero(singular_values > rank_tolerance))
     if calibration_rank < len(COMMAND_AXES):
         raise ValueError(
-            f"fitted visual Jacobian must have rank 3; got rank {calibration_rank}"
+            f"fitted Jacobian must have rank 3; got rank {calibration_rank}"
         )
 
     condition_number = float(np.linalg.cond(jacobian_observation))
@@ -235,11 +235,11 @@ def fit_visual_jacobian_calibration(
         raise ValueError("condition_warning_threshold must be finite and positive")
     if condition_number > condition_warning_threshold:
         raise ValueError(
-            "visual Jacobian is poorly conditioned: condition number "
+            "Jacobian is poorly conditioned: condition number "
             f"{condition_number:.4g} > {condition_warning_threshold:.4g}"
         )
 
-    axis_scale, *_ = derive_axis_scale_from_jacobian(visual_jacobian, command_delta)
+    axis_scale, *_ = derive_axis_scale_from_jacobian(px_per_cmd_mm, command_delta)
     warnings = list(format_probe_warning_lines(measurement_warnings, command_delta))
     attrs: dict[str, Any] = {
         "capture_count": capture_count,
@@ -271,9 +271,9 @@ def fit_visual_jacobian_calibration(
     }
     dataset = xr.Dataset(
         data_vars={
-            "visual_jacobian_px_per_cmd_mm": (
+            "px_per_cmd_mm": (
                 ("camera", "pixel_axis", "command_axis"),
-                visual_jacobian,
+                px_per_cmd_mm,
                 {"units": "px/commanded-mm"},
             ),
             "axis_scale_cmd_mm": (
@@ -346,7 +346,7 @@ def validate_visual_calibration_dataset(dataset: xr.Dataset) -> None:
             "missing required calibration variables: " + ", ".join(missing)
         )
 
-    jacobian = np.asarray(dataset["visual_jacobian_px_per_cmd_mm"].values, dtype=float)
+    jacobian = np.asarray(dataset["px_per_cmd_mm"].values, dtype=float)
     axis_scale = np.asarray(dataset["axis_scale_cmd_mm"].values, dtype=float)
     reference_cam0 = np.asarray(dataset["reference_cam0"].values)
     reference_cam1 = np.asarray(dataset["reference_cam1"].values)
@@ -361,12 +361,12 @@ def validate_visual_calibration_dataset(dataset: xr.Dataset) -> None:
 
     if jacobian.shape != (len(CAMERAS), len(PIXEL_AXES), len(COMMAND_AXES)):
         raise ValueError(
-            "visual_jacobian_px_per_cmd_mm must have shape "
+            "px_per_cmd_mm must have shape "
             "(camera, pixel_axis, command_axis)"
         )
     if not np.isfinite(jacobian).all():
         raise ValueError(
-            "visual_jacobian_px_per_cmd_mm must contain only finite values"
+            "px_per_cmd_mm must contain only finite values"
         )
     jacobian_observation = jacobian.reshape(
         len(OBSERVATION_AXES),
@@ -377,13 +377,13 @@ def validate_visual_calibration_dataset(dataset: xr.Dataset) -> None:
     rank_tolerance = 1e-3 * largest_singular_value
     rank = int(np.count_nonzero(singular_values > rank_tolerance))
     if rank < len(COMMAND_AXES):
-        raise ValueError(f"visual Jacobian must have rank 3; got rank {rank}")
+        raise ValueError(f"Jacobian must have rank 3; got rank {rank}")
     condition_number = float(np.linalg.cond(jacobian_observation))
-    if condition_number > constants.DEFAULT_VISUAL_JACOBIAN_CONDITION_WARNING:
+    if condition_number > constants.DEFAULT_JACOBIAN_CONDITION_WARNING:
         raise ValueError(
-            "visual Jacobian is poorly conditioned: condition number "
+            "Jacobian is poorly conditioned: condition number "
             f"{condition_number:.4g} > "
-            f"{constants.DEFAULT_VISUAL_JACOBIAN_CONDITION_WARNING:.4g}"
+            f"{constants.DEFAULT_JACOBIAN_CONDITION_WARNING:.4g}"
         )
     if axis_scale.shape != (len(COMMAND_AXES),):
         raise ValueError("axis_scale_cmd_mm must have shape (command_axis,)")
@@ -662,18 +662,18 @@ def _discard_pending_calibration_entries(path: str | Path) -> None:
         discard_spool_entry(entry)
 
 
-def assign_refined_visual_jacobian(
+def assign_refined_jacobian(
     calibration: xr.Dataset,
-    visual_jacobian: np.ndarray,
+    px_per_cmd_mm: np.ndarray,
     *,
     save_path: str | Path | None = None,
 ) -> xr.Dataset:
     """Return calibration with a refined Jacobian and persist it when requested."""
 
     validate_visual_calibration_dataset(calibration)
-    jacobian = _as_visual_jacobian(visual_jacobian)
+    jacobian = _as_jacobian(px_per_cmd_mm)
     updated = _canonical_visual_calibration_dataset(calibration).copy(deep=True)
-    updated["visual_jacobian_px_per_cmd_mm"] = (
+    updated["px_per_cmd_mm"] = (
         ("camera", "pixel_axis", "command_axis"),
         jacobian,
         {"units": "px/commanded-mm"},
@@ -693,7 +693,7 @@ def assign_refined_visual_jacobian(
     return updated
 
 
-def refine_visual_jacobian_from_observations(
+def refine_jacobian_from_observations(
     calibration: xr.Dataset,
     correction_command_delta_mm: Sequence[Sequence[float]],
     correction_measured_delta_px: Sequence[Any],
@@ -727,15 +727,15 @@ def refine_visual_jacobian_from_observations(
     combined_delta = np.vstack([probe_delta, correction_delta])
     combined_observation = np.vstack([probe_observation, correction_observation])
     coef = _fit_robust_least_squares(combined_delta, combined_observation)
-    visual_jacobian = coef.T.reshape(
+    px_per_cmd_mm = coef.T.reshape(
         len(CAMERAS),
         len(PIXEL_AXES),
         len(COMMAND_AXES),
     )
-    _validate_refined_visual_jacobian(calibration, visual_jacobian)
-    return assign_refined_visual_jacobian(
+    _validate_refined_jacobian(calibration, px_per_cmd_mm)
+    return assign_refined_jacobian(
         calibration,
-        visual_jacobian,
+        px_per_cmd_mm,
         save_path=save_path,
     )
 
@@ -835,11 +835,11 @@ def estimate_command_offset(
     if isinstance(calibration_or_jacobian, xr.Dataset):
         validate_visual_calibration_dataset(calibration_or_jacobian)
         jacobian = np.asarray(
-            calibration_or_jacobian["visual_jacobian_px_per_cmd_mm"].values,
+            calibration_or_jacobian["px_per_cmd_mm"].values,
             dtype=np.float64,
         )
     else:
-        jacobian = _as_visual_jacobian(calibration_or_jacobian)
+        jacobian = _as_jacobian(calibration_or_jacobian)
 
     observation = _shift_to_observation(_shift_values(shift))
     jacobian_observation = _jacobian_to_observation(jacobian)
@@ -850,7 +850,7 @@ def estimate_command_offset(
 
 
 def solve_damped_command_correction(
-    visual_jacobian: np.ndarray,
+    px_per_cmd_mm: np.ndarray,
     shift: xr.Dataset | xr.DataArray | Sequence[float],
     axis_scale_cmd_mm: Sequence[float],
     *,
@@ -867,7 +867,7 @@ def solve_damped_command_correction(
     """Solve the damped normalized-command correction ``Delta a``."""
 
     jacobian_observation = _jacobian_to_observation(
-        _as_visual_jacobian(visual_jacobian)
+        _as_jacobian(px_per_cmd_mm)
     )
     observation = _shift_to_observation(_shift_values(shift))
     axis_scale = np.asarray(axis_scale_cmd_mm, dtype=np.float64)
@@ -924,7 +924,7 @@ def solve_damped_command_correction(
 
 
 def solve_lqr_command_correction(
-    visual_jacobian: np.ndarray,
+    px_per_cmd_mm: np.ndarray,
     shift: xr.Dataset | xr.DataArray | Sequence[float],
     axis_scale_cmd_mm: Sequence[float],
     *,
@@ -943,7 +943,7 @@ def solve_lqr_command_correction(
     """Solve the nominal image-space LQR correction in commanded-mm units."""
 
     jacobian_observation = _jacobian_to_observation(
-        _as_visual_jacobian(visual_jacobian)
+        _as_jacobian(px_per_cmd_mm)
     )
     observation = _shift_to_observation(_shift_values(shift))
     axis_scale = np.asarray(axis_scale_cmd_mm, dtype=np.float64)
@@ -1000,7 +1000,7 @@ def solve_lqr_command_correction(
 
 
 def lqr_projected_residual(
-    visual_jacobian: np.ndarray,
+    px_per_cmd_mm: np.ndarray,
     shift: xr.Dataset | xr.DataArray | Sequence[float],
     axis_scale_cmd_mm: Sequence[float],
     *,
@@ -1014,7 +1014,7 @@ def lqr_projected_residual(
     """Return ``||U_c.T @ S_e^-1 @ e||`` for the LQR stopping criterion."""
 
     jacobian_observation = _jacobian_to_observation(
-        _as_visual_jacobian(visual_jacobian)
+        _as_jacobian(px_per_cmd_mm)
     )
     design = compute_lqr_correction_design(
         jacobian_observation,
@@ -1088,7 +1088,7 @@ def compute_lqr_correction_design(
         full_matrices=False,
     )
     if singular_values.size == 0 or singular_values[0] <= 0.0:
-        raise ValueError("visual Jacobian has zero gain; cannot design LQR")
+        raise ValueError("Jacobian has zero gain; cannot design LQR")
 
     rank = int(
         np.count_nonzero(
@@ -1096,7 +1096,7 @@ def compute_lqr_correction_design(
         )
     )
     if rank == 0:
-        raise ValueError("visual Jacobian numerical rank is zero; cannot design LQR")
+        raise ValueError("Jacobian numerical rank is zero; cannot design LQR")
 
     controllable_basis = left_singular_vectors[:, :rank]
     state_matrix = np.eye(rank, dtype=np.float64)
@@ -1503,30 +1503,30 @@ def _as_correction_observation_matrix(
     return observations
 
 
-def _validate_refined_visual_jacobian(
+def _validate_refined_jacobian(
     calibration: xr.Dataset,
-    visual_jacobian: np.ndarray,
+    px_per_cmd_mm: np.ndarray,
 ) -> None:
-    jacobian_observation = _jacobian_to_observation(visual_jacobian)
+    jacobian_observation = _jacobian_to_observation(px_per_cmd_mm)
     singular_values = np.linalg.svd(jacobian_observation, compute_uv=False)
     largest_singular_value = float(singular_values[0]) if singular_values.size else 0.0
     rank_tolerance = 1e-3 * largest_singular_value
     rank = int(np.count_nonzero(singular_values > rank_tolerance))
     if rank < len(COMMAND_AXES):
-        raise ValueError(f"refined visual Jacobian must have rank 3; got rank {rank}")
+        raise ValueError(f"refined Jacobian must have rank 3; got rank {rank}")
 
     condition_number = float(np.linalg.cond(jacobian_observation))
     threshold = float(
         calibration.attrs.get(
             "condition_warning_threshold",
-            constants.DEFAULT_VISUAL_JACOBIAN_CONDITION_WARNING,
+            constants.DEFAULT_JACOBIAN_CONDITION_WARNING,
         )
     )
     if not np.isfinite(threshold) or threshold <= 0.0:
-        threshold = constants.DEFAULT_VISUAL_JACOBIAN_CONDITION_WARNING
+        threshold = constants.DEFAULT_JACOBIAN_CONDITION_WARNING
     if condition_number > threshold:
         raise ValueError(
-            "refined visual Jacobian is poorly conditioned: condition number "
+            "refined Jacobian is poorly conditioned: condition number "
             f"{condition_number:.4g} > {threshold:.4g}"
         )
 
@@ -1984,14 +1984,14 @@ def _fit_robust_least_squares(
 
 
 def derive_axis_scale_from_jacobian(
-    visual_jacobian: np.ndarray,
+    px_per_cmd_mm: np.ndarray,
     command_delta: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
     """Derive correction damping scales from fitted sensitivity."""
 
-    axis_sensitivity = np.linalg.norm(_jacobian_to_observation(visual_jacobian), axis=0)
+    axis_sensitivity = np.linalg.norm(_jacobian_to_observation(px_per_cmd_mm), axis=0)
     if not np.isfinite(axis_sensitivity).all() or np.any(axis_sensitivity <= 0.0):
-        raise ValueError("visual Jacobian axis sensitivity must be finite and positive")
+        raise ValueError("Jacobian axis sensitivity must be finite and positive")
 
     command_delta = np.asarray(command_delta, dtype=np.float64)
     if command_delta.ndim != 2 or command_delta.shape[1] != len(COMMAND_AXES):
@@ -2073,22 +2073,22 @@ def _shift_to_observation(shift_values: np.ndarray) -> np.ndarray:
     raise ValueError("shift must have shape (2, 2) or contain four observation values")
 
 
-def _as_visual_jacobian(values: np.ndarray) -> np.ndarray:
+def _as_jacobian(values: np.ndarray) -> np.ndarray:
     jacobian = np.asarray(values, dtype=np.float64)
     if jacobian.shape != (len(CAMERAS), len(PIXEL_AXES), len(COMMAND_AXES)):
         raise ValueError(
-            "visual_jacobian_px_per_cmd_mm must have shape "
+            "px_per_cmd_mm must have shape "
             "(camera, pixel_axis, command_axis)"
         )
     if not np.isfinite(jacobian).all():
         raise ValueError(
-            "visual_jacobian_px_per_cmd_mm must contain only finite values"
+            "px_per_cmd_mm must contain only finite values"
         )
     return jacobian
 
 
 def _jacobian_to_observation(jacobian: np.ndarray) -> np.ndarray:
-    return _as_visual_jacobian(jacobian).reshape(
+    return _as_jacobian(jacobian).reshape(
         len(OBSERVATION_AXES),
         len(COMMAND_AXES),
     )

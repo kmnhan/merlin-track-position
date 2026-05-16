@@ -2,7 +2,7 @@
 
 This repository implements image-based sample-position tracking and correction
 for Beamline 4.0.3 MERLIN at the Advanced Light Source. The controller uses a
-locally calibrated visual Jacobian between commanded motor displacements and
+locally calibrated Jacobian between commanded motor displacements and
 two-camera image displacements, then applies a closed-loop Linear Quadratic
 Regulator (LQR) in the controllable image subspace.
 
@@ -125,7 +125,7 @@ observed image change has the same sign and approximate magnitude as
 
 ### Calibration Routine
 
-Before correction, the visual Jacobian `J` is estimated from finite-difference
+Before correction, the Jacobian `J` is estimated from finite-difference
 probe moves:
 
 1. read the initial BCS `x`, `y`, and `z` command positions;
@@ -134,7 +134,7 @@ probe moves:
    `z`;
 4. for each probe, acquire pre-move images, command the move, acquire post-move
    images, and register the post-move images against the pre-move images;
-5. estimate `visual_jacobian_px_per_cmd_mm` from the valid
+5. estimate `px_per_cmd_mm` from the valid
    `(probe_command_delta_mm, probe_measured_delta_px)` rows;
 6. persist the calibration dataset to disk and reload it from that path.
 
@@ -168,9 +168,9 @@ Calibration is rejected if:
 - a probe image response is below `DEFAULT_VISUAL_CALIBRATION_MIN_SHIFT_PX`
   (`2.0 px` by default);
 - the commanded probe deltas do not span the three command axes;
-- the fitted visual Jacobian has rank less than 3;
+- the fitted Jacobian has rank less than 3;
 - the condition number exceeds
-  `DEFAULT_VISUAL_JACOBIAN_CONDITION_WARNING` (`100.0` by default).
+  `DEFAULT_JACOBIAN_CONDITION_WARNING` (`100.0` by default).
 
 The rank and condition-number checks are observability checks. Rank less than 3
 means the three command directions cannot be distinguished in image space. A
@@ -215,7 +215,7 @@ is represented by `axis_scale_cmd_mm`. The normalized command is
 \Delta a_k = S_m\tilde a_k.
 ```
 
-The scale is derived from the fitted visual Jacobian. For command axis `j`,
+The scale is derived from the fitted Jacobian. For command axis `j`,
 
 ```math
 c_j = \|J_{:,j}\|_2
@@ -471,11 +471,11 @@ LQR convergence is evaluated in the controllable normalized image subspace:
 The default tolerance is
 
 ```text
-DEFAULT_LQR_CORRECTION_PROJECTED_TOLERANCE = 1.0
+DEFAULT_LQR_CORRECTION_PROJECTED_TOLERANCE = 2.0
 ```
 
-This means the controllable image error is within roughly one normalized image
-tolerance unit. The pixel residual
+This means the controllable image error is within roughly two normalized image
+tolerance units. The pixel residual
 
 ```math
 \sqrt{e_k^\mathsf{T}We_k}
@@ -778,7 +778,7 @@ acquired.
 The required calibration variables are:
 
 ```text
-visual_jacobian_px_per_cmd_mm(camera, pixel_axis, command_axis)
+px_per_cmd_mm(camera, pixel_axis, command_axis)
 axis_scale_cmd_mm(command_axis)
 reference_cam0(y_cam0, x_cam0)
 reference_cam1(y_cam1, x_cam1)
@@ -810,7 +810,7 @@ correction_cmd_mm(command_axis)
 axis_scale_cmd_mm(command_axis)
 initial_commanded_position_mm(command_axis)
 final_commanded_position_mm(command_axis)
-visual_jacobian_px_per_cmd_mm(camera, pixel_axis, command_axis)
+px_per_cmd_mm(camera, pixel_axis, command_axis)
 shift_px(camera, pixel_axis)
 iteration_shift_px(iteration, camera, pixel_axis)
 iteration_weighted_residual_px(iteration)
@@ -888,7 +888,7 @@ proposal from the final state.
 ```python
 from merlin_track_position.tracking.correct import do_correction
 
-result = do_correction("visual_jacobian_calibration.h5")
+result = do_correction("calibration.h5")
 
 print(result["shift_px"].values)  # shape: (camera, pixel_axis)
 print(result["estimated_command_offset_mm"].values)  # [x_mm, y_mm, z_mm]
@@ -906,7 +906,7 @@ Calibration can be initiated from before/after commanded-mm probe moves:
 from merlin_track_position.tracking.calibrate import run_calibration
 
 calibration = run_calibration(
-    output_path="visual_jacobian_calibration.h5",
+    output_path="calibration.h5",
 )
 ```
 
@@ -930,7 +930,7 @@ correction_cmd_mm = -gain * Sm @ Ks @ x_hat
 
 Calibration results are xarray datasets. The main dataset variables are:
 
-- `visual_jacobian_px_per_cmd_mm(camera, pixel_axis, command_axis)`
+- `px_per_cmd_mm(camera, pixel_axis, command_axis)`
 - `axis_scale_cmd_mm(command_axis)`
 - `reference_cam0(y_cam0, x_cam0)`
 - `reference_cam1(y_cam1, x_cam1)`

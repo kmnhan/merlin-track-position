@@ -15,9 +15,9 @@ from merlin_track_position.tracking.calibration_core import (
     PIXEL_AXES,
     derive_axis_scale_from_jacobian,
     flush_pending_calibration_datasets,
-    fit_visual_jacobian_calibration,
+    fit_jacobian_calibration,
     load_calibration_dataset,
-    refine_visual_jacobian_from_observations,
+    refine_jacobian_from_observations,
     save_calibration_dataset,
     save_calibration_dataset_deferred,
     solve_damped_command_correction,
@@ -47,7 +47,7 @@ TEST_LQR_MOTOR_PENALTY = 100.0
 TEST_LQR_SVD_RELATIVE_TOLERANCE = 1e-6
 
 
-def visual_jacobian():
+def px_per_cmd_mm():
     return np.array(
         [
             [[270.0, -140.0, 70.0], [90.0, 310.0, -120.0]],
@@ -121,7 +121,7 @@ def assert_hdf5_image_dataset_compressed(
 
 def calibration_dataset(jacobian=None):
     if jacobian is None:
-        jacobian = visual_jacobian()
+        jacobian = px_per_cmd_mm()
     command_delta = probe_deltas()
     measured = measured_from_jacobian(command_delta, jacobian)
     pre_commanded = np.cumsum(
@@ -131,7 +131,7 @@ def calibration_dataset(jacobian=None):
     post_commanded = pre_commanded + command_delta
     dataset = xr.Dataset(
         data_vars={
-            "visual_jacobian_px_per_cmd_mm": (
+            "px_per_cmd_mm": (
                 ("camera", "pixel_axis", "command_axis"),
                 jacobian,
             ),
@@ -179,7 +179,7 @@ class ShiftDetectionTests(unittest.TestCase):
         calibration = calibration_dataset()
         shift = measured_from_jacobian(
             offset_mm.reshape(1, len(COMMAND_AXES)),
-            calibration["visual_jacobian_px_per_cmd_mm"].values,
+            calibration["px_per_cmd_mm"].values,
         )[0]
         measurement = shift_dataset(shift).assign_attrs(
             {"warnings": "registration warning"}
@@ -225,9 +225,9 @@ class VisualCalibrationTests(unittest.TestCase):
             constants.DEFAULT_VISUAL_CALIBRATION_REPEATS_PER_DIRECTION * 6,
         )
 
-    def test_fitted_visual_jacobian_matches_synthetic_response(self):
+    def test_fitted_px_per_cmd_mm_matches_synthetic_response(self):
         command_delta = probe_deltas()
-        expected = visual_jacobian()
+        expected = px_per_cmd_mm()
         measured = measured_from_jacobian(command_delta, expected)
         shift_values = iter(
             measured[probe_index, camera_index]
@@ -249,7 +249,7 @@ class VisualCalibrationTests(unittest.TestCase):
             "merlin_track_position.tracking.calibration_core.estimate_shift",
             side_effect=fake_estimate_shift,
         ):
-            calibration = fit_visual_jacobian_calibration(
+            calibration = fit_jacobian_calibration(
                 reference_cam0=np.zeros((8, 9)),
                 reference_cam1=np.zeros((8, 9)),
                 before_images_cam0=empty_capture_stacks(len(command_delta)),
@@ -266,14 +266,14 @@ class VisualCalibrationTests(unittest.TestCase):
             )
 
         np.testing.assert_allclose(
-            calibration["visual_jacobian_px_per_cmd_mm"].values,
+            calibration["px_per_cmd_mm"].values,
             expected,
             atol=1e-10,
         )
 
     def test_fitted_visual_calibration_preserves_reference_image_dtype(self):
         command_delta = probe_deltas()
-        expected = visual_jacobian()
+        expected = px_per_cmd_mm()
         measured = measured_from_jacobian(command_delta, expected)
         shift_values = iter(
             measured[probe_index, camera_index]
@@ -302,7 +302,7 @@ class VisualCalibrationTests(unittest.TestCase):
             "merlin_track_position.tracking.calibration_core.estimate_shift",
             side_effect=fake_estimate_shift,
         ):
-            calibration = fit_visual_jacobian_calibration(
+            calibration = fit_jacobian_calibration(
                 reference_cam0=reference_cam0,
                 reference_cam1=reference_cam1,
                 before_images_cam0=capture_stacks,
@@ -359,7 +359,7 @@ class VisualCalibrationTests(unittest.TestCase):
             "merlin_track_position.tracking.calibration_core.estimate_shift",
             side_effect=fake_estimate_shift,
         ):
-            calibration = fit_visual_jacobian_calibration(
+            calibration = fit_jacobian_calibration(
                 reference_cam0=np.zeros((8, 9)),
                 reference_cam1=np.zeros((8, 9)),
                 before_images_cam0=empty_capture_stacks(len(command_delta)),
@@ -383,7 +383,7 @@ class VisualCalibrationTests(unittest.TestCase):
             _axis_scale_bounds,
             _target_response,
         ) = derive_axis_scale_from_jacobian(
-            calibration["visual_jacobian_px_per_cmd_mm"].values,
+            calibration["px_per_cmd_mm"].values,
             calibration["probe_command_delta_mm"].values,
         )
         np.testing.assert_allclose(axis_sensitivity, [1000.0, 10.0, 100.0], atol=1e-9)
@@ -401,7 +401,7 @@ class VisualCalibrationTests(unittest.TestCase):
             dataset["probe_measured_delta_px"].values,
             measured_from_jacobian(
                 dataset["probe_command_delta_mm"].values,
-                dataset["visual_jacobian_px_per_cmd_mm"].values,
+                dataset["px_per_cmd_mm"].values,
             ),
         )
 
@@ -590,7 +590,7 @@ class VisualCalibrationTests(unittest.TestCase):
             ),
             self.assertRaisesRegex(ValueError, "below threshold"),
         ):
-            fit_visual_jacobian_calibration(
+            fit_jacobian_calibration(
                 reference_cam0=np.zeros((3, 3)),
                 reference_cam1=np.zeros((3, 3)),
                 before_images_cam0=empty_capture_stacks(3, shape=(3, 3)),
@@ -606,9 +606,9 @@ class VisualCalibrationTests(unittest.TestCase):
                 n_jobs=1,
             )
 
-    def test_rank_deficient_visual_jacobian_is_rejected(self):
+    def test_rank_deficient_px_per_cmd_mm_is_rejected(self):
         bad = calibration_dataset()
-        bad["visual_jacobian_px_per_cmd_mm"] = (
+        bad["px_per_cmd_mm"] = (
             ("camera", "pixel_axis", "command_axis"),
             np.ones((2, 2, 3), dtype=float),
         )
@@ -660,7 +660,7 @@ class VisualCalibrationTests(unittest.TestCase):
             ),
             self.assertRaisesRegex(ValueError, r"probe\(s\): 1"),
         ):
-            fit_visual_jacobian_calibration(
+            fit_jacobian_calibration(
                 reference_cam0=np.zeros((3, 3)),
                 reference_cam1=np.zeros((3, 3)),
                 before_images_cam0=empty_capture_stacks(3, shape=(3, 3)),
@@ -729,7 +729,7 @@ class CorrectionTests(unittest.TestCase):
             p0 = np.array([[60.0, -40.0], [20.0, 10.0]], dtype=float)
             p1 = np.zeros((2, 2), dtype=float)
             expected_delta = solve_damped_command_correction(
-                calibration_dataset()["visual_jacobian_px_per_cmd_mm"].values,
+                calibration_dataset()["px_per_cmd_mm"].values,
                 shift_dataset(p0),
                 calibration_dataset()["axis_scale_cmd_mm"].values,
                 gain=TEST_CORRECTION_GAIN,
@@ -851,7 +851,7 @@ class CorrectionTests(unittest.TestCase):
             p0 = np.array([[60.0, -40.0], [20.0, 10.0]], dtype=float)
             p1 = np.zeros((len(CAMERAS), len(PIXEL_AXES)), dtype=float)
             expected_delta = solve_lqr_command_correction(
-                calibration["visual_jacobian_px_per_cmd_mm"].values,
+                calibration["px_per_cmd_mm"].values,
                 shift_dataset(p0),
                 calibration["axis_scale_cmd_mm"].values,
                 gain=TEST_CORRECTION_GAIN,
@@ -904,7 +904,7 @@ class CorrectionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = self.save_calibration(tmpdir)
             calibration = calibration_dataset()
-            jacobian = calibration["visual_jacobian_px_per_cmd_mm"].values.reshape(
+            jacobian = calibration["px_per_cmd_mm"].values.reshape(
                 len(CAMERAS) * len(PIXEL_AXES),
                 len(COMMAND_AXES),
             )
@@ -975,7 +975,7 @@ class CorrectionTests(unittest.TestCase):
             p0 = np.array([[60.0, -40.0], [20.0, 10.0]], dtype=float)
             p1 = np.zeros((len(CAMERAS), len(PIXEL_AXES)), dtype=float)
             expected_delta = solve_lqr_command_correction(
-                calibration["visual_jacobian_px_per_cmd_mm"].values,
+                calibration["px_per_cmd_mm"].values,
                 shift_dataset(p0),
                 calibration["axis_scale_cmd_mm"].values,
                 gain=TEST_CORRECTION_GAIN,
@@ -1096,7 +1096,7 @@ class CorrectionTests(unittest.TestCase):
             lqr_gain = 0.25
             lqr_max_step = 0.125
             expected_delta = solve_lqr_command_correction(
-                calibration["visual_jacobian_px_per_cmd_mm"].values,
+                calibration["px_per_cmd_mm"].values,
                 shift_dataset(p0),
                 calibration["axis_scale_cmd_mm"].values,
                 gain=lqr_gain,
@@ -1148,7 +1148,7 @@ class CorrectionTests(unittest.TestCase):
             calibration = calibration_dataset()
             offset_mm = np.array([0.0005, 0.0, 0.0], dtype=float)
             p0 = (
-                calibration["visual_jacobian_px_per_cmd_mm"].values.reshape(
+                calibration["px_per_cmd_mm"].values.reshape(
                     len(CAMERAS) * len(PIXEL_AXES), len(COMMAND_AXES)
                 )
                 @ offset_mm
@@ -1208,7 +1208,7 @@ class CorrectionTests(unittest.TestCase):
                 ),
                 patch(
                     "merlin_track_position.tracking.correct."
-                    "refine_visual_jacobian_from_observations"
+                    "refine_jacobian_from_observations"
                 ) as refine,
             ):
                 result = do_correction(
@@ -1234,7 +1234,7 @@ class CorrectionTests(unittest.TestCase):
             calibration = calibration_dataset()
             offset_mm = np.array([0.0005, 0.0, 0.0], dtype=float)
             p0 = (
-                calibration["visual_jacobian_px_per_cmd_mm"].values.reshape(
+                calibration["px_per_cmd_mm"].values.reshape(
                     len(CAMERAS) * len(PIXEL_AXES), len(COMMAND_AXES)
                 )
                 @ offset_mm
@@ -1279,7 +1279,7 @@ class CorrectionTests(unittest.TestCase):
             calibration = calibration_dataset()
             p0 = x_shift(30.0)
             correction_delta = solve_lqr_command_correction(
-                calibration["visual_jacobian_px_per_cmd_mm"].values,
+                calibration["px_per_cmd_mm"].values,
                 shift_dataset(p0),
                 calibration["axis_scale_cmd_mm"].values,
                 gain=TEST_CORRECTION_GAIN,
@@ -1291,7 +1291,7 @@ class CorrectionTests(unittest.TestCase):
                 weights=TEST_CORRECTION_WEIGHTS,
             )
             predicted_delta = (
-                calibration["visual_jacobian_px_per_cmd_mm"].values.reshape(
+                calibration["px_per_cmd_mm"].values.reshape(
                     len(CAMERAS) * len(PIXEL_AXES), len(COMMAND_AXES)
                 )
                 @ correction_delta
@@ -1372,7 +1372,7 @@ class CorrectionTests(unittest.TestCase):
 
     def test_low_visual_impact_axis_components_are_zeroed(self):
         correction = solve_damped_command_correction(
-            visual_jacobian(),
+            px_per_cmd_mm(),
             shift_dataset(np.array([[2.0, 0.0], [0.0, 0.0]])),
             calibration_dataset()["axis_scale_cmd_mm"].values,
             gain=0.3,
@@ -1386,7 +1386,7 @@ class CorrectionTests(unittest.TestCase):
 
     def test_lqr_gain_is_stable_and_reduces_predicted_residual(self):
         calibration = calibration_dataset()
-        jacobian = calibration["visual_jacobian_px_per_cmd_mm"].values.reshape(
+        jacobian = calibration["px_per_cmd_mm"].values.reshape(
             len(CAMERAS) * len(PIXEL_AXES),
             len(COMMAND_AXES),
         )
@@ -1412,7 +1412,7 @@ class CorrectionTests(unittest.TestCase):
 
         shift = np.array([[60.0, -40.0], [20.0, 10.0]], dtype=float)
         correction = solve_lqr_command_correction(
-            calibration["visual_jacobian_px_per_cmd_mm"].values,
+            calibration["px_per_cmd_mm"].values,
             shift_dataset(shift),
             axis_scale,
             gain=TEST_CORRECTION_GAIN,
@@ -1428,7 +1428,7 @@ class CorrectionTests(unittest.TestCase):
 
     def test_lqr_kalman_helpers_update_and_gate_measurements(self):
         calibration = calibration_dataset()
-        jacobian = calibration["visual_jacobian_px_per_cmd_mm"].values.reshape(
+        jacobian = calibration["px_per_cmd_mm"].values.reshape(
             len(CAMERAS) * len(PIXEL_AXES),
             len(COMMAND_AXES),
         )
@@ -1560,14 +1560,14 @@ class CorrectionTests(unittest.TestCase):
                 dtype=float,
             )
             p0 = (
-                calibration["visual_jacobian_px_per_cmd_mm"].values.reshape(
+                calibration["px_per_cmd_mm"].values.reshape(
                     len(CAMERAS) * len(PIXEL_AXES), len(COMMAND_AXES)
                 )
                 @ offset_mm
             ).reshape(len(CAMERAS), len(PIXEL_AXES))
             p1 = np.zeros((len(CAMERAS), len(PIXEL_AXES)), dtype=float)
             expected_delta = solve_damped_command_correction(
-                calibration["visual_jacobian_px_per_cmd_mm"].values,
+                calibration["px_per_cmd_mm"].values,
                 shift_dataset(p0),
                 calibration["axis_scale_cmd_mm"].values,
                 gain=TEST_CORRECTION_GAIN,
@@ -1678,7 +1678,7 @@ class CorrectionTests(unittest.TestCase):
             calibration = calibration_dataset()
             offset_mm = np.array([0.020, 0.0, 0.0], dtype=float)
             p0 = (
-                calibration["visual_jacobian_px_per_cmd_mm"].values.reshape(
+                calibration["px_per_cmd_mm"].values.reshape(
                     len(CAMERAS) * len(PIXEL_AXES), len(COMMAND_AXES)
                 )
                 @ offset_mm
@@ -1717,14 +1717,14 @@ class CorrectionTests(unittest.TestCase):
             calibration = calibration_dataset()
             offset_mm = np.array([0.020, 0.0, 0.0], dtype=float)
             p0 = (
-                calibration["visual_jacobian_px_per_cmd_mm"].values.reshape(
+                calibration["px_per_cmd_mm"].values.reshape(
                     len(CAMERAS) * len(PIXEL_AXES), len(COMMAND_AXES)
                 )
                 @ offset_mm
             ).reshape(len(CAMERAS), len(PIXEL_AXES))
             p1 = np.zeros((len(CAMERAS), len(PIXEL_AXES)), dtype=float)
             expected_delta = solve_damped_command_correction(
-                calibration["visual_jacobian_px_per_cmd_mm"].values,
+                calibration["px_per_cmd_mm"].values,
                 shift_dataset(p0),
                 calibration["axis_scale_cmd_mm"].values,
                 gain=TEST_CORRECTION_GAIN,
@@ -1767,13 +1767,13 @@ class CorrectionTests(unittest.TestCase):
             calibration = calibration_dataset()
             offset_mm = np.array([0.0, 0.014, 0.0], dtype=float)
             p0 = (
-                calibration["visual_jacobian_px_per_cmd_mm"].values.reshape(
+                calibration["px_per_cmd_mm"].values.reshape(
                     len(CAMERAS) * len(PIXEL_AXES), len(COMMAND_AXES)
                 )
                 @ offset_mm
             ).reshape(len(CAMERAS), len(PIXEL_AXES))
             raw_delta = solve_damped_command_correction(
-                calibration["visual_jacobian_px_per_cmd_mm"].values,
+                calibration["px_per_cmd_mm"].values,
                 shift_dataset(p0),
                 calibration["axis_scale_cmd_mm"].values,
                 gain=0.3,
@@ -1781,7 +1781,7 @@ class CorrectionTests(unittest.TestCase):
                 weights=TEST_CORRECTION_WEIGHTS,
             )
             predicted_delta = (
-                calibration["visual_jacobian_px_per_cmd_mm"].values.reshape(
+                calibration["px_per_cmd_mm"].values.reshape(
                     len(CAMERAS) * len(PIXEL_AXES), len(COMMAND_AXES)
                 )
                 @ raw_delta
@@ -1843,8 +1843,8 @@ class CorrectionTests(unittest.TestCase):
         self.assertEqual(int(reloaded.attrs["jacobian_refinement_count"]), 1)
         self.assertFalse(
             np.allclose(
-                reloaded["visual_jacobian_px_per_cmd_mm"].values,
-                visual_jacobian(),
+                reloaded["px_per_cmd_mm"].values,
+                px_per_cmd_mm(),
             )
         )
 
@@ -1853,15 +1853,15 @@ class CorrectionTests(unittest.TestCase):
         tiny_delta = np.array([[0.001, 0.0, 0.0]])
         bad_tiny_measurement = np.full((1, len(CAMERAS), len(PIXEL_AXES)), 5.0)
 
-        refined = refine_visual_jacobian_from_observations(
+        refined = refine_jacobian_from_observations(
             calibration,
             tiny_delta,
             bad_tiny_measurement,
         )
 
         np.testing.assert_allclose(
-            refined["visual_jacobian_px_per_cmd_mm"].values,
-            calibration["visual_jacobian_px_per_cmd_mm"].values,
+            refined["px_per_cmd_mm"].values,
+            calibration["px_per_cmd_mm"].values,
             atol=0.1,
         )
 
@@ -1904,8 +1904,8 @@ class CorrectionTests(unittest.TestCase):
         self.assertIn("move_feedback_alpha", saved)
         self.assertIn("move_feedback_parallel_px", saved)
         self.assertIn("move_feedback_valid", saved)
-        self.assertIn("move_visual_jacobian_before_px_per_cmd_mm", saved)
-        self.assertIn("move_visual_jacobian_after_px_per_cmd_mm", saved)
+        self.assertIn("move_px_per_cmd_mm_before", saved)
+        self.assertIn("move_px_per_cmd_mm_after", saved)
         self.assertTrue(bool(saved["move_feedback_valid"].values[0]))
 
     def test_correction_history_compresses_current_images_and_preserves_dtype(self):
@@ -2048,7 +2048,7 @@ class CorrectionTests(unittest.TestCase):
 
                 observed_refinement_rows: list[int] = []
                 original_refine = (
-                    correct_module.refine_visual_jacobian_from_observations
+                    correct_module.refine_jacobian_from_observations
                 )
 
                 def spy_refine(calibration, correction_delta, measured_delta, **kwargs):
@@ -2079,7 +2079,7 @@ class CorrectionTests(unittest.TestCase):
                     ),
                     patch(
                         "merlin_track_position.tracking.correct."
-                        "refine_visual_jacobian_from_observations",
+                        "refine_jacobian_from_observations",
                         side_effect=spy_refine,
                     ),
                 ):
@@ -2166,7 +2166,7 @@ class CorrectionTests(unittest.TestCase):
             calibration = calibration_dataset()
             p0 = x_shift(30.0)
             correction_delta = solve_damped_command_correction(
-                calibration["visual_jacobian_px_per_cmd_mm"].values,
+                calibration["px_per_cmd_mm"].values,
                 shift_dataset(p0),
                 calibration["axis_scale_cmd_mm"].values,
                 gain=TEST_CORRECTION_GAIN,
@@ -2174,7 +2174,7 @@ class CorrectionTests(unittest.TestCase):
                 weights=TEST_CORRECTION_WEIGHTS,
             )
             predicted_delta = (
-                calibration["visual_jacobian_px_per_cmd_mm"].values.reshape(
+                calibration["px_per_cmd_mm"].values.reshape(
                     len(CAMERAS) * len(PIXEL_AXES), len(COMMAND_AXES)
                 )
                 @ correction_delta

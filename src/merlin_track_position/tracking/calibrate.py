@@ -19,7 +19,7 @@ from merlin_track_position.instruments.cameras import (
 from merlin_track_position.instruments.motors import get_positions, move_motors_and_wait
 from merlin_track_position.tracking.calibration_core import (
     COMMAND_AXES,
-    fit_visual_jacobian_calibration,
+    fit_jacobian_calibration,
     load_calibration_dataset,
     save_calibration_dataset_deferred,
 )
@@ -163,7 +163,7 @@ def run_calibration(
         context |= {str(key): value for key, value in additional_context.items()}
 
     shift_options = {"check_tiles": True} | shift_kwargs
-    calibration = fit_visual_jacobian_calibration(
+    calibration = fit_jacobian_calibration(
         reference_cam0=reference_cam0,
         reference_cam1=reference_cam1,
         before_images_cam0=before_images_cam0,

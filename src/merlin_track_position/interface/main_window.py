@@ -643,11 +643,11 @@ class MainWindow(_MainWindowGUI):
         if (
             result.attrs.get("calibration_persistence_status") == "pending"
             and self._calibration is not None
-            and "visual_jacobian_px_per_cmd_mm" in result
+            and "px_per_cmd_mm" in result
         ):
             calibration = self._calibration.load().copy(deep=True)
-            calibration["visual_jacobian_px_per_cmd_mm"] = result[
-                "visual_jacobian_px_per_cmd_mm"
+            calibration["px_per_cmd_mm"] = result[
+                "px_per_cmd_mm"
             ]
             if "calibration_jacobian_refinement_count" in result.attrs:
                 calibration.attrs["jacobian_refinement_count"] = int(

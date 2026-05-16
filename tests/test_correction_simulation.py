@@ -58,7 +58,7 @@ class CorrectionSimulationTests(unittest.TestCase):
     def test_initial_offsets_from_correction_history_projects_first_iteration(self):
         calibration = sample_calibration()
         offset_um = np.array([4.0, -3.0, 2.0], dtype=float)
-        jacobian = calibration["visual_jacobian_px_per_cmd_mm"].values.reshape(4, 3)
+        jacobian = calibration["px_per_cmd_mm"].values.reshape(4, 3)
         shift_px = (jacobian @ (offset_um / 1000.0)).reshape(2, 2)
         with tempfile.TemporaryDirectory() as tmpdir:
             calibration_path = Path(tmpdir) / "calibration.h5"
