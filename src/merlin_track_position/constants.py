@@ -40,18 +40,19 @@ MOTOR_STALE_READBACK_DEADBAND: dict[str, float] = {
 }
 MOTOR_STALE_READBACK_DELAY_S: float = 10.0
 
-# Correction offset pruning thresholds. Values are in commanded mm and are applied
-# to estimated command offsets before sending gain-scaled correction components.
-CORRECTION_COMMAND_DEADBAND_MM_BY_AXIS: dict[str, float] = {
-    "x": 0.003,
-    "y": 0.003,
-    "z": 0.003,
+# Damped-WLS command pruning thresholds. Values are in commanded mm and are
+# applied to estimated command offsets before sending gain-scaled correction
+# components. The LQR correction path bypasses these deadbands.
+DAMPED_WLS_CORRECTION_COMMAND_DEADBAND_MM_BY_AXIS: dict[str, float] = {
+    "x": 0.001,
+    "y": 0.001,
+    "z": 0.001,
 }
 
 # Default number of image pairs captured at each calibration/correction position.
 DEFAULT_CAPTURE_COUNT: int = 3
 
-# Default number of worker threads for calibration fitting.
+# Default number of worker threads for calibration fitting. 1 works best on the DAQ PC.
 CALIBRATION_FIT_N_JOBS: int = 1
 
 
@@ -78,18 +79,37 @@ DEFAULT_VISUAL_CALIBRATION_MIN_SHIFT_PX: float = 2.0
 # Calibration condition number threshold above which the fit is rejected.
 DEFAULT_VISUAL_JACOBIAN_CONDITION_WARNING: float = 100.0
 
-# Closed-loop correction defaults in command-mm visual-servo space.
+# Shared closed-loop correction defaults in command-mm visual-servo space.
+# Supported algorithms: "damped_wls" and "lqr".
+CORRECTION_ALGORITHM: str = "damped_wls"
+# Observation weights are ordered as cam0_du, cam0_dv, cam1_du, cam1_dv.
+CORRECTION_OBSERVATION_WEIGHTS: tuple[float, float, float, float] | None = (
+    0.80,
+    1.33,
+    1.21,
+    0.66,
+)
 DEFAULT_CORRECTION_PIXEL_TOLERANCE_PX: float = 0.55
-DEFAULT_CORRECTION_GAIN: float = 0.6
-DEFAULT_CORRECTION_MIN_GAIN: float = 0.15
-DEFAULT_CORRECTION_DAMPING_MU: float = 1.0
-DEFAULT_CORRECTION_MAX_NORMALIZED_STEP: float = 0.5
-DEFAULT_CORRECTION_MIN_AXIS_PREDICTED_SHIFT_PX: float = 0.04
-DEFAULT_CORRECTION_MIN_TOTAL_PREDICTED_SHIFT_PX: float = 0.1
-DEFAULT_CORRECTION_MIN_FEEDBACK_ALPHA: float = 0.25
-DEFAULT_CORRECTION_MIN_FEEDBACK_PARALLEL_SHIFT_PX: float = 0.15
 DEFAULT_CORRECTION_MIN_COMMAND_NORM_MM: float = 1e-9
 DEFAULT_CORRECTION_MAX_MOVES: int = 12
+
+# Damped-WLS solver and legacy closed-loop guardrails. LQR still records
+# feedback diagnostics, but it does not use these thresholds to prune/stop.
+DEFAULT_DAMPED_WLS_CORRECTION_GAIN: float = 0.6
+DEFAULT_DAMPED_WLS_CORRECTION_MIN_GAIN: float = 0.15
+DEFAULT_DAMPED_WLS_CORRECTION_MAX_NORMALIZED_STEP: float = 0.5
+DEFAULT_DAMPED_WLS_CORRECTION_DAMPING_MU: float = 1.0
+DEFAULT_DAMPED_WLS_CORRECTION_MIN_AXIS_PREDICTED_SHIFT_PX: float = 0.04
+DEFAULT_DAMPED_WLS_CORRECTION_MIN_TOTAL_PREDICTED_SHIFT_PX: float = 0.1
+DEFAULT_DAMPED_WLS_CORRECTION_MIN_FEEDBACK_ALPHA: float = 0.25
+DEFAULT_DAMPED_WLS_CORRECTION_MIN_FEEDBACK_PARALLEL_SHIFT_PX: float = 0.15
+
+# LQR-only solver weights and numerical tolerance.
+DEFAULT_LQR_CORRECTION_GAIN: float = 0.95
+DEFAULT_LQR_CORRECTION_MAX_NORMALIZED_STEP: float = 0.5
+DEFAULT_LQR_CORRECTION_IMAGE_SCALE_PX: float = 0.1
+DEFAULT_LQR_CORRECTION_MOTOR_PENALTY: float = 100.0
+DEFAULT_LQR_CORRECTION_SVD_RELATIVE_TOLERANCE: float = 1e-6
 
 # Image size for initial crop from each camera array.
 IMAGE_WIDTH_CAM0: int = 704

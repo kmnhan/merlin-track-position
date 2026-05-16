@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 import numpy as np
+from scipy.linalg import solve_discrete_are
 import xarray as xr
 
 from merlin_track_position import constants
@@ -853,13 +854,13 @@ def solve_damped_command_correction(
     shift: xr.Dataset | xr.DataArray | Sequence[float],
     axis_scale_cmd_mm: Sequence[float],
     *,
-    gain: float = constants.DEFAULT_CORRECTION_GAIN,
-    damping_mu: float = constants.DEFAULT_CORRECTION_DAMPING_MU,
+    gain: float = constants.DEFAULT_DAMPED_WLS_CORRECTION_GAIN,
+    damping_mu: float = constants.DEFAULT_DAMPED_WLS_CORRECTION_DAMPING_MU,
     max_normalized_step: float | None = (
-        constants.DEFAULT_CORRECTION_MAX_NORMALIZED_STEP
+        constants.DEFAULT_DAMPED_WLS_CORRECTION_MAX_NORMALIZED_STEP
     ),
     min_axis_predicted_shift_px: float = (
-        constants.DEFAULT_CORRECTION_MIN_AXIS_PREDICTED_SHIFT_PX
+        constants.DEFAULT_DAMPED_WLS_CORRECTION_MIN_AXIS_PREDICTED_SHIFT_PX
     ),
     weights: Sequence[float] | np.ndarray | None = None,
 ) -> np.ndarray:
@@ -920,6 +921,174 @@ def solve_damped_command_correction(
     if not np.isfinite(correction_cmd_mm).all():
         raise ValueError("computed correction contains non-finite values")
     return correction_cmd_mm
+
+
+def solve_lqr_command_correction(
+    visual_jacobian: np.ndarray,
+    shift: xr.Dataset | xr.DataArray | Sequence[float],
+    axis_scale_cmd_mm: Sequence[float],
+    *,
+    gain: float = constants.DEFAULT_LQR_CORRECTION_GAIN,
+    image_scale_px: float = constants.DEFAULT_LQR_CORRECTION_IMAGE_SCALE_PX,
+    motor_penalty: float = constants.DEFAULT_LQR_CORRECTION_MOTOR_PENALTY,
+    svd_relative_tolerance: float = (
+        constants.DEFAULT_LQR_CORRECTION_SVD_RELATIVE_TOLERANCE
+    ),
+    max_normalized_step: float | None = (
+        constants.DEFAULT_LQR_CORRECTION_MAX_NORMALIZED_STEP
+    ),
+    min_axis_predicted_shift_px: float = 0.0,
+    weights: Sequence[float] | np.ndarray | None = None,
+) -> np.ndarray:
+    """Solve the nominal image-space LQR correction in commanded-mm units."""
+
+    jacobian_observation = _jacobian_to_observation(
+        _as_visual_jacobian(visual_jacobian)
+    )
+    observation = _shift_to_observation(_shift_values(shift))
+    axis_scale = np.asarray(axis_scale_cmd_mm, dtype=np.float64)
+    if axis_scale.shape != (len(COMMAND_AXES),):
+        raise ValueError("axis_scale_cmd_mm must have one value for x/y/z")
+    if not np.isfinite(axis_scale).all() or np.any(axis_scale <= 0.0):
+        raise ValueError("axis_scale_cmd_mm must contain finite positive values")
+
+    gain = float(gain)
+    if not np.isfinite(gain) or gain <= 0.0:
+        raise ValueError("gain must be finite and positive")
+    if max_normalized_step is not None:
+        max_normalized_step = float(max_normalized_step)
+        if np.isnan(max_normalized_step) or max_normalized_step <= 0.0:
+            raise ValueError("max_normalized_step must be positive or None")
+    min_axis_predicted_shift_px = float(min_axis_predicted_shift_px)
+    if (
+        not np.isfinite(min_axis_predicted_shift_px)
+        or min_axis_predicted_shift_px < 0.0
+    ):
+        raise ValueError("min_axis_predicted_shift_px must be finite and non-negative")
+
+    feedback_gain, *_ = _compute_lqr_feedback_gain(
+        jacobian_observation,
+        axis_scale,
+        image_scale_px=image_scale_px,
+        motor_penalty=motor_penalty,
+        svd_relative_tolerance=svd_relative_tolerance,
+        weights=weights,
+    )
+    correction_cmd_mm = -gain * (feedback_gain @ observation)
+    if max_normalized_step is not None and np.isfinite(max_normalized_step):
+        normalized_component = correction_cmd_mm / axis_scale
+        max_component = float(np.max(np.abs(normalized_component)))
+        if max_component > max_normalized_step:
+            correction_cmd_mm *= max_normalized_step / max_component
+
+    if min_axis_predicted_shift_px > 0.0:
+        weight_matrix = _observation_weight_matrix(weights)
+        axis_sensitivity = np.sqrt(
+            np.diag(jacobian_observation.T @ weight_matrix @ jacobian_observation)
+        )
+        predicted_axis_shift_px = np.abs(correction_cmd_mm) * axis_sensitivity
+        correction_cmd_mm = correction_cmd_mm.copy()
+        correction_cmd_mm[predicted_axis_shift_px < min_axis_predicted_shift_px] = 0.0
+
+    if correction_cmd_mm.shape != (len(COMMAND_AXES),):
+        raise ValueError("computed correction has unexpected shape")
+    if not np.isfinite(correction_cmd_mm).all():
+        raise ValueError("computed correction contains non-finite values")
+    return correction_cmd_mm
+
+
+def _compute_lqr_feedback_gain(
+    jacobian_observation: np.ndarray,
+    axis_scale_cmd_mm: Sequence[float],
+    *,
+    image_scale_px: float,
+    motor_penalty: float,
+    svd_relative_tolerance: float,
+    weights: Sequence[float] | np.ndarray | None,
+) -> tuple[np.ndarray, np.ndarray, int, np.ndarray]:
+    jacobian = np.asarray(jacobian_observation, dtype=np.float64)
+    if jacobian.shape != (len(OBSERVATION_AXES), len(COMMAND_AXES)):
+        raise ValueError("jacobian_observation must have shape (4, 3)")
+    if not np.isfinite(jacobian).all():
+        raise ValueError("jacobian_observation must contain only finite values")
+
+    axis_scale = np.asarray(axis_scale_cmd_mm, dtype=np.float64)
+    if axis_scale.shape != (len(COMMAND_AXES),):
+        raise ValueError("axis_scale_cmd_mm must have one value for x/y/z")
+    if not np.isfinite(axis_scale).all() or np.any(axis_scale <= 0.0):
+        raise ValueError("axis_scale_cmd_mm must contain finite positive values")
+
+    motor_penalty = float(motor_penalty)
+    svd_relative_tolerance = float(svd_relative_tolerance)
+    if not np.isfinite(motor_penalty) or motor_penalty <= 0.0:
+        raise ValueError("motor_penalty must be finite and positive")
+    if (
+        not np.isfinite(svd_relative_tolerance)
+        or svd_relative_tolerance <= 0.0
+    ):
+        raise ValueError("svd_relative_tolerance must be finite and positive")
+
+    image_scale = _lqr_image_scale_from_weights(image_scale_px, weights)
+    normalized_jacobian = (
+        jacobian * axis_scale[np.newaxis, :]
+    ) / image_scale[:, np.newaxis]
+    left_singular_vectors, singular_values, _ = np.linalg.svd(
+        normalized_jacobian,
+        full_matrices=False,
+    )
+    if singular_values.size == 0 or singular_values[0] <= 0.0:
+        raise ValueError("visual Jacobian has zero gain; cannot design LQR")
+
+    rank = int(
+        np.count_nonzero(
+            singular_values > svd_relative_tolerance * float(singular_values[0])
+        )
+    )
+    if rank == 0:
+        raise ValueError("visual Jacobian numerical rank is zero; cannot design LQR")
+
+    controllable_basis = left_singular_vectors[:, :rank]
+    state_matrix = np.eye(rank, dtype=np.float64)
+    input_matrix = controllable_basis.T @ normalized_jacobian
+    state_cost = np.eye(rank, dtype=np.float64)
+    input_cost = motor_penalty * np.eye(len(COMMAND_AXES), dtype=np.float64)
+
+    riccati_solution = solve_discrete_are(
+        state_matrix,
+        input_matrix,
+        state_cost,
+        input_cost,
+    )
+    feedback_lhs = input_matrix.T @ riccati_solution @ input_matrix + input_cost
+    feedback_rhs = input_matrix.T @ riccati_solution @ state_matrix
+    normalized_feedback_gain = np.linalg.solve(feedback_lhs, feedback_rhs)
+    closed_loop_eigenvalues = np.linalg.eigvals(
+        state_matrix - input_matrix @ normalized_feedback_gain
+    )
+    if (
+        not np.isfinite(closed_loop_eigenvalues).all()
+        or np.max(np.abs(closed_loop_eigenvalues)) >= 1.0
+    ):
+        raise ValueError("computed LQR closed-loop eigenvalues are not stable")
+
+    image_feedback_gain = normalized_feedback_gain @ controllable_basis.T
+    real_feedback_gain = axis_scale[:, np.newaxis] * (
+        image_feedback_gain / image_scale[np.newaxis, :]
+    )
+    return real_feedback_gain, closed_loop_eigenvalues, rank, singular_values
+
+
+def _lqr_image_scale_from_weights(
+    image_scale_px: float,
+    weights: Sequence[float] | np.ndarray | None,
+) -> np.ndarray:
+    image_scale_px = float(image_scale_px)
+    if not np.isfinite(image_scale_px) or image_scale_px <= 0.0:
+        raise ValueError("image_scale_px must be finite and positive")
+    weight_values = _observation_weight_values(weights)
+    if np.any(weight_values <= 0.0):
+        raise ValueError("LQR observation weights must all be positive")
+    return image_scale_px / np.sqrt(weight_values)
 
 
 def weighted_pixel_residual(
@@ -1545,8 +1714,14 @@ def _jacobian_to_observation(jacobian: np.ndarray) -> np.ndarray:
 def _observation_weight_matrix(
     weights: Sequence[float] | np.ndarray | None,
 ) -> np.ndarray:
+    return np.diag(_observation_weight_values(weights))
+
+
+def _observation_weight_values(
+    weights: Sequence[float] | np.ndarray | None,
+) -> np.ndarray:
     if weights is None:
-        return np.eye(len(OBSERVATION_AXES), dtype=np.float64)
+        return np.ones(len(OBSERVATION_AXES), dtype=np.float64)
     values = np.asarray(weights, dtype=np.float64)
     if values.shape == (len(CAMERAS), len(PIXEL_AXES)):
         values = values.reshape(-1)
@@ -1556,7 +1731,7 @@ def _observation_weight_matrix(
         raise ValueError("weights must contain finite non-negative values")
     if not np.any(values > 0.0):
         raise ValueError("weights must include at least one positive value")
-    return np.diag(values)
+    return values
 
 
 def _pad_warnings(

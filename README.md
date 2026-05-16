@@ -417,17 +417,17 @@ locally accurate.
 The default numerical parameters are:
 
 ```text
-lambda = DEFAULT_CORRECTION_GAIN = 0.3
-lambda_min = DEFAULT_CORRECTION_MIN_GAIN = 0.15
-mu = DEFAULT_CORRECTION_DAMPING_MU = 1.0
-max |Delta q_j| = DEFAULT_CORRECTION_MAX_NORMALIZED_STEP = 0.5
+lambda = DEFAULT_DAMPED_WLS_CORRECTION_GAIN = 0.6
+lambda_min = DEFAULT_DAMPED_WLS_CORRECTION_MIN_GAIN = 0.15
+mu = DEFAULT_DAMPED_WLS_CORRECTION_DAMPING_MU = 1.0
+max |Delta q_j| = DEFAULT_DAMPED_WLS_CORRECTION_MAX_NORMALIZED_STEP = 0.5
 min per-axis predicted response =
-    DEFAULT_CORRECTION_MIN_AXIS_PREDICTED_SHIFT_PX = 0.15 px
+    DEFAULT_DAMPED_WLS_CORRECTION_MIN_AXIS_PREDICTED_SHIFT_PX = 0.04 px
 min total predicted response =
-    DEFAULT_CORRECTION_MIN_TOTAL_PREDICTED_SHIFT_PX = 0.30 px
-min feedback alpha = DEFAULT_CORRECTION_MIN_FEEDBACK_ALPHA = 0.25
+    DEFAULT_DAMPED_WLS_CORRECTION_MIN_TOTAL_PREDICTED_SHIFT_PX = 0.10 px
+min feedback alpha = DEFAULT_DAMPED_WLS_CORRECTION_MIN_FEEDBACK_ALPHA = 0.25
 min feedback parallel response =
-    DEFAULT_CORRECTION_MIN_FEEDBACK_PARALLEL_SHIFT_PX = 0.15 px
+    DEFAULT_DAMPED_WLS_CORRECTION_MIN_FEEDBACK_PARALLEL_SHIFT_PX = 0.15 px
 min command norm = DEFAULT_CORRECTION_MIN_COMMAND_NORM_MM = 1e-9 mm
 max_moves = DEFAULT_CORRECTION_MAX_MOVES = 12
 ```
@@ -583,9 +583,10 @@ The closed-loop correction algorithm proceeds as follows:
 12. if feedback is valid and the residual decreased, refit the visual Jacobian
     from the calibration probes plus accepted correction observations and save
     the refined calibration dataset to disk;
-13. if feedback is valid but the residual increased or stayed flat, skip the
-    Jacobian update, halve the gain down to `DEFAULT_CORRECTION_MIN_GAIN`,
-    double `mu`, and continue from the newly measured image state;
+13. for damped WLS only: if feedback is valid but the residual increased or
+    stayed flat, skip the Jacobian update, halve the gain down to
+    `DEFAULT_DAMPED_WLS_CORRECTION_MIN_GAIN`, double `mu`, and continue from
+    the newly measured image state;
 14. if feedback is invalid, record the move diagnostics and stop unless the new
     residual is already within tolerance;
 15. save the correction result into the sibling correction-history file.
