@@ -285,7 +285,7 @@ Observation weights, when supplied, are folded into the image scale as
 
 ```math
 e_{\mathrm{scale},i} =
-\frac{\texttt{image_scale_px}}{\sqrt{w_i}}.
+\frac{\texttt{image\_scale\_px}}{\sqrt{w_i}}.
 ```
 
 The normalized image measurement and normalized Jacobian are
