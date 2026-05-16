@@ -790,6 +790,10 @@ pre_readback_position_mm(probe, command_axis)
 post_readback_position_mm(probe, command_axis)
 ```
 
+`reference_cam0` and `reference_cam1` are full camera-frame references. When a
+calibration includes GUI ROI metadata, registration crops these references and
+the live image stacks at measurement time instead of storing cropped references.
+
 Calibration datasets also include non-derivable diagnostics:
 
 ```text
@@ -940,6 +944,9 @@ Calibration results are xarray datasets. The main dataset variables are:
 - `post_commanded_position_mm(probe, command_axis)`
 - `pre_readback_position_mm(probe, command_axis)`
 - `post_readback_position_mm(probe, command_axis)`
+
+Reference images are saved as full camera frames. GUI ROI bounds, when present,
+define the processing crop used for registration and correction.
 
 Saved calibration datasets intentionally omit values that can be recomputed
 exactly, such as predicted probe shifts, probe residuals, axis-scale

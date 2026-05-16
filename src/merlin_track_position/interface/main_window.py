@@ -775,7 +775,7 @@ class MainWindow(_MainWindowGUI):
             raise RuntimeError("correction state changed before startup")
 
         logger.info("Starting correction: calibration_path=%s", self._calibration_path)
-        camera_pair = self._camera_pair_for_current_rois()
+        camera_pair = self._camera_pair_for_current_images()
         self._correction_thread.configure(
             self._calibration,
             camera_pair,
@@ -1197,7 +1197,7 @@ class MainWindow(_MainWindowGUI):
         output_path = dialog.output_path()
         roi_geometries = self._current_roi_geometries()
         roi_metadata = _roi_metadata_from_geometries(roi_geometries)
-        camera_pair = self._camera_pair_for_current_rois()
+        camera_pair = self._camera_pair_for_current_images()
         try:
             self._calibration_total_steps = visual_calibration_probe_count()
             self._calibration_thread.configure(
@@ -1286,7 +1286,7 @@ class MainWindow(_MainWindowGUI):
         if self._calibration is None:
             return
 
-        camera_pair = self._camera_pair_for_current_rois()
+        camera_pair = self._camera_pair_for_current_images()
         try:
             self._detect_shift_thread.configure(self._calibration, camera_pair)
         except Exception as exc:
@@ -1574,12 +1574,11 @@ class MainWindow(_MainWindowGUI):
     def _current_roi_geometries(self) -> dict[str, RoiGeometry]:
         return {camera: self._get_roi_geometry(camera) for camera in CAMERA_IMAGE_SIZES}
 
-    def _camera_pair_for_current_rois(self) -> CameraPairPlugin:
-        roi_geometries = self._current_roi_geometries()
+    def _camera_pair_for_current_images(self) -> CameraPairPlugin:
         return CameraPairPlugin(
             CallableCameraPlugin("cam0", self._capture_cam0_image),
             CallableCameraPlugin("cam1", self._capture_cam1_image),
-        ).cropped(roi_geometries["cam0"], roi_geometries["cam1"])
+        )
 
     def _set_roi_geometry(
         self,

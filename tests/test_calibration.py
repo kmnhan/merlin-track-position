@@ -9,6 +9,11 @@ import numpy as np
 import xarray as xr
 
 from merlin_track_position import constants
+from merlin_track_position.instruments.cameras import (
+    CallableCameraPlugin,
+    CameraPairPlugin,
+    crop_image_to_roi,
+)
 from merlin_track_position.tracking.calibration_core import (
     CAMERAS,
     COMMAND_AXES,
@@ -27,7 +32,10 @@ from merlin_track_position.tracking.calibration_core import (
 )
 import merlin_track_position.tracking.calibration_core as calibration_core
 import merlin_track_position.tracking.correct as correct_module
-from merlin_track_position.tracking.calibrate import visual_calibration_probe_count
+from merlin_track_position.tracking.calibrate import (
+    run_calibration,
+    visual_calibration_probe_count,
+)
 from merlin_track_position.tracking.correct import (
     correction_history_path,
     do_correction,
@@ -224,6 +232,90 @@ class VisualCalibrationTests(unittest.TestCase):
             visual_calibration_probe_count(),
             constants.DEFAULT_VISUAL_CALIBRATION_REPEATS_PER_DIRECTION * 6,
         )
+
+    def test_run_calibration_stores_full_references_and_fits_cropped_images(self):
+        full_cam0 = np.arange(5 * 6, dtype=np.uint16).reshape(5, 6)
+        full_cam1 = np.arange(7 * 8, dtype=np.uint16).reshape(7, 8) + 100
+        roi_metadata = {
+            "roi_cam0_x": 1.0,
+            "roi_cam0_y": 2.0,
+            "roi_cam0_width": 3.0,
+            "roi_cam0_height": 2.0,
+            "roi_cam1_x": 2.0,
+            "roi_cam1_y": 1.0,
+            "roi_cam1_width": 2.0,
+            "roi_cam1_height": 3.0,
+        }
+        expected_crop_cam0 = crop_image_to_roi(
+            full_cam0,
+            (
+                roi_metadata["roi_cam0_x"],
+                roi_metadata["roi_cam0_y"],
+                roi_metadata["roi_cam0_width"],
+                roi_metadata["roi_cam0_height"],
+            ),
+        )
+        expected_crop_cam1 = crop_image_to_roi(
+            full_cam1,
+            (
+                roi_metadata["roi_cam1_x"],
+                roi_metadata["roi_cam1_y"],
+                roi_metadata["roi_cam1_width"],
+                roi_metadata["roi_cam1_height"],
+            ),
+        )
+        camera_pair = CameraPairPlugin(
+            CallableCameraPlugin("cam0", lambda: full_cam0),
+            CallableCameraPlugin("cam1", lambda: full_cam1),
+        )
+        fit_calls = []
+
+        def fake_fit_jacobian_calibration(**kwargs):
+            fit_calls.append(kwargs)
+            np.testing.assert_array_equal(kwargs["reference_cam0"], expected_crop_cam0)
+            np.testing.assert_array_equal(kwargs["reference_cam1"], expected_crop_cam1)
+            for name, expected_shape in (
+                ("before_images_cam0", (1, *expected_crop_cam0.shape)),
+                ("after_images_cam0", (1, *expected_crop_cam0.shape)),
+                ("before_images_cam1", (1, *expected_crop_cam1.shape)),
+                ("after_images_cam1", (1, *expected_crop_cam1.shape)),
+            ):
+                for stack in kwargs[name]:
+                    self.assertEqual(stack.shape, expected_shape)
+            return calibration_dataset().assign_attrs(kwargs["additional_context"])
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_path = Path(tmpdir) / "calibration.h5"
+            with (
+                patch(
+                    "merlin_track_position.tracking.calibrate.get_positions",
+                    return_value=(0.0, 0.0, 0.0, 0.0, 0.0, 5.0),
+                ),
+                patch(
+                    "merlin_track_position.tracking.calibrate.move_motors_and_wait",
+                    side_effect=lambda _axes, goals: tuple(goals),
+                ),
+                patch("merlin_track_position.tracking.calibrate.time.sleep"),
+                patch(
+                    "merlin_track_position.tracking.calibrate.fit_jacobian_calibration",
+                    side_effect=fake_fit_jacobian_calibration,
+                ),
+            ):
+                calibration = run_calibration(
+                    camera_pair,
+                    output_path=output_path,
+                    repeats_per_direction=1,
+                    capture_count=1,
+                    additional_context=roi_metadata,
+                )
+
+        self.assertEqual(len(fit_calls), 1)
+        np.testing.assert_array_equal(calibration["reference_cam0"].values, full_cam0)
+        np.testing.assert_array_equal(calibration["reference_cam1"].values, full_cam1)
+        self.assertEqual(calibration["reference_cam0"].shape, full_cam0.shape)
+        self.assertEqual(calibration["reference_cam1"].shape, full_cam1.shape)
+        self.assertEqual(calibration.attrs["roi_cam0_width"], 3.0)
+        self.assertEqual(calibration.attrs["roi_cam1_height"], 3.0)
 
     def test_fitted_px_per_cmd_mm_matches_synthetic_response(self):
         command_delta = probe_deltas()
@@ -702,6 +794,52 @@ class CorrectionTests(unittest.TestCase):
                 side_effect=lambda *args, **kwargs: next(measurement_iter),
             ),
         )
+
+    def test_capture_measurement_crops_full_references_and_current_images(self):
+        calibration = calibration_dataset().assign_attrs(
+            {
+                "roi_cam0_x": 1.0,
+                "roi_cam0_y": 1.0,
+                "roi_cam0_width": 2.0,
+                "roi_cam0_height": 2.0,
+                "roi_cam1_x": 2.0,
+                "roi_cam1_y": 1.0,
+                "roi_cam1_width": 3.0,
+                "roi_cam1_height": 2.0,
+            }
+        )
+        reference_cam0 = np.asarray(calibration["reference_cam0"].values)
+        reference_cam1 = np.asarray(calibration["reference_cam1"].values)
+        current_cam0 = np.arange(1 * 4 * 5, dtype=float).reshape(1, 4, 5)
+        current_cam1 = np.arange(1 * 6 * 7, dtype=float).reshape(1, 6, 7)
+        expected_reference_cam0 = crop_image_to_roi(reference_cam0, (1, 1, 2, 2))
+        expected_reference_cam1 = crop_image_to_roi(reference_cam1, (2, 1, 3, 2))
+        expected_current_cam0 = crop_image_to_roi(current_cam0[0], (1, 1, 2, 2))
+        expected_current_cam1 = crop_image_to_roi(current_cam1[0], (2, 1, 3, 2))
+
+        with (
+            patch(
+                "merlin_track_position.tracking.correct.capture_image_stack",
+                return_value=(current_cam0, current_cam1),
+            ),
+            patch(
+                "merlin_track_position.tracking.correct.measure_image_error",
+                return_value=shift_dataset(np.zeros((2, 2), dtype=float)),
+            ) as measure,
+        ):
+            correct_module._capture_measurement(
+                calibration,
+                object(),
+                reference_cam0,
+                reference_cam1,
+                1,
+            )
+
+        args = measure.call_args.args
+        np.testing.assert_array_equal(args[0], expected_reference_cam0)
+        np.testing.assert_array_equal(args[1], expected_current_cam0[np.newaxis, :, :])
+        np.testing.assert_array_equal(args[2], expected_reference_cam1)
+        np.testing.assert_array_equal(args[3], expected_current_cam1[np.newaxis, :, :])
 
     def test_no_move_when_initial_residual_is_under_tolerance(self):
         with tempfile.TemporaryDirectory() as tmpdir:

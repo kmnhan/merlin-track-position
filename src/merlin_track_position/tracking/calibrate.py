@@ -18,12 +18,18 @@ from merlin_track_position.instruments.cameras import (
 )
 from merlin_track_position.instruments.motors import get_positions, move_motors_and_wait
 from merlin_track_position.tracking.calibration_core import (
+    CAMERAS,
     COMMAND_AXES,
     fit_jacobian_calibration,
     load_calibration_dataset,
     save_calibration_dataset_deferred,
+    validate_visual_calibration_dataset,
 )
 from merlin_track_position.tracking.persistence import persistence_result_attrs
+from merlin_track_position.tracking.roi import (
+    crop_stack_to_roi,
+    roi_geometry_from_attrs,
+)
 
 logger = logging.getLogger("merlin_track_position.tracking.calibrate")
 
@@ -69,6 +75,11 @@ def run_calibration(
     if camera_pair is None:
         camera_pair = default_camera_pair()
 
+    roi_geometries = {
+        camera: roi_geometry_from_attrs(additional_context or {}, camera)
+        for camera in CAMERAS
+    }
+
     x0, y0, z0, polar, tilt, cam = get_positions(("x", "y", "z", "p", "t", "cam"))
     commanded_position = np.asarray([x0, y0, z0], dtype=np.float64)
 
@@ -85,9 +96,17 @@ def run_calibration(
         camera_pair,
         capture_count,
     )
-    reference_cam0, reference_cam1 = (
+    full_reference_cam0, full_reference_cam1 = (
         _representative_image(reference_stacks[0]),
         _representative_image(reference_stacks[1]),
+    )
+    processing_reference_stacks = _crop_stacks_for_calibration(
+        reference_stacks,
+        roi_geometries,
+    )
+    reference_cam0, reference_cam1 = (
+        _representative_image(processing_reference_stacks[0]),
+        _representative_image(processing_reference_stacks[1]),
     )
 
     before_images_cam0: list[np.ndarray] = []
@@ -128,11 +147,19 @@ def run_calibration(
             camera_pair,
             capture_count,
         )
+        before_processing_stacks = _crop_stacks_for_calibration(
+            before_stacks,
+            roi_geometries,
+        )
+        after_processing_stacks = _crop_stacks_for_calibration(
+            after_stacks,
+            roi_geometries,
+        )
 
-        before_images_cam0.append(before_stacks[0])
-        before_images_cam1.append(before_stacks[1])
-        after_images_cam0.append(after_stacks[0])
-        after_images_cam1.append(after_stacks[1])
+        before_images_cam0.append(before_processing_stacks[0])
+        before_images_cam1.append(before_processing_stacks[1])
+        after_images_cam0.append(after_processing_stacks[0])
+        after_images_cam1.append(after_processing_stacks[1])
         command_delta_mm.append(delta.copy())
         pre_commanded_position_mm.append(pre_commanded)
         post_commanded_position_mm.append(target_position.copy())
@@ -180,6 +207,11 @@ def run_calibration(
         additional_context=context,
         **shift_options,
     )
+    calibration = _replace_reference_images(
+        calibration,
+        full_reference_cam0,
+        full_reference_cam1,
+    )
     persistence = save_calibration_dataset_deferred(calibration, output_path)
     if persistence.flushed:
         saved = load_calibration_dataset(output_path)
@@ -187,6 +219,53 @@ def run_calibration(
         saved = calibration.load().copy(deep=True)
         saved.attrs["calibration_path"] = str(output_path)
     return saved.assign_attrs(persistence_result_attrs("calibration", persistence))
+
+
+def _crop_stacks_for_calibration(
+    stacks: tuple[np.ndarray, ...],
+    roi_geometries: Mapping[str, tuple[float, float, float, float] | None],
+) -> tuple[np.ndarray, ...]:
+    cropped: list[np.ndarray] = []
+    for camera, stack in zip(CAMERAS, stacks, strict=True):
+        roi_geometry = roi_geometries[camera]
+        if roi_geometry is None:
+            cropped.append(stack)
+        else:
+            cropped.append(crop_stack_to_roi(stack, roi_geometry))
+    return tuple(cropped)
+
+
+def _replace_reference_images(
+    calibration: xr.Dataset,
+    reference_cam0: np.ndarray,
+    reference_cam1: np.ndarray,
+) -> xr.Dataset:
+    updated = calibration.drop_vars(
+        [
+            name
+            for name in (
+                "reference_cam0",
+                "reference_cam1",
+                "y_cam0",
+                "x_cam0",
+                "y_cam1",
+                "x_cam1",
+            )
+            if name in calibration.variables
+        ]
+    )
+    updated = updated.assign_coords(
+        {
+            "y_cam0": np.arange(reference_cam0.shape[0], dtype=np.int64),
+            "x_cam0": np.arange(reference_cam0.shape[1], dtype=np.int64),
+            "y_cam1": np.arange(reference_cam1.shape[0], dtype=np.int64),
+            "x_cam1": np.arange(reference_cam1.shape[1], dtype=np.int64),
+        }
+    )
+    updated["reference_cam0"] = (("y_cam0", "x_cam0"), reference_cam0)
+    updated["reference_cam1"] = (("y_cam1", "x_cam1"), reference_cam1)
+    validate_visual_calibration_dataset(updated)
+    return updated
 
 
 def _make_visual_probe_deltas(

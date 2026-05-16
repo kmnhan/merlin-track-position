@@ -13,9 +13,7 @@ import xarray as xr
 from merlin_track_position import constants
 from merlin_track_position.instruments.cameras import (
     CameraPairPlugin,
-    RoiGeometry,
     capture_image_stack,
-    crop_image_to_roi,
     default_camera_pair,
     normalize_capture_count,
 )
@@ -50,18 +48,10 @@ from merlin_track_position.tracking.persistence import (
     persistence_result_attrs,
     stage_dataset,
 )
+from merlin_track_position.tracking.roi import matching_reference_and_stack
 
 logger = logging.getLogger("merlin_track_position.tracking.correct")
 
-ROI_ATTR_KEYS: dict[str, tuple[str, str, str, str]] = {
-    camera: (
-        f"roi_{camera}_x",
-        f"roi_{camera}_y",
-        f"roi_{camera}_width",
-        f"roi_{camera}_height",
-    )
-    for camera in CAMERAS
-}
 CORRECTION_ALGORITHMS = ("damped_wls", "lqr")
 _USE_ALGORITHM_DEFAULT = object()
 
@@ -2107,14 +2097,14 @@ def _capture_measurement(
         current_cam0.shape,
         current_cam1.shape,
     )
-    current_cam0 = _crop_current_stack_if_needed(
-        calibration,
+    reference_cam0, current_cam0 = matching_reference_and_stack(
+        calibration.attrs,
         "cam0",
         reference_cam0,
         current_cam0,
     )
-    current_cam1 = _crop_current_stack_if_needed(
-        calibration,
+    reference_cam1, current_cam1 = matching_reference_and_stack(
+        calibration.attrs,
         "cam1",
         reference_cam1,
         current_cam1,
@@ -2274,50 +2264,3 @@ def _active_correction_indices(correction_cmd_mm: np.ndarray) -> tuple[int, ...]
         for index, value in enumerate(np.asarray(correction_cmd_mm, dtype=np.float64))
         if value != 0.0
     )
-
-
-def _crop_current_stack_if_needed(
-    calibration: xr.Dataset,
-    camera: str,
-    reference: np.ndarray,
-    current_stack: np.ndarray,
-) -> np.ndarray:
-    if current_stack.shape[1:] == np.shape(reference):
-        return current_stack
-
-    roi_geometry = _roi_geometry_from_attrs(calibration, camera)
-    if roi_geometry is None:
-        return current_stack
-
-    cropped_stack = np.stack(
-        [crop_image_to_roi(image, roi_geometry) for image in current_stack],
-        axis=0,
-    )
-    if cropped_stack.shape[1:] != np.shape(reference):
-        raise ValueError(
-            f"cropped {camera} image shape {cropped_stack.shape[1:]!r} "
-            f"does not match calibration reference shape {np.shape(reference)!r}"
-        )
-    return cropped_stack
-
-
-def _roi_geometry_from_attrs(
-    calibration: xr.Dataset,
-    camera: str,
-) -> RoiGeometry | None:
-    keys = ROI_ATTR_KEYS[camera]
-    present = tuple(key in calibration.attrs for key in keys)
-    if not any(present):
-        return None
-    if not all(present):
-        missing = ", ".join(key for key, exists in zip(keys, present) if not exists)
-        raise ValueError(f"incomplete ROI metadata for {camera}; missing {missing}")
-
-    try:
-        roi_geometry = tuple(float(calibration.attrs[key]) for key in keys)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"ROI metadata for {camera} must be numeric") from exc
-
-    if not np.isfinite(roi_geometry).all():
-        raise ValueError(f"ROI metadata for {camera} must be finite")
-    return roi_geometry

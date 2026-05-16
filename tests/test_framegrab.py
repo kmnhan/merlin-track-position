@@ -1,11 +1,12 @@
 import json
 import unittest
+from importlib import resources
 from unittest.mock import patch
 
 import numpy as np
 
 from merlin_track_position import constants
-from merlin_track_position.instruments import basler
+from merlin_track_position.instruments import basler, simulated_hardware
 from merlin_track_position.instruments.basler import get_basler_image
 from merlin_track_position.instruments.cameras import (
     CallableCameraPlugin,
@@ -156,13 +157,30 @@ class DevelopmentModeFramegrabTests(unittest.TestCase):
         )
         self.assertEqual(image.dtype, np.float64)
 
-    def test_development_mode_basler_placeholder_uses_simulator(self):
+    def test_zero_position_basler_frame_matches_packaged_reference(self):
         with patch.object(constants, "IS_DAQ_PC", False):
             image = get_basler_image()
+
+        data_path = (
+            resources.files("merlin_track_position.instruments")
+            / "data"
+            / simulated_hardware.SYNTHETIC_CALIBRATION_FILE
+        )
+        with data_path.open("rb") as file:
+            with np.load(file, allow_pickle=False) as archive:
+                reference_cam1 = archive["reference_cam1"]
+                roi = tuple(
+                    float(np.asarray(archive[f"roi_cam1_{key}"]).reshape(-1)[0])
+                    for key in ("x", "y", "width", "height")
+                )
 
         self.assertEqual(
             image.shape,
             (constants.IMAGE_HEIGHT_CAM1, constants.IMAGE_WIDTH_CAM1),
+        )
+        np.testing.assert_allclose(
+            crop_image_to_roi(image, roi),
+            reference_cam1,
         )
         self.assertEqual(image.dtype, np.float64)
 
@@ -530,6 +548,34 @@ class DevelopmentModeFramegrabTests(unittest.TestCase):
 
         expected_shift_px = (
             simulator.get_command_um_to_pixel("cam0") @ command_offset_um
+        )
+        measured = estimate_shift(
+            reference,
+            shifted,
+            check_tiles=False,
+            clip_percentiles=None,
+        )
+
+        self.assertGreater(float(np.mean(np.abs(shifted - reference))), 0.0)
+        np.testing.assert_allclose(
+            measured["shift_px"].values,
+            expected_shift_px,
+            atol=0.2,
+        )
+
+    def test_simulated_basler_shift_tracks_motor_positions(self):
+        command_offset_um = np.array([60.0, -30.0, 20.0], dtype=np.float64)
+
+        with (
+            patch.object(constants, "IS_DAQ_PC", False),
+            patch("merlin_track_position.instruments.simulated_hardware.time.sleep"),
+        ):
+            reference = get_basler_image()
+            move_motors_and_wait(("x", "y", "z"), command_offset_um * 1e-3)
+            shifted = get_basler_image()
+
+        expected_shift_px = (
+            simulator.get_command_um_to_pixel("cam1") @ command_offset_um
         )
         measured = estimate_shift(
             reference,

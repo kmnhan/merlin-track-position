@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import functools
 import logging
+import math
 import threading
 import time
 from collections.abc import Iterable
@@ -37,6 +38,8 @@ DEFAULT_POSITIONS = {
 @dataclass(frozen=True)
 class SyntheticCalibration:
     reference_image: npt.NDArray[np.float64]
+    reference_image_cam1: npt.NDArray[np.float64]
+    command_um_to_pixel_3d: npt.NDArray[np.float64]
 
 
 CAM0_COMMAND_UM_TO_PIXEL_3D = np.array(
@@ -61,6 +64,13 @@ def _readonly_float64(array: npt.ArrayLike) -> npt.NDArray[np.float64]:
     return result
 
 
+def _default_command_um_to_pixel_3d() -> npt.NDArray[np.float64]:
+    return np.stack(
+        [CAM0_COMMAND_UM_TO_PIXEL_3D, CAM1_COMMAND_UM_TO_PIXEL_3D],
+        axis=0,
+    )
+
+
 @functools.cache
 def load_synthetic_calibration() -> SyntheticCalibration:
     """Load the packaged development-mode reference image and calibration."""
@@ -71,14 +81,53 @@ def load_synthetic_calibration() -> SyntheticCalibration:
     )
     with data_path.open("rb") as file:
         with np.load(file) as archive:
+            archive_keys = set(archive.files)
+            if "reference_image" in archive_keys:
+                reference_image = archive["reference_image"]
+            else:
+                reference_image = archive["reference_cam0"]
+
+            if "reference_cam1" in archive_keys:
+                reference_image_cam1 = archive["reference_cam1"]
+            else:
+                reference_image_cam1 = _generated_synthetic_cam1_reference()
+
+            if "command_um_to_pixel_3d" in archive_keys:
+                command_um_to_pixel_3d = archive["command_um_to_pixel_3d"]
+            elif "px_per_cmd_mm" in archive_keys:
+                command_um_to_pixel_3d = archive["px_per_cmd_mm"] / 1000.0
+            else:
+                command_um_to_pixel_3d = _default_command_um_to_pixel_3d()
+
             return SyntheticCalibration(
-                reference_image=_readonly_float64(archive["reference_image"]),
+                reference_image=_readonly_float64(
+                    _reference_source_image(
+                        reference_image,
+                        archive,
+                        "cam0",
+                        (constants.IMAGE_HEIGHT_CAM0, constants.IMAGE_WIDTH_CAM0),
+                    )
+                ),
+                reference_image_cam1=_readonly_float64(
+                    _reference_source_image(
+                        reference_image_cam1,
+                        archive,
+                        "cam1",
+                        (constants.IMAGE_HEIGHT_CAM1, constants.IMAGE_WIDTH_CAM1),
+                    )
+                ),
+                command_um_to_pixel_3d=_readonly_float64(command_um_to_pixel_3d),
             )
 
 
 @functools.cache
 def load_synthetic_cam1_reference() -> npt.NDArray[np.float64]:
-    """Generate a deterministic development-mode reference image for camera 1."""
+    """Load the packaged development-mode reference image for camera 1."""
+    return load_synthetic_calibration().reference_image_cam1
+
+
+def _generated_synthetic_cam1_reference() -> npt.NDArray[np.float64]:
+    """Generate a fallback development-mode reference image for camera 1."""
     rng = np.random.default_rng(20260507)
     shape = (constants.IMAGE_HEIGHT_CAM1, constants.IMAGE_WIDTH_CAM1)
     y, x = np.indices(shape, dtype=np.float64)
@@ -90,6 +139,74 @@ def load_synthetic_cam1_reference() -> npt.NDArray[np.float64]:
     if maximum > 0.0:
         image /= maximum
     return _readonly_float64(image)
+
+
+def _reference_source_image(
+    image: npt.ArrayLike,
+    archive: np.lib.npyio.NpzFile,
+    camera: str,
+    full_shape: tuple[int, int],
+) -> npt.NDArray:
+    image_array = np.asarray(image)
+    if image_array.shape[:2] == full_shape:
+        return image_array
+
+    rect = _reference_roi_rect(archive, camera, full_shape)
+    if rect is None:
+        return image_array
+
+    y0, y1, x0, x1 = rect
+    if image_array.shape[:2] != (y1 - y0, x1 - x0):
+        logger.warning(
+            "Ignoring %s ROI metadata because image shape %s does not match "
+            "ROI crop shape %s.",
+            camera,
+            image_array.shape[:2],
+            (y1 - y0, x1 - x0),
+        )
+        return image_array
+
+    fill_value = float(np.median(image_array))
+    canvas = np.full(full_shape, fill_value, dtype=image_array.dtype)
+    canvas[y0:y1, x0:x1] = image_array
+    return canvas
+
+
+def _reference_roi_rect(
+    archive: np.lib.npyio.NpzFile,
+    camera: str,
+    full_shape: tuple[int, int],
+) -> tuple[int, int, int, int] | None:
+    keys = (
+        f"roi_{camera}_x",
+        f"roi_{camera}_y",
+        f"roi_{camera}_width",
+        f"roi_{camera}_height",
+    )
+    if any(key not in archive.files for key in keys):
+        return None
+
+    try:
+        x, y, width, height = (
+            float(np.asarray(archive[key]).reshape(-1)[0]) for key in keys
+        )
+    except (TypeError, ValueError, IndexError):
+        return None
+
+    if not all(math.isfinite(value) for value in (x, y, width, height)):
+        return None
+
+    image_height, image_width = full_shape
+    width = min(max(width, 1.0), float(image_width))
+    height = min(max(height, 1.0), float(image_height))
+    x = min(max(x, 0.0), float(image_width) - width)
+    y = min(max(y, 0.0), float(image_height) - height)
+
+    x0 = min(max(int(math.floor(x)), 0), image_width - 1)
+    y0 = min(max(int(math.floor(y)), 0), image_height - 1)
+    x1 = min(max(int(math.ceil(x + width)), x0 + 1), image_width)
+    y1 = min(max(int(math.ceil(y + height)), y0 + 1), image_height)
+    return y0, y1, x0, x1
 
 
 class SimulatedHardware:
@@ -159,14 +276,12 @@ class SimulatedHardware:
         self,
         camera: str | None = None,
     ) -> npt.NDArray[np.float64]:
+        command_um_to_pixel = load_synthetic_calibration().command_um_to_pixel_3d
         if camera == "cam0":
-            return CAM0_COMMAND_UM_TO_PIXEL_3D.copy()
+            return command_um_to_pixel[0].copy()
         if camera == "cam1":
-            return CAM1_COMMAND_UM_TO_PIXEL_3D.copy()
-        return np.stack(
-            [CAM0_COMMAND_UM_TO_PIXEL_3D, CAM1_COMMAND_UM_TO_PIXEL_3D],
-            axis=0,
-        )
+            return command_um_to_pixel[1].copy()
+        return command_um_to_pixel.copy()
 
     def get_framegrabber_image(self) -> npt.NDArray[np.float64]:
         x_mm, y_mm, z_mm = self.get_positions(("x", "y", "z"))
@@ -174,9 +289,10 @@ class SimulatedHardware:
             [x_mm * 1000.0, y_mm * 1000.0, z_mm * 1000.0],
             dtype=np.float64,
         )
-        du_px, dv_px = CAM0_COMMAND_UM_TO_PIXEL_3D @ command_offset_um
+        calibration = load_synthetic_calibration()
+        du_px, dv_px = calibration.command_um_to_pixel_3d[0] @ command_offset_um
         shifted = ndimage.shift(
-            load_synthetic_calibration().reference_image,
+            calibration.reference_image,
             shift=(float(dv_px), float(du_px)),
             order=3,
             mode="nearest",
@@ -191,9 +307,10 @@ class SimulatedHardware:
             [x_mm * 1000.0, y_mm * 1000.0, z_mm * 1000.0],
             dtype=np.float64,
         )
-        du_px, dv_px = CAM1_COMMAND_UM_TO_PIXEL_3D @ command_offset_um
+        calibration = load_synthetic_calibration()
+        du_px, dv_px = calibration.command_um_to_pixel_3d[1] @ command_offset_um
         shifted = ndimage.shift(
-            load_synthetic_cam1_reference(),
+            calibration.reference_image_cam1,
             shift=(float(dv_px), float(du_px)),
             order=3,
             mode="nearest",
