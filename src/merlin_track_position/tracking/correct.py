@@ -24,12 +24,17 @@ from merlin_track_position.tracking.calibration_core import (
     CAMERAS,
     COMMAND_AXES,
     PIXEL_AXES,
+    compute_lqr_correction_design,
     estimate_command_offset,
+    initialize_lqr_kalman_state,
     load_calibration_dataset,
     measure_image_error,
+    predict_lqr_kalman_state,
     refine_visual_jacobian_from_observations,
     solve_damped_command_correction,
     solve_lqr_command_correction,
+    solve_lqr_state_command_correction,
+    update_lqr_kalman_state,
     validate_visual_calibration_dataset,
     weighted_pixel_residual,
 )
@@ -218,6 +223,23 @@ def do_correction(
         raise ValueError("min_command_norm_mm must be finite and non-negative")
     if max_moves < 0:
         raise ValueError("max_moves must be >= 0")
+    lqr_kalman_filter_enabled = (
+        correction_algorithm == "lqr"
+        and bool(constants.DEFAULT_LQR_CORRECTION_USE_KALMAN_FILTER)
+    )
+    lqr_kalman_process_noise = constants.DEFAULT_LQR_CORRECTION_KALMAN_PROCESS_NOISE
+    lqr_kalman_measurement_noise = (
+        constants.DEFAULT_LQR_CORRECTION_KALMAN_MEASUREMENT_NOISE
+    )
+    lqr_kalman_measurement_covariance = (
+        constants.DEFAULT_LQR_CORRECTION_KALMAN_MEASUREMENT_COVARIANCE
+    )
+    lqr_kalman_initial_covariance = (
+        constants.DEFAULT_LQR_CORRECTION_KALMAN_INITIAL_COVARIANCE
+    )
+    lqr_kalman_innovation_gate = (
+        constants.DEFAULT_LQR_CORRECTION_KALMAN_INNOVATION_GATE
+    )
     logger.info(
         "Correction parameters: algorithm=%s, capture_count=%d, pixel_tolerance_px=%g, "
         "gain=%g, min_gain=%g, damping_mu=%g, "
@@ -242,6 +264,16 @@ def do_correction(
         calibration["visual_jacobian_px_per_cmd_mm"].values,
         dtype=np.float64,
     )
+    lqr_design: dict[str, Any] | None = None
+    if lqr_kalman_filter_enabled:
+        lqr_design = compute_lqr_correction_design(
+            jacobian.reshape(len(CAMERAS) * len(PIXEL_AXES), len(COMMAND_AXES)),
+            axis_scale,
+            image_scale_px=lqr_image_scale_px,
+            motor_penalty=lqr_motor_penalty,
+            svd_relative_tolerance=lqr_svd_relative_tolerance,
+            weights=weights,
+        )
     logger.info("Reading initial commanded x/y/z positions.")
     commanded_position_mm = np.asarray(
         motor_backend.get_positions(COMMAND_AXES),
@@ -289,11 +321,40 @@ def do_correction(
     move_max_normalized_component: list[float] = []
     move_active_axis_mask: list[np.ndarray] = []
     move_jacobian_refined: list[bool] = []
+    iteration_lqr_kalman_state: list[np.ndarray] = []
+    iteration_lqr_kalman_predicted_state: list[np.ndarray] = []
+    iteration_lqr_kalman_innovation: list[np.ndarray] = []
+    iteration_lqr_kalman_innovation_mahalanobis: list[float] = []
+    iteration_lqr_kalman_measurement_accepted: list[bool] = []
     warnings: list[str] = [
         line.strip()
         for line in str(measurement.attrs.get("warnings", "")).splitlines()
         if line.strip()
     ]
+
+    lqr_kalman_state: dict[str, np.ndarray | float | bool] | None = None
+    if lqr_kalman_filter_enabled:
+        if lqr_design is None:
+            raise RuntimeError("LQR Kalman design was not initialized")
+        lqr_kalman_state = initialize_lqr_kalman_state(
+            measurement,
+            lqr_design,
+            initial_covariance=lqr_kalman_initial_covariance,
+        )
+        _append_lqr_kalman_diagnostics(
+            lqr_kalman_state,
+            iteration_lqr_kalman_state=iteration_lqr_kalman_state,
+            iteration_lqr_kalman_predicted_state=(
+                iteration_lqr_kalman_predicted_state
+            ),
+            iteration_lqr_kalman_innovation=iteration_lqr_kalman_innovation,
+            iteration_lqr_kalman_innovation_mahalanobis=(
+                iteration_lqr_kalman_innovation_mahalanobis
+            ),
+            iteration_lqr_kalman_measurement_accepted=(
+                iteration_lqr_kalman_measurement_accepted
+            ),
+        )
 
     move_count = 0
     converged = residual <= pixel_tolerance_px
@@ -321,10 +382,24 @@ def do_correction(
                 lqr_image_scale_px=lqr_image_scale_px,
                 lqr_motor_penalty=lqr_motor_penalty,
                 lqr_svd_relative_tolerance=lqr_svd_relative_tolerance,
+                lqr_kalman_filter_enabled=lqr_kalman_filter_enabled,
+                lqr_design=lqr_design,
+                lqr_kalman_state=lqr_kalman_state,
                 weights=weights,
             ),
             iteration_shift_px=iteration_shift_px,
             iteration_weighted_residuals=iteration_weighted_residuals,
+            iteration_lqr_kalman_state=iteration_lqr_kalman_state,
+            iteration_lqr_kalman_predicted_state=(
+                iteration_lqr_kalman_predicted_state
+            ),
+            iteration_lqr_kalman_innovation=iteration_lqr_kalman_innovation,
+            iteration_lqr_kalman_innovation_mahalanobis=(
+                iteration_lqr_kalman_innovation_mahalanobis
+            ),
+            iteration_lqr_kalman_measurement_accepted=(
+                iteration_lqr_kalman_measurement_accepted
+            ),
             move_command_delta_mm=move_command_delta_mm,
             move_requested_position_mm=move_requested_position_mm,
             move_final_readback_position_mm=move_final_readback_position_mm,
@@ -370,6 +445,12 @@ def do_correction(
             lqr_image_scale_px=lqr_image_scale_px,
             lqr_motor_penalty=lqr_motor_penalty,
             lqr_svd_relative_tolerance=lqr_svd_relative_tolerance,
+            lqr_kalman_filter_enabled=lqr_kalman_filter_enabled,
+            lqr_kalman_process_noise=lqr_kalman_process_noise,
+            lqr_kalman_measurement_noise=lqr_kalman_measurement_noise,
+            lqr_kalman_measurement_covariance=lqr_kalman_measurement_covariance,
+            lqr_kalman_initial_covariance=lqr_kalman_initial_covariance,
+            lqr_kalman_innovation_gate=lqr_kalman_innovation_gate,
             algorithm=correction_algorithm,
             initial_commanded_position_mm=initial_commanded_position_mm,
             commanded_position_mm=commanded_position_mm,
@@ -417,20 +498,30 @@ def do_correction(
             measurement,
             weights=weights,
         )
-        raw_correction_cmd_mm = _solve_command_correction(
-            algorithm=correction_algorithm,
-            jacobian=jacobian,
-            measurement=measurement,
-            axis_scale=axis_scale,
-            gain=gain_used,
-            damping_mu=mu_used,
-            max_normalized_step=max_normalized_step,
-            min_axis_predicted_shift_px=min_axis_predicted_shift_px,
-            lqr_image_scale_px=lqr_image_scale_px,
-            lqr_motor_penalty=lqr_motor_penalty,
-            lqr_svd_relative_tolerance=lqr_svd_relative_tolerance,
-            weights=weights,
-        )
+        if lqr_kalman_filter_enabled:
+            if lqr_design is None or lqr_kalman_state is None:
+                raise RuntimeError("LQR Kalman state was not initialized")
+            raw_correction_cmd_mm = solve_lqr_state_command_correction(
+                lqr_design,
+                np.asarray(lqr_kalman_state["state"], dtype=np.float64),
+                gain=gain_used,
+                max_normalized_step=max_normalized_step,
+            )
+        else:
+            raw_correction_cmd_mm = _solve_command_correction(
+                algorithm=correction_algorithm,
+                jacobian=jacobian,
+                measurement=measurement,
+                axis_scale=axis_scale,
+                gain=gain_used,
+                damping_mu=mu_used,
+                max_normalized_step=max_normalized_step,
+                min_axis_predicted_shift_px=min_axis_predicted_shift_px,
+                lqr_image_scale_px=lqr_image_scale_px,
+                lqr_motor_penalty=lqr_motor_penalty,
+                lqr_svd_relative_tolerance=lqr_svd_relative_tolerance,
+                weights=weights,
+            )
         correction_cmd_mm = _prune_command_correction(
             correction_algorithm,
             raw_correction_cmd_mm,
@@ -461,6 +552,18 @@ def do_correction(
                 warnings[-1],
             )
             break
+
+        lqr_kalman_prediction: dict[str, np.ndarray] | None = None
+        if lqr_kalman_filter_enabled:
+            if lqr_design is None or lqr_kalman_state is None:
+                raise RuntimeError("LQR Kalman state was not initialized")
+            lqr_kalman_prediction = predict_lqr_kalman_state(
+                np.asarray(lqr_kalman_state["state"], dtype=np.float64),
+                np.asarray(lqr_kalman_state["covariance"], dtype=np.float64),
+                correction_cmd_mm,
+                lqr_design,
+                process_noise=lqr_kalman_process_noise,
+            )
 
         predicted_delta_px = (
             jacobian_before.reshape(len(CAMERAS) * len(PIXEL_AXES), len(COMMAND_AXES))
@@ -533,6 +636,42 @@ def do_correction(
             after_residual,
             decreased,
         )
+        if lqr_kalman_filter_enabled:
+            if lqr_design is None or lqr_kalman_prediction is None:
+                raise RuntimeError("LQR Kalman prediction was not initialized")
+            lqr_kalman_update = update_lqr_kalman_state(
+                lqr_kalman_prediction["state"],
+                lqr_kalman_prediction["covariance"],
+                after_measurement,
+                lqr_design,
+                measurement_noise=lqr_kalman_measurement_noise,
+                measurement_covariance=lqr_kalman_measurement_covariance,
+                innovation_gate=lqr_kalman_innovation_gate,
+            )
+            lqr_kalman_state = lqr_kalman_update
+            _append_lqr_kalman_diagnostics(
+                lqr_kalman_update,
+                iteration_lqr_kalman_state=iteration_lqr_kalman_state,
+                iteration_lqr_kalman_predicted_state=(
+                    iteration_lqr_kalman_predicted_state
+                ),
+                iteration_lqr_kalman_innovation=iteration_lqr_kalman_innovation,
+                iteration_lqr_kalman_innovation_mahalanobis=(
+                    iteration_lqr_kalman_innovation_mahalanobis
+                ),
+                iteration_lqr_kalman_measurement_accepted=(
+                    iteration_lqr_kalman_measurement_accepted
+                ),
+            )
+            if not bool(lqr_kalman_update["measurement_accepted"]):
+                warnings.append(
+                    _lqr_kalman_gated_measurement_warning(
+                        innovation_mahalanobis=float(
+                            lqr_kalman_update["innovation_mahalanobis"]
+                        ),
+                        innovation_gate=lqr_kalman_innovation_gate,
+                    )
+                )
         jacobian_refined = False
         measured_delta_px = np.asarray(
             after_measurement["shift_px"].values, dtype=np.float64
@@ -1415,6 +1554,59 @@ def _invalid_feedback_warning(
     )
 
 
+def _lqr_kalman_gated_measurement_warning(
+    *,
+    innovation_mahalanobis: float,
+    innovation_gate: float | None,
+) -> str:
+    gate_text = "disabled" if innovation_gate is None else f"{innovation_gate:.4g}"
+    return (
+        "LQR Kalman measurement rejected by innovation gate: "
+        f"mahalanobis={innovation_mahalanobis:.4g}, gate={gate_text}; "
+        "using predicted state"
+    )
+
+
+def _append_lqr_kalman_diagnostics(
+    update: dict[str, np.ndarray | float | bool],
+    *,
+    iteration_lqr_kalman_state: list[np.ndarray],
+    iteration_lqr_kalman_predicted_state: list[np.ndarray],
+    iteration_lqr_kalman_innovation: list[np.ndarray],
+    iteration_lqr_kalman_innovation_mahalanobis: list[float],
+    iteration_lqr_kalman_measurement_accepted: list[bool],
+) -> None:
+    iteration_lqr_kalman_state.append(
+        np.asarray(update["state"], dtype=np.float64)
+    )
+    iteration_lqr_kalman_predicted_state.append(
+        np.asarray(update["predicted_state"], dtype=np.float64)
+    )
+    iteration_lqr_kalman_innovation.append(
+        np.asarray(update["innovation"], dtype=np.float64).reshape(
+            len(CAMERAS),
+            len(PIXEL_AXES),
+        )
+    )
+    iteration_lqr_kalman_innovation_mahalanobis.append(
+        float(update["innovation_mahalanobis"])
+    )
+    iteration_lqr_kalman_measurement_accepted.append(
+        bool(update["measurement_accepted"])
+    )
+
+
+def _attrs_safe_numeric_config(value: Any) -> str | float:
+    if value is None:
+        return ""
+    array = np.asarray(value, dtype=np.float64)
+    if array.ndim == 0:
+        return float(array)
+    if not np.isfinite(array).all():
+        raise ValueError("numeric config attrs must contain only finite values")
+    return " ".join(f"{float(item):.17g}" for item in array.reshape(-1))
+
+
 def _reported_next_correction(
     *,
     converged: bool,
@@ -1429,7 +1621,10 @@ def _reported_next_correction(
     lqr_image_scale_px: float,
     lqr_motor_penalty: float,
     lqr_svd_relative_tolerance: float,
-    weights: Sequence[float] | np.ndarray | None,
+    lqr_kalman_filter_enabled: bool = False,
+    lqr_design: dict[str, Any] | None = None,
+    lqr_kalman_state: dict[str, np.ndarray | float | bool] | None = None,
+    weights: Sequence[float] | np.ndarray | None = None,
 ) -> np.ndarray:
     if converged:
         return np.zeros(len(COMMAND_AXES), dtype=np.float64)
@@ -1438,20 +1633,30 @@ def _reported_next_correction(
         measurement,
         weights=weights,
     )
-    raw_correction = _solve_command_correction(
-        algorithm=algorithm,
-        jacobian=jacobian,
-        measurement=measurement,
-        axis_scale=axis_scale,
-        gain=gain,
-        damping_mu=damping_mu,
-        max_normalized_step=max_normalized_step,
-        min_axis_predicted_shift_px=min_axis_predicted_shift_px,
-        lqr_image_scale_px=lqr_image_scale_px,
-        lqr_motor_penalty=lqr_motor_penalty,
-        lqr_svd_relative_tolerance=lqr_svd_relative_tolerance,
-        weights=weights,
-    )
+    if lqr_kalman_filter_enabled:
+        if algorithm != "lqr" or lqr_design is None or lqr_kalman_state is None:
+            raise RuntimeError("LQR Kalman state was not initialized")
+        raw_correction = solve_lqr_state_command_correction(
+            lqr_design,
+            np.asarray(lqr_kalman_state["state"], dtype=np.float64),
+            gain=gain,
+            max_normalized_step=max_normalized_step,
+        )
+    else:
+        raw_correction = _solve_command_correction(
+            algorithm=algorithm,
+            jacobian=jacobian,
+            measurement=measurement,
+            axis_scale=axis_scale,
+            gain=gain,
+            damping_mu=damping_mu,
+            max_normalized_step=max_normalized_step,
+            min_axis_predicted_shift_px=min_axis_predicted_shift_px,
+            lqr_image_scale_px=lqr_image_scale_px,
+            lqr_motor_penalty=lqr_motor_penalty,
+            lqr_svd_relative_tolerance=lqr_svd_relative_tolerance,
+            weights=weights,
+        )
     return _prune_command_correction(
         algorithm,
         raw_correction,
@@ -1468,6 +1673,11 @@ def _build_correction_result(
     next_correction: np.ndarray,
     iteration_shift_px: Sequence[np.ndarray],
     iteration_weighted_residuals: Sequence[float],
+    iteration_lqr_kalman_state: Sequence[np.ndarray],
+    iteration_lqr_kalman_predicted_state: Sequence[np.ndarray],
+    iteration_lqr_kalman_innovation: Sequence[np.ndarray],
+    iteration_lqr_kalman_innovation_mahalanobis: Sequence[float],
+    iteration_lqr_kalman_measurement_accepted: Sequence[bool],
     move_command_delta_mm: Sequence[np.ndarray],
     move_requested_position_mm: Sequence[np.ndarray],
     move_final_readback_position_mm: Sequence[np.ndarray],
@@ -1511,6 +1721,12 @@ def _build_correction_result(
     lqr_image_scale_px: float,
     lqr_motor_penalty: float,
     lqr_svd_relative_tolerance: float,
+    lqr_kalman_filter_enabled: bool,
+    lqr_kalman_process_noise: Any,
+    lqr_kalman_measurement_noise: float,
+    lqr_kalman_measurement_covariance: Any,
+    lqr_kalman_initial_covariance: float,
+    lqr_kalman_innovation_gate: float | None,
     algorithm: str,
     initial_commanded_position_mm: np.ndarray,
     commanded_position_mm: np.ndarray,
@@ -1657,6 +1873,44 @@ def _build_correction_result(
         iteration=np.arange(len(iteration_weighted_residuals), dtype=np.int64),
         move=np.arange(move_count, dtype=np.int64),
     )
+    if lqr_kalman_filter_enabled:
+        result = result.assign(
+            {
+                "iteration_lqr_kalman_state": (
+                    ("iteration", "lqr_state"),
+                    _stack_lqr_state_or_empty(iteration_lqr_kalman_state),
+                ),
+                "iteration_lqr_kalman_predicted_state": (
+                    ("iteration", "lqr_state"),
+                    _stack_lqr_state_or_empty(
+                        iteration_lqr_kalman_predicted_state
+                    ),
+                ),
+                "iteration_lqr_kalman_innovation": (
+                    ("iteration", "camera", "pixel_axis"),
+                    _stack_shift_or_empty(iteration_lqr_kalman_innovation),
+                ),
+                "iteration_lqr_kalman_innovation_mahalanobis": (
+                    ("iteration",),
+                    np.asarray(
+                        iteration_lqr_kalman_innovation_mahalanobis,
+                        dtype=np.float64,
+                    ),
+                ),
+                "iteration_lqr_kalman_measurement_accepted": (
+                    ("iteration",),
+                    np.asarray(
+                        iteration_lqr_kalman_measurement_accepted,
+                        dtype=bool,
+                    ),
+                ),
+            }
+        ).assign_coords(
+            lqr_state=np.arange(
+                _lqr_state_count(iteration_lqr_kalman_state),
+                dtype=np.int64,
+            )
+        )
     max_normalized_attr = (
         float(max_normalized_step) if max_normalized_step is not None else np.inf
     )
@@ -1697,6 +1951,26 @@ def _build_correction_result(
             "correction_lqr_motor_penalty": float(lqr_motor_penalty),
             "correction_lqr_svd_relative_tolerance": float(
                 lqr_svd_relative_tolerance
+            ),
+            "correction_lqr_kalman_filter_enabled": bool(
+                lqr_kalman_filter_enabled
+            ),
+            "correction_lqr_kalman_process_noise": _attrs_safe_numeric_config(
+                lqr_kalman_process_noise
+            ),
+            "correction_lqr_kalman_measurement_noise": float(
+                lqr_kalman_measurement_noise
+            ),
+            "correction_lqr_kalman_measurement_covariance": (
+                _attrs_safe_numeric_config(lqr_kalman_measurement_covariance)
+            ),
+            "correction_lqr_kalman_initial_covariance": float(
+                lqr_kalman_initial_covariance
+            ),
+            "correction_lqr_kalman_innovation_gate": (
+                np.inf
+                if lqr_kalman_innovation_gate is None
+                else float(lqr_kalman_innovation_gate)
             ),
         }
     return result.assign_attrs(attrs)
@@ -1760,6 +2034,18 @@ def _stack_shift_or_empty(rows: Sequence[np.ndarray]) -> np.ndarray:
     if not rows:
         return np.empty((0, len(CAMERAS), len(PIXEL_AXES)), dtype=np.float64)
     return np.stack(rows, axis=0).astype(np.float64, copy=False)
+
+
+def _stack_lqr_state_or_empty(rows: Sequence[np.ndarray]) -> np.ndarray:
+    if not rows:
+        return np.empty((0, 0), dtype=np.float64)
+    return np.stack(rows, axis=0).astype(np.float64, copy=False)
+
+
+def _lqr_state_count(rows: Sequence[np.ndarray]) -> int:
+    if not rows:
+        return 0
+    return int(np.asarray(rows[0]).size)
 
 
 def _stack_jacobian_or_empty(rows: Sequence[np.ndarray]) -> np.ndarray:

@@ -900,6 +900,125 @@ class CorrectionTests(unittest.TestCase):
         self.assertEqual(result.attrs["correction_algorithm"], "lqr")
         self.assertIn("correction_lqr_motor_penalty", result.attrs)
 
+    def test_lqr_kalman_algorithm_uses_filtered_state_for_command(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self.save_calibration(tmpdir)
+            calibration = calibration_dataset()
+            p0 = np.array([[60.0, -40.0], [20.0, 10.0]], dtype=float)
+            p1 = np.zeros((len(CAMERAS), len(PIXEL_AXES)), dtype=float)
+            expected_delta = solve_lqr_command_correction(
+                calibration["visual_jacobian_px_per_cmd_mm"].values,
+                shift_dataset(p0),
+                calibration["axis_scale_cmd_mm"].values,
+                gain=TEST_CORRECTION_GAIN,
+                image_scale_px=TEST_LQR_IMAGE_SCALE_PX,
+                motor_penalty=TEST_LQR_MOTOR_PENALTY,
+                svd_relative_tolerance=TEST_LQR_SVD_RELATIVE_TOLERANCE,
+                max_normalized_step=TEST_CORRECTION_MAX_NORMALIZED_STEP,
+                min_axis_predicted_shift_px=0.0,
+                weights=TEST_CORRECTION_WEIGHTS,
+            )
+            hardware_patches = self.patch_hardware(
+                [shift_dataset(p0), shift_dataset(p1)]
+            )
+            with (
+                patch.object(constants, "CORRECTION_ALGORITHM", "lqr"),
+                patch.object(
+                    constants,
+                    "DEFAULT_LQR_CORRECTION_USE_KALMAN_FILTER",
+                    True,
+                ),
+                patch.object(
+                    constants,
+                    "DEFAULT_LQR_CORRECTION_KALMAN_INNOVATION_GATE",
+                    None,
+                ),
+                hardware_patches[0],
+                hardware_patches[1],
+                hardware_patches[2],
+                patch(
+                    "merlin_track_position.tracking.correct.move_motors_and_wait",
+                    return_value=(100.0, 200.0, 300.0),
+                ) as move,
+            ):
+                result = do_correction(
+                    path,
+                    capture_count=1,
+                    max_moves=1,
+                    gain=TEST_CORRECTION_GAIN,
+                    max_normalized_step=TEST_CORRECTION_MAX_NORMALIZED_STEP,
+                    lqr_image_scale_px=TEST_LQR_IMAGE_SCALE_PX,
+                    lqr_motor_penalty=TEST_LQR_MOTOR_PENALTY,
+                    lqr_svd_relative_tolerance=TEST_LQR_SVD_RELATIVE_TOLERANCE,
+                    weights=TEST_CORRECTION_WEIGHTS,
+                )
+
+        requested = np.asarray(move.call_args.args[1], dtype=float)
+        np.testing.assert_allclose(
+            requested,
+            np.array([10.0, 20.0, 30.0]) + expected_delta,
+        )
+        self.assertTrue(result.attrs["correction_lqr_kalman_filter_enabled"])
+        self.assertIn("iteration_lqr_kalman_state", result)
+        self.assertEqual(result.sizes["lqr_state"], len(COMMAND_AXES))
+        np.testing.assert_array_equal(
+            result["iteration_lqr_kalman_measurement_accepted"].values,
+            np.array([True, True]),
+        )
+
+    def test_lqr_kalman_gate_rejects_inconsistent_post_move_measurement(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self.save_calibration(tmpdir)
+            p0 = np.array([[60.0, -40.0], [20.0, 10.0]], dtype=float)
+            p1 = np.full((len(CAMERAS), len(PIXEL_AXES)), 1_000.0, dtype=float)
+            hardware_patches = self.patch_hardware(
+                [shift_dataset(p0), shift_dataset(p1)]
+            )
+            with (
+                patch.object(constants, "CORRECTION_ALGORITHM", "lqr"),
+                patch.object(
+                    constants,
+                    "DEFAULT_LQR_CORRECTION_USE_KALMAN_FILTER",
+                    True,
+                ),
+                patch.object(
+                    constants,
+                    "DEFAULT_LQR_CORRECTION_KALMAN_INNOVATION_GATE",
+                    1e-9,
+                ),
+                hardware_patches[0],
+                hardware_patches[1],
+                hardware_patches[2],
+                patch(
+                    "merlin_track_position.tracking.correct.move_motors_and_wait",
+                    return_value=(100.0, 200.0, 300.0),
+                ),
+            ):
+                result = do_correction(
+                    path,
+                    capture_count=1,
+                    max_moves=1,
+                    gain=TEST_CORRECTION_GAIN,
+                    max_normalized_step=TEST_CORRECTION_MAX_NORMALIZED_STEP,
+                    lqr_image_scale_px=TEST_LQR_IMAGE_SCALE_PX,
+                    lqr_motor_penalty=TEST_LQR_MOTOR_PENALTY,
+                    lqr_svd_relative_tolerance=TEST_LQR_SVD_RELATIVE_TOLERANCE,
+                    weights=TEST_CORRECTION_WEIGHTS,
+                )
+
+        np.testing.assert_array_equal(
+            result["iteration_lqr_kalman_measurement_accepted"].values,
+            np.array([True, False]),
+        )
+        np.testing.assert_allclose(
+            result["iteration_lqr_kalman_state"].values[-1],
+            result["iteration_lqr_kalman_predicted_state"].values[-1],
+        )
+        self.assertIn(
+            "LQR Kalman measurement rejected",
+            result.attrs["warnings"],
+        )
+
     def test_lqr_uses_lqr_specific_default_gain_and_step_cap(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = self.save_calibration(tmpdir)
@@ -1238,6 +1357,69 @@ class CorrectionTests(unittest.TestCase):
         before = shift.reshape(-1)
         after = before + jacobian @ correction
         self.assertLess(float(np.linalg.norm(after)), float(np.linalg.norm(before)))
+
+    def test_lqr_kalman_helpers_update_and_gate_measurements(self):
+        calibration = calibration_dataset()
+        jacobian = calibration["visual_jacobian_px_per_cmd_mm"].values.reshape(
+            len(CAMERAS) * len(PIXEL_AXES),
+            len(COMMAND_AXES),
+        )
+        axis_scale = calibration["axis_scale_cmd_mm"].values
+        design = calibration_core.compute_lqr_correction_design(
+            jacobian,
+            axis_scale,
+            image_scale_px=TEST_LQR_IMAGE_SCALE_PX,
+            motor_penalty=TEST_LQR_MOTOR_PENALTY,
+            svd_relative_tolerance=TEST_LQR_SVD_RELATIVE_TOLERANCE,
+            weights=TEST_CORRECTION_WEIGHTS,
+        )
+        initial = calibration_core.initialize_lqr_kalman_state(
+            shift_dataset(np.array([[4.0, -3.0], [2.0, 1.0]], dtype=float)),
+            design,
+            initial_covariance=10.0,
+        )
+        command = calibration_core.solve_lqr_state_command_correction(
+            design,
+            initial["state"],
+            gain=0.5,
+            max_normalized_step=None,
+        )
+        predicted = calibration_core.predict_lqr_kalman_state(
+            initial["state"],
+            initial["covariance"],
+            command,
+            design,
+            process_noise=0.1,
+        )
+        accepted = calibration_core.update_lqr_kalman_state(
+            predicted["state"],
+            predicted["covariance"],
+            shift_dataset(np.array([[1.0, -1.0], [0.5, 0.25]], dtype=float)),
+            design,
+            measurement_noise=1.0,
+            innovation_gate=1e12,
+        )
+
+        self.assertTrue(bool(accepted["measurement_accepted"]))
+        self.assertEqual(accepted["state"].shape, (len(COMMAND_AXES),))
+        self.assertEqual(
+            accepted["covariance"].shape,
+            (len(COMMAND_AXES), len(COMMAND_AXES)),
+        )
+        self.assertTrue(np.isfinite(accepted["state"]).all())
+
+        rejected = calibration_core.update_lqr_kalman_state(
+            predicted["state"],
+            predicted["covariance"],
+            shift_dataset(np.full((len(CAMERAS), len(PIXEL_AXES)), 1_000.0)),
+            design,
+            measurement_noise=1.0,
+            innovation_gate=1e-9,
+        )
+
+        self.assertFalse(bool(rejected["measurement_accepted"]))
+        np.testing.assert_allclose(rejected["state"], predicted["state"])
+        np.testing.assert_allclose(rejected["covariance"], predicted["covariance"])
 
     def test_lqr_normalized_step_limit_caps_largest_axis_component(self):
         jacobian = np.array(

@@ -16,10 +16,14 @@ from merlin_track_position.tracking.calibration_core import (
     CAMERAS,
     COMMAND_AXES,
     PIXEL_AXES,
-    _compute_lqr_feedback_gain,
+    compute_lqr_correction_design,
     estimate_command_offset,
+    initialize_lqr_kalman_state,
     load_calibration_dataset,
     measure_image_error,
+    predict_lqr_kalman_state,
+    solve_lqr_state_command_correction,
+    update_lqr_kalman_state,
     validate_visual_calibration_dataset,
 )
 
@@ -175,6 +179,9 @@ def simulate_shift_correction(
     motor_error_model: Mapping[str, Any] | None = None,
     trials_per_offset: int = 1,
     min_command_norm_mm: float = constants.DEFAULT_CORRECTION_MIN_COMMAND_NORM_MM,
+    measurement_noise_covariance_px: (
+        float | Sequence[Sequence[float]] | np.ndarray | None
+    ) = None,
 ) -> xr.Dataset:
     """Run fast closed-loop simulations directly in image-shift space."""
 
@@ -191,6 +198,7 @@ def simulate_shift_correction(
         motor_error_model=motor_error_model,
         trials_per_offset=trials_per_offset,
         min_command_norm_mm=min_command_norm_mm,
+        measurement_noise_covariance_px=measurement_noise_covariance_px,
         shift_kwargs={},
     )
 
@@ -224,6 +232,7 @@ def simulate_image_correction(
         motor_error_model=motor_error_model,
         trials_per_offset=trials_per_offset,
         min_command_norm_mm=min_command_norm_mm,
+        measurement_noise_covariance_px=None,
         shift_kwargs={} if shift_kwargs is None else dict(shift_kwargs),
     )
 
@@ -297,6 +306,9 @@ def _simulate_correction(
     motor_error_model: Mapping[str, Any] | None,
     trials_per_offset: int,
     min_command_norm_mm: float,
+    measurement_noise_covariance_px: (
+        float | Sequence[Sequence[float]] | np.ndarray | None
+    ),
     shift_kwargs: Mapping[str, Any],
 ) -> xr.Dataset:
     weights_values = _observation_weights(weights)
@@ -344,6 +356,12 @@ def _simulate_correction(
         len(COMMAND_AXES),
     )
     sampled_tail_event = sampled_tail_event.reshape(trial_count, max_moves)
+    measurement_noise = _sample_measurement_noise_px(
+        rng,
+        trial_count,
+        max_moves + 1,
+        measurement_noise_covariance_px,
+    )
 
     true_state_um = np.full(
         (algorithm_count, trial_count, max_moves + 1, len(COMMAND_AXES)),
@@ -387,6 +405,14 @@ def _simulate_correction(
         state_um = initial_um.copy()
         done = np.zeros(trial_count, dtype=bool)
         moves_done = np.zeros(trial_count, dtype=np.int64)
+        kalman_state, kalman_covariance = _initial_simulation_kalman_arrays(
+            model,
+            trial_count,
+        )
+        kalman_predicted_state, kalman_predicted_covariance = (
+            _initial_simulation_kalman_arrays(model, trial_count)
+        )
+        kalman_prediction_pending = np.zeros(trial_count, dtype=bool)
         for iteration in range(max_moves + 1):
             true_state_um[algorithm_index, :, iteration, :] = state_um
             shifts = _measure_states(
@@ -396,7 +422,38 @@ def _simulate_correction(
                 mode=mode,
                 shift_kwargs=shift_kwargs,
             )
+            if measurement_noise is not None:
+                shifts = shifts + measurement_noise[:, iteration, :, :]
             measured_shift_px[algorithm_index, :, iteration, :, :] = shifts
+            if bool(model.get("lqr_use_kalman_filter", False)):
+                if iteration == 0:
+                    for trial_index in range(trial_count):
+                        initialized = initialize_lqr_kalman_state(
+                            shifts[trial_index],
+                            model["lqr_design"],
+                            initial_covariance=model["lqr_kalman_initial_covariance"],
+                        )
+                        kalman_state[trial_index] = initialized["state"]
+                        kalman_covariance[trial_index] = initialized["covariance"]
+                else:
+                    update_indices = np.nonzero(kalman_prediction_pending)[0]
+                    for trial_index in update_indices:
+                        updated = update_lqr_kalman_state(
+                            kalman_predicted_state[trial_index],
+                            kalman_predicted_covariance[trial_index],
+                            shifts[trial_index],
+                            model["lqr_design"],
+                            measurement_noise=model[
+                                "lqr_kalman_measurement_noise"
+                            ],
+                            measurement_covariance=model[
+                                "lqr_kalman_measurement_covariance"
+                            ],
+                            innovation_gate=model["lqr_kalman_innovation_gate"],
+                        )
+                        kalman_state[trial_index] = updated["state"]
+                        kalman_covariance[trial_index] = updated["covariance"]
+                    kalman_prediction_pending[update_indices] = False
             residuals = _weighted_residuals(shifts, weights_values)
             weighted_residual_px[algorithm_index, :, iteration] = residuals
 
@@ -420,25 +477,32 @@ def _simulate_correction(
                 break
 
             active_indices = np.nonzero(active)[0]
-            commands_um = _commands_from_shifts(
-                model,
-                shifts[active],
-                axis_scale,
-                jacobian_observation,
-                weights_values,
-            )
+            if bool(model.get("lqr_use_kalman_filter", False)):
+                commands_um = _commands_from_kalman_states(
+                    model,
+                    kalman_state[active],
+                )
+            else:
+                commands_um = _commands_from_shifts(
+                    model,
+                    shifts[active],
+                    axis_scale,
+                    jacobian_observation,
+                    weights_values,
+                )
             command_norm_mm = np.linalg.norm(commands_um / 1000.0, axis=1)
             should_move = command_norm_mm > min_command_norm_mm
             if np.any(should_move):
                 moving_indices = active_indices[should_move]
+                moving_commands_um = commands_um[should_move]
                 command_delta_um[
                     algorithm_index,
                     moving_indices,
                     iteration,
                     :,
-                ] = commands_um[should_move]
+                ] = moving_commands_um
                 errors_um = sampled_error_um[moving_indices, iteration, :]
-                applied_um = commands_um[should_move] + errors_um
+                applied_um = moving_commands_um + errors_um
                 applied_delta_um[
                     algorithm_index,
                     moving_indices,
@@ -461,6 +525,20 @@ def _simulate_correction(
                     moving_indices,
                     iteration,
                 ] = True
+                if bool(model.get("lqr_use_kalman_filter", False)):
+                    for local_index, trial_index in enumerate(moving_indices):
+                        predicted = predict_lqr_kalman_state(
+                            kalman_state[trial_index],
+                            kalman_covariance[trial_index],
+                            moving_commands_um[local_index] / 1000.0,
+                            model["lqr_design"],
+                            process_noise=model["lqr_kalman_process_noise"],
+                        )
+                        kalman_predicted_state[trial_index] = predicted["state"]
+                        kalman_predicted_covariance[trial_index] = predicted[
+                            "covariance"
+                        ]
+                    kalman_prediction_pending[moving_indices] = True
                 state_um[moving_indices] += applied_um
                 moves_done[moving_indices] += 1
 
@@ -532,6 +610,9 @@ def _simulate_correction(
             "weights": tuple(float(value) for value in weights_values),
             "weights_order": OBSERVATION_AXES,
             "error_model_name": str(motor_error_model.get("name", "custom")),
+            "measurement_noise_covariance_px": _simulation_attrs_config(
+                measurement_noise_covariance_px
+            ),
         },
     )
 
@@ -646,7 +727,7 @@ def _command_model(
             config.get("gain", constants.DEFAULT_LQR_CORRECTION_GAIN),
             "gain",
         )
-        feedback_gain, *_ = _compute_lqr_feedback_gain(
+        lqr_design = compute_lqr_correction_design(
             jacobian_observation,
             axis_scale,
             image_scale_px=_positive_float(
@@ -672,7 +753,7 @@ def _command_model(
             ),
             weights=weights,
         )
-        gain_matrix = gain * feedback_gain
+        gain_matrix = gain * np.asarray(lqr_design["real_feedback_gain"])
         max_normalized_step = config.get(
             "max_normalized_step",
             constants.DEFAULT_LQR_CORRECTION_MAX_NORMALIZED_STEP,
@@ -680,6 +761,12 @@ def _command_model(
         min_axis_predicted_shift_px = config.get(
             "min_axis_predicted_shift_px",
             0.0,
+        )
+        lqr_use_kalman_filter = bool(
+            config.get(
+                "lqr_use_kalman_filter",
+                constants.DEFAULT_LQR_CORRECTION_USE_KALMAN_FILTER,
+            )
         )
 
     max_step = _optional_positive_float(max_normalized_step, "max_normalized_step")
@@ -690,12 +777,59 @@ def _command_model(
     axis_sensitivity = np.sqrt(
         np.diag(jacobian_observation.T @ weight_matrix @ jacobian_observation)
     )
-    return {
+    model = {
         "gain_matrix": gain_matrix,
         "max_normalized_step": max_step,
         "min_axis_predicted_shift_px": min_axis_shift,
         "axis_sensitivity": axis_sensitivity,
     }
+    if algorithm == "lqr" and lqr_use_kalman_filter:
+        model |= {
+            "lqr_use_kalman_filter": True,
+            "lqr_design": lqr_design,
+            "gain": gain,
+            "lqr_kalman_process_noise": _simulation_kalman_covariance_config(
+                config.get(
+                    "lqr_kalman_process_noise",
+                    constants.DEFAULT_LQR_CORRECTION_KALMAN_PROCESS_NOISE,
+                ),
+                int(lqr_design["rank"]),
+                "lqr_kalman_process_noise",
+                allow_zero=True,
+            ),
+            "lqr_kalman_measurement_noise": _positive_float(
+                config.get(
+                    "lqr_kalman_measurement_noise",
+                    constants.DEFAULT_LQR_CORRECTION_KALMAN_MEASUREMENT_NOISE,
+                ),
+                "lqr_kalman_measurement_noise",
+            ),
+            "lqr_kalman_measurement_covariance": (
+                None
+                if config.get("lqr_kalman_measurement_covariance", None) is None
+                else _simulation_kalman_covariance_config(
+                    config["lqr_kalman_measurement_covariance"],
+                    len(OBSERVATION_AXES),
+                    "lqr_kalman_measurement_covariance",
+                    allow_zero=False,
+                )
+            ),
+            "lqr_kalman_initial_covariance": _positive_float(
+                config.get(
+                    "lqr_kalman_initial_covariance",
+                    constants.DEFAULT_LQR_CORRECTION_KALMAN_INITIAL_COVARIANCE,
+                ),
+                "lqr_kalman_initial_covariance",
+            ),
+            "lqr_kalman_innovation_gate": _optional_positive_float(
+                config.get(
+                    "lqr_kalman_innovation_gate",
+                    constants.DEFAULT_LQR_CORRECTION_KALMAN_INNOVATION_GATE,
+                ),
+                "lqr_kalman_innovation_gate",
+            ),
+        }
+    return model
 
 
 def _commands_from_shifts(
@@ -724,6 +858,41 @@ def _commands_from_shifts(
         correction_mm = correction_mm.copy()
         correction_mm[predicted_axis_shift_px < min_axis_predicted_shift_px] = 0.0
     return 1000.0 * correction_mm
+
+
+def _commands_from_kalman_states(
+    model: Mapping[str, Any],
+    states: np.ndarray,
+) -> np.ndarray:
+    state_rows = np.asarray(states, dtype=np.float64)
+    commands = [
+        solve_lqr_state_command_correction(
+            model["lqr_design"],
+            state,
+            gain=float(model["gain"]),
+            max_normalized_step=model["max_normalized_step"],
+        )
+        for state in state_rows
+    ]
+    if not commands:
+        return np.empty((0, len(COMMAND_AXES)), dtype=np.float64)
+    return 1000.0 * np.stack(commands, axis=0)
+
+
+def _initial_simulation_kalman_arrays(
+    model: Mapping[str, Any],
+    trial_count: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    if not bool(model.get("lqr_use_kalman_filter", False)):
+        return (
+            np.empty((trial_count, 0), dtype=np.float64),
+            np.empty((trial_count, 0, 0), dtype=np.float64),
+        )
+    rank = int(model["lqr_design"]["rank"])
+    return (
+        np.zeros((trial_count, rank), dtype=np.float64),
+        np.zeros((trial_count, rank, rank), dtype=np.float64),
+    )
 
 
 def _measure_states(
@@ -817,6 +986,39 @@ def _sample_model_component(
     return location[np.newaxis, :] + coordinates @ basis.T
 
 
+def _sample_measurement_noise_px(
+    rng: np.random.Generator,
+    trial_count: int,
+    iteration_count: int,
+    covariance_px: float | Sequence[Sequence[float]] | np.ndarray | None,
+) -> np.ndarray | None:
+    if covariance_px is None:
+        return None
+    covariance_config = _simulation_kalman_covariance_config(
+        covariance_px,
+        len(OBSERVATION_AXES),
+        "measurement_noise_covariance_px",
+        allow_zero=True,
+    )
+    covariance_values = np.asarray(covariance_config, dtype=np.float64)
+    covariance = (
+        float(covariance_values) * np.eye(len(OBSERVATION_AXES), dtype=np.float64)
+        if covariance_values.ndim == 0
+        else covariance_values
+    )
+    samples = rng.multivariate_normal(
+        mean=np.zeros(len(OBSERVATION_AXES), dtype=np.float64),
+        cov=covariance,
+        size=trial_count * iteration_count,
+    )
+    return samples.reshape(
+        trial_count,
+        iteration_count,
+        len(CAMERAS),
+        len(PIXEL_AXES),
+    )
+
+
 def _model_vector(model: Mapping[str, Any], key: str) -> np.ndarray:
     values = np.asarray(model[key], dtype=np.float64)
     if values.shape != (len(COMMAND_AXES),):
@@ -853,6 +1055,49 @@ def _optional_positive_float(value: Any, name: str) -> float | None:
     if value is None:
         return None
     return _positive_float(value, name)
+
+
+def _simulation_kalman_covariance_config(
+    value: Any,
+    size: int,
+    name: str,
+    *,
+    allow_zero: bool,
+) -> float | np.ndarray:
+    values = np.asarray(value, dtype=np.float64)
+    if values.ndim == 0:
+        scalar = float(values)
+        if (
+            not np.isfinite(scalar)
+            or scalar < 0.0
+            or (scalar == 0.0 and not allow_zero)
+        ):
+            bound = "non-negative" if allow_zero else "positive"
+            raise ValueError(f"{name} must be finite and {bound}")
+        return scalar
+    if values.shape != (size, size):
+        raise ValueError(f"{name} must be scalar or have shape ({size}, {size})")
+    if not np.isfinite(values).all():
+        raise ValueError(f"{name} must contain only finite values")
+    values = 0.5 * (values + values.T)
+    eigenvalues = np.linalg.eigvalsh(values)
+    if np.min(eigenvalues) < -1e-12 or (
+        not allow_zero and np.min(eigenvalues) <= 0.0
+    ):
+        bound = "positive semidefinite" if allow_zero else "positive definite"
+        raise ValueError(f"{name} must be {bound}")
+    return values
+
+
+def _simulation_attrs_config(value: Any) -> str | float:
+    if value is None:
+        return ""
+    values = np.asarray(value, dtype=np.float64)
+    if values.ndim == 0:
+        return float(values)
+    if not np.isfinite(values).all():
+        raise ValueError("simulation attrs config must contain only finite values")
+    return " ".join(f"{float(item):.17g}" for item in values.reshape(-1))
 
 
 def _require_result_vars(result: xr.Dataset, names: Sequence[str]) -> None:

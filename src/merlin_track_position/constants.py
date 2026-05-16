@@ -111,6 +111,23 @@ DEFAULT_LQR_CORRECTION_IMAGE_SCALE_PX: float = 0.1
 DEFAULT_LQR_CORRECTION_MOTOR_PENALTY: float = 100.0
 DEFAULT_LQR_CORRECTION_SVD_RELATIVE_TOLERANCE: float = 1e-6
 
+# LQR-only Kalman observer. Disabled by default so the nominal LQR command law
+# is unchanged unless this is explicitly enabled.
+DEFAULT_LQR_CORRECTION_USE_KALMAN_FILTER: bool = False
+DEFAULT_LQR_CORRECTION_KALMAN_PROCESS_NOISE: float = 0.05
+DEFAULT_LQR_CORRECTION_KALMAN_MEASUREMENT_NOISE: float = 1.0
+DEFAULT_LQR_CORRECTION_KALMAN_MEASUREMENT_COVARIANCE: (
+    tuple[
+        tuple[float, float, float, float],
+        tuple[float, float, float, float],
+        tuple[float, float, float, float],
+        tuple[float, float, float, float],
+    ]
+    | None
+) = None
+DEFAULT_LQR_CORRECTION_KALMAN_INITIAL_COVARIANCE: float = 100.0
+DEFAULT_LQR_CORRECTION_KALMAN_INNOVATION_GATE: float = 16.0
+
 # Image size for initial crop from each camera array.
 IMAGE_WIDTH_CAM0: int = 704
 IMAGE_HEIGHT_CAM0: int = 480

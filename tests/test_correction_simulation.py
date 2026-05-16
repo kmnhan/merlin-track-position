@@ -156,6 +156,36 @@ class CorrectionSimulationTests(unittest.TestCase):
         self.assertEqual(summary.sizes["algorithm"], 2)
         self.assertTrue(np.isfinite(summary["move_count_mean"].values).all())
 
+    def test_shift_level_lqr_kalman_run_is_repeatable_with_measurement_noise(self):
+        kwargs = dict(
+            calibration=sample_calibration(),
+            algorithm_configs=[
+                {
+                    "name": "lqr_kalman",
+                    "algorithm": "lqr",
+                    "gain": 0.8,
+                    "lqr_use_kalman_filter": True,
+                    "lqr_kalman_process_noise": 0.05,
+                    "lqr_kalman_measurement_noise": 1.0,
+                    "lqr_kalman_innovation_gate": None,
+                }
+            ],
+            initial_offsets_um=default_initial_offsets_um((2.0,)),
+            seed=12345,
+            pixel_tolerance_px=0.2,
+            max_moves=5,
+            trials_per_offset=2,
+            measurement_noise_covariance_px=0.01,
+        )
+
+        first = simulate_shift_correction(**kwargs)
+        second = simulate_shift_correction(**kwargs)
+
+        xr.testing.assert_identical(first, second)
+        self.assertEqual(first.attrs["measurement_noise_covariance_px"], 0.01)
+        self.assertEqual(first.sizes["algorithm"], 1)
+        self.assertTrue(np.isfinite(first["weighted_residual_px"].values).any())
+
     def test_image_level_no_error_reduces_measured_residual(self):
         result = simulate_image_correction(
             sample_calibration(),

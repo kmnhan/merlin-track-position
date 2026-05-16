@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 import tempfile
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Sequence
@@ -966,7 +966,7 @@ def solve_lqr_command_correction(
     ):
         raise ValueError("min_axis_predicted_shift_px must be finite and non-negative")
 
-    feedback_gain, *_ = _compute_lqr_feedback_gain(
+    design = compute_lqr_correction_design(
         jacobian_observation,
         axis_scale,
         image_scale_px=image_scale_px,
@@ -974,12 +974,14 @@ def solve_lqr_command_correction(
         svd_relative_tolerance=svd_relative_tolerance,
         weights=weights,
     )
-    correction_cmd_mm = -gain * (feedback_gain @ observation)
-    if max_normalized_step is not None and np.isfinite(max_normalized_step):
-        normalized_component = correction_cmd_mm / axis_scale
-        max_component = float(np.max(np.abs(normalized_component)))
-        if max_component > max_normalized_step:
-            correction_cmd_mm *= max_normalized_step / max_component
+    normalized_observation = observation / np.asarray(design["image_scale"])
+    state = np.asarray(design["controllable_basis"]).T @ normalized_observation
+    correction_cmd_mm = solve_lqr_state_command_correction(
+        design,
+        state,
+        gain=gain,
+        max_normalized_step=max_normalized_step,
+    )
 
     if min_axis_predicted_shift_px > 0.0:
         weight_matrix = _observation_weight_matrix(weights)
@@ -997,7 +999,7 @@ def solve_lqr_command_correction(
     return correction_cmd_mm
 
 
-def _compute_lqr_feedback_gain(
+def compute_lqr_correction_design(
     jacobian_observation: np.ndarray,
     axis_scale_cmd_mm: Sequence[float],
     *,
@@ -1005,7 +1007,9 @@ def _compute_lqr_feedback_gain(
     motor_penalty: float,
     svd_relative_tolerance: float,
     weights: Sequence[float] | np.ndarray | None,
-) -> tuple[np.ndarray, np.ndarray, int, np.ndarray]:
+) -> dict[str, np.ndarray | float | int]:
+    """Return the normalized LQR design matrices for correction control."""
+
     jacobian = np.asarray(jacobian_observation, dtype=np.float64)
     if jacobian.shape != (len(OBSERVATION_AXES), len(COMMAND_AXES)):
         raise ValueError("jacobian_observation must have shape (4, 3)")
@@ -1075,7 +1079,339 @@ def _compute_lqr_feedback_gain(
     real_feedback_gain = axis_scale[:, np.newaxis] * (
         image_feedback_gain / image_scale[np.newaxis, :]
     )
-    return real_feedback_gain, closed_loop_eigenvalues, rank, singular_values
+    return {
+        "real_feedback_gain": real_feedback_gain,
+        "normalized_feedback_gain": normalized_feedback_gain,
+        "controllable_basis": controllable_basis,
+        "input_matrix": input_matrix,
+        "normalized_jacobian": normalized_jacobian,
+        "image_scale": image_scale,
+        "axis_scale": axis_scale,
+        "closed_loop_eigenvalues": closed_loop_eigenvalues,
+        "rank": rank,
+        "singular_values": singular_values,
+        "motor_penalty": motor_penalty,
+        "svd_relative_tolerance": svd_relative_tolerance,
+    }
+
+
+def _compute_lqr_feedback_gain(
+    jacobian_observation: np.ndarray,
+    axis_scale_cmd_mm: Sequence[float],
+    *,
+    image_scale_px: float,
+    motor_penalty: float,
+    svd_relative_tolerance: float,
+    weights: Sequence[float] | np.ndarray | None,
+) -> tuple[np.ndarray, np.ndarray, int, np.ndarray]:
+    design = compute_lqr_correction_design(
+        jacobian_observation,
+        axis_scale_cmd_mm,
+        image_scale_px=image_scale_px,
+        motor_penalty=motor_penalty,
+        svd_relative_tolerance=svd_relative_tolerance,
+        weights=weights,
+    )
+    return (
+        np.asarray(design["real_feedback_gain"], dtype=np.float64),
+        np.asarray(design["closed_loop_eigenvalues"]),
+        int(design["rank"]),
+        np.asarray(design["singular_values"], dtype=np.float64),
+    )
+
+
+def solve_lqr_state_command_correction(
+    lqr_design: Mapping[str, Any],
+    state: Sequence[float] | np.ndarray,
+    *,
+    gain: float = constants.DEFAULT_LQR_CORRECTION_GAIN,
+    max_normalized_step: float | None = (
+        constants.DEFAULT_LQR_CORRECTION_MAX_NORMALIZED_STEP
+    ),
+) -> np.ndarray:
+    """Solve an LQR command from a normalized controllable-subspace state."""
+
+    normalized_feedback_gain = _lqr_design_matrix(
+        lqr_design,
+        "normalized_feedback_gain",
+        (len(COMMAND_AXES), int(lqr_design["rank"])),
+    )
+    axis_scale = _lqr_design_vector(lqr_design, "axis_scale", len(COMMAND_AXES))
+    state_values = np.asarray(state, dtype=np.float64)
+    if state_values.shape != (int(lqr_design["rank"]),):
+        raise ValueError("state must have one value per LQR controllable state")
+    if not np.isfinite(state_values).all():
+        raise ValueError("state must contain only finite values")
+
+    gain = float(gain)
+    if not np.isfinite(gain) or gain <= 0.0:
+        raise ValueError("gain must be finite and positive")
+    if max_normalized_step is not None:
+        max_normalized_step = float(max_normalized_step)
+        if np.isnan(max_normalized_step) or max_normalized_step <= 0.0:
+            raise ValueError("max_normalized_step must be positive or None")
+
+    normalized_command = -gain * (normalized_feedback_gain @ state_values)
+    if max_normalized_step is not None and np.isfinite(max_normalized_step):
+        max_component = float(np.max(np.abs(normalized_command)))
+        if max_component > max_normalized_step:
+            normalized_command *= max_normalized_step / max_component
+    correction_cmd_mm = axis_scale * normalized_command
+    if correction_cmd_mm.shape != (len(COMMAND_AXES),):
+        raise ValueError("computed correction has unexpected shape")
+    if not np.isfinite(correction_cmd_mm).all():
+        raise ValueError("computed correction contains non-finite values")
+    return correction_cmd_mm
+
+
+def initialize_lqr_kalman_state(
+    measured_shift: xr.Dataset | xr.DataArray | Sequence[float],
+    lqr_design: Mapping[str, Any],
+    *,
+    initial_covariance: float = (
+        constants.DEFAULT_LQR_CORRECTION_KALMAN_INITIAL_COVARIANCE
+    ),
+) -> dict[str, np.ndarray | float | bool]:
+    """Initialize the LQR Kalman observer from the first camera measurement."""
+
+    controllable_basis = _lqr_design_matrix(
+        lqr_design,
+        "controllable_basis",
+        (len(OBSERVATION_AXES), int(lqr_design["rank"])),
+    )
+    image_scale = _lqr_design_vector(lqr_design, "image_scale", len(OBSERVATION_AXES))
+    observation = _shift_to_observation(_shift_values(measured_shift))
+    normalized_measurement = observation / image_scale
+    state = controllable_basis.T @ normalized_measurement
+    initial_covariance = float(initial_covariance)
+    if not np.isfinite(initial_covariance) or initial_covariance <= 0.0:
+        raise ValueError("initial_covariance must be finite and positive")
+    covariance = initial_covariance * np.eye(int(lqr_design["rank"]), dtype=np.float64)
+    innovation = normalized_measurement - controllable_basis @ state
+    return {
+        "state": state,
+        "covariance": covariance,
+        "predicted_state": state.copy(),
+        "predicted_covariance": covariance.copy(),
+        "innovation": innovation,
+        "innovation_mahalanobis": np.nan,
+        "measurement_accepted": True,
+    }
+
+
+def predict_lqr_kalman_state(
+    state: Sequence[float] | np.ndarray,
+    covariance: Sequence[Sequence[float]] | np.ndarray,
+    command_delta_mm: Sequence[float] | np.ndarray,
+    lqr_design: Mapping[str, Any],
+    *,
+    process_noise: float | Sequence[Sequence[float]] | np.ndarray = (
+        constants.DEFAULT_LQR_CORRECTION_KALMAN_PROCESS_NOISE
+    ),
+) -> dict[str, np.ndarray]:
+    """Predict the LQR Kalman state after a commanded motor offset."""
+
+    rank = int(lqr_design["rank"])
+    state_values = _state_vector(state, rank, "state")
+    covariance_values = _covariance_matrix(covariance, rank, "covariance")
+    axis_scale = _lqr_design_vector(lqr_design, "axis_scale", len(COMMAND_AXES))
+    input_matrix = _lqr_design_matrix(
+        lqr_design,
+        "input_matrix",
+        (rank, len(COMMAND_AXES)),
+    )
+    command = np.asarray(command_delta_mm, dtype=np.float64)
+    if command.shape != (len(COMMAND_AXES),):
+        raise ValueError("command_delta_mm must have one value for x/y/z")
+    if not np.isfinite(command).all():
+        raise ValueError("command_delta_mm must contain only finite values")
+    normalized_command = command / axis_scale
+    q = _covariance_matrix(process_noise, rank, "process_noise", allow_zero=True)
+    return {
+        "state": state_values + input_matrix @ normalized_command,
+        "covariance": covariance_values + q,
+    }
+
+
+def update_lqr_kalman_state(
+    predicted_state: Sequence[float] | np.ndarray,
+    predicted_covariance: Sequence[Sequence[float]] | np.ndarray,
+    measured_shift: xr.Dataset | xr.DataArray | Sequence[float],
+    lqr_design: Mapping[str, Any],
+    *,
+    measurement_noise: float = (
+        constants.DEFAULT_LQR_CORRECTION_KALMAN_MEASUREMENT_NOISE
+    ),
+    measurement_covariance: (
+        Sequence[Sequence[float]] | np.ndarray | None
+    ) = constants.DEFAULT_LQR_CORRECTION_KALMAN_MEASUREMENT_COVARIANCE,
+    innovation_gate: float | None = (
+        constants.DEFAULT_LQR_CORRECTION_KALMAN_INNOVATION_GATE
+    ),
+) -> dict[str, np.ndarray | float | bool]:
+    """Update the LQR Kalman observer from a full 4-channel image measurement."""
+
+    rank = int(lqr_design["rank"])
+    state_pred = _state_vector(predicted_state, rank, "predicted_state")
+    covariance_pred = _covariance_matrix(
+        predicted_covariance,
+        rank,
+        "predicted_covariance",
+    )
+    controllable_basis = _lqr_design_matrix(
+        lqr_design,
+        "controllable_basis",
+        (len(OBSERVATION_AXES), rank),
+    )
+    image_scale = _lqr_design_vector(lqr_design, "image_scale", len(OBSERVATION_AXES))
+    observation = _shift_to_observation(_shift_values(measured_shift))
+    normalized_measurement = observation / image_scale
+    measurement_cov = _measurement_covariance_matrix(
+        measurement_covariance,
+        measurement_noise,
+    )
+
+    innovation = normalized_measurement - controllable_basis @ state_pred
+    innovation_covariance = (
+        controllable_basis @ covariance_pred @ controllable_basis.T
+        + measurement_cov
+    )
+    innovation_mahalanobis = float(
+        innovation @ np.linalg.solve(innovation_covariance, innovation)
+    )
+    if innovation_gate is not None:
+        innovation_gate = float(innovation_gate)
+        if not np.isfinite(innovation_gate) or innovation_gate <= 0.0:
+            raise ValueError("innovation_gate must be finite and positive or None")
+    accepted = bool(
+        innovation_gate is None or innovation_mahalanobis <= innovation_gate
+    )
+    if not accepted:
+        return {
+            "state": state_pred.copy(),
+            "covariance": covariance_pred.copy(),
+            "predicted_state": state_pred,
+            "predicted_covariance": covariance_pred,
+            "innovation": innovation,
+            "innovation_mahalanobis": innovation_mahalanobis,
+            "measurement_accepted": False,
+        }
+
+    kalman_gain = (
+        covariance_pred
+        @ controllable_basis.T
+        @ np.linalg.solve(
+            innovation_covariance,
+            np.eye(len(OBSERVATION_AXES), dtype=np.float64),
+        )
+    )
+    state = state_pred + kalman_gain @ innovation
+    identity = np.eye(rank, dtype=np.float64)
+    covariance_transform = identity - kalman_gain @ controllable_basis
+    covariance = (
+        covariance_transform @ covariance_pred @ covariance_transform.T
+        + kalman_gain @ measurement_cov @ kalman_gain.T
+    )
+    covariance = 0.5 * (covariance + covariance.T)
+    if not np.isfinite(state).all() or not np.isfinite(covariance).all():
+        raise ValueError("Kalman update produced non-finite values")
+    return {
+        "state": state,
+        "covariance": covariance,
+        "predicted_state": state_pred,
+        "predicted_covariance": covariance_pred,
+        "innovation": innovation,
+        "innovation_mahalanobis": innovation_mahalanobis,
+        "measurement_accepted": True,
+    }
+
+
+def _lqr_design_vector(
+    lqr_design: Mapping[str, Any],
+    key: str,
+    size: int,
+) -> np.ndarray:
+    values = np.asarray(lqr_design[key], dtype=np.float64)
+    if values.shape != (size,):
+        raise ValueError(f"LQR design {key!r} must have shape ({size},)")
+    if not np.isfinite(values).all():
+        raise ValueError(f"LQR design {key!r} must contain only finite values")
+    return values
+
+
+def _lqr_design_matrix(
+    lqr_design: Mapping[str, Any],
+    key: str,
+    shape: tuple[int, int],
+) -> np.ndarray:
+    values = np.asarray(lqr_design[key], dtype=np.float64)
+    if values.shape != shape:
+        raise ValueError(f"LQR design {key!r} must have shape {shape}")
+    if not np.isfinite(values).all():
+        raise ValueError(f"LQR design {key!r} must contain only finite values")
+    return values
+
+
+def _state_vector(
+    values: Sequence[float] | np.ndarray,
+    size: int,
+    name: str,
+) -> np.ndarray:
+    vector = np.asarray(values, dtype=np.float64)
+    if vector.shape != (size,):
+        raise ValueError(f"{name} must have shape ({size},)")
+    if not np.isfinite(vector).all():
+        raise ValueError(f"{name} must contain only finite values")
+    return vector
+
+
+def _covariance_matrix(
+    values: float | Sequence[Sequence[float]] | np.ndarray,
+    size: int,
+    name: str,
+    *,
+    allow_zero: bool = True,
+) -> np.ndarray:
+    matrix = np.asarray(values, dtype=np.float64)
+    if matrix.ndim == 0:
+        scalar = float(matrix)
+        if (
+            not np.isfinite(scalar)
+            or scalar < 0.0
+            or (scalar == 0.0 and not allow_zero)
+        ):
+            bound = "non-negative" if allow_zero else "positive"
+            raise ValueError(f"{name} must be finite and {bound}")
+        return scalar * np.eye(size, dtype=np.float64)
+    if matrix.shape != (size, size):
+        raise ValueError(f"{name} must be scalar or have shape ({size}, {size})")
+    if not np.isfinite(matrix).all():
+        raise ValueError(f"{name} must contain only finite values")
+    matrix = 0.5 * (matrix + matrix.T)
+    eigenvalues = np.linalg.eigvalsh(matrix)
+    if np.min(eigenvalues) < -1e-12 or (
+        not allow_zero and np.min(eigenvalues) <= 0.0
+    ):
+        bound = "positive semidefinite" if allow_zero else "positive definite"
+        raise ValueError(f"{name} must be {bound}")
+    return matrix
+
+
+def _measurement_covariance_matrix(
+    measurement_covariance: Sequence[Sequence[float]] | np.ndarray | None,
+    measurement_noise: float,
+) -> np.ndarray:
+    if measurement_covariance is None:
+        measurement_noise = float(measurement_noise)
+        if not np.isfinite(measurement_noise) or measurement_noise <= 0.0:
+            raise ValueError("measurement_noise must be finite and positive")
+        return measurement_noise * np.eye(len(OBSERVATION_AXES), dtype=np.float64)
+    return _covariance_matrix(
+        measurement_covariance,
+        len(OBSERVATION_AXES),
+        "measurement_covariance",
+        allow_zero=False,
+    )
 
 
 def _lqr_image_scale_from_weights(
