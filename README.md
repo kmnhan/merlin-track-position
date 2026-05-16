@@ -1,4 +1,4 @@
-# LQR Image-Space Visual Servoing for MERLIN Sample-Position Correction
+# Sample-Position Correction System for Beamline 4.0.3 MERLIN at the Advanced Light Source
 
 This repository implements image-based sample-position tracking and correction
 for Beamline 4.0.3 MERLIN at the Advanced Light Source. The controller uses a
