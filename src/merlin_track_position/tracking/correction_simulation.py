@@ -173,7 +173,12 @@ def simulate_shift_correction(
     initial_offsets_um: Sequence[Sequence[float]] | np.ndarray,
     seed: int,
     *,
-    pixel_tolerance_px: float = constants.DEFAULT_CORRECTION_PIXEL_TOLERANCE_PX,
+    damped_wls_pixel_tolerance_px: float = (
+        constants.DEFAULT_DAMPED_WLS_CORRECTION_PIXEL_TOLERANCE_PX
+    ),
+    lqr_projected_tolerance: float = (
+        constants.DEFAULT_LQR_CORRECTION_PROJECTED_TOLERANCE
+    ),
     max_moves: int = constants.DEFAULT_CORRECTION_MAX_MOVES,
     weights: Sequence[float] | np.ndarray | None = None,
     motor_error_model: Mapping[str, Any] | None = None,
@@ -192,7 +197,8 @@ def simulate_shift_correction(
         initial_offsets_um,
         seed,
         mode="shift",
-        pixel_tolerance_px=pixel_tolerance_px,
+        damped_wls_pixel_tolerance_px=damped_wls_pixel_tolerance_px,
+        lqr_projected_tolerance=lqr_projected_tolerance,
         max_moves=max_moves,
         weights=weights,
         motor_error_model=motor_error_model,
@@ -209,7 +215,12 @@ def simulate_image_correction(
     initial_offsets_um: Sequence[Sequence[float]] | np.ndarray,
     seed: int,
     *,
-    pixel_tolerance_px: float = constants.DEFAULT_CORRECTION_PIXEL_TOLERANCE_PX,
+    damped_wls_pixel_tolerance_px: float = (
+        constants.DEFAULT_DAMPED_WLS_CORRECTION_PIXEL_TOLERANCE_PX
+    ),
+    lqr_projected_tolerance: float = (
+        constants.DEFAULT_LQR_CORRECTION_PROJECTED_TOLERANCE
+    ),
     max_moves: int = constants.DEFAULT_CORRECTION_MAX_MOVES,
     weights: Sequence[float] | np.ndarray | None = None,
     motor_error_model: Mapping[str, Any] | None = None,
@@ -226,7 +237,8 @@ def simulate_image_correction(
         initial_offsets_um,
         seed,
         mode="image",
-        pixel_tolerance_px=pixel_tolerance_px,
+        damped_wls_pixel_tolerance_px=damped_wls_pixel_tolerance_px,
+        lqr_projected_tolerance=lqr_projected_tolerance,
         max_moves=max_moves,
         weights=weights,
         motor_error_model=motor_error_model,
@@ -242,13 +254,22 @@ def summarize_simulation(result: xr.Dataset) -> xr.Dataset:
 
     _require_result_vars(
         result,
-        ("converged", "move_count", "final_weighted_residual_px"),
+        (
+            "converged",
+            "move_count",
+            "final_weighted_residual_px",
+            "final_correction_criterion_residual",
+        ),
     )
     algorithms = result.coords["algorithm"].values
     converged = np.asarray(result["converged"].values, dtype=bool)
     move_count = np.asarray(result["move_count"].values, dtype=np.float64)
     final_residual = np.asarray(
         result["final_weighted_residual_px"].values,
+        dtype=np.float64,
+    )
+    final_criterion = np.asarray(
+        result["final_correction_criterion_residual"].values,
         dtype=np.float64,
     )
     rows: dict[str, list[float]] = {
@@ -263,10 +284,15 @@ def summarize_simulation(result: xr.Dataset) -> xr.Dataset:
         "final_residual_p90_px": [],
         "final_residual_p95_px": [],
         "final_residual_max_px": [],
+        "final_criterion_median": [],
+        "final_criterion_p90": [],
+        "final_criterion_p95": [],
+        "final_criterion_max": [],
     }
     for index in range(len(algorithms)):
         moves = move_count[index]
         residuals = final_residual[index]
+        criteria = final_criterion[index]
         rows["trial_count"].append(float(moves.size))
         rows["success_rate"].append(float(np.mean(converged[index])))
         rows["move_count_mean"].append(float(np.mean(moves)))
@@ -278,6 +304,10 @@ def summarize_simulation(result: xr.Dataset) -> xr.Dataset:
         rows["final_residual_p90_px"].append(float(np.percentile(residuals, 90)))
         rows["final_residual_p95_px"].append(float(np.percentile(residuals, 95)))
         rows["final_residual_max_px"].append(float(np.max(residuals)))
+        rows["final_criterion_median"].append(float(np.median(criteria)))
+        rows["final_criterion_p90"].append(float(np.percentile(criteria, 90)))
+        rows["final_criterion_p95"].append(float(np.percentile(criteria, 95)))
+        rows["final_criterion_max"].append(float(np.max(criteria)))
 
     return xr.Dataset(
         data_vars={
@@ -300,7 +330,8 @@ def _simulate_correction(
     seed: int,
     *,
     mode: str,
-    pixel_tolerance_px: float,
+    damped_wls_pixel_tolerance_px: float,
+    lqr_projected_tolerance: float,
     max_moves: int,
     weights: Sequence[float] | np.ndarray | None,
     motor_error_model: Mapping[str, Any] | None,
@@ -312,7 +343,14 @@ def _simulate_correction(
     shift_kwargs: Mapping[str, Any],
 ) -> xr.Dataset:
     weights_values = _observation_weights(weights)
-    pixel_tolerance_px = _nonnegative_float(pixel_tolerance_px, "pixel_tolerance_px")
+    damped_wls_pixel_tolerance_px = _nonnegative_float(
+        damped_wls_pixel_tolerance_px,
+        "damped_wls_pixel_tolerance_px",
+    )
+    lqr_projected_tolerance = _nonnegative_float(
+        lqr_projected_tolerance,
+        "lqr_projected_tolerance",
+    )
     min_command_norm_mm = _nonnegative_float(
         min_command_norm_mm,
         "min_command_norm_mm",
@@ -384,6 +422,7 @@ def _simulate_correction(
         np.nan,
         dtype=np.float64,
     )
+    correction_criterion_residual = np.full_like(weighted_residual_px, np.nan)
     command_delta_um = np.full(
         (algorithm_count, trial_count, max_moves, len(COMMAND_AXES)),
         np.nan,
@@ -399,6 +438,10 @@ def _simulate_correction(
         (algorithm_count, trial_count),
         np.nan,
         dtype=np.float64,
+    )
+    final_correction_criterion_residual = np.full_like(
+        final_weighted_residual_px,
+        np.nan,
     )
 
     for algorithm_index, model in enumerate(command_models):
@@ -456,18 +499,34 @@ def _simulate_correction(
                     kalman_prediction_pending[update_indices] = False
             residuals = _weighted_residuals(shifts, weights_values)
             weighted_residual_px[algorithm_index, :, iteration] = residuals
+            criterion_residuals = _criterion_residuals(model, shifts, weights_values)
+            correction_criterion_residual[algorithm_index, :, iteration] = (
+                criterion_residuals
+            )
 
-            newly_converged = (~done) & (residuals <= pixel_tolerance_px)
+            newly_converged = (~done) & (
+                criterion_residuals <= _model_tolerance(
+                    model,
+                    damped_wls_pixel_tolerance_px=damped_wls_pixel_tolerance_px,
+                    lqr_projected_tolerance=lqr_projected_tolerance,
+                )
+            )
             converged[algorithm_index, newly_converged] = True
             done[newly_converged] = True
             if iteration == max_moves:
                 final_weighted_residual_px[algorithm_index, :] = residuals
+                final_correction_criterion_residual[algorithm_index, :] = (
+                    criterion_residuals
+                )
                 move_count[algorithm_index, :] = moves_done
                 break
 
             active = ~done
             if not np.any(active):
                 final_weighted_residual_px[algorithm_index, :] = residuals
+                final_correction_criterion_residual[algorithm_index, :] = (
+                    criterion_residuals
+                )
                 move_count[algorithm_index, :] = moves_done
                 true_state_um[algorithm_index, :, iteration + 1 :, :] = state_um[
                     :,
@@ -567,6 +626,10 @@ def _simulate_correction(
                 weighted_residual_px,
                 {"units": "px"},
             ),
+            "correction_criterion_residual": (
+                ("algorithm", "trial", "iteration"),
+                correction_criterion_residual,
+            ),
             "command_delta_um": (
                 ("algorithm", "trial", "move", "command_axis"),
                 command_delta_um,
@@ -591,6 +654,10 @@ def _simulate_correction(
                 final_weighted_residual_px,
                 {"units": "px"},
             ),
+            "final_correction_criterion_residual": (
+                ("algorithm", "trial"),
+                final_correction_criterion_residual,
+            ),
         },
         coords={
             "algorithm": names,
@@ -604,7 +671,8 @@ def _simulate_correction(
         attrs={
             "simulation_mode": mode,
             "seed": int(seed),
-            "pixel_tolerance_px": float(pixel_tolerance_px),
+            "damped_wls_pixel_tolerance_px": float(damped_wls_pixel_tolerance_px),
+            "lqr_projected_tolerance": float(lqr_projected_tolerance),
             "max_moves": int(max_moves),
             "trials_per_offset": int(trials_per_offset),
             "weights": tuple(float(value) for value in weights_values),
@@ -778,15 +846,17 @@ def _command_model(
         np.diag(jacobian_observation.T @ weight_matrix @ jacobian_observation)
     )
     model = {
+        "algorithm": algorithm,
         "gain_matrix": gain_matrix,
         "max_normalized_step": max_step,
         "min_axis_predicted_shift_px": min_axis_shift,
         "axis_sensitivity": axis_sensitivity,
     }
+    if algorithm == "lqr":
+        model["lqr_design"] = lqr_design
     if algorithm == "lqr" and lqr_use_kalman_filter:
         model |= {
             "lqr_use_kalman_filter": True,
-            "lqr_design": lqr_design,
             "gain": gain,
             "lqr_kalman_process_noise": _simulation_kalman_covariance_config(
                 config.get(
@@ -951,6 +1021,41 @@ def _shift_image(reference: np.ndarray, shift_px: np.ndarray) -> np.ndarray:
 def _weighted_residuals(shifts: np.ndarray, weights: np.ndarray) -> np.ndarray:
     observations = np.asarray(shifts, dtype=np.float64).reshape(-1, len(OBSERVATION_AXES))
     return np.sqrt(np.sum(weights[np.newaxis, :] * observations * observations, axis=1))
+
+
+def _criterion_residuals(
+    model: Mapping[str, Any],
+    shifts: np.ndarray,
+    weights: np.ndarray,
+) -> np.ndarray:
+    algorithm = str(model["algorithm"])
+    if algorithm == "damped_wls":
+        return _weighted_residuals(shifts, weights)
+    if algorithm == "lqr":
+        observations = np.asarray(shifts, dtype=np.float64).reshape(
+            -1,
+            len(OBSERVATION_AXES),
+        )
+        design = model["lqr_design"]
+        image_scale = np.asarray(design["image_scale"], dtype=np.float64)
+        controllable_basis = np.asarray(design["controllable_basis"], dtype=np.float64)
+        projected = (observations / image_scale[np.newaxis, :]) @ controllable_basis
+        return np.linalg.norm(projected, axis=1)
+    raise ValueError(f"unsupported correction algorithm {algorithm!r}")
+
+
+def _model_tolerance(
+    model: Mapping[str, Any],
+    *,
+    damped_wls_pixel_tolerance_px: float,
+    lqr_projected_tolerance: float,
+) -> float:
+    algorithm = str(model["algorithm"])
+    if algorithm == "damped_wls":
+        return float(damped_wls_pixel_tolerance_px)
+    if algorithm == "lqr":
+        return float(lqr_projected_tolerance)
+    raise ValueError(f"unsupported correction algorithm {algorithm!r}")
 
 
 def _as_rng(rng: np.random.Generator | int) -> np.random.Generator:

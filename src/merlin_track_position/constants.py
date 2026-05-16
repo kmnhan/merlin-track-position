@@ -89,12 +89,12 @@ CORRECTION_OBSERVATION_WEIGHTS: tuple[float, float, float, float] | None = (
     1.21,
     0.66,
 )
-DEFAULT_CORRECTION_PIXEL_TOLERANCE_PX: float = 0.55
 DEFAULT_CORRECTION_MIN_COMMAND_NORM_MM: float = 1e-9
 DEFAULT_CORRECTION_MAX_MOVES: int = 12
 
 # Damped-WLS solver and legacy closed-loop guardrails. LQR still records
 # feedback diagnostics, but it does not use these thresholds to prune/stop.
+DEFAULT_DAMPED_WLS_CORRECTION_PIXEL_TOLERANCE_PX: float = 0.55
 DEFAULT_DAMPED_WLS_CORRECTION_GAIN: float = 0.6
 DEFAULT_DAMPED_WLS_CORRECTION_MIN_GAIN: float = 0.15
 DEFAULT_DAMPED_WLS_CORRECTION_MAX_NORMALIZED_STEP: float = 0.5
@@ -110,6 +110,7 @@ DEFAULT_LQR_CORRECTION_MAX_NORMALIZED_STEP: float = 0.5
 DEFAULT_LQR_CORRECTION_IMAGE_SCALE_PX: float = 0.1
 DEFAULT_LQR_CORRECTION_MOTOR_PENALTY: float = 100.0
 DEFAULT_LQR_CORRECTION_SVD_RELATIVE_TOLERANCE: float = 1e-6
+DEFAULT_LQR_CORRECTION_PROJECTED_TOLERANCE: float = 2.0
 
 # LQR-only Kalman observer. Disabled by default so the nominal LQR command law
 # is unchanged unless this is explicitly enabled.

@@ -28,6 +28,7 @@ from merlin_track_position.tracking.calibration_core import (
     estimate_command_offset,
     initialize_lqr_kalman_state,
     load_calibration_dataset,
+    lqr_projected_residual_from_design,
     measure_image_error,
     predict_lqr_kalman_state,
     refine_visual_jacobian_from_observations,
@@ -117,7 +118,8 @@ def do_correction(
     calibration_path: str | Path | None = None,
     max_retries: int = 4,
     capture_count: int = constants.DEFAULT_CAPTURE_COUNT,
-    pixel_tolerance_px: float = constants.DEFAULT_CORRECTION_PIXEL_TOLERANCE_PX,
+    damped_wls_pixel_tolerance_px: float | object = _USE_ALGORITHM_DEFAULT,
+    lqr_projected_tolerance: float | object = _USE_ALGORITHM_DEFAULT,
     gain: float | object = _USE_ALGORITHM_DEFAULT,
     min_gain: float | object = _USE_ALGORITHM_DEFAULT,
     damping_mu: float = constants.DEFAULT_DAMPED_WLS_CORRECTION_DAMPING_MU,
@@ -179,7 +181,18 @@ def do_correction(
             else np.nan
         )
 
-    pixel_tolerance_px = float(pixel_tolerance_px)
+    damped_wls_pixel_tolerance_px = _resolve_damped_wls_pixel_tolerance(
+        damped_wls_pixel_tolerance_px
+    )
+    lqr_projected_tolerance = _resolve_lqr_projected_tolerance(
+        lqr_projected_tolerance
+    )
+    correction_tolerance = _correction_tolerance_for_algorithm(
+        correction_algorithm,
+        damped_wls_pixel_tolerance_px=damped_wls_pixel_tolerance_px,
+        lqr_projected_tolerance=lqr_projected_tolerance,
+    )
+    correction_criterion = _correction_criterion_for_algorithm(correction_algorithm)
     current_gain = float(gain)
     min_gain = float(min_gain)
     current_mu = float(damping_mu)
@@ -188,8 +201,6 @@ def do_correction(
     min_feedback_parallel_shift_px = float(min_feedback_parallel_shift_px)
     min_command_norm_mm = float(min_command_norm_mm)
     max_moves = int(max_moves)
-    if not np.isfinite(pixel_tolerance_px) or pixel_tolerance_px < 0.0:
-        raise ValueError("pixel_tolerance_px must be finite and non-negative")
     if not np.isfinite(current_gain) or current_gain <= 0.0:
         raise ValueError("gain must be finite and positive")
     if correction_algorithm == "damped_wls":
@@ -241,13 +252,14 @@ def do_correction(
         constants.DEFAULT_LQR_CORRECTION_KALMAN_INNOVATION_GATE
     )
     logger.info(
-        "Correction parameters: algorithm=%s, capture_count=%d, pixel_tolerance_px=%g, "
-        "gain=%g, min_gain=%g, damping_mu=%g, "
+        "Correction parameters: algorithm=%s, capture_count=%d, criterion=%s, "
+        "tolerance=%g, gain=%g, min_gain=%g, damping_mu=%g, "
         "min_total_predicted_shift_px=%g, min_feedback_alpha=%g, "
         "min_feedback_parallel_shift_px=%g, max_moves=%d",
         correction_algorithm,
         capture_count,
-        pixel_tolerance_px,
+        correction_criterion,
+        correction_tolerance,
         current_gain,
         min_gain,
         current_mu,
@@ -265,7 +277,7 @@ def do_correction(
         dtype=np.float64,
     )
     lqr_design: dict[str, Any] | None = None
-    if lqr_kalman_filter_enabled:
+    if correction_algorithm == "lqr":
         lqr_design = compute_lqr_correction_design(
             jacobian.reshape(len(CAMERAS) * len(PIXEL_AXES), len(COMMAND_AXES)),
             axis_scale,
@@ -296,11 +308,23 @@ def do_correction(
         capture_count,
         **shift_kwargs,
     )
-    residual = weighted_pixel_residual(measurement, weights=weights)
-    logger.info("Initial weighted residual: %.6g px", residual)
+    weighted_residual = weighted_pixel_residual(measurement, weights=weights)
+    criterion_residual = _correction_criterion_residual(
+        correction_algorithm,
+        measurement,
+        weighted_residual=weighted_residual,
+        lqr_design=lqr_design,
+    )
+    logger.info(
+        "Initial correction criterion residual: %.6g (%s); weighted residual: %.6g px",
+        criterion_residual,
+        correction_criterion,
+        weighted_residual,
+    )
 
     iteration_shift_px = [np.asarray(measurement["shift_px"].values, dtype=np.float64)]
-    iteration_weighted_residuals = [residual]
+    iteration_weighted_residuals = [weighted_residual]
+    iteration_criterion_residuals = [criterion_residual]
     move_command_delta_mm: list[np.ndarray] = []
     move_requested_position_mm: list[np.ndarray] = []
     move_final_readback_position_mm: list[np.ndarray] = []
@@ -357,7 +381,7 @@ def do_correction(
         )
 
     move_count = 0
-    converged = residual <= pixel_tolerance_px
+    converged = criterion_residual <= correction_tolerance
 
     def build_result(completed: bool) -> xr.Dataset:
         return _build_correction_result(
@@ -389,6 +413,7 @@ def do_correction(
             ),
             iteration_shift_px=iteration_shift_px,
             iteration_weighted_residuals=iteration_weighted_residuals,
+            iteration_criterion_residuals=iteration_criterion_residuals,
             iteration_lqr_kalman_state=iteration_lqr_kalman_state,
             iteration_lqr_kalman_predicted_state=(
                 iteration_lqr_kalman_predicted_state
@@ -429,7 +454,10 @@ def do_correction(
             correction_history_completed=completed,
             converged=converged,
             move_count=move_count,
-            pixel_tolerance_px=pixel_tolerance_px,
+            damped_wls_pixel_tolerance_px=damped_wls_pixel_tolerance_px,
+            lqr_projected_tolerance=lqr_projected_tolerance,
+            correction_tolerance=correction_tolerance,
+            correction_criterion=correction_criterion,
             gain=gain,
             min_gain=min_gain,
             damping_mu=damping_mu,
@@ -484,9 +512,11 @@ def do_correction(
 
     while not converged and move_count < max_moves:
         logger.info(
-            "Correction iteration %d starting: residual=%.6g px, gain=%g, mu=%g",
+            "Correction iteration %d starting: criterion_residual=%.6g, "
+            "weighted_residual=%.6g px, gain=%g, mu=%g",
             move_count + 1,
-            residual,
+            criterion_residual,
+            weighted_residual,
             current_gain,
             current_mu,
         )
@@ -629,11 +659,22 @@ def do_correction(
             capture_count,
             **shift_kwargs,
         )
-        after_residual = weighted_pixel_residual(after_measurement, weights=weights)
-        decreased = bool(after_residual < residual)
+        after_weighted_residual = weighted_pixel_residual(
+            after_measurement,
+            weights=weights,
+        )
+        after_criterion_residual = _correction_criterion_residual(
+            correction_algorithm,
+            after_measurement,
+            weighted_residual=after_weighted_residual,
+            lqr_design=lqr_design,
+        )
+        decreased = bool(after_criterion_residual < criterion_residual)
         logger.info(
-            "Post-move weighted residual: %.6g px; decreased=%s",
-            after_residual,
+            "Post-move criterion residual: %.6g; weighted residual: %.6g px; "
+            "decreased=%s",
+            after_criterion_residual,
+            after_weighted_residual,
             decreased,
         )
         if lqr_kalman_filter_enabled:
@@ -691,7 +732,7 @@ def do_correction(
         stop_after_invalid_feedback = (
             _algorithm_stops_after_invalid_feedback(correction_algorithm)
             and not feedback_valid
-            and after_residual > pixel_tolerance_px
+            and after_criterion_residual > correction_tolerance
         )
         logger.info(
             "Post-move feedback metrics: predicted_response=%.6g px, "
@@ -774,8 +815,8 @@ def do_correction(
         move_final_readback_position_mm.append(final_readback_mm)
         move_gain.append(gain_used)
         move_damping_mu.append(mu_used)
-        move_pre_weighted_residuals.append(float(residual))
-        move_post_weighted_residuals.append(float(after_residual))
+        move_pre_weighted_residuals.append(float(weighted_residual))
+        move_post_weighted_residuals.append(float(after_weighted_residual))
         move_predicted_delta_px.append(predicted_delta_px)
         move_measured_delta_px.append(measured_delta_px)
         move_model_residual_delta_px.append(model_residual_delta_px)
@@ -799,22 +840,26 @@ def do_correction(
         move_jacobian_refined.append(jacobian_refined)
 
         measurement = after_measurement
-        residual = after_residual
+        weighted_residual = after_weighted_residual
+        criterion_residual = after_criterion_residual
         iteration_shift_px.append(
             np.asarray(measurement["shift_px"].values, dtype=np.float64)
         )
-        iteration_weighted_residuals.append(float(residual))
+        iteration_weighted_residuals.append(float(weighted_residual))
+        iteration_criterion_residuals.append(float(criterion_residual))
         warnings.extend(
             line.strip()
             for line in str(measurement.attrs.get("warnings", "")).splitlines()
             if line.strip()
         )
         move_count += 1
-        converged = residual <= pixel_tolerance_px
+        converged = criterion_residual <= correction_tolerance
         logger.info(
-            "Correction iteration %d complete: residual=%.6g px, converged=%s",
+            "Correction iteration %d complete: criterion_residual=%.6g, "
+            "weighted_residual=%.6g px, converged=%s",
             move_count,
-            residual,
+            criterion_residual,
+            weighted_residual,
             converged,
         )
         save_progress(completed=False)
@@ -824,19 +869,20 @@ def do_correction(
     if not converged:
         warnings.append(
             "correction did not converge within "
-            f"{max_moves} move(s); final residual {residual:.4g} px exceeds "
-            f"{pixel_tolerance_px:.4g} px"
+            f"{max_moves} move(s); final {correction_criterion} "
+            f"{criterion_residual:.4g} exceeds {correction_tolerance:.4g}"
         )
         logger.info(
-            "Correction finished without convergence: moves=%d, residual=%.6g px",
+            "Correction finished without convergence: moves=%d, "
+            "criterion_residual=%.6g",
             move_count,
-            residual,
+            criterion_residual,
         )
     else:
         logger.info(
-            "Correction converged: moves=%d, residual=%.6g px",
+            "Correction converged: moves=%d, criterion_residual=%.6g",
             move_count,
-            residual,
+            criterion_residual,
         )
 
     return save_progress(completed=True)
@@ -1449,6 +1495,63 @@ def _correction_weights(
     return constants.CORRECTION_OBSERVATION_WEIGHTS
 
 
+def _resolve_damped_wls_pixel_tolerance(value: float | object) -> float:
+    if value is _USE_ALGORITHM_DEFAULT:
+        value = constants.DEFAULT_DAMPED_WLS_CORRECTION_PIXEL_TOLERANCE_PX
+    tolerance = float(value)
+    if not np.isfinite(tolerance) or tolerance < 0.0:
+        raise ValueError(
+            "damped_wls_pixel_tolerance_px must be finite and non-negative"
+        )
+    return tolerance
+
+
+def _resolve_lqr_projected_tolerance(value: float | object) -> float:
+    if value is _USE_ALGORITHM_DEFAULT:
+        value = constants.DEFAULT_LQR_CORRECTION_PROJECTED_TOLERANCE
+    tolerance = float(value)
+    if not np.isfinite(tolerance) or tolerance < 0.0:
+        raise ValueError("lqr_projected_tolerance must be finite and non-negative")
+    return tolerance
+
+
+def _correction_tolerance_for_algorithm(
+    algorithm: str,
+    *,
+    damped_wls_pixel_tolerance_px: float,
+    lqr_projected_tolerance: float,
+) -> float:
+    if algorithm == "damped_wls":
+        return float(damped_wls_pixel_tolerance_px)
+    if algorithm == "lqr":
+        return float(lqr_projected_tolerance)
+    raise ValueError(f"unsupported correction algorithm {algorithm!r}")
+
+
+def _correction_criterion_for_algorithm(algorithm: str) -> str:
+    if algorithm == "damped_wls":
+        return "weighted_pixel_residual_px"
+    if algorithm == "lqr":
+        return "lqr_projected_normalized_error"
+    raise ValueError(f"unsupported correction algorithm {algorithm!r}")
+
+
+def _correction_criterion_residual(
+    algorithm: str,
+    measurement: xr.Dataset,
+    *,
+    weighted_residual: float,
+    lqr_design: dict[str, Any] | None,
+) -> float:
+    if algorithm == "damped_wls":
+        return float(weighted_residual)
+    if algorithm == "lqr":
+        if lqr_design is None:
+            raise RuntimeError("LQR design was not initialized")
+        return lqr_projected_residual_from_design(lqr_design, measurement)
+    raise ValueError(f"unsupported correction algorithm {algorithm!r}")
+
+
 def _default_gain_for_algorithm(algorithm: str) -> float:
     if algorithm == "damped_wls":
         return constants.DEFAULT_DAMPED_WLS_CORRECTION_GAIN
@@ -1673,6 +1776,7 @@ def _build_correction_result(
     next_correction: np.ndarray,
     iteration_shift_px: Sequence[np.ndarray],
     iteration_weighted_residuals: Sequence[float],
+    iteration_criterion_residuals: Sequence[float],
     iteration_lqr_kalman_state: Sequence[np.ndarray],
     iteration_lqr_kalman_predicted_state: Sequence[np.ndarray],
     iteration_lqr_kalman_innovation: Sequence[np.ndarray],
@@ -1705,7 +1809,10 @@ def _build_correction_result(
     correction_history_completed: bool,
     converged: bool,
     move_count: int,
-    pixel_tolerance_px: float,
+    damped_wls_pixel_tolerance_px: float,
+    lqr_projected_tolerance: float,
+    correction_tolerance: float,
+    correction_criterion: str,
     gain: float,
     min_gain: float,
     damping_mu: float,
@@ -1773,6 +1880,10 @@ def _build_correction_result(
                 ("iteration",),
                 np.asarray(iteration_weighted_residuals, dtype=np.float64),
                 {"units": "px"},
+            ),
+            "iteration_correction_criterion_residual": (
+                ("iteration",),
+                np.asarray(iteration_criterion_residuals, dtype=np.float64),
             ),
             "move_command_delta_mm": (
                 ("move", "command_axis"),
@@ -1923,7 +2034,11 @@ def _build_correction_result(
         "correction_converged": bool(converged),
         "correction_iterations": int(move_count),
         "correction_algorithm": algorithm,
-        "pixel_tolerance_px": float(pixel_tolerance_px),
+        "correction_criterion": correction_criterion,
+        "correction_tolerance": float(correction_tolerance),
+        "correction_damped_wls_pixel_tolerance_px": float(
+            damped_wls_pixel_tolerance_px
+        ),
         "correction_gain": float(gain),
         "correction_min_gain": float(min_gain),
         "correction_damping_mu": float(damping_mu),
@@ -1952,6 +2067,7 @@ def _build_correction_result(
             "correction_lqr_svd_relative_tolerance": float(
                 lqr_svd_relative_tolerance
             ),
+            "correction_lqr_projected_tolerance": float(lqr_projected_tolerance),
             "correction_lqr_kalman_filter_enabled": bool(
                 lqr_kalman_filter_enabled
             ),

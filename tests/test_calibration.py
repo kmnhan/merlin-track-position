@@ -900,6 +900,74 @@ class CorrectionTests(unittest.TestCase):
         self.assertEqual(result.attrs["correction_algorithm"], "lqr")
         self.assertIn("correction_lqr_motor_penalty", result.attrs)
 
+    def test_lqr_convergence_uses_projected_normalized_error(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self.save_calibration(tmpdir)
+            calibration = calibration_dataset()
+            jacobian = calibration["visual_jacobian_px_per_cmd_mm"].values.reshape(
+                len(CAMERAS) * len(PIXEL_AXES),
+                len(COMMAND_AXES),
+            )
+            axis_scale = calibration["axis_scale_cmd_mm"].values
+            design = calibration_core.compute_lqr_correction_design(
+                jacobian,
+                axis_scale,
+                image_scale_px=TEST_LQR_IMAGE_SCALE_PX,
+                motor_penalty=TEST_LQR_MOTOR_PENALTY,
+                svd_relative_tolerance=TEST_LQR_SVD_RELATIVE_TOLERANCE,
+                weights=TEST_CORRECTION_WEIGHTS,
+            )
+            controllable_basis = np.asarray(design["controllable_basis"])
+            _, _, vh = np.linalg.svd(controllable_basis.T, full_matrices=True)
+            normalized_null_error = vh[-1]
+            shift = (
+                10.0
+                * np.asarray(design["image_scale"])
+                * normalized_null_error
+            ).reshape(len(CAMERAS), len(PIXEL_AXES))
+            self.assertGreater(
+                weighted_pixel_residual(
+                    shift_dataset(shift),
+                    weights=TEST_CORRECTION_WEIGHTS,
+                ),
+                constants.DEFAULT_DAMPED_WLS_CORRECTION_PIXEL_TOLERANCE_PX,
+            )
+            self.assertLess(
+                calibration_core.lqr_projected_residual_from_design(
+                    design,
+                    shift_dataset(shift),
+                ),
+                constants.DEFAULT_LQR_CORRECTION_PROJECTED_TOLERANCE,
+            )
+            hardware_patches = self.patch_hardware([shift_dataset(shift)])
+            with (
+                patch.object(constants, "CORRECTION_ALGORITHM", "lqr"),
+                hardware_patches[0],
+                hardware_patches[1],
+                hardware_patches[2],
+                patch(
+                    "merlin_track_position.tracking.correct.move_motors_and_wait",
+                    Mock(),
+                ) as move,
+            ):
+                result = do_correction(
+                    path,
+                    capture_count=1,
+                    max_moves=1,
+                    lqr_image_scale_px=TEST_LQR_IMAGE_SCALE_PX,
+                    lqr_motor_penalty=TEST_LQR_MOTOR_PENALTY,
+                    lqr_svd_relative_tolerance=TEST_LQR_SVD_RELATIVE_TOLERANCE,
+                    weights=TEST_CORRECTION_WEIGHTS,
+                )
+
+        move.assert_not_called()
+        self.assertTrue(result.attrs["correction_converged"])
+        self.assertEqual(
+            result.attrs["correction_criterion"],
+            "lqr_projected_normalized_error",
+        )
+        self.assertIn("iteration_correction_criterion_residual", result)
+
     def test_lqr_kalman_algorithm_uses_filtered_state_for_command(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = self.save_calibration(tmpdir)
@@ -1103,7 +1171,7 @@ class CorrectionTests(unittest.TestCase):
                     path,
                     capture_count=1,
                     max_moves=1,
-                    pixel_tolerance_px=0.001,
+                    lqr_projected_tolerance=0.001,
                     gain=TEST_CORRECTION_GAIN,
                     min_total_predicted_shift_px=10.0,
                     lqr_image_scale_px=TEST_LQR_IMAGE_SCALE_PX,
@@ -1190,7 +1258,7 @@ class CorrectionTests(unittest.TestCase):
                     path,
                     capture_count=1,
                     max_moves=2,
-                    pixel_tolerance_px=0.001,
+                    lqr_projected_tolerance=0.001,
                     gain=TEST_CORRECTION_GAIN,
                     min_total_predicted_shift_px=10.0,
                     lqr_image_scale_px=TEST_LQR_IMAGE_SCALE_PX,

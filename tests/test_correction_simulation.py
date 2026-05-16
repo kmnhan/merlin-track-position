@@ -99,7 +99,8 @@ class CorrectionSimulationTests(unittest.TestCase):
             ],
             np.array([[5.0, -3.0, 2.0], [-5.0, 4.0, -3.0]]),
             seed=10,
-            pixel_tolerance_px=0.05,
+            damped_wls_pixel_tolerance_px=0.05,
+            lqr_projected_tolerance=0.5,
             max_moves=8,
             motor_error_model=ZERO_MOTOR_ERROR_MODEL_UM,
             weights=(1.0, 1.0, 1.0, 1.0),
@@ -129,7 +130,8 @@ class CorrectionSimulationTests(unittest.TestCase):
             ],
             initial_offsets_um=default_initial_offsets_um((2.0, 5.0)),
             seed=20260515,
-            pixel_tolerance_px=0.2,
+            damped_wls_pixel_tolerance_px=0.2,
+            lqr_projected_tolerance=2.0,
             max_moves=6,
             trials_per_offset=2,
         )
@@ -172,7 +174,8 @@ class CorrectionSimulationTests(unittest.TestCase):
             ],
             initial_offsets_um=default_initial_offsets_um((2.0,)),
             seed=12345,
-            pixel_tolerance_px=0.2,
+            damped_wls_pixel_tolerance_px=0.2,
+            lqr_projected_tolerance=2.0,
             max_moves=5,
             trials_per_offset=2,
             measurement_noise_covariance_px=0.01,
@@ -200,7 +203,7 @@ class CorrectionSimulationTests(unittest.TestCase):
             ],
             np.array([[10.0, -4.0, 6.0]]),
             seed=100,
-            pixel_tolerance_px=0.05,
+            damped_wls_pixel_tolerance_px=0.05,
             max_moves=1,
             motor_error_model=ZERO_MOTOR_ERROR_MODEL_UM,
             weights=(1.0, 1.0, 1.0, 1.0),
@@ -211,31 +214,20 @@ class CorrectionSimulationTests(unittest.TestCase):
         self.assertLess(residual[-1], residual[0])
         self.assertTrue(np.isfinite(result["measured_shift_px"].values).all())
 
-    def test_equal_gain_wls_and_lqr_match_and_higher_lqr_gain_uses_fewer_moves(self):
+    def test_lqr_higher_gain_uses_fewer_moves_with_projected_criterion(self):
         result = simulate_shift_correction(
             sample_calibration(),
             [
-                {
-                    "name": "wls_g06",
-                    "algorithm": "damped_wls",
-                    "gain": 0.6,
-                    "damping_mu": 1.0,
-                },
                 {"name": "lqr_g06", "algorithm": "lqr", "gain": 0.6},
                 {"name": "lqr_g10", "algorithm": "lqr", "gain": 1.0},
             ],
             default_initial_offsets_um((2.0, 5.0, 10.0)),
             seed=20260515,
-            pixel_tolerance_px=0.2,
+            lqr_projected_tolerance=2.0,
             max_moves=12,
             trials_per_offset=2,
         )
 
-        move_count = result["move_count"].sel(algorithm=["wls_g06", "lqr_g06"])
-        np.testing.assert_array_equal(
-            move_count.sel(algorithm="wls_g06").values,
-            move_count.sel(algorithm="lqr_g06").values,
-        )
         lqr_g06_mean = float(result["move_count"].sel(algorithm="lqr_g06").mean())
         lqr_g10_mean = float(result["move_count"].sel(algorithm="lqr_g10").mean())
         self.assertLess(lqr_g10_mean, lqr_g06_mean)

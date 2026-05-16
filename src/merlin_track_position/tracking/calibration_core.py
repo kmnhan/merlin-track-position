@@ -999,6 +999,53 @@ def solve_lqr_command_correction(
     return correction_cmd_mm
 
 
+def lqr_projected_residual(
+    visual_jacobian: np.ndarray,
+    shift: xr.Dataset | xr.DataArray | Sequence[float],
+    axis_scale_cmd_mm: Sequence[float],
+    *,
+    image_scale_px: float = constants.DEFAULT_LQR_CORRECTION_IMAGE_SCALE_PX,
+    motor_penalty: float = constants.DEFAULT_LQR_CORRECTION_MOTOR_PENALTY,
+    svd_relative_tolerance: float = (
+        constants.DEFAULT_LQR_CORRECTION_SVD_RELATIVE_TOLERANCE
+    ),
+    weights: Sequence[float] | np.ndarray | None = None,
+) -> float:
+    """Return ``||U_c.T @ S_e^-1 @ e||`` for the LQR stopping criterion."""
+
+    jacobian_observation = _jacobian_to_observation(
+        _as_visual_jacobian(visual_jacobian)
+    )
+    design = compute_lqr_correction_design(
+        jacobian_observation,
+        axis_scale_cmd_mm,
+        image_scale_px=image_scale_px,
+        motor_penalty=motor_penalty,
+        svd_relative_tolerance=svd_relative_tolerance,
+        weights=weights,
+    )
+    return lqr_projected_residual_from_design(design, shift)
+
+
+def lqr_projected_residual_from_design(
+    lqr_design: Mapping[str, Any],
+    shift: xr.Dataset | xr.DataArray | Sequence[float],
+) -> float:
+    """Return the projected normalized error norm for an existing LQR design."""
+
+    rank = int(lqr_design["rank"])
+    controllable_basis = _lqr_design_matrix(
+        lqr_design,
+        "controllable_basis",
+        (len(OBSERVATION_AXES), rank),
+    )
+    image_scale = _lqr_design_vector(lqr_design, "image_scale", len(OBSERVATION_AXES))
+    observation = _shift_to_observation(_shift_values(shift))
+    normalized_observation = observation / image_scale
+    projected_state = controllable_basis.T @ normalized_observation
+    return float(np.linalg.norm(projected_state))
+
+
 def compute_lqr_correction_design(
     jacobian_observation: np.ndarray,
     axis_scale_cmd_mm: Sequence[float],
