@@ -963,22 +963,6 @@ uv run pytest -q
 ## References
 
 [1] S. Duan, S. Wang, Y. Yang, C. Huang, L. Gu, H. Liu, and W. Zhang,
-"A sample-position-autocorrection system with precision better than
-$1\,\mu\mathrm{m}$ in angle-resolved photoemission experiments,"
+"A sample-position-autocorrection system with precision better than 1μm in angle-resolved photoemission experiments,"
 *Review of Scientific Instruments* **93**, 103905, 2022.
 <https://doi.org/10.1063/5.0106299>
-
-[2] F. Chaumette and S. Hutchinson, "Visual Servo Control, Part I: Basic
-Approaches," *IEEE Robotics & Automation Magazine* **13**(4), 82--90, 2006.
-<https://doi.org/10.1109/MRA.2006.250573>
-
-[3] R. E. Kalman, "A New Approach to Linear Filtering and Prediction Problems,"
-*Journal of Basic Engineering* **82**(1), 35--45, 1960.
-<https://doi.org/10.1115/1.3662552>
-
-[4] B. D. O. Anderson and J. B. Moore, *Optimal Control: Linear Quadratic
-Methods*, Prentice Hall, 1990.
-
-[5] P. J. Huber, "Robust Estimation of a Location Parameter," *The Annals of
-Mathematical Statistics* **35**(1), 73--101, 1964.
-<https://doi.org/10.1214/aoms/1177703732>
