@@ -106,7 +106,7 @@ For each camera, compute the sub-pixel shift against the reference image:
 
 ```math
 (\Delta u_{i,k}, \Delta v_{i,k})
-= \operatorname{CrossCorrShift}(I_{i,k}, I_i^\star),
+= \text{CrossCorrShift}(I_{i,k}, I_i^\star),
 \quad i \in \{0,1\}.
 ```
 
@@ -193,7 +193,7 @@ axis_scale_cmd_mm(command_axis)
 and correction reuses that saved scale. Let
 
 ```math
-S_m = \operatorname{diag}(s_x, s_y, s_z),
+S_m = \text{diag}(s_x, s_y, s_z),
 ```
 
 where
@@ -237,7 +237,7 @@ r_j = c_jh_j.
 The target response is the median over axes:
 
 ```math
-r_\star = \operatorname{median}(r_x,r_y,r_z).
+r_\star = \text{median}(r_x,r_y,r_z).
 ```
 
 The raw command scale is
@@ -249,7 +249,7 @@ s_j^{\mathrm{raw}} = \frac{r_\star}{c_j}.
 The saved scale is clamped to configured operational bounds:
 
 ```math
-s_j = \operatorname{clip}
+s_j = \text{clip}
 \left(
 s_j^{\mathrm{raw}},
 s_{j,\min},
@@ -272,7 +272,7 @@ z: 0.1 to 0.8 commanded-mm
 Image channels are also normalized. Let
 
 ```math
-S_e = \operatorname{diag}(e_{\mathrm{scale}}),
+S_e = \text{diag}(e_{\mathrm{scale}}),
 ```
 
 where the default scalar image scale is
@@ -670,7 +670,7 @@ z_{k+1} - z_k - J_n\tilde a_k.
 Because this includes measurement noise twice,
 
 ```math
-\operatorname{cov}(\delta z_k) \approx Q_{\mathrm{image}} + 2R.
+\text{cov}(\delta z_k) \approx Q_{\mathrm{image}} + 2R.
 ```
 
 A rough starting estimate is
@@ -678,7 +678,7 @@ A rough starting estimate is
 ```math
 Q_s \approx
 U_c^\mathsf{T}
-\left(\operatorname{cov}(\delta z_k)-2R\right)
+\left(\text{cov}(\delta z_k)-2R\right)
 U_c,
 ```
 
