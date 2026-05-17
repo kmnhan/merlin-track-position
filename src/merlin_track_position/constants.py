@@ -81,7 +81,7 @@ DEFAULT_JACOBIAN_CONDITION_WARNING: float = 100.0
 
 # Shared closed-loop correction defaults in command-mm visual-servo space.
 # Supported algorithms: "damped_wls" and "lqr".
-CORRECTION_ALGORITHM: str = "damped_wls"
+CORRECTION_ALGORITHM: str = "lqr"
 # Observation weights are ordered as cam0_du, cam0_dv, cam1_du, cam1_dv.
 CORRECTION_OBSERVATION_WEIGHTS: tuple[float, float, float, float] | None = (
     0.80,
