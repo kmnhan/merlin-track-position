@@ -1,6 +1,7 @@
 import os
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -857,8 +858,20 @@ class CorrectionTests(unittest.TestCase):
             ):
                 result = do_correction(path, capture_count=1)
 
+            history_path = correction_history_path(path)
+            with xr.open_dataset(
+                history_path,
+                engine="h5netcdf",
+                group="run_000000",
+            ) as saved_on_disk:
+                saved = saved_on_disk.load()
+
         self.assertTrue(result.attrs["correction_converged"])
         self.assertEqual(result.sizes["move"], 0)
+        self.assertNotIn("correction_move_started_at", result.attrs)
+        self.assertNotIn("correction_move_finished_at", result.attrs)
+        self.assertNotIn("correction_move_started_at", saved.attrs)
+        self.assertNotIn("correction_move_finished_at", saved.attrs)
         move.assert_not_called()
 
     def test_damped_correction_uses_command_state_not_readback_state(self):
@@ -948,6 +961,14 @@ class CorrectionTests(unittest.TestCase):
 
             with (
                 patch(
+                    "merlin_track_position.tracking.correct._local_timestamp_iso",
+                    side_effect=(
+                        "2026-01-01T00:00:01-08:00",
+                        "2026-01-01T00:00:02-08:00",
+                        "2026-01-01T00:00:03-08:00",
+                    ),
+                ),
+                patch(
                     "merlin_track_position.tracking.correct.get_positions",
                     side_effect=AssertionError("direct BCS get should not be used"),
                 ),
@@ -976,6 +997,14 @@ class CorrectionTests(unittest.TestCase):
 
         self.assertTrue(result.attrs["correction_converged"])
         self.assertEqual(len(backend.moves), 2)
+        self.assertEqual(
+            result.attrs["correction_move_started_at"],
+            "2026-01-01T00:00:01-08:00",
+        )
+        self.assertEqual(
+            result.attrs["correction_move_finished_at"],
+            "2026-01-01T00:00:03-08:00",
+        )
         self.assertEqual(events[0], ("get", tuple(COMMAND_AXES)))
         self.assertEqual(
             [event[0] for event in events],
@@ -2034,6 +2063,23 @@ class CorrectionTests(unittest.TestCase):
         self.assertEqual(str(saved.attrs["calibration_path"]), str(path))
         self.assertEqual(int(saved.attrs["correction_history_completed"]), 1)
         self.assertEqual(saved.sizes["move"], 1)
+        self.assertIn("correction_move_started_at", result.attrs)
+        self.assertIn("correction_move_finished_at", result.attrs)
+        self.assertEqual(
+            saved.attrs["correction_move_started_at"],
+            result.attrs["correction_move_started_at"],
+        )
+        self.assertEqual(
+            saved.attrs["correction_move_finished_at"],
+            result.attrs["correction_move_finished_at"],
+        )
+        move_started = datetime.fromisoformat(
+            str(saved.attrs["correction_move_started_at"])
+        )
+        move_finished = datetime.fromisoformat(
+            str(saved.attrs["correction_move_finished_at"])
+        )
+        self.assertLessEqual(move_started, move_finished)
         self.assertIn("move_measured_delta_px", saved)
         self.assertIn("move_predicted_delta_px", saved)
         self.assertIn("move_model_residual_delta_px", saved)

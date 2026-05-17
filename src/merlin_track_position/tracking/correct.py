@@ -288,6 +288,8 @@ def do_correction(
     correction_log_path = correction_history_path(resolved_path)
     correction_run_id = _next_correction_history_run_id(correction_log_path)
     correction_started_at_utc = datetime.now(UTC).isoformat()
+    correction_move_started_at: str | None = None
+    correction_move_finished_at: str | None = None
 
     logger.info("Capturing initial correction measurement.")
     measurement = _capture_measurement(
@@ -441,6 +443,8 @@ def do_correction(
             correction_history_path=correction_log_path,
             correction_run_id=correction_run_id,
             correction_started_at_utc=correction_started_at_utc,
+            correction_move_started_at=correction_move_started_at,
+            correction_move_finished_at=correction_move_finished_at,
             correction_history_completed=completed,
             converged=converged,
             move_count=move_count,
@@ -622,6 +626,8 @@ def do_correction(
             active_axes,
             active_requested_position_mm,
         )
+        if correction_move_started_at is None:
+            correction_move_started_at = _local_timestamp_iso()
         motor_backend.move_motors_and_wait(
             active_axes,
             active_requested_position_mm,
@@ -630,6 +636,7 @@ def do_correction(
             # Do not expand a small correction into a large backlash pre-position.
             backlash_correction={},
         )
+        correction_move_finished_at = _local_timestamp_iso()
         logger.info("Correction motor move returned; reading final x/y/z positions.")
         final_readback_mm = np.asarray(
             motor_backend.get_positions(COMMAND_AXES),
@@ -1796,6 +1803,8 @@ def _build_correction_result(
     correction_history_path: Path,
     correction_run_id: int,
     correction_started_at_utc: str,
+    correction_move_started_at: str | None,
+    correction_move_finished_at: str | None,
     correction_history_completed: bool,
     converged: bool,
     move_count: int,
@@ -2050,6 +2059,15 @@ def _build_correction_result(
         "correction_applied": move_count > 0,
         "warnings": "\n".join(tuple(dict.fromkeys(warnings))),
     }
+    if (
+        move_count > 0
+        and correction_move_started_at is not None
+        and correction_move_finished_at is not None
+    ):
+        attrs |= {
+            "correction_move_started_at": correction_move_started_at,
+            "correction_move_finished_at": correction_move_finished_at,
+        }
     if algorithm == "lqr":
         attrs |= {
             "correction_lqr_image_scale_px": float(lqr_image_scale_px),
@@ -2080,6 +2098,10 @@ def _build_correction_result(
             ),
         }
     return result.assign_attrs(attrs)
+
+
+def _local_timestamp_iso() -> str:
+    return datetime.now().astimezone().isoformat()
 
 
 def _capture_measurement(

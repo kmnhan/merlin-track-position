@@ -836,6 +836,19 @@ move_max_normalized_component(move)
 move_active_axis_mask(move, command_axis)
 ```
 
+When at least one correction move is issued, the correction run also records
+run-level local-time attributes:
+
+```text
+correction_move_started_at
+correction_move_finished_at
+```
+
+The start is captured immediately before the first commanded correction move,
+and the finish is captured immediately after the last commanded correction move
+returns. Values are local ISO timestamps with the local UTC offset included.
+Runs that stop before issuing a motor move omit both attributes.
+
 When the Kalman observer is enabled, correction outputs also include:
 
 ```text
