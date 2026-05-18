@@ -130,7 +130,7 @@ class _BaslerCameraSession:
         camera.Open()
         try:
             _configure_camera(camera)
-            camera.MaxNumBuffer = 5
+            camera.MaxNumBuffer = 10
             camera.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
         except Exception:
             _close_camera(camera)
