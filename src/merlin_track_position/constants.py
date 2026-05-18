@@ -58,9 +58,9 @@ CALIBRATION_FIT_N_JOBS: int = 1
 
 # Default commanded-mm probe steps for calibration.
 DEFAULT_VISUAL_CALIBRATION_STEP_MM_BY_AXIS: dict[str, float] = {
-    "x": 0.3,
-    "y": 0.5,
-    "z": 0.3,
+    "x": 0.2,
+    "y": 0.2,
+    "z": 0.2,
 }
 
 # Bounds used when deriving correction damping scales from the fitted Jacobian.
