@@ -18,7 +18,6 @@ from merlin_track_position.constants import MOTOR_SERVER_PORT
 logger = logging.getLogger("merlin_track_position.server")
 _UNSET = object()
 _XYZ_AXES = ("x", "y", "z")
-_FINAL_STATUSES = {"OK", "ERROR"}
 _DEFAULT_XYZ_MOVE_TIMEOUT_MS = 60_000
 _MOVE_RESULT_TIMEOUT_MARGIN_S = 30.0
 _REQUEST_LOG_LIMIT = 500
@@ -101,9 +100,12 @@ class TrackShiftMotorBackend:
         self._next_move_id = 1
         self._pending_move_id: int | None = None
         self._pending_axes: tuple[str, ...] = ()
+        self._pending_payload: dict[str, typing.Any] | None = None
         self._pending_result: _MoveResult | object = _UNSET
+        self._cancel_message: str | None = None
 
     def get_positions(self, motor_aliases: Sequence[str]) -> tuple[float, ...]:
+        self._raise_if_cancelled()
         positions: list[float] = []
         for motor_alias in motor_aliases:
             axis = str(motor_alias)
@@ -130,6 +132,7 @@ class TrackShiftMotorBackend:
         if not axes:
             return ()
 
+        self._raise_if_cancelled()
         active_targets_mm: dict[str, float] = {}
         for axis, goal in zip(axes, goals, strict=True):
             if axis not in _XYZ_AXES:
@@ -145,6 +148,7 @@ class TrackShiftMotorBackend:
         with self._condition:
             if self._pending_move_id is not None:
                 raise RuntimeError("Track Shift correction already has a pending move")
+            self._raise_if_cancelled()
             move_id = self._next_move_id
             self._next_move_id += 1
             self._pending_move_id = move_id
@@ -161,6 +165,9 @@ class TrackShiftMotorBackend:
             "timeout_ms": timeout_ms,
             "max_retries": int(max_retries),
         }
+        with self._condition:
+            if self._pending_move_id == move_id:
+                self._pending_payload = dict(payload)
         logger.info(
             "Requesting LabVIEW XYZ correction move: session_id=%s, move_id=%s, "
             "axes=%s, targets_mm=%s, timeout_ms=%d",
@@ -171,7 +178,7 @@ class TrackShiftMotorBackend:
             timeout_ms,
         )
         try:
-            self._send_move_request(payload)
+            self._send_move_request(dict(payload))
             result = self._wait_for_move_result(timeout_ms)
         except Exception:
             with self._condition:
@@ -191,7 +198,7 @@ class TrackShiftMotorBackend:
         )
         return self.get_positions(axes)
 
-    def submit_move_result(self, request: Mapping[str, typing.Any]) -> None:
+    def submit_move_result(self, request: Mapping[str, typing.Any]) -> _MoveResult:
         with self._condition:
             if self._pending_move_id is None:
                 raise TrackShiftProtocolError(
@@ -204,18 +211,17 @@ class TrackShiftMotorBackend:
                 session_id = str(request["session_id"])
                 move_id = int(request["move_id"])
             except Exception as exc:
-                ok = False
-                message = f"malformed MOVE_RESULT identifiers: {exc}"
+                raise TrackShiftProtocolError(
+                    f"malformed MOVE_RESULT identifiers: {exc}"
+                ) from exc
             else:
                 if session_id != self.session_id:
-                    ok = False
-                    message = (
+                    raise TrackShiftProtocolError(
                         f"MOVE_RESULT session_id {session_id!r} did not match "
                         f"active session {self.session_id!r}"
                     )
                 elif move_id != self._pending_move_id:
-                    ok = False
-                    message = (
+                    raise TrackShiftProtocolError(
                         f"MOVE_RESULT move_id {move_id!r} did not match pending "
                         f"move_id {self._pending_move_id!r}"
                     )
@@ -246,9 +252,11 @@ class TrackShiftMotorBackend:
                 message=message,
             )
             self._condition.notify_all()
+            return self._pending_result
 
     def cancel_pending(self, message: str) -> None:
         with self._condition:
+            self._cancel_message = str(message)
             if self._pending_move_id is not None:
                 self._pending_result = _MoveResult(
                     ok=False,
@@ -256,6 +264,16 @@ class TrackShiftMotorBackend:
                     message=message,
                 )
                 self._condition.notify_all()
+
+    def pending_move(self) -> dict[str, typing.Any] | None:
+        with self._condition:
+            if (
+                self._pending_move_id is None
+                or self._pending_payload is None
+                or self._pending_result is not _UNSET
+            ):
+                return None
+            return dict(self._pending_payload)
 
     def _wait_for_move_result(self, timeout_ms: int) -> _MoveResult:
         deadline = time.monotonic() + timeout_ms / 1000.0 + (
@@ -282,7 +300,12 @@ class TrackShiftMotorBackend:
     def _clear_pending_move(self) -> None:
         self._pending_move_id = None
         self._pending_axes = ()
+        self._pending_payload = None
         self._pending_result = _UNSET
+
+    def _raise_if_cancelled(self) -> None:
+        if self._cancel_message is not None:
+            raise RuntimeError(self._cancel_message)
 
 
 class MotorServer(QtCore.QThread):
@@ -291,25 +314,28 @@ class MotorServer(QtCore.QThread):
     def __init__(self, parent: QtCore.QObject | None = None):
         super().__init__(parent)
 
-        self._ret_val: typing.Any = _UNSET
-        self._ret_val_cv = threading.Condition()
+        self._state_lock = threading.RLock()
         self._active_motor_backend: TrackShiftMotorBackend | None = None
+        self._session_id: str | None = None
+        self._target: int | None = None
+        self._state = "idle"
+        self._message = ""
 
         self._running = threading.Event()
 
     @QtCore.Slot(object)
     def set_result(self, success: bool, msg: str) -> None:
-        if success:
-            self._set_response("OK", msg)
-        else:
-            self._set_response(
-                "ERROR",
-                msg
-                + " This will shut down the motor subsystem, and it will need to be restarted by clicking on the indicator box in the right panel.",
-            )
+        message = str(msg)
+        with self._state_lock:
+            if self._active_motor_backend is not None and not success:
+                self._active_motor_backend.cancel_pending(message)
+            self._active_motor_backend = None
+            self._state = "complete" if success else "error"
+            self._message = message
 
     def current_motor_backend(self) -> TrackShiftMotorBackend | None:
-        return self._active_motor_backend
+        with self._state_lock:
+            return self._active_motor_backend
 
     def run(self) -> None:
         _socket = None
@@ -332,22 +358,26 @@ class MotorServer(QtCore.QThread):
                     try:
                         raw: str = _socket.recv_string(flags=zmq.NOBLOCK)
                         req = _decode_json_request(raw)
-                        immediate_response = self._handle_request(req)
-                        if immediate_response is None:
-                            status, msg = self._wait_for_response()
-                        else:
-                            status, msg = immediate_response
-
+                        status, msg = self._handle_request(req)
                         _socket.send_multipart([status.encode(), msg.encode()])
-                        if status in _FINAL_STATUSES:
-                            self._clear_active_backend()
 
                     except Exception as exc:
                         logger.warning("Failed to process message: %s", exc)
-                        self._clear_active_backend(str(exc))
                         try:
                             _socket.send_multipart(
-                                [b"ERROR", f"Track Shift protocol error: {exc}".encode()]
+                                [
+                                    b"ERROR",
+                                    _json_payload(
+                                        {
+                                            "ok": False,
+                                            "state": "error",
+                                            "message": (
+                                                "Track Shift protocol error: "
+                                                f"{exc}"
+                                            ),
+                                        }
+                                    ).encode(),
+                                ]
                             )
                         except Exception:
                             logger.exception("Failed to send protocol error response.")
@@ -362,96 +392,173 @@ class MotorServer(QtCore.QThread):
                     logger.exception("Failed to close ZMQ server socket.")
             self._running.clear()
             self._clear_active_backend("motor server stopped")
-            with self._ret_val_cv:
-                self._ret_val_cv.notify_all()
             logger.info("ZMQ server stopped")
 
     def stop(self) -> None:
         self._running.clear()
         self.requestInterruption()
         self._clear_active_backend("motor server stop requested")
-        with self._ret_val_cv:
-            self._ret_val_cv.notify_all()
 
     def _handle_request(
         self,
         req: Mapping[str, typing.Any],
-    ) -> tuple[str, str] | None:
+    ) -> tuple[str, str]:
+        if not isinstance(req, Mapping):
+            return self._error_response("Track Shift request must be a JSON object")
         command = str(req.get("command", "")).upper()
+        if command == "STATUS":
+            return ("OK", _json_payload(self._status_payload()))
+
         if command == "MOVE_RESULT":
-            if self._active_motor_backend is None:
-                return ("ERROR", "received MOVE_RESULT without an active correction")
-            self._active_motor_backend.submit_move_result(req)
-            return None
+            return self._handle_move_result(req)
 
-        if command in ("", "START"):
-            return self._handle_start_request(req, use_labview_backend=command == "START")
+        if command == "ABORT":
+            return self._handle_abort_request(req)
 
-        return ("ERROR", f"unknown Track Shift command: {command!r}")
+        if command == "START":
+            return self._handle_start_request(req)
+
+        return self._error_response(f"unknown Track Shift command: {command!r}")
 
     def _handle_start_request(
         self,
         req: Mapping[str, typing.Any],
-        *,
-        use_labview_backend: bool,
-    ) -> tuple[str, str] | None:
-        if self._active_motor_backend is not None:
-            return ("ERROR", "a Track Shift correction session is already active")
+    ) -> tuple[str, str]:
+        with self._state_lock:
+            if self._active_motor_backend is not None:
+                return self._error_response(
+                    "a Track Shift correction session is already active"
+                )
 
-        target = round(req["target"])
+        try:
+            target = round(req["target"])
+        except Exception as exc:
+            return self._error_response(f"START target is required and numeric: {exc}")
         logger.debug(
-            "Received Track Shift correction request: target=%d, labview_backend=%s",
+            "Received Track Shift correction request: target=%d",
             target,
-            use_labview_backend,
         )
 
-        if use_labview_backend:
+        try:
             initial_positions = _coerce_axis_positions(
                 req.get("positions_mm", {}),
                 required_axes=_XYZ_AXES,
             )
             timeout_ms = int(req.get("timeout_ms", _DEFAULT_XYZ_MOVE_TIMEOUT_MS))
-            self._active_motor_backend = TrackShiftMotorBackend(
-                session_id=str(req.get("session_id") or uuid.uuid4().hex),
-                initial_positions_mm=initial_positions,
-                send_move_request=self._send_move_request,
-                default_move_timeout_ms=timeout_ms,
-            )
+        except Exception as exc:
+            return self._error_response(f"malformed START request: {exc}")
+
+        backend = TrackShiftMotorBackend(
+            session_id=str(req.get("session_id") or uuid.uuid4().hex),
+            initial_positions_mm=initial_positions,
+            send_move_request=self._send_move_request,
+            default_move_timeout_ms=timeout_ms,
+        )
+        with self._state_lock:
+            if self._active_motor_backend is not None:
+                return self._error_response(
+                    "a Track Shift correction session is already active"
+                )
+            self._active_motor_backend = backend
+            self._session_id = backend.session_id
+            self._target = int(target)
+            self._state = "correcting"
+            self._message = ""
             logger.info(
                 "Started Track Shift LabVIEW motor backend: session_id=%s, "
                 "positions_mm=%s",
-                self._active_motor_backend.session_id,
+                backend.session_id,
                 initial_positions,
             )
 
         self.sigMoveDetected.emit(target)
-        return None
+        return ("OK", _json_payload(self._status_payload()))
+
+    def _handle_move_result(self, req: Mapping[str, typing.Any]) -> tuple[str, str]:
+        with self._state_lock:
+            backend = self._active_motor_backend
+        if backend is None:
+            return self._error_response(
+                "received MOVE_RESULT without an active correction"
+            )
+        try:
+            move_result = backend.submit_move_result(req)
+        except Exception as exc:
+            return self._error_response(str(exc))
+
+        with self._state_lock:
+            if self._active_motor_backend is backend:
+                self._state = "correcting"
+                self._message = move_result.message
+
+        payload = self._status_payload()
+        payload["accepted_move_result"] = {
+            "session_id": backend.session_id,
+            "move_id": int(req["move_id"]),
+            "ok": bool(move_result.ok),
+            "message": move_result.message,
+        }
+        return ("OK", _json_payload(payload))
+
+    def _handle_abort_request(self, req: Mapping[str, typing.Any]) -> tuple[str, str]:
+        requested_session_id = req.get("session_id")
+        with self._state_lock:
+            if (
+                requested_session_id
+                and self._session_id is not None
+                and str(requested_session_id) != self._session_id
+            ):
+                return self._error_response(
+                    f"ABORT session_id {requested_session_id!r} did not match "
+                    f"active session {self._session_id!r}"
+                )
+            message = str(req.get("message") or "Track Shift correction aborted")
+            self._clear_active_backend(message)
+            self._state = "error"
+            self._message = message
+        return ("OK", _json_payload(self._status_payload()))
 
     def _send_move_request(self, payload: dict[str, typing.Any]) -> None:
-        self._set_response("MOVE", _json_payload(payload))
-
-    def _set_response(self, status: str, msg: str) -> None:
-        with self._ret_val_cv:
-            if self._ret_val is not _UNSET:
-                logger.warning(
-                    "Overwriting pending Track Shift response: old=%s, new=%s",
-                    self._ret_val,
-                    (status, msg),
+        with self._state_lock:
+            if (
+                self._active_motor_backend is None
+                or payload.get("session_id") != self._active_motor_backend.session_id
+            ):
+                raise RuntimeError(
+                    "cannot publish Track Shift move without an active session"
                 )
-            self._ret_val = (status, str(msg))
-            self._ret_val_cv.notify_all()
-
-    def _wait_for_response(self) -> tuple[str, str]:
-        with self._ret_val_cv:
-            while self._ret_val is _UNSET:
-                if not self._running.is_set() or self.isInterruptionRequested():
-                    raise RuntimeError("motor server stopped before response was ready")
-                self._ret_val_cv.wait(0.1)
-            status, msg = self._ret_val
-            self._ret_val = _UNSET
-        return str(status), str(msg)
+            self._state = "move_pending"
+            self._message = "LabVIEW XYZ correction move pending"
 
     def _clear_active_backend(self, message: str = "correction session ended") -> None:
-        if self._active_motor_backend is not None:
-            self._active_motor_backend.cancel_pending(message)
-            self._active_motor_backend = None
+        with self._state_lock:
+            if self._active_motor_backend is not None:
+                self._active_motor_backend.cancel_pending(message)
+                self._active_motor_backend = None
+
+    def _status_payload(self) -> dict[str, typing.Any]:
+        with self._state_lock:
+            backend = self._active_motor_backend
+            state = self._state
+            pending_move = None if backend is None else backend.pending_move()
+            if backend is not None:
+                state = "move_pending" if pending_move is not None else "correcting"
+            elif state not in {"complete", "error"}:
+                state = "idle"
+
+            payload: dict[str, typing.Any] = {
+                "ok": state != "error",
+                "state": state,
+                "session_id": self._session_id or "",
+                "target": self._target,
+                "message": self._message,
+            }
+            if pending_move is not None:
+                payload["pending_move"] = pending_move
+            return payload
+
+    def _error_response(self, message: str) -> tuple[str, str]:
+        payload = self._status_payload()
+        payload["ok"] = False
+        payload["message"] = str(message)
+        return ("ERROR", _json_payload(payload))

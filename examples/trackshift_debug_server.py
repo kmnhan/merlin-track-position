@@ -77,11 +77,8 @@ def _pretty(payload: Any) -> str:
     return json.dumps(payload, indent=2, sort_keys=True)
 
 
-def _send(socket: zmq.Socket, status: str, payload: str | dict[str, Any]) -> None:
-    if isinstance(payload, dict):
-        payload_text = _json_dumps(payload)
-    else:
-        payload_text = payload
+def _send(socket: zmq.Socket, status: str, payload: dict[str, Any]) -> None:
+    payload_text = _json_dumps(payload)
     print(f"\n--> reply status={status!r}")
     print(f"--> reply payload={_preview(payload_text)!r}")
     socket.send_multipart([status.encode("utf-8"), payload_text.encode("utf-8")])
@@ -131,12 +128,33 @@ def _move_payload(
     }
 
 
+def _status_payload(
+    *,
+    ok: bool,
+    state: str,
+    session_id: str,
+    target: Any,
+    message: str,
+    pending_move: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    payload = {
+        "ok": ok,
+        "state": state,
+        "session_id": session_id,
+        "target": target,
+        "message": message,
+    }
+    if pending_move is not None:
+        payload["pending_move"] = pending_move
+    return payload
+
+
 def _validate_move_result(
     request: dict[str, Any],
     *,
     expected_session_id: str,
     expected_move_id: int,
-) -> None:
+) -> list[str]:
     problems: list[str] = []
     if request.get("command") != "MOVE_RESULT":
         problems.append("command is not MOVE_RESULT")
@@ -167,13 +185,7 @@ def _validate_move_result(
             else:
                 if not math.isfinite(value):
                     problems.append(f"positions_mm[{axis!r}] is not finite")
-
-    if problems:
-        print("!! MOVE_RESULT validation problems:")
-        for problem in problems:
-            print(f"   - {problem}")
-    else:
-        print("MOVE_RESULT validation: OK")
+    return problems
 
 
 def run_server(args: argparse.Namespace) -> int:
@@ -183,21 +195,24 @@ def run_server(args: argparse.Namespace) -> int:
     socket.setsockopt(zmq.LINGER, 0)
     socket.bind(args.bind)
 
-    print(f"Track Shift debug server listening on {args.bind}")
+    print(f"Track Shift polling debug server listening on {args.bind}")
     if moves:
-        print("Scripted moves:")
+        print("Scripted STATUS moves:")
         for index, move in enumerate(moves, start=1):
             print(
                 f"  {index}: axes={move.axes}, targets_mm={move.targets_mm}, "
                 f"timeout_ms={move.timeout_ms}"
             )
     else:
-        print("No --move supplied; START will receive OK without XYZ motion.")
+        print("No --move supplied; first STATUS after START will report complete.")
     print("Press Ctrl-C to stop.\n")
 
     session_id = args.session_id or uuid.uuid4().hex
+    target: Any = None
+    state = "idle"
+    message = ""
     next_move_index = 0
-    awaiting_move_id: int | None = None
+    pending_move: dict[str, Any] | None = None
     current_positions_mm = {axis: 0.0 for axis in XYZ_AXES}
 
     try:
@@ -207,14 +222,24 @@ def run_server(args: argparse.Namespace) -> int:
                 _send(
                     socket,
                     "ERROR",
-                    "invalid JSON request from LabVIEW; "
-                    f"raw length={len(raw or '')}; preview={_preview(raw or '')!r}",
+                    _status_payload(
+                        ok=False,
+                        state="error",
+                        session_id=session_id,
+                        target=target,
+                        message=(
+                            "invalid JSON request from LabVIEW; "
+                            f"raw length={len(raw or '')}; "
+                            f"preview={_preview(raw or '')!r}"
+                        ),
+                    ),
                 )
                 continue
 
             command = str(request.get("command", "")).upper()
-            if command in ("", "START"):
+            if command == "START":
                 session_id = str(request.get("session_id") or session_id)
+                target = request.get("target")
                 positions = request.get("positions_mm")
                 if isinstance(positions, dict):
                     for axis in XYZ_AXES:
@@ -223,77 +248,155 @@ def run_server(args: argparse.Namespace) -> int:
                         except Exception:
                             current_positions_mm[axis] = 0.0
                 next_move_index = 0
-                awaiting_move_id = None
-                print(f"START target={request.get('target')!r}")
+                pending_move = None
+                state = "correcting"
+                message = "debug server: correction started"
+                print(f"START target={target!r}")
                 print(f"START positions_mm={request.get('positions_mm')!r}")
-                if not moves:
-                    _send(socket, "OK", "debug server: no scripted moves configured")
-                    continue
-
-                move_id = 1
-                awaiting_move_id = move_id
-                payload = _move_payload(
-                    session_id=session_id,
-                    move_id=move_id,
-                    move=moves[next_move_index],
-                    max_retries=args.max_retries,
-                    current_positions_mm=current_positions_mm,
+                _send(
+                    socket,
+                    "OK",
+                    _status_payload(
+                        ok=True,
+                        state=state,
+                        session_id=session_id,
+                        target=target,
+                        message=message,
+                    ),
                 )
-                next_move_index += 1
-                _send(socket, "MOVE", payload)
+                continue
+
+            if command == "STATUS":
+                if state == "correcting" and pending_move is None:
+                    if next_move_index < len(moves):
+                        move_id = next_move_index + 1
+                        pending_move = _move_payload(
+                            session_id=session_id,
+                            move_id=move_id,
+                            move=moves[next_move_index],
+                            max_retries=args.max_retries,
+                            current_positions_mm=current_positions_mm,
+                        )
+                        next_move_index += 1
+                        state = "move_pending"
+                        message = "debug server: LabVIEW XYZ move pending"
+                    else:
+                        state = "complete"
+                        message = "debug server: scripted moves complete"
+
+                _send(
+                    socket,
+                    "OK",
+                    _status_payload(
+                        ok=state != "error",
+                        state=state,
+                        session_id=session_id,
+                        target=target,
+                        message=message,
+                        pending_move=pending_move,
+                    ),
+                )
                 continue
 
             if command == "MOVE_RESULT":
-                if awaiting_move_id is None:
-                    _send(socket, "ERROR", "MOVE_RESULT received with no pending MOVE")
+                if pending_move is None:
+                    _send(
+                        socket,
+                        "ERROR",
+                        _status_payload(
+                            ok=False,
+                            state=state,
+                            session_id=session_id,
+                            target=target,
+                            message="MOVE_RESULT received with no pending move",
+                        ),
+                    )
                     continue
 
-                _validate_move_result(
+                problems = _validate_move_result(
                     request,
                     expected_session_id=session_id,
-                    expected_move_id=awaiting_move_id,
+                    expected_move_id=int(pending_move["move_id"]),
                 )
+                if problems:
+                    print("!! MOVE_RESULT validation problems:")
+                    for problem in problems:
+                        print(f"   - {problem}")
+                    _send(
+                        socket,
+                        "ERROR",
+                        _status_payload(
+                            ok=False,
+                            state=state,
+                            session_id=session_id,
+                            target=target,
+                            message="; ".join(problems),
+                            pending_move=pending_move,
+                        ),
+                    )
+                    continue
+
                 ok = bool(request.get("ok", False))
                 print(f"MOVE_RESULT ok={ok!r} message={request.get('message')!r}")
                 positions = request.get("positions_mm")
                 if isinstance(positions, dict):
                     for axis in XYZ_AXES:
-                        try:
-                            current_positions_mm[axis] = float(
-                                positions.get(axis, current_positions_mm[axis])
-                            )
-                        except Exception:
-                            pass
+                        current_positions_mm[axis] = float(positions[axis])
 
-                if not ok:
-                    _send(
-                        socket,
-                        "ERROR",
+                if ok:
+                    pending_move = None
+                    state = "correcting"
+                    message = "debug server: MOVE_RESULT accepted"
+                else:
+                    pending_move = None
+                    state = "error"
+                    message = (
                         "debug server: LabVIEW reported failed MOVE_RESULT: "
-                        + str(request.get("message", "")),
+                        + str(request.get("message", ""))
                     )
-                    awaiting_move_id = None
-                    continue
 
-                if next_move_index >= len(moves):
-                    _send(socket, "OK", "debug server: scripted moves complete")
-                    awaiting_move_id = None
-                    continue
-
-                move_id = awaiting_move_id + 1
-                awaiting_move_id = move_id
-                payload = _move_payload(
-                    session_id=session_id,
-                    move_id=move_id,
-                    move=moves[next_move_index],
-                    max_retries=args.max_retries,
-                    current_positions_mm=current_positions_mm,
+                _send(
+                    socket,
+                    "OK",
+                    _status_payload(
+                        ok=state != "error",
+                        state=state,
+                        session_id=session_id,
+                        target=target,
+                        message=message,
+                    ),
                 )
-                next_move_index += 1
-                _send(socket, "MOVE", payload)
                 continue
 
-            _send(socket, "ERROR", f"unknown command {command!r}")
+            if command == "ABORT":
+                pending_move = None
+                state = "error"
+                message = str(request.get("message") or "debug server: aborted")
+                _send(
+                    socket,
+                    "OK",
+                    _status_payload(
+                        ok=False,
+                        state=state,
+                        session_id=session_id,
+                        target=target,
+                        message=message,
+                    ),
+                )
+                continue
+
+            _send(
+                socket,
+                "ERROR",
+                _status_payload(
+                    ok=False,
+                    state=state,
+                    session_id=session_id,
+                    target=target,
+                    message=f"unknown command {command!r}",
+                    pending_move=pending_move,
+                ),
+            )
     except KeyboardInterrupt:
         print("\nStopping debug server.")
         return 0
@@ -305,7 +408,7 @@ def run_server(args: argparse.Namespace) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Standalone Track Shift ZMQ debug server for LabVIEW driver testing."
+            "Standalone Track Shift polling debug server for LabVIEW driver testing."
         )
     )
     parser.add_argument("--bind", default=DEFAULT_BIND, help=f"default: {DEFAULT_BIND}")
@@ -315,15 +418,15 @@ def main(argv: list[str] | None = None) -> int:
         default=[],
         metavar="AXIS=MM[,AXIS=MM...]",
         help=(
-            "script one MOVE reply, e.g. --move x=0.5,z=-1.4. "
-            "Repeat for multiple iterative moves. If omitted, START replies OK."
+            "script one pending move returned by STATUS, e.g. "
+            "--move x=0.5,z=-1.4. Repeat for multiple iterative moves."
         ),
     )
     parser.add_argument(
         "--timeout-ms",
         type=int,
         default=DEFAULT_TIMEOUT_MS,
-        help=f"timeout_ms included in MOVE payloads; default {DEFAULT_TIMEOUT_MS}",
+        help=f"timeout_ms included in pending moves; default {DEFAULT_TIMEOUT_MS}",
     )
     parser.add_argument("--max-retries", type=int, default=4)
     parser.add_argument("--session-id", default="")
@@ -331,4 +434,4 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(main(sys.argv[1:]))

@@ -1,5 +1,6 @@
 import json
 import threading
+import time
 import unittest
 
 from merlin_track_position.server import MotorServer, TrackShiftMotorBackend
@@ -79,26 +80,67 @@ class TrackShiftMotorBackendTests(unittest.TestCase):
 
 
 class MotorServerDialogueTests(unittest.TestCase):
-    def test_start_creates_backend_and_move_result_unblocks_move(self):
+    def _decoded_response(self, response):
+        status, payload = response
+        return status, json.loads(payload)
+
+    def _wait_for_state(self, server, expected_state, *, timeout_s=2.0):
+        deadline = time.monotonic() + timeout_s
+        last_payload = None
+        while time.monotonic() < deadline:
+            status, payload = self._decoded_response(
+                server._handle_request({"command": "STATUS"})
+            )
+            self.assertEqual(status, "OK")
+            last_payload = payload
+            if payload["state"] == expected_state:
+                return payload
+            time.sleep(0.01)
+        self.fail(f"state {expected_state!r} not reached; last payload={last_payload!r}")
+
+    def test_start_creates_backend_and_returns_correcting_immediately(self):
         server = MotorServer()
         server._running.set()
         targets = []
         server.sigMoveDetected.connect(lambda target: targets.append(target))
 
         try:
-            response = server._handle_request(
+            status, payload = self._decoded_response(
+                server._handle_request(
+                    {
+                        "command": "START",
+                        "target": 1,
+                        "positions_mm": {"x": 0.1, "y": 2.0, "z": -0.3},
+                        "session_id": "session-1",
+                    }
+                )
+            )
+            self.assertEqual(status, "OK")
+            self.assertEqual(payload["state"], "correcting")
+            self.assertEqual(payload["session_id"], "session-1")
+            self.assertEqual(payload["target"], 1)
+            self.assertEqual(targets, [1])
+            self.assertIsNotNone(server.current_motor_backend())
+        finally:
+            server.stop()
+
+    def test_status_returns_pending_move_idempotently_and_move_result_unblocks_move(
+        self,
+    ):
+        server = MotorServer()
+        server._running.set()
+        try:
+            server._handle_request(
                 {
                     "command": "START",
                     "target": 1,
                     "positions_mm": {"x": 0.1, "y": 2.0, "z": -0.3},
                     "session_id": "session-1",
+                    "timeout_ms": 1000,
                 }
             )
-            self.assertIsNone(response)
-            self.assertEqual(targets, [1])
             backend = server.current_motor_backend()
             self.assertIsNotNone(backend)
-
             move_result = []
 
             def request_move():
@@ -108,32 +150,155 @@ class MotorServerDialogueTests(unittest.TestCase):
 
             thread = threading.Thread(target=request_move)
             thread.start()
-            status, payload = server._wait_for_response()
-            decoded_payload = json.loads(payload)
+            pending = self._wait_for_state(server, "move_pending")
+            repeated = self._wait_for_state(server, "move_pending")
 
-            self.assertEqual(status, "MOVE")
-            self.assertEqual(decoded_payload["session_id"], "session-1")
-            self.assertEqual(decoded_payload["move_id"], 1)
-            self.assertEqual(decoded_payload["axes"], ["x"])
+            pending_move = pending["pending_move"]
+            repeated_move = repeated["pending_move"]
+            self.assertEqual(pending_move, repeated_move)
+            self.assertEqual(pending_move["session_id"], "session-1")
+            self.assertEqual(pending_move["move_id"], 1)
+            self.assertEqual(pending_move["axes"], ["x"])
             self.assertEqual(
-                decoded_payload["targets_mm"],
+                pending_move["targets_mm"],
                 {"x": 0.25, "y": 2.0, "z": -0.3},
             )
 
-            response = server._handle_request(
+            status, payload = self._decoded_response(
+                server._handle_request(
+                    {
+                        "command": "MOVE_RESULT",
+                        "session_id": "session-1",
+                        "move_id": 1,
+                        "ok": True,
+                        "positions_mm": {"x": 0.25, "y": 2.0, "z": -0.3},
+                        "message": "done",
+                    }
+                )
+            )
+            self.assertEqual(status, "OK")
+            self.assertEqual(payload["state"], "correcting")
+            self.assertEqual(payload["accepted_move_result"]["move_id"], 1)
+            thread.join(timeout=2.0)
+
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(move_result, [(0.25,)])
+
+            server.set_result(True, "Correction converged after 1 move(s).")
+            status, payload = self._decoded_response(
+                server._handle_request({"command": "STATUS"})
+            )
+            self.assertEqual(status, "OK")
+            self.assertEqual(payload["state"], "complete")
+            self.assertEqual(payload["message"], "Correction converged after 1 move(s).")
+            self.assertIsNone(server.current_motor_backend())
+        finally:
+            server.stop()
+
+    def test_session_mismatch_does_not_consume_pending_move(self):
+        server = MotorServer()
+        server._running.set()
+        try:
+            server._handle_request(
+                {
+                    "command": "START",
+                    "target": 1,
+                    "positions_mm": {"x": 0.1, "y": 2.0, "z": -0.3},
+                    "session_id": "session-1",
+                    "timeout_ms": 1000,
+                }
+            )
+            backend = server.current_motor_backend()
+            self.assertIsNotNone(backend)
+            move_errors = []
+
+            def request_move():
+                try:
+                    backend.move_motors_and_wait(("z",), (-0.5,), move_timeout_s=1.0)
+                except Exception as exc:
+                    move_errors.append(str(exc))
+
+            thread = threading.Thread(target=request_move)
+            thread.start()
+            pending = self._wait_for_state(server, "move_pending")
+            move_id = pending["pending_move"]["move_id"]
+
+            status, payload = self._decoded_response(
+                server._handle_request(
+                    {
+                        "command": "MOVE_RESULT",
+                        "session_id": "stale-session",
+                        "move_id": move_id,
+                        "ok": True,
+                        "positions_mm": {"x": 0.1, "y": 2.0, "z": -0.5},
+                    }
+                )
+            )
+
+            self.assertEqual(status, "ERROR")
+            self.assertIn("did not match active session", payload["message"])
+            self.assertEqual(self._wait_for_state(server, "move_pending"), pending)
+            self.assertTrue(thread.is_alive())
+
+            server._handle_request(
                 {
                     "command": "MOVE_RESULT",
                     "session_id": "session-1",
-                    "move_id": 1,
-                    "ok": True,
-                    "positions_mm": {"x": 0.25, "y": 2.0, "z": -0.3},
-                    "message": "done",
+                    "move_id": move_id,
+                    "ok": False,
+                    "positions_mm": {"x": 0.1, "y": 2.0, "z": -0.3},
+                    "message": "cleanup",
                 }
             )
             thread.join(timeout=2.0)
-
-            self.assertIsNone(response)
             self.assertFalse(thread.is_alive())
-            self.assertEqual(move_result, [(0.25,)])
+            self.assertEqual(move_errors, ["cleanup"])
+        finally:
+            server.stop()
+
+    def test_abort_marks_error_and_unblocks_pending_move(self):
+        server = MotorServer()
+        server._running.set()
+        try:
+            server._handle_request(
+                {
+                    "command": "START",
+                    "target": 1,
+                    "positions_mm": {"x": 0.1, "y": 2.0, "z": -0.3},
+                    "session_id": "session-1",
+                    "timeout_ms": 1000,
+                }
+            )
+            backend = server.current_motor_backend()
+            self.assertIsNotNone(backend)
+            move_errors = []
+
+            def request_move():
+                try:
+                    backend.move_motors_and_wait(("x",), (0.5,), move_timeout_s=1.0)
+                except Exception as exc:
+                    move_errors.append(str(exc))
+
+            thread = threading.Thread(target=request_move)
+            thread.start()
+            self._wait_for_state(server, "move_pending")
+
+            status, payload = self._decoded_response(
+                server._handle_request(
+                    {
+                        "command": "ABORT",
+                        "session_id": "session-1",
+                        "message": "operator abort",
+                    }
+                )
+            )
+            thread.join(timeout=2.0)
+
+            self.assertEqual(status, "OK")
+            self.assertEqual(payload["state"], "error")
+            self.assertEqual(payload["message"], "operator abort")
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(move_errors, ["operator abort"])
+            self.assertIsNone(server.current_motor_backend())
         finally:
             server.stop()

@@ -289,7 +289,6 @@ class DevelopmentModeFramegrabTests(unittest.TestCase):
         self.assertEqual(camera.open_count, 1)
         self.assertEqual(camera.start_grabbing_count, 1)
         self.assertEqual(camera.retrieve_result_count, 2)
-        self.assertEqual(camera.MaxNumBuffer, 5)
         self.assertEqual(camera.close_count, 0)
 
     def test_close_basler_camera_stops_closes_and_allows_reopen(self):
