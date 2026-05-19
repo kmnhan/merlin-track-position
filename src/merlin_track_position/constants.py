@@ -125,7 +125,7 @@ MOTOR_SERVER_PORT: int = 6554
 
 # Whether to move motors from Python using the BCS API or by sending commands to the
 # LabVIEW motor server.
-MOTOR_SERVER_USE_BCS_API_BACKEND: bool = False
+MOTOR_SERVER_USE_BCS_API_BACKEND: bool = True
 
 # These are default settings for BCS API server, probably shouldn't need to be changed.
 BCS_SERVER_HOST: str = "localhost"
