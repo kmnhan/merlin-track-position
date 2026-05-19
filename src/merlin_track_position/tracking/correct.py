@@ -706,6 +706,177 @@ def correction_history_path(calibration_path: str | Path) -> Path:
     return path.with_name(f"{path.stem}_corrections{suffix}")
 
 
+def correction_timestamps_from_history(path: str | Path) -> xr.Dataset:
+    """Extract run-level correction timestamps from a correction-history file."""
+
+    timestamp_attrs = (
+        "correction_started_at_utc",
+        "correction_move_started_at",
+        "correction_move_finished_at",
+    )
+    run_ids: list[int] = []
+    run_groups: list[str] = []
+    timestamp_values: dict[str, list[np.datetime64]] = {
+        attr_name: [] for attr_name in timestamp_attrs
+    }
+    with h5py.File(path, "r") as history_file:
+        run_names = sorted(
+            (
+                (run_id, group_name)
+                for group_name in history_file
+                if (run_id := _correction_history_run_id(group_name)) is not None
+            ),
+            key=lambda item: item[0],
+        )
+        for run_id, group_name in run_names:
+            group = history_file[group_name]
+            run_ids.append(run_id)
+            run_groups.append(group_name)
+            for attr_name in timestamp_attrs:
+                timestamp_values[attr_name].append(
+                    _correction_timestamp_attr_as_utc64(
+                        group.attrs.get(attr_name),
+                        attr_name,
+                    )
+                )
+
+    data_vars: dict[str, tuple[tuple[str, ...], np.ndarray]] = {}
+    for attr_name, values in timestamp_values.items():
+        output_name = attr_name if attr_name.endswith("_utc") else f"{attr_name}_utc"
+        data_vars[output_name] = (
+            ("run_id",),
+            np.asarray(values, dtype="datetime64[ns]"),
+        )
+
+    return xr.Dataset(
+        data_vars=data_vars,
+        coords={
+            "run_id": np.asarray(run_ids, dtype=np.int64),
+            "run_group": ("run_id", np.asarray(run_groups, dtype=object)),
+        },
+    )
+
+
+def correction_total_move_by_axis_from_history(
+    path: str | Path,
+) -> xr.DataArray:
+    """Extract signed commanded and image-detected x/y/z moves from history."""
+
+    timestamps: list[np.datetime64] = []
+    residuals: list[float] = []
+    moves_by_run: list[np.ndarray] = []
+    run_ids: list[int] = []
+    run_groups: list[str] = []
+
+    with h5py.File(path, "r") as history_file:
+        run_names = sorted(
+            (
+                (run_id, group_name)
+                for group_name in history_file
+                if (run_id := _correction_history_run_id(group_name)) is not None
+            ),
+            key=lambda item: item[0],
+        )
+        for run_id, group_name in run_names:
+            group = history_file[group_name]
+            run_ids.append(run_id)
+            run_groups.append(group_name)
+            timestamps.append(
+                _correction_timestamp_attr_as_utc64(
+                    group.attrs.get("correction_move_finished_at"),
+                    "correction_move_finished_at",
+                )
+            )
+            residual_px = np.nan
+            if (
+                "iteration_weighted_residual_px" in group
+                and group["iteration_weighted_residual_px"].shape[0] > 0
+            ):
+                residual_px = float(group["iteration_weighted_residual_px"][-1])
+            elif (
+                "move_post_weighted_residual_px" in group
+                and group["move_post_weighted_residual_px"].shape[0] > 0
+            ):
+                residual_px = float(group["move_post_weighted_residual_px"][-1])
+            residuals.append(residual_px)
+
+            commanded = np.full(len(COMMAND_AXES), np.nan, dtype=np.float64)
+            if "move_command_delta_mm" in group:
+                commanded = np.asarray(
+                    group["move_command_delta_mm"][...],
+                    dtype=np.float64,
+                ).sum(axis=0)
+
+            detected = np.full(len(COMMAND_AXES), np.nan, dtype=np.float64)
+            if "px_per_cmd_mm" in group:
+                jacobian = np.asarray(group["px_per_cmd_mm"][...], dtype=np.float64)
+                if (
+                    "iteration_shift_px" in group
+                    and group["iteration_shift_px"].shape[0] >= 2
+                ):
+                    shifts = group["iteration_shift_px"]
+                    initial_shift = np.asarray(shifts[0], dtype=np.float64)
+                    final_shift = np.asarray(shifts[-1], dtype=np.float64)
+                    total_delta = final_shift - initial_shift
+                    detected = estimate_command_offset(jacobian, total_delta)
+                elif "move_measured_delta_px" in group:
+                    total_delta = np.asarray(
+                        group["move_measured_delta_px"][...],
+                        dtype=np.float64,
+                    ).sum(axis=0)
+                    detected = estimate_command_offset(jacobian, total_delta)
+
+            moves_by_run.append(np.stack((commanded, detected), axis=0))
+
+    dimension = "after_move_timestamp_utc"
+    return xr.DataArray(
+        np.asarray(
+            moves_by_run,
+            dtype=np.float64,
+        ).reshape(len(run_ids), 2, len(COMMAND_AXES)),
+        dims=(dimension, "move_source", "command_axis"),
+        coords={
+            dimension: np.asarray(timestamps, dtype="datetime64[ns]"),
+            "run_id": (dimension, np.asarray(run_ids, dtype=np.int64)),
+            "run_group": (dimension, np.asarray(run_groups, dtype=object)),
+            "weighted_residual_px": (
+                dimension,
+                np.asarray(residuals, dtype=np.float64),
+            ),
+            "move_source": ["commanded", "detected"],
+            "command_axis": list(COMMAND_AXES),
+        },
+        name="total_move_mm",
+        attrs={
+            "units": "commanded-mm",
+            "long_name": "signed total correction move by source and axis",
+        },
+    )
+
+
+def _correction_timestamp_attr_as_utc64(
+    value: Any,
+    attr_name: str,
+) -> np.datetime64:
+    if value is None:
+        return np.datetime64("NaT", "ns")
+    if isinstance(value, bytes):
+        value = value.decode()
+    text = str(value).strip()
+    if not text:
+        return np.datetime64("NaT", "ns")
+    if text.endswith("Z"):
+        text = f"{text[:-1]}+00:00"
+    try:
+        timestamp = datetime.fromisoformat(text)
+    except ValueError as exc:
+        raise ValueError(f"invalid {attr_name}: {value!r}") from exc
+    if timestamp.tzinfo is None:
+        raise ValueError(f"{attr_name} must include a UTC offset: {value!r}")
+    timestamp_utc = timestamp.astimezone(UTC).replace(tzinfo=None)
+    return np.datetime64(timestamp_utc, "ns")
+
+
 def _apply_calibration_persistence_attrs(
     result: xr.Dataset,
     calibration: xr.Dataset,

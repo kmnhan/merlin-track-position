@@ -36,6 +36,8 @@ from merlin_track_position.tracking.calibrate import (
     visual_calibration_probe_count,
 )
 from merlin_track_position.tracking.correct import (
+    correction_timestamps_from_history,
+    correction_total_move_by_axis_from_history,
     correction_history_path,
     do_correction,
     flush_pending_correction_history_datasets,
@@ -1713,6 +1715,208 @@ class CorrectionTests(unittest.TestCase):
         self.assertEqual(loaded["current_cam1"].dtype, np.dtype(np.uint16))
         np.testing.assert_array_equal(loaded["current_cam0"].values, current_cam0)
         np.testing.assert_array_equal(loaded["current_cam1"].values, current_cam1)
+
+    def test_correction_timestamps_from_history_extracts_run_attrs(self):
+        first = shift_dataset(x_shift(1.0)).assign_attrs(
+            {
+                "calibration_path": "calibration.h5",
+                "correction_history_completed": True,
+                "correction_history_run_id": 2,
+                "correction_started_at_utc": "2026-05-19T10:00:00+00:00",
+                "correction_move_started_at": "2026-05-19T03:00:02-07:00",
+                "correction_move_finished_at": "2026-05-19T03:00:05-07:00",
+            }
+        )
+        second = shift_dataset(x_shift(2.0)).assign_attrs(
+            {
+                "calibration_path": "calibration.h5",
+                "correction_history_completed": True,
+                "correction_history_run_id": 0,
+                "correction_started_at_utc": "2026-05-19T10:10:00Z",
+            }
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            history_path = Path(tmpdir) / "correction-history.h5"
+            correct_module.save_correction_history_dataset(
+                first,
+                history_path,
+                run_id=2,
+            )
+            correct_module.save_correction_history_dataset(
+                second,
+                history_path,
+                run_id=0,
+            )
+            timestamps = correction_timestamps_from_history(history_path)
+
+        np.testing.assert_array_equal(timestamps["run_id"].values, np.array([0, 2]))
+        self.assertEqual(
+            timestamps["run_group"].values.tolist(),
+            ["run_000000", "run_000002"],
+        )
+        np.testing.assert_array_equal(
+            timestamps["correction_started_at_utc"].values,
+            np.array(
+                [
+                    "2026-05-19T10:10:00",
+                    "2026-05-19T10:00:00",
+                ],
+                dtype="datetime64[ns]",
+            ),
+        )
+        self.assertTrue(
+            np.isnat(timestamps["correction_move_started_at_utc"].values[0])
+        )
+        self.assertEqual(
+            timestamps["correction_move_started_at_utc"].values[1],
+            np.datetime64("2026-05-19T10:00:02", "ns"),
+        )
+        self.assertEqual(
+            timestamps["correction_move_finished_at_utc"].values[1],
+            np.datetime64("2026-05-19T10:00:05", "ns"),
+        )
+
+    def test_correction_total_move_by_axis_from_history(self):
+        jacobian = px_per_cmd_mm()
+        detected_move_delta_mm = np.array(
+            [
+                [0.0005, -0.001, 0.002],
+                [0.0015, 0.0, -0.001],
+            ],
+            dtype=float,
+        )
+        detected_total_delta_px = measured_from_jacobian(
+            detected_move_delta_mm.sum(axis=0, keepdims=True),
+            jacobian,
+        )[0]
+        first = shift_dataset(x_shift(1.0)).assign(
+            px_per_cmd_mm=(
+                ("camera", "pixel_axis", "command_axis"),
+                jacobian,
+                {"units": "px/commanded-mm"},
+            ),
+            move_command_delta_mm=(
+                ("move", "command_axis"),
+                np.array(
+                    [
+                        [0.001, -0.002, 0.0],
+                        [0.0, 0.003, -0.004],
+                    ],
+                    dtype=float,
+                ),
+                {"units": "commanded-mm"},
+            ),
+            iteration_shift_px=(
+                ("iteration", "camera", "pixel_axis"),
+                np.stack(
+                    (
+                        np.zeros_like(detected_total_delta_px),
+                        detected_total_delta_px,
+                    )
+                ),
+                {"units": "px"},
+            ),
+            iteration_weighted_residual_px=(
+                ("iteration",),
+                np.array([2.5, 0.75], dtype=float),
+                {"units": "px"},
+            ),
+        ).assign_coords(
+            move=np.arange(2, dtype=np.int64),
+            iteration=np.arange(2, dtype=np.int64),
+            command_axis=list(COMMAND_AXES),
+        ).assign_attrs(
+            {
+                "calibration_path": "calibration.h5",
+                "correction_history_completed": True,
+                "correction_history_run_id": 2,
+                "correction_move_finished_at": "2026-05-19T03:00:05-07:00",
+            }
+        )
+        second = shift_dataset(x_shift(2.0)).assign(
+            px_per_cmd_mm=(
+                ("camera", "pixel_axis", "command_axis"),
+                jacobian,
+                {"units": "px/commanded-mm"},
+            ),
+            move_command_delta_mm=(
+                ("move", "command_axis"),
+                np.empty((0, len(COMMAND_AXES)), dtype=float),
+                {"units": "commanded-mm"},
+            ),
+            move_measured_delta_px=(
+                ("move", "camera", "pixel_axis"),
+                np.empty((0, len(CAMERAS), len(PIXEL_AXES)), dtype=float),
+                {"units": "px"},
+            ),
+            iteration_weighted_residual_px=(
+                ("iteration",),
+                np.array([1.25], dtype=float),
+                {"units": "px"},
+            ),
+        ).assign_coords(
+            move=np.arange(0, dtype=np.int64),
+            iteration=np.arange(1, dtype=np.int64),
+            command_axis=list(COMMAND_AXES),
+        ).assign_attrs(
+            {
+                "calibration_path": "calibration.h5",
+                "correction_history_completed": True,
+                "correction_history_run_id": 0,
+            }
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            history_path = Path(tmpdir) / "correction-history.h5"
+            correct_module.save_correction_history_dataset(
+                first,
+                history_path,
+                run_id=2,
+            )
+            correct_module.save_correction_history_dataset(
+                second,
+                history_path,
+                run_id=0,
+            )
+            moves = correction_total_move_by_axis_from_history(history_path)
+
+        self.assertEqual(moves.name, "total_move_mm")
+        self.assertEqual(
+            moves.dims,
+            ("after_move_timestamp_utc", "move_source", "command_axis"),
+        )
+        np.testing.assert_array_equal(moves["run_id"].values, np.array([0, 2]))
+        self.assertEqual(
+            moves["move_source"].values.tolist(),
+            ["commanded", "detected"],
+        )
+        self.assertEqual(moves["command_axis"].values.tolist(), list(COMMAND_AXES))
+        np.testing.assert_allclose(
+            moves["weighted_residual_px"].values,
+            np.array([1.25, 0.75]),
+        )
+        np.testing.assert_allclose(
+            moves.values,
+            np.array(
+                [
+                    [
+                        [0.0, 0.0, 0.0],
+                        [0.0, 0.0, 0.0],
+                    ],
+                    [
+                        [0.001, 0.001, -0.004],
+                        [0.002, -0.001, 0.001],
+                    ],
+                ]
+            ),
+            atol=1e-12,
+        )
+        self.assertTrue(np.isnat(moves["after_move_timestamp_utc"].values[0]))
+        self.assertEqual(
+            moves["after_move_timestamp_utc"].values[1],
+            np.datetime64("2026-05-19T10:00:05", "ns"),
+        )
 
     def test_locked_correction_history_is_queued_and_flushes_later(self):
         with tempfile.TemporaryDirectory() as tmpdir:
