@@ -302,3 +302,161 @@ class MotorServerDialogueTests(unittest.TestCase):
             self.assertIsNone(server.current_motor_backend())
         finally:
             server.stop()
+
+    def test_bcs_api_backend_start_returns_correcting_without_pending_move(self):
+        server = MotorServer(use_bcs_api_backend=True)
+        server._running.set()
+        targets = []
+        server.sigMoveDetected.connect(lambda target: targets.append(target))
+
+        try:
+            status, payload = self._decoded_response(
+                server._handle_request(
+                    {
+                        "command": "START",
+                        "target": 1,
+                        "positions_mm": {"x": 0.1, "y": 2.0, "z": -0.3},
+                        "session_id": "session-1",
+                    }
+                )
+            )
+            self.assertEqual(status, "OK")
+            self.assertEqual(payload["state"], "correcting")
+            self.assertEqual(payload["session_id"], "session-1")
+            self.assertEqual(payload["target"], 1)
+            self.assertNotIn("pending_move", payload)
+            self.assertEqual(targets, [1])
+            self.assertIsNone(server.current_motor_backend())
+
+            status, repeated = self._decoded_response(
+                server._handle_request({"command": "STATUS"})
+            )
+            self.assertEqual(status, "OK")
+            self.assertEqual(repeated["state"], "correcting")
+            self.assertNotIn("pending_move", repeated)
+        finally:
+            server.stop()
+
+    def test_bcs_api_backend_final_status_persists(self):
+        server = MotorServer(use_bcs_api_backend=True)
+        server._running.set()
+        try:
+            server._handle_request(
+                {
+                    "command": "START",
+                    "target": 1,
+                    "positions_mm": {"x": 0.1, "y": 2.0, "z": -0.3},
+                    "session_id": "session-1",
+                }
+            )
+
+            server.set_result(True, "Correction converged after 0 move(s).")
+            status, payload = self._decoded_response(
+                server._handle_request({"command": "STATUS"})
+            )
+            self.assertEqual(status, "OK")
+            self.assertEqual(payload["state"], "complete")
+            self.assertEqual(
+                payload["message"],
+                "Correction converged after 0 move(s).",
+            )
+            self.assertNotIn("pending_move", payload)
+            self.assertIsNone(server.current_motor_backend())
+
+            server._handle_request(
+                {
+                    "command": "START",
+                    "target": 2,
+                    "positions_mm": {"x": 0.1, "y": 2.0, "z": -0.3},
+                    "session_id": "session-2",
+                }
+            )
+            server.set_result(False, "BCS API move failed")
+            status, payload = self._decoded_response(
+                server._handle_request({"command": "STATUS"})
+            )
+            self.assertEqual(status, "OK")
+            self.assertFalse(payload["ok"])
+            self.assertEqual(payload["state"], "error")
+            self.assertEqual(payload["message"], "BCS API move failed")
+            self.assertNotIn("pending_move", payload)
+        finally:
+            server.stop()
+
+    def test_bcs_api_backend_rejects_move_result_and_second_start(self):
+        server = MotorServer(use_bcs_api_backend=True)
+        server._running.set()
+        try:
+            server._handle_request(
+                {
+                    "command": "START",
+                    "target": 1,
+                    "positions_mm": {"x": 0.1, "y": 2.0, "z": -0.3},
+                    "session_id": "session-1",
+                }
+            )
+
+            status, payload = self._decoded_response(
+                server._handle_request(
+                    {
+                        "command": "MOVE_RESULT",
+                        "session_id": "session-1",
+                        "move_id": 1,
+                        "ok": True,
+                        "positions_mm": {"x": 0.1, "y": 2.0, "z": -0.3},
+                    }
+                )
+            )
+            self.assertEqual(status, "ERROR")
+            self.assertEqual(payload["state"], "correcting")
+            self.assertIn(
+                "without an active LabVIEW correction move",
+                payload["message"],
+            )
+
+            status, payload = self._decoded_response(
+                server._handle_request(
+                    {
+                        "command": "START",
+                        "target": 2,
+                        "positions_mm": {"x": 0.1, "y": 2.0, "z": -0.3},
+                        "session_id": "session-2",
+                    }
+                )
+            )
+            self.assertEqual(status, "ERROR")
+            self.assertIn("already active", payload["message"])
+        finally:
+            server.stop()
+
+    def test_bcs_api_backend_abort_marks_error(self):
+        server = MotorServer(use_bcs_api_backend=True)
+        server._running.set()
+        try:
+            server._handle_request(
+                {
+                    "command": "START",
+                    "target": 1,
+                    "positions_mm": {"x": 0.1, "y": 2.0, "z": -0.3},
+                    "session_id": "session-1",
+                }
+            )
+
+            status, payload = self._decoded_response(
+                server._handle_request(
+                    {
+                        "command": "ABORT",
+                        "session_id": "session-1",
+                        "message": "operator abort",
+                    }
+                )
+            )
+
+            self.assertEqual(status, "OK")
+            self.assertFalse(payload["ok"])
+            self.assertEqual(payload["state"], "error")
+            self.assertEqual(payload["message"], "operator abort")
+            self.assertNotIn("pending_move", payload)
+            self.assertIsNone(server.current_motor_backend())
+        finally:
+            server.stop()

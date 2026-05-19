@@ -13,7 +13,10 @@ import uuid
 import zmq
 from qtpy import QtCore
 
-from merlin_track_position.constants import MOTOR_SERVER_PORT
+from merlin_track_position.constants import (
+    MOTOR_SERVER_PORT,
+    MOTOR_SERVER_USE_BCS_API_BACKEND,
+)
 
 logger = logging.getLogger("merlin_track_position.server")
 _UNSET = object()
@@ -311,11 +314,22 @@ class TrackShiftMotorBackend:
 class MotorServer(QtCore.QThread):
     sigMoveDetected = QtCore.Signal(int)
 
-    def __init__(self, parent: QtCore.QObject | None = None):
+    def __init__(
+        self,
+        parent: QtCore.QObject | None = None,
+        *,
+        use_bcs_api_backend: bool | None = None,
+    ):
         super().__init__(parent)
 
+        self._use_bcs_api_backend = (
+            MOTOR_SERVER_USE_BCS_API_BACKEND
+            if use_bcs_api_backend is None
+            else bool(use_bcs_api_backend)
+        )
         self._state_lock = threading.RLock()
         self._active_motor_backend: TrackShiftMotorBackend | None = None
+        self._correction_active = False
         self._session_id: str | None = None
         self._target: int | None = None
         self._state = "idle"
@@ -330,6 +344,7 @@ class MotorServer(QtCore.QThread):
             if self._active_motor_backend is not None and not success:
                 self._active_motor_backend.cancel_pending(message)
             self._active_motor_backend = None
+            self._correction_active = False
             self._state = "complete" if success else "error"
             self._message = message
 
@@ -391,13 +406,13 @@ class MotorServer(QtCore.QThread):
                 except Exception:
                     logger.exception("Failed to close ZMQ server socket.")
             self._running.clear()
-            self._clear_active_backend("motor server stopped")
+            self._clear_active_session("motor server stopped")
             logger.info("ZMQ server stopped")
 
     def stop(self) -> None:
         self._running.clear()
         self.requestInterruption()
-        self._clear_active_backend("motor server stop requested")
+        self._clear_active_session("motor server stop requested")
 
     def _handle_request(
         self,
@@ -425,7 +440,7 @@ class MotorServer(QtCore.QThread):
         req: Mapping[str, typing.Any],
     ) -> tuple[str, str]:
         with self._state_lock:
-            if self._active_motor_backend is not None:
+            if self._correction_active:
                 return self._error_response(
                     "a Track Shift correction session is already active"
                 )
@@ -448,28 +463,40 @@ class MotorServer(QtCore.QThread):
         except Exception as exc:
             return self._error_response(f"malformed START request: {exc}")
 
-        backend = TrackShiftMotorBackend(
-            session_id=str(req.get("session_id") or uuid.uuid4().hex),
-            initial_positions_mm=initial_positions,
-            send_move_request=self._send_move_request,
-            default_move_timeout_ms=timeout_ms,
-        )
+        session_id = str(req.get("session_id") or uuid.uuid4().hex)
+        backend = None
+        if not self._use_bcs_api_backend:
+            backend = TrackShiftMotorBackend(
+                session_id=session_id,
+                initial_positions_mm=initial_positions,
+                send_move_request=self._send_move_request,
+                default_move_timeout_ms=timeout_ms,
+            )
         with self._state_lock:
-            if self._active_motor_backend is not None:
+            if self._correction_active:
                 return self._error_response(
                     "a Track Shift correction session is already active"
                 )
             self._active_motor_backend = backend
-            self._session_id = backend.session_id
+            self._correction_active = True
+            self._session_id = session_id
             self._target = int(target)
             self._state = "correcting"
             self._message = ""
-            logger.info(
-                "Started Track Shift LabVIEW motor backend: session_id=%s, "
-                "positions_mm=%s",
-                backend.session_id,
-                initial_positions,
-            )
+            if backend is None:
+                logger.info(
+                    "Started Track Shift BCS API motor backend: session_id=%s, "
+                    "positions_mm=%s",
+                    session_id,
+                    initial_positions,
+                )
+            else:
+                logger.info(
+                    "Started Track Shift LabVIEW motor backend: session_id=%s, "
+                    "positions_mm=%s",
+                    backend.session_id,
+                    initial_positions,
+                )
 
         self.sigMoveDetected.emit(target)
         return ("OK", _json_payload(self._status_payload()))
@@ -479,7 +506,7 @@ class MotorServer(QtCore.QThread):
             backend = self._active_motor_backend
         if backend is None:
             return self._error_response(
-                "received MOVE_RESULT without an active correction"
+                "received MOVE_RESULT without an active LabVIEW correction move"
             )
         try:
             move_result = backend.submit_move_result(req)
@@ -513,7 +540,7 @@ class MotorServer(QtCore.QThread):
                     f"active session {self._session_id!r}"
                 )
             message = str(req.get("message") or "Track Shift correction aborted")
-            self._clear_active_backend(message)
+            self._clear_active_session(message)
             self._state = "error"
             self._message = message
         return ("OK", _json_payload(self._status_payload()))
@@ -530,11 +557,12 @@ class MotorServer(QtCore.QThread):
             self._state = "move_pending"
             self._message = "LabVIEW XYZ correction move pending"
 
-    def _clear_active_backend(self, message: str = "correction session ended") -> None:
+    def _clear_active_session(self, message: str = "correction session ended") -> None:
         with self._state_lock:
             if self._active_motor_backend is not None:
                 self._active_motor_backend.cancel_pending(message)
                 self._active_motor_backend = None
+            self._correction_active = False
 
     def _status_payload(self) -> dict[str, typing.Any]:
         with self._state_lock:
@@ -543,6 +571,8 @@ class MotorServer(QtCore.QThread):
             pending_move = None if backend is None else backend.pending_move()
             if backend is not None:
                 state = "move_pending" if pending_move is not None else "correcting"
+            elif self._correction_active:
+                state = "correcting"
             elif state not in {"complete", "error"}:
                 state = "idle"
 

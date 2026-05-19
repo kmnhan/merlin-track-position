@@ -123,6 +123,10 @@ BASLER_EXPOSURE: int = 300000  # exposure time
 # If you change this, make sure to also update TrackTemperatureBL403 BCS Driver.vi
 MOTOR_SERVER_PORT: int = 6554
 
+# Whether to move motors from Python using the BCS API or by sending commands to the
+# LabVIEW motor server.
+MOTOR_SERVER_USE_BCS_API_BACKEND: bool = False
+
 # These are default settings for BCS API server, probably shouldn't need to be changed.
 BCS_SERVER_HOST: str = "localhost"
 BCS_SERVER_PORT: int = 5577
