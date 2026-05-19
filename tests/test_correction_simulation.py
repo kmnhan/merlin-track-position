@@ -79,27 +79,15 @@ class CorrectionSimulationTests(unittest.TestCase):
 
         np.testing.assert_allclose(projected, offset_um.reshape(1, 3), atol=1e-9)
 
-    def test_shift_level_no_error_converges_for_wls_and_lqr(self):
+    def test_shift_level_no_error_converges_for_lqr_configs(self):
         result = simulate_shift_correction(
             sample_calibration(),
             [
-                {
-                    "name": "wls",
-                    "algorithm": "damped_wls",
-                    "gain": 1.0,
-                    "damping_mu": 0.0,
-                    "max_normalized_step": None,
-                },
-                {
-                    "name": "lqr",
-                    "algorithm": "lqr",
-                    "gain": 1.0,
-                    "max_normalized_step": None,
-                },
+                {"name": "nominal", "gain": 1.0, "max_normalized_step": None},
+                {"name": "limited", "gain": 1.0, "max_normalized_step": 0.5},
             ],
             np.array([[5.0, -3.0, 2.0], [-5.0, 4.0, -3.0]]),
             seed=10,
-            damped_wls_pixel_tolerance_px=0.05,
             lqr_projected_tolerance=0.5,
             max_moves=8,
             motor_error_model=ZERO_MOTOR_ERROR_MODEL_UM,
@@ -107,7 +95,7 @@ class CorrectionSimulationTests(unittest.TestCase):
         )
 
         self.assertTrue(bool(result["converged"].values.all()))
-        self.assertEqual(result.sizes["algorithm"], 2)
+        self.assertEqual(result.sizes["lqr_config"], 2)
         self.assertEqual(result.sizes["trial"], 2)
         self.assertEqual(result.sizes["iteration"], 9)
         self.assertEqual(result.sizes["move"], 8)
@@ -115,22 +103,12 @@ class CorrectionSimulationTests(unittest.TestCase):
     def test_shift_level_robust_run_is_repeatable_and_summarizable(self):
         kwargs = dict(
             calibration=sample_calibration(),
-            algorithm_configs=[
-                {
-                    "name": "wls",
-                    "algorithm": "damped_wls",
-                    "gain": 0.6,
-                    "damping_mu": 1.0,
-                },
-                {
-                    "name": "lqr",
-                    "algorithm": "lqr",
-                    "gain": 0.6,
-                },
+            lqr_configs=[
+                {"name": "lqr_g06", "gain": 0.6},
+                {"name": "lqr_g09", "gain": 0.9},
             ],
             initial_offsets_um=default_initial_offsets_um((2.0, 5.0)),
             seed=20260515,
-            damped_wls_pixel_tolerance_px=0.2,
             lqr_projected_tolerance=2.0,
             max_moves=6,
             trials_per_offset=2,
@@ -142,7 +120,7 @@ class CorrectionSimulationTests(unittest.TestCase):
         self.assertEqual(
             set(first.dims),
             {
-                "algorithm",
+                "lqr_config",
                 "trial",
                 "iteration",
                 "move",
@@ -155,16 +133,15 @@ class CorrectionSimulationTests(unittest.TestCase):
 
         summary = summarize_simulation(first)
         self.assertIn("success_rate", summary)
-        self.assertEqual(summary.sizes["algorithm"], 2)
+        self.assertEqual(summary.sizes["lqr_config"], 2)
         self.assertTrue(np.isfinite(summary["move_count_mean"].values).all())
 
     def test_shift_level_lqr_kalman_run_is_repeatable_with_measurement_noise(self):
         kwargs = dict(
             calibration=sample_calibration(),
-            algorithm_configs=[
+            lqr_configs=[
                 {
                     "name": "lqr_kalman",
-                    "algorithm": "lqr",
                     "gain": 0.8,
                     "lqr_use_kalman_filter": True,
                     "lqr_kalman_process_noise": 0.05,
@@ -174,7 +151,6 @@ class CorrectionSimulationTests(unittest.TestCase):
             ],
             initial_offsets_um=default_initial_offsets_um((2.0,)),
             seed=12345,
-            damped_wls_pixel_tolerance_px=0.2,
             lqr_projected_tolerance=2.0,
             max_moves=5,
             trials_per_offset=2,
@@ -186,7 +162,7 @@ class CorrectionSimulationTests(unittest.TestCase):
 
         xr.testing.assert_identical(first, second)
         self.assertEqual(first.attrs["measurement_noise_covariance_px"], 0.01)
-        self.assertEqual(first.sizes["algorithm"], 1)
+        self.assertEqual(first.sizes["lqr_config"], 1)
         self.assertTrue(np.isfinite(first["weighted_residual_px"].values).any())
 
     def test_image_level_no_error_reduces_measured_residual(self):
@@ -194,16 +170,13 @@ class CorrectionSimulationTests(unittest.TestCase):
             sample_calibration(),
             [
                 {
-                    "name": "wls",
-                    "algorithm": "damped_wls",
+                    "name": "lqr",
                     "gain": 1.0,
-                    "damping_mu": 0.0,
                     "max_normalized_step": None,
                 }
             ],
             np.array([[10.0, -4.0, 6.0]]),
             seed=100,
-            damped_wls_pixel_tolerance_px=0.05,
             max_moves=1,
             motor_error_model=ZERO_MOTOR_ERROR_MODEL_UM,
             weights=(1.0, 1.0, 1.0, 1.0),
@@ -218,8 +191,8 @@ class CorrectionSimulationTests(unittest.TestCase):
         result = simulate_shift_correction(
             sample_calibration(),
             [
-                {"name": "lqr_g06", "algorithm": "lqr", "gain": 0.6},
-                {"name": "lqr_g10", "algorithm": "lqr", "gain": 1.0},
+                {"name": "lqr_g06", "gain": 0.6},
+                {"name": "lqr_g10", "gain": 1.0},
             ],
             default_initial_offsets_um((2.0, 5.0, 10.0)),
             seed=20260515,
@@ -228,8 +201,8 @@ class CorrectionSimulationTests(unittest.TestCase):
             trials_per_offset=2,
         )
 
-        lqr_g06_mean = float(result["move_count"].sel(algorithm="lqr_g06").mean())
-        lqr_g10_mean = float(result["move_count"].sel(algorithm="lqr_g10").mean())
+        lqr_g06_mean = float(result["move_count"].sel(lqr_config="lqr_g06").mean())
+        lqr_g10_mean = float(result["move_count"].sel(lqr_config="lqr_g10").mean())
         self.assertLess(lqr_g10_mean, lqr_g06_mean)
 
 

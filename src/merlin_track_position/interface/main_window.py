@@ -646,13 +646,6 @@ class MainWindow(_MainWindowGUI):
             and "px_per_cmd_mm" in result
         ):
             calibration = self._calibration.load().copy(deep=True)
-            calibration["px_per_cmd_mm"] = result[
-                "px_per_cmd_mm"
-            ]
-            if "calibration_jacobian_refinement_count" in result.attrs:
-                calibration.attrs["jacobian_refinement_count"] = int(
-                    result.attrs["calibration_jacobian_refinement_count"]
-                )
             for key, value in result.attrs.items():
                 if (
                     key.startswith("calibration_persistence_")
@@ -1240,10 +1233,7 @@ class MainWindow(_MainWindowGUI):
         response = QtWidgets.QMessageBox.warning(
             self,
             "Start sample correction?",
-            (
-                "Correction may move the x/y/z motors and may update the "
-                "calibration file if a Jacobian refinement is accepted."
-            ),
+            "Correction may move the x/y/z motors.",
             QtWidgets.QMessageBox.StandardButton.Ok
             | QtWidgets.QMessageBox.StandardButton.Cancel,
             QtWidgets.QMessageBox.StandardButton.Cancel,

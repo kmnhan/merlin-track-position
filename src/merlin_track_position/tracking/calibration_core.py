@@ -211,7 +211,7 @@ def fit_jacobian_calibration(
     if command_rank < len(COMMAND_AXES):
         raise ValueError("probe command deltas must span x/y/z command space")
 
-    coef = _fit_robust_least_squares(command_delta, observation)
+    coef = _fit_robust_calibration_response(command_delta, observation)
     px_per_cmd_mm = coef.T.reshape(len(CAMERAS), len(PIXEL_AXES), len(COMMAND_AXES))
     jacobian_observation = px_per_cmd_mm.reshape(
         len(OBSERVATION_AXES),
@@ -246,7 +246,6 @@ def fit_jacobian_calibration(
         "min_shift_px": min_shift_px,
         "condition_warning_threshold": condition_warning_threshold,
         "warnings": "\n".join(tuple(warnings)),
-        "jacobian_refinement_count": 0,
     }
     if additional_context is not None:
         attrs |= additional_context
@@ -662,84 +661,6 @@ def _discard_pending_calibration_entries(path: str | Path) -> None:
         discard_spool_entry(entry)
 
 
-def assign_refined_jacobian(
-    calibration: xr.Dataset,
-    px_per_cmd_mm: np.ndarray,
-    *,
-    save_path: str | Path | None = None,
-) -> xr.Dataset:
-    """Return calibration with a refined Jacobian and persist it when requested."""
-
-    validate_visual_calibration_dataset(calibration)
-    jacobian = _as_jacobian(px_per_cmd_mm)
-    updated = _canonical_visual_calibration_dataset(calibration).copy(deep=True)
-    updated["px_per_cmd_mm"] = (
-        ("camera", "pixel_axis", "command_axis"),
-        jacobian,
-        {"units": "px/commanded-mm"},
-    )
-    updated.attrs["jacobian_refinement_count"] = (
-        int(updated.attrs.get("jacobian_refinement_count", 0)) + 1
-    )
-    updated.attrs["jacobian_refined"] = "true"
-    validate_visual_calibration_dataset(updated)
-
-    if save_path is not None:
-        persistence = save_calibration_dataset_deferred(updated, save_path)
-        updated = updated.assign_attrs(
-            persistence_result_attrs("calibration", persistence)
-        )
-        updated.attrs["calibration_path"] = str(normalize_target_path(save_path))
-    return updated
-
-
-def refine_jacobian_from_observations(
-    calibration: xr.Dataset,
-    correction_command_delta_mm: Sequence[Sequence[float]],
-    correction_measured_delta_px: Sequence[Any],
-    *,
-    save_path: str | Path | None = None,
-) -> xr.Dataset:
-    """Refine ``J`` by pooling calibration probes with accepted correction moves.
-
-    The original calibration probes remain in the fit, so small correction moves
-    affect the normal equations in proportion to their command magnitude instead
-    of overwriting the fit from a single low-leverage move.
-    """
-
-    validate_visual_calibration_dataset(calibration)
-    correction_delta = _as_probe_command_matrix(
-        "correction_command_delta_mm",
-        correction_command_delta_mm,
-    )
-    correction_observation = _as_correction_observation_matrix(
-        correction_measured_delta_px,
-        correction_delta.shape[0],
-    )
-
-    probe_delta = np.asarray(
-        calibration["probe_command_delta_mm"].values,
-        dtype=np.float64,
-    )
-    probe_observation = _pixels_to_observations(
-        np.asarray(calibration["probe_measured_delta_px"].values, dtype=np.float64)
-    )
-    combined_delta = np.vstack([probe_delta, correction_delta])
-    combined_observation = np.vstack([probe_observation, correction_observation])
-    coef = _fit_robust_least_squares(combined_delta, combined_observation)
-    px_per_cmd_mm = coef.T.reshape(
-        len(CAMERAS),
-        len(PIXEL_AXES),
-        len(COMMAND_AXES),
-    )
-    _validate_refined_jacobian(calibration, px_per_cmd_mm)
-    return assign_refined_jacobian(
-        calibration,
-        px_per_cmd_mm,
-        save_path=save_path,
-    )
-
-
 def measure_image_error(
     reference_cam0: Any,
     current_cam0: Any,
@@ -849,80 +770,6 @@ def estimate_command_offset(
     return np.linalg.pinv(lhs) @ rhs
 
 
-def solve_damped_command_correction(
-    px_per_cmd_mm: np.ndarray,
-    shift: xr.Dataset | xr.DataArray | Sequence[float],
-    axis_scale_cmd_mm: Sequence[float],
-    *,
-    gain: float = constants.DEFAULT_DAMPED_WLS_CORRECTION_GAIN,
-    damping_mu: float = constants.DEFAULT_DAMPED_WLS_CORRECTION_DAMPING_MU,
-    max_normalized_step: float | None = (
-        constants.DEFAULT_DAMPED_WLS_CORRECTION_MAX_NORMALIZED_STEP
-    ),
-    min_axis_predicted_shift_px: float = (
-        constants.DEFAULT_DAMPED_WLS_CORRECTION_MIN_AXIS_PREDICTED_SHIFT_PX
-    ),
-    weights: Sequence[float] | np.ndarray | None = None,
-) -> np.ndarray:
-    """Solve the damped normalized-command correction ``Delta a``."""
-
-    jacobian_observation = _jacobian_to_observation(
-        _as_jacobian(px_per_cmd_mm)
-    )
-    observation = _shift_to_observation(_shift_values(shift))
-    axis_scale = np.asarray(axis_scale_cmd_mm, dtype=np.float64)
-    if axis_scale.shape != (len(COMMAND_AXES),):
-        raise ValueError("axis_scale_cmd_mm must have one value for x/y/z")
-    if not np.isfinite(axis_scale).all() or np.any(axis_scale <= 0.0):
-        raise ValueError("axis_scale_cmd_mm must contain finite positive values")
-
-    gain = float(gain)
-    damping_mu = float(damping_mu)
-    if not np.isfinite(gain) or gain <= 0.0:
-        raise ValueError("gain must be finite and positive")
-    if not np.isfinite(damping_mu) or damping_mu < 0.0:
-        raise ValueError("damping_mu must be finite and non-negative")
-    if max_normalized_step is not None:
-        max_normalized_step = float(max_normalized_step)
-        if np.isnan(max_normalized_step) or max_normalized_step <= 0.0:
-            raise ValueError("max_normalized_step must be positive or None")
-    min_axis_predicted_shift_px = float(min_axis_predicted_shift_px)
-    if (
-        not np.isfinite(min_axis_predicted_shift_px)
-        or min_axis_predicted_shift_px < 0.0
-    ):
-        raise ValueError("min_axis_predicted_shift_px must be finite and non-negative")
-
-    scale_matrix = np.diag(axis_scale)
-    normalized_jacobian = jacobian_observation @ scale_matrix
-    weight_matrix = _observation_weight_matrix(weights)
-    lhs = (
-        normalized_jacobian.T @ weight_matrix @ normalized_jacobian
-        + damping_mu * np.eye(len(COMMAND_AXES))
-    )
-    rhs = normalized_jacobian.T @ weight_matrix @ observation
-    delta_q = -gain * np.linalg.solve(lhs, rhs)
-    if max_normalized_step is not None and np.isfinite(max_normalized_step):
-        max_component = float(np.max(np.abs(delta_q)))
-        if max_component > max_normalized_step:
-            delta_q *= max_normalized_step / max_component
-
-    correction_cmd_mm = scale_matrix @ delta_q
-    if min_axis_predicted_shift_px > 0.0:
-        axis_sensitivity = np.sqrt(
-            np.diag(jacobian_observation.T @ weight_matrix @ jacobian_observation)
-        )
-        predicted_axis_shift_px = np.abs(correction_cmd_mm) * axis_sensitivity
-        correction_cmd_mm = correction_cmd_mm.copy()
-        correction_cmd_mm[predicted_axis_shift_px < min_axis_predicted_shift_px] = 0.0
-
-    if correction_cmd_mm.shape != (len(COMMAND_AXES),):
-        raise ValueError("computed correction has unexpected shape")
-    if not np.isfinite(correction_cmd_mm).all():
-        raise ValueError("computed correction contains non-finite values")
-    return correction_cmd_mm
-
-
 def solve_lqr_command_correction(
     px_per_cmd_mm: np.ndarray,
     shift: xr.Dataset | xr.DataArray | Sequence[float],
@@ -937,7 +784,6 @@ def solve_lqr_command_correction(
     max_normalized_step: float | None = (
         constants.DEFAULT_LQR_CORRECTION_MAX_NORMALIZED_STEP
     ),
-    min_axis_predicted_shift_px: float = 0.0,
     weights: Sequence[float] | np.ndarray | None = None,
 ) -> np.ndarray:
     """Solve the nominal image-space LQR correction in commanded-mm units."""
@@ -959,12 +805,6 @@ def solve_lqr_command_correction(
         max_normalized_step = float(max_normalized_step)
         if np.isnan(max_normalized_step) or max_normalized_step <= 0.0:
             raise ValueError("max_normalized_step must be positive or None")
-    min_axis_predicted_shift_px = float(min_axis_predicted_shift_px)
-    if (
-        not np.isfinite(min_axis_predicted_shift_px)
-        or min_axis_predicted_shift_px < 0.0
-    ):
-        raise ValueError("min_axis_predicted_shift_px must be finite and non-negative")
 
     design = compute_lqr_correction_design(
         jacobian_observation,
@@ -982,15 +822,6 @@ def solve_lqr_command_correction(
         gain=gain,
         max_normalized_step=max_normalized_step,
     )
-
-    if min_axis_predicted_shift_px > 0.0:
-        weight_matrix = _observation_weight_matrix(weights)
-        axis_sensitivity = np.sqrt(
-            np.diag(jacobian_observation.T @ weight_matrix @ jacobian_observation)
-        )
-        predicted_axis_shift_px = np.abs(correction_cmd_mm) * axis_sensitivity
-        correction_cmd_mm = correction_cmd_mm.copy()
-        correction_cmd_mm[predicted_axis_shift_px < min_axis_predicted_shift_px] = 0.0
 
     if correction_cmd_mm.shape != (len(COMMAND_AXES),):
         raise ValueError("computed correction has unexpected shape")
@@ -1486,51 +1317,6 @@ def weighted_pixel_residual(
     return float(np.sqrt(observation @ weight_matrix @ observation))
 
 
-def _as_correction_observation_matrix(
-    values: Sequence[Any],
-    expected_rows: int,
-) -> np.ndarray:
-    observations = _pixels_to_observations(np.asarray(values, dtype=np.float64))
-    if observations.ndim == 1:
-        observations = observations.reshape(1, -1)
-    if observations.shape != (expected_rows, len(OBSERVATION_AXES)):
-        raise ValueError(
-            "correction_measured_delta_px must have one measured pixel delta "
-            "per correction command"
-        )
-    if not np.isfinite(observations).all():
-        raise ValueError("correction_measured_delta_px must contain only finite values")
-    return observations
-
-
-def _validate_refined_jacobian(
-    calibration: xr.Dataset,
-    px_per_cmd_mm: np.ndarray,
-) -> None:
-    jacobian_observation = _jacobian_to_observation(px_per_cmd_mm)
-    singular_values = np.linalg.svd(jacobian_observation, compute_uv=False)
-    largest_singular_value = float(singular_values[0]) if singular_values.size else 0.0
-    rank_tolerance = 1e-3 * largest_singular_value
-    rank = int(np.count_nonzero(singular_values > rank_tolerance))
-    if rank < len(COMMAND_AXES):
-        raise ValueError(f"refined Jacobian must have rank 3; got rank {rank}")
-
-    condition_number = float(np.linalg.cond(jacobian_observation))
-    threshold = float(
-        calibration.attrs.get(
-            "condition_warning_threshold",
-            constants.DEFAULT_JACOBIAN_CONDITION_WARNING,
-        )
-    )
-    if not np.isfinite(threshold) or threshold <= 0.0:
-        threshold = constants.DEFAULT_JACOBIAN_CONDITION_WARNING
-    if condition_number > threshold:
-        raise ValueError(
-            "refined Jacobian is poorly conditioned: condition number "
-            f"{condition_number:.4g} > {threshold:.4g}"
-        )
-
-
 def _estimate_probe_capture_shifts(
     capture_arrays_by_camera: tuple[
         tuple[Sequence[np.ndarray], Sequence[np.ndarray]],
@@ -1955,7 +1741,7 @@ def _format_warning_number(value: float) -> str:
     return f"{float(value):.4g}"
 
 
-def _fit_robust_least_squares(
+def _fit_robust_calibration_response(
     command_delta: np.ndarray,
     observation: np.ndarray,
 ) -> np.ndarray:
@@ -1987,7 +1773,7 @@ def derive_axis_scale_from_jacobian(
     px_per_cmd_mm: np.ndarray,
     command_delta: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
-    """Derive correction damping scales from fitted sensitivity."""
+    """Derive correction command normalization scales from fitted sensitivity."""
 
     axis_sensitivity = np.linalg.norm(_jacobian_to_observation(px_per_cmd_mm), axis=0)
     if not np.isfinite(axis_sensitivity).all() or np.any(axis_sensitivity <= 0.0):

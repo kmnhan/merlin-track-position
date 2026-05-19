@@ -1,4 +1,4 @@
-"""Repeatable closed-loop correction simulations for algorithm tuning."""
+"""Repeatable closed-loop LQR correction simulations for parameter tuning."""
 
 from __future__ import annotations
 
@@ -169,13 +169,10 @@ def sample_robust_motor_error_um(
 
 def simulate_shift_correction(
     calibration: xr.Dataset | str | Path,
-    algorithm_configs: Sequence[Mapping[str, Any]],
+    lqr_configs: Sequence[Mapping[str, Any]],
     initial_offsets_um: Sequence[Sequence[float]] | np.ndarray,
     seed: int,
     *,
-    damped_wls_pixel_tolerance_px: float = (
-        constants.DEFAULT_DAMPED_WLS_CORRECTION_PIXEL_TOLERANCE_PX
-    ),
     lqr_projected_tolerance: float = (
         constants.DEFAULT_LQR_CORRECTION_PROJECTED_TOLERANCE
     ),
@@ -193,11 +190,10 @@ def simulate_shift_correction(
     calibration_dataset = _as_calibration_dataset(calibration)
     return _simulate_correction(
         calibration_dataset,
-        algorithm_configs,
+        lqr_configs,
         initial_offsets_um,
         seed,
         mode="shift",
-        damped_wls_pixel_tolerance_px=damped_wls_pixel_tolerance_px,
         lqr_projected_tolerance=lqr_projected_tolerance,
         max_moves=max_moves,
         weights=weights,
@@ -211,13 +207,10 @@ def simulate_shift_correction(
 
 def simulate_image_correction(
     calibration: xr.Dataset | str | Path,
-    algorithm_configs: Sequence[Mapping[str, Any]],
+    lqr_configs: Sequence[Mapping[str, Any]],
     initial_offsets_um: Sequence[Sequence[float]] | np.ndarray,
     seed: int,
     *,
-    damped_wls_pixel_tolerance_px: float = (
-        constants.DEFAULT_DAMPED_WLS_CORRECTION_PIXEL_TOLERANCE_PX
-    ),
     lqr_projected_tolerance: float = (
         constants.DEFAULT_LQR_CORRECTION_PROJECTED_TOLERANCE
     ),
@@ -233,11 +226,10 @@ def simulate_image_correction(
     calibration_dataset = _as_calibration_dataset(calibration)
     return _simulate_correction(
         calibration_dataset,
-        algorithm_configs,
+        lqr_configs,
         initial_offsets_um,
         seed,
         mode="image",
-        damped_wls_pixel_tolerance_px=damped_wls_pixel_tolerance_px,
         lqr_projected_tolerance=lqr_projected_tolerance,
         max_moves=max_moves,
         weights=weights,
@@ -250,7 +242,7 @@ def simulate_image_correction(
 
 
 def summarize_simulation(result: xr.Dataset) -> xr.Dataset:
-    """Summarize convergence, move count, and final residuals by algorithm."""
+    """Summarize convergence, move count, and final residuals by LQR config."""
 
     _require_result_vars(
         result,
@@ -261,7 +253,7 @@ def summarize_simulation(result: xr.Dataset) -> xr.Dataset:
             "final_correction_criterion_residual",
         ),
     )
-    algorithms = result.coords["algorithm"].values
+    lqr_configs = result.coords["lqr_config"].values
     converged = np.asarray(result["converged"].values, dtype=bool)
     move_count = np.asarray(result["move_count"].values, dtype=np.float64)
     final_residual = np.asarray(
@@ -289,7 +281,7 @@ def summarize_simulation(result: xr.Dataset) -> xr.Dataset:
         "final_criterion_p95": [],
         "final_criterion_max": [],
     }
-    for index in range(len(algorithms)):
+    for index in range(len(lqr_configs)):
         moves = move_count[index]
         residuals = final_residual[index]
         criteria = final_criterion[index]
@@ -311,10 +303,10 @@ def summarize_simulation(result: xr.Dataset) -> xr.Dataset:
 
     return xr.Dataset(
         data_vars={
-            name: (("algorithm",), np.asarray(values, dtype=np.float64))
+            name: (("lqr_config",), np.asarray(values, dtype=np.float64))
             for name, values in rows.items()
         },
-        coords={"algorithm": algorithms},
+        coords={"lqr_config": lqr_configs},
         attrs={
             "source_simulation_mode": result.attrs.get("simulation_mode", ""),
             "source_seed": result.attrs.get("seed", ""),
@@ -325,12 +317,11 @@ def summarize_simulation(result: xr.Dataset) -> xr.Dataset:
 
 def _simulate_correction(
     calibration: xr.Dataset,
-    algorithm_configs: Sequence[Mapping[str, Any]],
+    lqr_configs: Sequence[Mapping[str, Any]],
     initial_offsets_um: Sequence[Sequence[float]] | np.ndarray,
     seed: int,
     *,
     mode: str,
-    damped_wls_pixel_tolerance_px: float,
     lqr_projected_tolerance: float,
     max_moves: int,
     weights: Sequence[float] | np.ndarray | None,
@@ -343,10 +334,6 @@ def _simulate_correction(
     shift_kwargs: Mapping[str, Any],
 ) -> xr.Dataset:
     weights_values = _observation_weights(weights)
-    damped_wls_pixel_tolerance_px = _nonnegative_float(
-        damped_wls_pixel_tolerance_px,
-        "damped_wls_pixel_tolerance_px",
-    )
     lqr_projected_tolerance = _nonnegative_float(
         lqr_projected_tolerance,
         "lqr_projected_tolerance",
@@ -362,10 +349,10 @@ def _simulate_correction(
     if trials_per_offset <= 0:
         raise ValueError("trials_per_offset must be positive")
 
-    configs = _algorithm_configs(algorithm_configs)
+    configs = _lqr_configs(lqr_configs)
     initial_um = _initial_offsets(initial_offsets_um, trials_per_offset)
     trial_count = initial_um.shape[0]
-    algorithm_count = len(configs)
+    config_count = len(configs)
     px_per_cmd_mm = np.asarray(
         calibration["px_per_cmd_mm"].values,
         dtype=np.float64,
@@ -402,13 +389,13 @@ def _simulate_correction(
     )
 
     true_state_um = np.full(
-        (algorithm_count, trial_count, max_moves + 1, len(COMMAND_AXES)),
+        (config_count, trial_count, max_moves + 1, len(COMMAND_AXES)),
         np.nan,
         dtype=np.float64,
     )
     measured_shift_px = np.full(
         (
-            algorithm_count,
+            config_count,
             trial_count,
             max_moves + 1,
             len(CAMERAS),
@@ -418,24 +405,24 @@ def _simulate_correction(
         dtype=np.float64,
     )
     weighted_residual_px = np.full(
-        (algorithm_count, trial_count, max_moves + 1),
+        (config_count, trial_count, max_moves + 1),
         np.nan,
         dtype=np.float64,
     )
     correction_criterion_residual = np.full_like(weighted_residual_px, np.nan)
     command_delta_um = np.full(
-        (algorithm_count, trial_count, max_moves, len(COMMAND_AXES)),
+        (config_count, trial_count, max_moves, len(COMMAND_AXES)),
         np.nan,
         dtype=np.float64,
     )
     applied_delta_um = np.full_like(command_delta_um, np.nan)
     motor_error_um = np.full_like(command_delta_um, np.nan)
-    tail_event = np.zeros((algorithm_count, trial_count, max_moves), dtype=bool)
-    move_executed = np.zeros((algorithm_count, trial_count, max_moves), dtype=bool)
-    converged = np.zeros((algorithm_count, trial_count), dtype=bool)
-    move_count = np.zeros((algorithm_count, trial_count), dtype=np.int64)
+    tail_event = np.zeros((config_count, trial_count, max_moves), dtype=bool)
+    move_executed = np.zeros((config_count, trial_count, max_moves), dtype=bool)
+    converged = np.zeros((config_count, trial_count), dtype=bool)
+    move_count = np.zeros((config_count, trial_count), dtype=np.int64)
     final_weighted_residual_px = np.full(
-        (algorithm_count, trial_count),
+        (config_count, trial_count),
         np.nan,
         dtype=np.float64,
     )
@@ -444,7 +431,7 @@ def _simulate_correction(
         np.nan,
     )
 
-    for algorithm_index, model in enumerate(command_models):
+    for config_index, model in enumerate(command_models):
         state_um = initial_um.copy()
         done = np.zeros(trial_count, dtype=bool)
         moves_done = np.zeros(trial_count, dtype=np.int64)
@@ -457,7 +444,7 @@ def _simulate_correction(
         )
         kalman_prediction_pending = np.zeros(trial_count, dtype=bool)
         for iteration in range(max_moves + 1):
-            true_state_um[algorithm_index, :, iteration, :] = state_um
+            true_state_um[config_index, :, iteration, :] = state_um
             shifts = _measure_states(
                 calibration,
                 jacobian_observation,
@@ -467,7 +454,7 @@ def _simulate_correction(
             )
             if measurement_noise is not None:
                 shifts = shifts + measurement_noise[:, iteration, :, :]
-            measured_shift_px[algorithm_index, :, iteration, :, :] = shifts
+            measured_shift_px[config_index, :, iteration, :, :] = shifts
             if bool(model.get("lqr_use_kalman_filter", False)):
                 if iteration == 0:
                     for trial_index in range(trial_count):
@@ -498,37 +485,33 @@ def _simulate_correction(
                         kalman_covariance[trial_index] = updated["covariance"]
                     kalman_prediction_pending[update_indices] = False
             residuals = _weighted_residuals(shifts, weights_values)
-            weighted_residual_px[algorithm_index, :, iteration] = residuals
-            criterion_residuals = _criterion_residuals(model, shifts, weights_values)
-            correction_criterion_residual[algorithm_index, :, iteration] = (
+            weighted_residual_px[config_index, :, iteration] = residuals
+            criterion_residuals = _criterion_residuals(model, shifts)
+            correction_criterion_residual[config_index, :, iteration] = (
                 criterion_residuals
             )
 
             newly_converged = (~done) & (
-                criterion_residuals <= _model_tolerance(
-                    model,
-                    damped_wls_pixel_tolerance_px=damped_wls_pixel_tolerance_px,
-                    lqr_projected_tolerance=lqr_projected_tolerance,
-                )
+                criterion_residuals <= lqr_projected_tolerance
             )
-            converged[algorithm_index, newly_converged] = True
+            converged[config_index, newly_converged] = True
             done[newly_converged] = True
             if iteration == max_moves:
-                final_weighted_residual_px[algorithm_index, :] = residuals
-                final_correction_criterion_residual[algorithm_index, :] = (
+                final_weighted_residual_px[config_index, :] = residuals
+                final_correction_criterion_residual[config_index, :] = (
                     criterion_residuals
                 )
-                move_count[algorithm_index, :] = moves_done
+                move_count[config_index, :] = moves_done
                 break
 
             active = ~done
             if not np.any(active):
-                final_weighted_residual_px[algorithm_index, :] = residuals
-                final_correction_criterion_residual[algorithm_index, :] = (
+                final_weighted_residual_px[config_index, :] = residuals
+                final_correction_criterion_residual[config_index, :] = (
                     criterion_residuals
                 )
-                move_count[algorithm_index, :] = moves_done
-                true_state_um[algorithm_index, :, iteration + 1 :, :] = state_um[
+                move_count[config_index, :] = moves_done
+                true_state_um[config_index, :, iteration + 1 :, :] = state_um[
                     :,
                     np.newaxis,
                     :,
@@ -546,8 +529,6 @@ def _simulate_correction(
                     model,
                     shifts[active],
                     axis_scale,
-                    jacobian_observation,
-                    weights_values,
                 )
             command_norm_mm = np.linalg.norm(commands_um / 1000.0, axis=1)
             should_move = command_norm_mm > min_command_norm_mm
@@ -555,7 +536,7 @@ def _simulate_correction(
                 moving_indices = active_indices[should_move]
                 moving_commands_um = commands_um[should_move]
                 command_delta_um[
-                    algorithm_index,
+                    config_index,
                     moving_indices,
                     iteration,
                     :,
@@ -563,24 +544,24 @@ def _simulate_correction(
                 errors_um = sampled_error_um[moving_indices, iteration, :]
                 applied_um = moving_commands_um + errors_um
                 applied_delta_um[
-                    algorithm_index,
+                    config_index,
                     moving_indices,
                     iteration,
                     :,
                 ] = applied_um
                 motor_error_um[
-                    algorithm_index,
+                    config_index,
                     moving_indices,
                     iteration,
                     :,
                 ] = errors_um
                 tail_event[
-                    algorithm_index,
+                    config_index,
                     moving_indices,
                     iteration,
                 ] = sampled_tail_event[moving_indices, iteration]
                 move_executed[
-                    algorithm_index,
+                    config_index,
                     moving_indices,
                     iteration,
                 ] = True
@@ -602,65 +583,63 @@ def _simulate_correction(
                 moves_done[moving_indices] += 1
 
     names = [str(config["name"]) for config in configs]
-    kinds = [str(config["algorithm"]) for config in configs]
     return xr.Dataset(
         data_vars={
-            "algorithm_kind": (("algorithm",), np.asarray(kinds, dtype=object)),
             "initial_offset_um": (
                 ("trial", "command_axis"),
                 initial_um,
                 {"units": "um"},
             ),
             "true_state_um": (
-                ("algorithm", "trial", "iteration", "command_axis"),
+                ("lqr_config", "trial", "iteration", "command_axis"),
                 true_state_um,
                 {"units": "um"},
             ),
             "measured_shift_px": (
-                ("algorithm", "trial", "iteration", "camera", "pixel_axis"),
+                ("lqr_config", "trial", "iteration", "camera", "pixel_axis"),
                 measured_shift_px,
                 {"units": "px"},
             ),
             "weighted_residual_px": (
-                ("algorithm", "trial", "iteration"),
+                ("lqr_config", "trial", "iteration"),
                 weighted_residual_px,
                 {"units": "px"},
             ),
             "correction_criterion_residual": (
-                ("algorithm", "trial", "iteration"),
+                ("lqr_config", "trial", "iteration"),
                 correction_criterion_residual,
             ),
             "command_delta_um": (
-                ("algorithm", "trial", "move", "command_axis"),
+                ("lqr_config", "trial", "move", "command_axis"),
                 command_delta_um,
                 {"units": "um"},
             ),
             "applied_delta_um": (
-                ("algorithm", "trial", "move", "command_axis"),
+                ("lqr_config", "trial", "move", "command_axis"),
                 applied_delta_um,
                 {"units": "um"},
             ),
             "motor_error_um": (
-                ("algorithm", "trial", "move", "command_axis"),
+                ("lqr_config", "trial", "move", "command_axis"),
                 motor_error_um,
                 {"units": "um"},
             ),
-            "tail_event": (("algorithm", "trial", "move"), tail_event),
-            "move_executed": (("algorithm", "trial", "move"), move_executed),
-            "converged": (("algorithm", "trial"), converged),
-            "move_count": (("algorithm", "trial"), move_count),
+            "tail_event": (("lqr_config", "trial", "move"), tail_event),
+            "move_executed": (("lqr_config", "trial", "move"), move_executed),
+            "converged": (("lqr_config", "trial"), converged),
+            "move_count": (("lqr_config", "trial"), move_count),
             "final_weighted_residual_px": (
-                ("algorithm", "trial"),
+                ("lqr_config", "trial"),
                 final_weighted_residual_px,
                 {"units": "px"},
             ),
             "final_correction_criterion_residual": (
-                ("algorithm", "trial"),
+                ("lqr_config", "trial"),
                 final_correction_criterion_residual,
             ),
         },
         coords={
-            "algorithm": names,
+            "lqr_config": names,
             "trial": np.arange(trial_count, dtype=np.int64),
             "iteration": np.arange(max_moves + 1, dtype=np.int64),
             "move": np.arange(max_moves, dtype=np.int64),
@@ -671,7 +650,6 @@ def _simulate_correction(
         attrs={
             "simulation_mode": mode,
             "seed": int(seed),
-            "damped_wls_pixel_tolerance_px": float(damped_wls_pixel_tolerance_px),
             "lqr_projected_tolerance": float(lqr_projected_tolerance),
             "max_moves": int(max_moves),
             "trials_per_offset": int(trials_per_offset),
@@ -730,24 +708,38 @@ def _initial_offsets(
     return np.repeat(offsets, trials_per_offset, axis=0)
 
 
-def _algorithm_configs(
-    algorithm_configs: Sequence[Mapping[str, Any]],
-) -> list[Mapping[str, Any]]:
-    configs = [dict(config) for config in algorithm_configs]
+def _lqr_configs(
+    lqr_configs: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    configs = [dict(config) for config in lqr_configs]
     if not configs:
-        raise ValueError("algorithm_configs must not be empty")
+        raise ValueError("lqr_configs must not be empty")
+    allowed_keys = {
+        "name",
+        "gain",
+        "max_normalized_step",
+        "lqr_image_scale_px",
+        "lqr_motor_penalty",
+        "lqr_svd_relative_tolerance",
+        "lqr_use_kalman_filter",
+        "lqr_kalman_process_noise",
+        "lqr_kalman_measurement_noise",
+        "lqr_kalman_measurement_covariance",
+        "lqr_kalman_initial_covariance",
+        "lqr_kalman_innovation_gate",
+    }
     names: set[str] = set()
     for config in configs:
+        extra_keys = set(config) - allowed_keys
+        if extra_keys:
+            keys = ", ".join(sorted(str(key) for key in extra_keys))
+            raise ValueError(f"unsupported LQR config keys: {keys}")
         name = str(config.get("name", "")).strip()
-        algorithm = str(config.get("algorithm", "")).strip().lower()
         if not name:
-            raise ValueError("each algorithm config must include a non-empty name")
+            raise ValueError("each LQR config must include a non-empty name")
         if name in names:
-            raise ValueError(f"duplicate algorithm config name {name!r}")
-        if algorithm not in {"damped_wls", "lqr"}:
-            raise ValueError("algorithm must be 'damped_wls' or 'lqr'")
+            raise ValueError(f"duplicate LQR config name {name!r}")
         config["name"] = name
-        config["algorithm"] = algorithm
         names.add(name)
     return configs
 
@@ -758,103 +750,55 @@ def _command_model(
     axis_scale: np.ndarray,
     weights: np.ndarray,
 ) -> Mapping[str, Any]:
-    algorithm = str(config["algorithm"])
-    weight_matrix = np.diag(weights)
-    if algorithm == "damped_wls":
-        gain = _positive_float(
-            config.get("gain", constants.DEFAULT_DAMPED_WLS_CORRECTION_GAIN),
-            "gain",
-        )
-        damping_mu = _nonnegative_float(
+    gain = _positive_float(
+        config.get("gain", constants.DEFAULT_LQR_CORRECTION_GAIN),
+        "gain",
+    )
+    lqr_design = compute_lqr_correction_design(
+        jacobian_observation,
+        axis_scale,
+        image_scale_px=_positive_float(
             config.get(
-                "damping_mu",
-                constants.DEFAULT_DAMPED_WLS_CORRECTION_DAMPING_MU,
-            ),
-            "damping_mu",
-        )
-        scale_matrix = np.diag(axis_scale)
-        normalized_jacobian = jacobian_observation @ scale_matrix
-        lhs = (
-            normalized_jacobian.T @ weight_matrix @ normalized_jacobian
-            + damping_mu * np.eye(len(COMMAND_AXES), dtype=np.float64)
-        )
-        gain_matrix = gain * (
-            scale_matrix
-            @ np.linalg.solve(lhs, normalized_jacobian.T @ weight_matrix)
-        )
-        max_normalized_step = config.get(
-            "max_normalized_step",
-            constants.DEFAULT_DAMPED_WLS_CORRECTION_MAX_NORMALIZED_STEP,
-        )
-        min_axis_predicted_shift_px = config.get(
-            "min_axis_predicted_shift_px",
-            0.0,
-        )
-    else:
-        gain = _positive_float(
-            config.get("gain", constants.DEFAULT_LQR_CORRECTION_GAIN),
-            "gain",
-        )
-        lqr_design = compute_lqr_correction_design(
-            jacobian_observation,
-            axis_scale,
-            image_scale_px=_positive_float(
-                config.get(
-                    "lqr_image_scale_px",
-                    constants.DEFAULT_LQR_CORRECTION_IMAGE_SCALE_PX,
-                ),
                 "lqr_image_scale_px",
+                constants.DEFAULT_LQR_CORRECTION_IMAGE_SCALE_PX,
             ),
-            motor_penalty=_positive_float(
-                config.get(
-                    "lqr_motor_penalty",
-                    constants.DEFAULT_LQR_CORRECTION_MOTOR_PENALTY,
-                ),
-                "lqr_motor_penalty",
-            ),
-            svd_relative_tolerance=_positive_float(
-                config.get(
-                    "lqr_svd_relative_tolerance",
-                    constants.DEFAULT_LQR_CORRECTION_SVD_RELATIVE_TOLERANCE,
-                ),
-                "lqr_svd_relative_tolerance",
-            ),
-            weights=weights,
-        )
-        gain_matrix = gain * np.asarray(lqr_design["real_feedback_gain"])
-        max_normalized_step = config.get(
-            "max_normalized_step",
-            constants.DEFAULT_LQR_CORRECTION_MAX_NORMALIZED_STEP,
-        )
-        min_axis_predicted_shift_px = config.get(
-            "min_axis_predicted_shift_px",
-            0.0,
-        )
-        lqr_use_kalman_filter = bool(
+            "lqr_image_scale_px",
+        ),
+        motor_penalty=_positive_float(
             config.get(
-                "lqr_use_kalman_filter",
-                constants.DEFAULT_LQR_CORRECTION_USE_KALMAN_FILTER,
-            )
+                "lqr_motor_penalty",
+                constants.DEFAULT_LQR_CORRECTION_MOTOR_PENALTY,
+            ),
+            "lqr_motor_penalty",
+        ),
+        svd_relative_tolerance=_positive_float(
+            config.get(
+                "lqr_svd_relative_tolerance",
+                constants.DEFAULT_LQR_CORRECTION_SVD_RELATIVE_TOLERANCE,
+            ),
+            "lqr_svd_relative_tolerance",
+        ),
+        weights=weights,
+    )
+    gain_matrix = gain * np.asarray(lqr_design["real_feedback_gain"])
+    max_normalized_step = config.get(
+        "max_normalized_step",
+        constants.DEFAULT_LQR_CORRECTION_MAX_NORMALIZED_STEP,
+    )
+    lqr_use_kalman_filter = bool(
+        config.get(
+            "lqr_use_kalman_filter",
+            constants.DEFAULT_LQR_CORRECTION_USE_KALMAN_FILTER,
         )
+    )
 
     max_step = _optional_positive_float(max_normalized_step, "max_normalized_step")
-    min_axis_shift = _nonnegative_float(
-        min_axis_predicted_shift_px,
-        "min_axis_predicted_shift_px",
-    )
-    axis_sensitivity = np.sqrt(
-        np.diag(jacobian_observation.T @ weight_matrix @ jacobian_observation)
-    )
     model = {
-        "algorithm": algorithm,
         "gain_matrix": gain_matrix,
         "max_normalized_step": max_step,
-        "min_axis_predicted_shift_px": min_axis_shift,
-        "axis_sensitivity": axis_sensitivity,
+        "lqr_design": lqr_design,
     }
-    if algorithm == "lqr":
-        model["lqr_design"] = lqr_design
-    if algorithm == "lqr" and lqr_use_kalman_filter:
+    if lqr_use_kalman_filter:
         model |= {
             "lqr_use_kalman_filter": True,
             "gain": gain,
@@ -906,11 +850,11 @@ def _commands_from_shifts(
     model: Mapping[str, Any],
     shift_px: np.ndarray,
     axis_scale: np.ndarray,
-    jacobian_observation: np.ndarray,
-    weights: np.ndarray,
 ) -> np.ndarray:
-    del jacobian_observation, weights
-    observations = np.asarray(shift_px, dtype=np.float64).reshape(-1, len(OBSERVATION_AXES))
+    observations = np.asarray(shift_px, dtype=np.float64).reshape(
+        -1,
+        len(OBSERVATION_AXES),
+    )
     correction_mm = -(observations @ np.asarray(model["gain_matrix"]).T)
     max_normalized_step = model["max_normalized_step"]
     if max_normalized_step is not None:
@@ -920,13 +864,6 @@ def _commands_from_shifts(
             float(max_normalized_step) / np.maximum(max_component, 1e-300),
         )
         correction_mm *= scale[:, np.newaxis]
-    min_axis_predicted_shift_px = float(model["min_axis_predicted_shift_px"])
-    if min_axis_predicted_shift_px > 0.0:
-        predicted_axis_shift_px = (
-            np.abs(correction_mm) * np.asarray(model["axis_sensitivity"])
-        )
-        correction_mm = correction_mm.copy()
-        correction_mm[predicted_axis_shift_px < min_axis_predicted_shift_px] = 0.0
     return 1000.0 * correction_mm
 
 
@@ -1026,36 +963,16 @@ def _weighted_residuals(shifts: np.ndarray, weights: np.ndarray) -> np.ndarray:
 def _criterion_residuals(
     model: Mapping[str, Any],
     shifts: np.ndarray,
-    weights: np.ndarray,
 ) -> np.ndarray:
-    algorithm = str(model["algorithm"])
-    if algorithm == "damped_wls":
-        return _weighted_residuals(shifts, weights)
-    if algorithm == "lqr":
-        observations = np.asarray(shifts, dtype=np.float64).reshape(
-            -1,
-            len(OBSERVATION_AXES),
-        )
-        design = model["lqr_design"]
-        image_scale = np.asarray(design["image_scale"], dtype=np.float64)
-        controllable_basis = np.asarray(design["controllable_basis"], dtype=np.float64)
-        projected = (observations / image_scale[np.newaxis, :]) @ controllable_basis
-        return np.linalg.norm(projected, axis=1)
-    raise ValueError(f"unsupported correction algorithm {algorithm!r}")
-
-
-def _model_tolerance(
-    model: Mapping[str, Any],
-    *,
-    damped_wls_pixel_tolerance_px: float,
-    lqr_projected_tolerance: float,
-) -> float:
-    algorithm = str(model["algorithm"])
-    if algorithm == "damped_wls":
-        return float(damped_wls_pixel_tolerance_px)
-    if algorithm == "lqr":
-        return float(lqr_projected_tolerance)
-    raise ValueError(f"unsupported correction algorithm {algorithm!r}")
+    observations = np.asarray(shifts, dtype=np.float64).reshape(
+        -1,
+        len(OBSERVATION_AXES),
+    )
+    design = model["lqr_design"]
+    image_scale = np.asarray(design["image_scale"], dtype=np.float64)
+    controllable_basis = np.asarray(design["controllable_basis"], dtype=np.float64)
+    projected = (observations / image_scale[np.newaxis, :]) @ controllable_basis
+    return np.linalg.norm(projected, axis=1)
 
 
 def _as_rng(rng: np.random.Generator | int) -> np.random.Generator:

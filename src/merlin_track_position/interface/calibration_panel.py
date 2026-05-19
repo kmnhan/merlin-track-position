@@ -71,8 +71,8 @@ METRIC_ROWS: tuple[tuple[str, str, str], ...] = (
         "axis_scale_cmd_mm",
         "Axis scale cmd mm",
         _tooltip_html(
-            ("Saved x/y/z command scales used by normalized damped correction.",),
-            ("These are commanded-mm damping scales, not measured physical travel.",),
+            ("Saved x/y/z command scales used by normalized LQR correction.",),
+            ("These are commanded-mm normalization scales, not measured physical travel.",),
         ),
     ),
     (
@@ -89,17 +89,6 @@ METRIC_ROWS: tuple[tuple[str, str, str], ...] = (
         _tooltip_html(
             ("Target image response used when deriving correction axis scales.",),
             ("Shown for diagnosing scale clamping during calibration.",),
-        ),
-    ),
-    (
-        "jacobian_refinement_count",
-        "Jacobian updates",
-        _tooltip_html(
-            (
-                "Number of accepted closed-loop Jacobian refinements saved "
-                "into this dataset.",
-            ),
-            ("Nonzero means correction has refined the calibration on disk.",),
         ),
     ),
     (
@@ -398,9 +387,6 @@ def _calibration_summary(dataset: xr.Dataset) -> dict[str, object]:
         "axis_scale_unclamped_cmd_mm": axis_scale_unclamped,
         "axis_scale_bounds_cmd_mm": axis_scale_bounds,
         "axis_scale_target_response_px": axis_scale_target_response_px,
-        "jacobian_refinement_count": int(
-            dataset.attrs.get("jacobian_refinement_count", 0)
-        ),
         "residual_rms_px": residual_rms_px,
         "residual_max_px": residual_max_px,
         "residual_rms_cmd_mm": residual_rms_cmd_mm,

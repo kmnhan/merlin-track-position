@@ -23,10 +23,8 @@ from merlin_track_position.tracking.calibration_core import (
     flush_pending_calibration_datasets,
     fit_jacobian_calibration,
     load_calibration_dataset,
-    refine_jacobian_from_observations,
     save_calibration_dataset,
     save_calibration_dataset_deferred,
-    solve_damped_command_correction,
     solve_lqr_command_correction,
     validate_visual_calibration_dataset,
     weighted_pixel_residual,
@@ -47,10 +45,8 @@ from merlin_track_position.tracking.detect import detect_shift
 from merlin_track_position.tracking.persistence import pending_entry_count
 
 TEST_CORRECTION_GAIN = 0.6
-TEST_CORRECTION_DAMPING_MU = 1.0
 TEST_CORRECTION_MAX_NORMALIZED_STEP = 0.5
 TEST_CORRECTION_WEIGHTS = (1.0, 1.0, 1.0, 1.0)
-TEST_CORRECTION_DEADBANDS_MM_BY_AXIS = {"x": 0.001, "y": 0.001, "z": 0.001}
 TEST_LQR_IMAGE_SCALE_PX = 0.1
 TEST_LQR_MOTOR_PENALTY = 100.0
 TEST_LQR_SVD_RELATIVE_TOLERANCE = 1e-6
@@ -173,10 +169,7 @@ def calibration_dataset(jacobian=None):
             "y_cam1": np.arange(6),
             "x_cam1": np.arange(7),
         },
-        attrs={
-            "warnings": "",
-            "jacobian_refinement_count": 0,
-        },
+        attrs={"warnings": ""},
     )
     validate_visual_calibration_dataset(dataset)
     return dataset
@@ -480,11 +473,11 @@ class VisualCalibrationTests(unittest.TestCase):
             calibration["probe_command_delta_mm"].values,
         )
         np.testing.assert_allclose(axis_sensitivity, [1000.0, 10.0, 100.0], atol=1e-9)
-        np.testing.assert_allclose(axis_scale_unclamped, [0.03, 3.0, 0.3], atol=1e-9)
-        np.testing.assert_allclose(derived_axis_scale, [0.1, 1.0, 0.3], atol=1e-9)
+        np.testing.assert_allclose(axis_scale_unclamped, [0.02, 2.0, 0.2], atol=1e-9)
+        np.testing.assert_allclose(derived_axis_scale, [0.1, 1.0, 0.2], atol=1e-9)
         np.testing.assert_allclose(
             calibration["axis_scale_cmd_mm"].values,
-            [0.1, 1.0, 0.3],
+            [0.1, 1.0, 0.2],
             atol=1e-9,
         )
 
@@ -629,13 +622,13 @@ class VisualCalibrationTests(unittest.TestCase):
             path = tmp_path / "calibration.h5"
             original_save = calibration_core.save_calibration_dataset
             original_save(
-                calibration_dataset().assign_attrs(jacobian_refinement_count=0),
+                calibration_dataset().assign_attrs(calibration_note="original"),
                 path,
             )
 
-            queued = calibration_dataset().assign_attrs(jacobian_refinement_count=1)
+            queued = calibration_dataset().assign_attrs(calibration_note="queued")
             replacement = calibration_dataset().assign_attrs(
-                jacobian_refinement_count=99
+                calibration_note="replacement"
             )
 
             with patch.dict(
@@ -654,7 +647,7 @@ class VisualCalibrationTests(unittest.TestCase):
                 flush_results = flush_pending_calibration_datasets(path)
                 loaded = load_calibration_dataset(path)
 
-            self.assertEqual(int(loaded.attrs["jacobian_refinement_count"]), 99)
+            self.assertEqual(loaded.attrs["calibration_note"], "replacement")
             self.assertEqual(len(flush_results), 1)
             self.assertFalse(flush_results[0].flushed)
             self.assertFalse(flush_results[0].pending)
@@ -874,17 +867,20 @@ class CorrectionTests(unittest.TestCase):
         self.assertNotIn("correction_move_finished_at", saved.attrs)
         move.assert_not_called()
 
-    def test_damped_correction_uses_command_state_not_readback_state(self):
+    def test_correction_uses_command_state_not_readback_state(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = self.save_calibration(tmpdir)
             p0 = np.array([[60.0, -40.0], [20.0, 10.0]], dtype=float)
             p1 = np.zeros((2, 2), dtype=float)
-            expected_delta = solve_damped_command_correction(
+            expected_delta = solve_lqr_command_correction(
                 calibration_dataset()["px_per_cmd_mm"].values,
                 shift_dataset(p0),
                 calibration_dataset()["axis_scale_cmd_mm"].values,
                 gain=TEST_CORRECTION_GAIN,
-                damping_mu=TEST_CORRECTION_DAMPING_MU,
+                image_scale_px=TEST_LQR_IMAGE_SCALE_PX,
+                motor_penalty=TEST_LQR_MOTOR_PENALTY,
+                svd_relative_tolerance=TEST_LQR_SVD_RELATIVE_TOLERANCE,
+                max_normalized_step=TEST_CORRECTION_MAX_NORMALIZED_STEP,
                 weights=TEST_CORRECTION_WEIGHTS,
             )
             hardware_patches = self.patch_hardware(
@@ -905,7 +901,10 @@ class CorrectionTests(unittest.TestCase):
                     capture_count=1,
                     max_moves=1,
                     gain=TEST_CORRECTION_GAIN,
-                    damping_mu=TEST_CORRECTION_DAMPING_MU,
+                    max_normalized_step=TEST_CORRECTION_MAX_NORMALIZED_STEP,
+                    lqr_image_scale_px=TEST_LQR_IMAGE_SCALE_PX,
+                    lqr_motor_penalty=TEST_LQR_MOTOR_PENALTY,
+                    lqr_svd_relative_tolerance=TEST_LQR_SVD_RELATIVE_TOLERANCE,
                     weights=TEST_CORRECTION_WEIGHTS,
                 )
 
@@ -914,7 +913,10 @@ class CorrectionTests(unittest.TestCase):
             np.asarray(requested, dtype=float),
             np.array([10.0, 20.0, 30.0]) + expected_delta,
         )
-        self.assertEqual(result.attrs["correction_algorithm"], "damped_wls")
+        self.assertEqual(
+            result.attrs["correction_criterion"],
+            "lqr_projected_normalized_error",
+        )
 
     def test_correction_can_delegate_iterative_moves_to_motor_backend(self):
         class FakeMotorBackend:
@@ -1011,7 +1013,7 @@ class CorrectionTests(unittest.TestCase):
             ["get", "measure", "move", "get", "measure", "move", "get", "measure"],
         )
 
-    def test_lqr_algorithm_moves_commanded_mm_through_existing_loop(self):
+    def test_lqr_correction_moves_commanded_mm_through_existing_loop(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = self.save_calibration(tmpdir)
             calibration = calibration_dataset()
@@ -1026,14 +1028,12 @@ class CorrectionTests(unittest.TestCase):
                 motor_penalty=TEST_LQR_MOTOR_PENALTY,
                 svd_relative_tolerance=TEST_LQR_SVD_RELATIVE_TOLERANCE,
                 max_normalized_step=TEST_CORRECTION_MAX_NORMALIZED_STEP,
-                min_axis_predicted_shift_px=0.0,
                 weights=TEST_CORRECTION_WEIGHTS,
             )
             hardware_patches = self.patch_hardware(
                 [shift_dataset(p0), shift_dataset(p1)]
             )
             with (
-                patch.object(constants, "CORRECTION_ALGORITHM", "lqr"),
                 hardware_patches[0],
                 hardware_patches[1],
                 hardware_patches[2],
@@ -1064,7 +1064,6 @@ class CorrectionTests(unittest.TestCase):
             result["move_model_residual_delta_px"].values[0],
             expected_model_residual,
         )
-        self.assertEqual(result.attrs["correction_algorithm"], "lqr")
         self.assertIn("correction_lqr_motor_penalty", result.attrs)
 
     def test_lqr_convergence_uses_projected_normalized_error(self):
@@ -1097,7 +1096,7 @@ class CorrectionTests(unittest.TestCase):
                     shift_dataset(shift),
                     weights=TEST_CORRECTION_WEIGHTS,
                 ),
-                constants.DEFAULT_DAMPED_WLS_CORRECTION_PIXEL_TOLERANCE_PX,
+                0.0,
             )
             self.assertLess(
                 calibration_core.lqr_projected_residual_from_design(
@@ -1108,7 +1107,6 @@ class CorrectionTests(unittest.TestCase):
             )
             hardware_patches = self.patch_hardware([shift_dataset(shift)])
             with (
-                patch.object(constants, "CORRECTION_ALGORITHM", "lqr"),
                 hardware_patches[0],
                 hardware_patches[1],
                 hardware_patches[2],
@@ -1135,7 +1133,7 @@ class CorrectionTests(unittest.TestCase):
         )
         self.assertIn("iteration_correction_criterion_residual", result)
 
-    def test_lqr_kalman_algorithm_uses_filtered_state_for_command(self):
+    def test_lqr_kalman_correction_uses_filtered_state_for_command(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = self.save_calibration(tmpdir)
             calibration = calibration_dataset()
@@ -1150,14 +1148,12 @@ class CorrectionTests(unittest.TestCase):
                 motor_penalty=TEST_LQR_MOTOR_PENALTY,
                 svd_relative_tolerance=TEST_LQR_SVD_RELATIVE_TOLERANCE,
                 max_normalized_step=TEST_CORRECTION_MAX_NORMALIZED_STEP,
-                min_axis_predicted_shift_px=0.0,
                 weights=TEST_CORRECTION_WEIGHTS,
             )
             hardware_patches = self.patch_hardware(
                 [shift_dataset(p0), shift_dataset(p1)]
             )
             with (
-                patch.object(constants, "CORRECTION_ALGORITHM", "lqr"),
                 patch.object(
                     constants,
                     "DEFAULT_LQR_CORRECTION_USE_KALMAN_FILTER",
@@ -1210,7 +1206,6 @@ class CorrectionTests(unittest.TestCase):
                 [shift_dataset(p0), shift_dataset(p1)]
             )
             with (
-                patch.object(constants, "CORRECTION_ALGORITHM", "lqr"),
                 patch.object(
                     constants,
                     "DEFAULT_LQR_CORRECTION_USE_KALMAN_FILTER",
@@ -1271,14 +1266,12 @@ class CorrectionTests(unittest.TestCase):
                 motor_penalty=TEST_LQR_MOTOR_PENALTY,
                 svd_relative_tolerance=TEST_LQR_SVD_RELATIVE_TOLERANCE,
                 max_normalized_step=lqr_max_step,
-                min_axis_predicted_shift_px=0.0,
                 weights=TEST_CORRECTION_WEIGHTS,
             )
             hardware_patches = self.patch_hardware(
                 [shift_dataset(p0), shift_dataset(p1)]
             )
             with (
-                patch.object(constants, "CORRECTION_ALGORITHM", "lqr"),
                 patch.object(constants, "DEFAULT_LQR_CORRECTION_GAIN", lqr_gain),
                 patch.object(
                     constants,
@@ -1309,137 +1302,6 @@ class CorrectionTests(unittest.TestCase):
             np.array([10.0, 20.0, 30.0]) + expected_delta,
         )
 
-    def test_lqr_bypasses_legacy_predicted_response_pruning(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = self.save_calibration(tmpdir)
-            calibration = calibration_dataset()
-            offset_mm = np.array([0.0005, 0.0, 0.0], dtype=float)
-            p0 = (
-                calibration["px_per_cmd_mm"].values.reshape(
-                    len(CAMERAS) * len(PIXEL_AXES), len(COMMAND_AXES)
-                )
-                @ offset_mm
-            ).reshape(len(CAMERAS), len(PIXEL_AXES))
-            p1 = np.zeros((len(CAMERAS), len(PIXEL_AXES)), dtype=float)
-            hardware_patches = self.patch_hardware(
-                [shift_dataset(p0), shift_dataset(p1)]
-            )
-            with (
-                patch.object(constants, "CORRECTION_ALGORITHM", "lqr"),
-                hardware_patches[0],
-                hardware_patches[1],
-                hardware_patches[2],
-                patch(
-                    "merlin_track_position.tracking.correct.move_motors_and_wait",
-                    return_value=(10.0, 20.0, 30.0),
-                ) as move,
-            ):
-                result = do_correction(
-                    path,
-                    capture_count=1,
-                    max_moves=1,
-                    lqr_projected_tolerance=0.001,
-                    gain=TEST_CORRECTION_GAIN,
-                    min_total_predicted_shift_px=10.0,
-                    lqr_image_scale_px=TEST_LQR_IMAGE_SCALE_PX,
-                    lqr_motor_penalty=TEST_LQR_MOTOR_PENALTY,
-                    lqr_svd_relative_tolerance=TEST_LQR_SVD_RELATIVE_TOLERANCE,
-                    weights=TEST_CORRECTION_WEIGHTS,
-                )
-
-        move.assert_called_once()
-        self.assertTrue(result.attrs["correction_converged"])
-        self.assertNotIn("observable feedback threshold", result.attrs["warnings"])
-
-    def test_lqr_keeps_nominal_jacobian_fixed_after_improvement(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = self.save_calibration(tmpdir)
-            p0 = x_shift(30.0)
-            p1 = x_shift(10.0)
-            hardware_patches = self.patch_hardware(
-                [shift_dataset(p0), shift_dataset(p1)]
-            )
-            with (
-                patch.object(constants, "CORRECTION_ALGORITHM", "lqr"),
-                hardware_patches[0],
-                hardware_patches[1],
-                hardware_patches[2],
-                patch(
-                    "merlin_track_position.tracking.correct.move_motors_and_wait",
-                    return_value=(10.0, 20.0, 30.0),
-                ),
-                patch(
-                    "merlin_track_position.tracking.correct."
-                    "_correction_feedback_is_valid",
-                    return_value=True,
-                ),
-                patch(
-                    "merlin_track_position.tracking.correct."
-                    "refine_jacobian_from_observations"
-                ) as refine,
-            ):
-                result = do_correction(
-                    path,
-                    capture_count=1,
-                    max_moves=1,
-                    gain=TEST_CORRECTION_GAIN,
-                    lqr_image_scale_px=TEST_LQR_IMAGE_SCALE_PX,
-                    lqr_motor_penalty=TEST_LQR_MOTOR_PENALTY,
-                    lqr_svd_relative_tolerance=TEST_LQR_SVD_RELATIVE_TOLERANCE,
-                    weights=TEST_CORRECTION_WEIGHTS,
-                )
-
-            reloaded = load_calibration_dataset(path)
-
-        refine.assert_not_called()
-        self.assertFalse(bool(result["move_jacobian_refined"].values[0]))
-        self.assertEqual(int(reloaded.attrs["jacobian_refinement_count"]), 0)
-
-    def test_lqr_continues_after_invalid_feedback(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = self.save_calibration(tmpdir)
-            calibration = calibration_dataset()
-            offset_mm = np.array([0.0005, 0.0, 0.0], dtype=float)
-            p0 = (
-                calibration["px_per_cmd_mm"].values.reshape(
-                    len(CAMERAS) * len(PIXEL_AXES), len(COMMAND_AXES)
-                )
-                @ offset_mm
-            ).reshape(len(CAMERAS), len(PIXEL_AXES))
-            p1 = p0.copy()
-            p2 = np.zeros((len(CAMERAS), len(PIXEL_AXES)), dtype=float)
-            hardware_patches = self.patch_hardware(
-                [shift_dataset(p0), shift_dataset(p1), shift_dataset(p2)]
-            )
-            with (
-                patch.object(constants, "CORRECTION_ALGORITHM", "lqr"),
-                hardware_patches[0],
-                hardware_patches[1],
-                hardware_patches[2],
-                patch(
-                    "merlin_track_position.tracking.correct.move_motors_and_wait",
-                    return_value=(10.0, 20.0, 30.0),
-                ) as move,
-            ):
-                result = do_correction(
-                    path,
-                    capture_count=1,
-                    max_moves=2,
-                    lqr_projected_tolerance=0.001,
-                    gain=TEST_CORRECTION_GAIN,
-                    min_total_predicted_shift_px=10.0,
-                    lqr_image_scale_px=TEST_LQR_IMAGE_SCALE_PX,
-                    lqr_motor_penalty=TEST_LQR_MOTOR_PENALTY,
-                    lqr_svd_relative_tolerance=TEST_LQR_SVD_RELATIVE_TOLERANCE,
-                    weights=TEST_CORRECTION_WEIGHTS,
-                )
-
-        self.assertEqual(move.call_count, 2)
-        self.assertEqual(result.sizes["move"], 2)
-        self.assertFalse(bool(result["move_feedback_valid"].values[0]))
-        self.assertTrue(result.attrs["correction_converged"])
-        self.assertNotIn("post-move image response", result.attrs["warnings"])
-
     def test_lqr_keeps_gain_fixed_after_valid_nondecreasing_feedback(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = self.save_calibration(tmpdir)
@@ -1454,7 +1316,6 @@ class CorrectionTests(unittest.TestCase):
                 motor_penalty=TEST_LQR_MOTOR_PENALTY,
                 svd_relative_tolerance=TEST_LQR_SVD_RELATIVE_TOLERANCE,
                 max_normalized_step=TEST_CORRECTION_MAX_NORMALIZED_STEP,
-                min_axis_predicted_shift_px=0.0,
                 weights=TEST_CORRECTION_WEIGHTS,
             )
             predicted_delta = (
@@ -1481,7 +1342,6 @@ class CorrectionTests(unittest.TestCase):
                 [shift_dataset(p0), shift_dataset(p1)]
             )
             with (
-                patch.object(constants, "CORRECTION_ALGORITHM", "lqr"),
                 hardware_patches[0],
                 hardware_patches[1],
                 hardware_patches[2],
@@ -1495,7 +1355,6 @@ class CorrectionTests(unittest.TestCase):
                     capture_count=1,
                     max_moves=1,
                     gain=TEST_CORRECTION_GAIN,
-                    min_gain=0.15,
                     max_normalized_step=TEST_CORRECTION_MAX_NORMALIZED_STEP,
                     lqr_image_scale_px=TEST_LQR_IMAGE_SCALE_PX,
                     lqr_motor_penalty=TEST_LQR_MOTOR_PENALTY,
@@ -1512,44 +1371,6 @@ class CorrectionTests(unittest.TestCase):
             float(result.attrs["correction_final_gain"]),
             TEST_CORRECTION_GAIN,
         )
-        self.assertAlmostEqual(
-            float(result.attrs["correction_final_damping_mu"]),
-            TEST_CORRECTION_DAMPING_MU,
-        )
-
-    def test_normalized_step_limit_caps_largest_axis_component(self):
-        jacobian = np.array(
-            [
-                [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
-                [[0.0, 0.0, 1.0], [0.0, 0.0, 0.0]],
-            ],
-            dtype=float,
-        )
-        correction = solve_damped_command_correction(
-            jacobian,
-            shift_dataset(np.array([[10.0, 0.0], [0.0, 0.0]])),
-            axis_scale_cmd_mm=[1.0, 1.0, 1.0],
-            gain=1.0,
-            damping_mu=0.0,
-            max_normalized_step=0.5,
-            min_axis_predicted_shift_px=0.0,
-        )
-
-        np.testing.assert_allclose(correction, [-0.5, 0.0, 0.0])
-
-    def test_low_visual_impact_axis_components_are_zeroed(self):
-        correction = solve_damped_command_correction(
-            px_per_cmd_mm(),
-            shift_dataset(np.array([[2.0, 0.0], [0.0, 0.0]])),
-            calibration_dataset()["axis_scale_cmd_mm"].values,
-            gain=0.3,
-            damping_mu=1e-2,
-            min_axis_predicted_shift_px=0.25,
-        )
-
-        self.assertNotEqual(correction[0], 0.0)
-        self.assertEqual(correction[1], 0.0)
-        self.assertEqual(correction[2], 0.0)
 
     def test_lqr_gain_is_stable_and_reduces_predicted_residual(self):
         calibration = calibration_dataset()
@@ -1586,7 +1407,6 @@ class CorrectionTests(unittest.TestCase):
             image_scale_px=TEST_LQR_IMAGE_SCALE_PX,
             motor_penalty=TEST_LQR_MOTOR_PENALTY,
             svd_relative_tolerance=TEST_LQR_SVD_RELATIVE_TOLERANCE,
-            min_axis_predicted_shift_px=0.0,
             weights=TEST_CORRECTION_WEIGHTS,
         )
         before = shift.reshape(-1)
@@ -1673,114 +1493,15 @@ class CorrectionTests(unittest.TestCase):
             motor_penalty=TEST_LQR_MOTOR_PENALTY,
             svd_relative_tolerance=TEST_LQR_SVD_RELATIVE_TOLERANCE,
             max_normalized_step=0.5,
-            min_axis_predicted_shift_px=0.0,
             weights=TEST_CORRECTION_WEIGHTS,
         )
 
         np.testing.assert_allclose(correction, [-0.5, 0.0, 0.0])
 
-    def test_tiny_correction_stops_without_motor_move(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = self.save_calibration(tmpdir)
-            p0 = np.array([[0.62, 0.0], [0.0, 0.0]])
-            hardware_patches = self.patch_hardware([shift_dataset(p0)])
-            with (
-                patch.object(
-                    constants,
-                    "DAMPED_WLS_CORRECTION_COMMAND_DEADBAND_MM_BY_AXIS",
-                    TEST_CORRECTION_DEADBANDS_MM_BY_AXIS,
-                ),
-                hardware_patches[0],
-                hardware_patches[1],
-                hardware_patches[2],
-                patch(
-                    "merlin_track_position.tracking.correct.move_motors_and_wait",
-                    Mock(),
-                ) as move,
-            ):
-                result = do_correction(
-                    path,
-                    capture_count=1,
-                    max_moves=1,
-                    gain=TEST_CORRECTION_GAIN,
-                    damping_mu=TEST_CORRECTION_DAMPING_MU,
-                    weights=TEST_CORRECTION_WEIGHTS,
-                )
-
-        move.assert_not_called()
-        self.assertFalse(result.attrs["correction_converged"])
-        self.assertIn(
-            "estimated command offset is within correction deadbands",
-            result.attrs["warnings"],
-        )
-
-    def test_offset_above_deadband_is_corrected_when_gained_step_is_small(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = self.save_calibration(tmpdir)
-            calibration = calibration_dataset()
-            offset_mm = np.array(
-                [
-                    0.0,
-                    1.5 * TEST_CORRECTION_DEADBANDS_MM_BY_AXIS["y"],
-                    0.0,
-                ],
-                dtype=float,
-            )
-            p0 = (
-                calibration["px_per_cmd_mm"].values.reshape(
-                    len(CAMERAS) * len(PIXEL_AXES), len(COMMAND_AXES)
-                )
-                @ offset_mm
-            ).reshape(len(CAMERAS), len(PIXEL_AXES))
-            p1 = np.zeros((len(CAMERAS), len(PIXEL_AXES)), dtype=float)
-            expected_delta = solve_damped_command_correction(
-                calibration["px_per_cmd_mm"].values,
-                shift_dataset(p0),
-                calibration["axis_scale_cmd_mm"].values,
-                gain=TEST_CORRECTION_GAIN,
-                damping_mu=TEST_CORRECTION_DAMPING_MU,
-                weights=TEST_CORRECTION_WEIGHTS,
-            )
-            self.assertLess(
-                abs(expected_delta[1]),
-                TEST_CORRECTION_DEADBANDS_MM_BY_AXIS["y"],
-            )
-            hardware_patches = self.patch_hardware(
-                [shift_dataset(p0), shift_dataset(p1)]
-            )
-            with (
-                patch.object(
-                    constants,
-                    "DAMPED_WLS_CORRECTION_COMMAND_DEADBAND_MM_BY_AXIS",
-                    TEST_CORRECTION_DEADBANDS_MM_BY_AXIS,
-                ),
-                hardware_patches[0],
-                hardware_patches[1],
-                hardware_patches[2],
-                patch(
-                    "merlin_track_position.tracking.correct.move_motors_and_wait",
-                    Mock(),
-                ) as move,
-            ):
-                do_correction(
-                    path,
-                    capture_count=1,
-                    max_moves=1,
-                    gain=TEST_CORRECTION_GAIN,
-                    damping_mu=TEST_CORRECTION_DAMPING_MU,
-                    weights=TEST_CORRECTION_WEIGHTS,
-                )
-
-        self.assertEqual(move.call_args.args[0], ("y",))
-        np.testing.assert_allclose(
-            np.asarray(move.call_args.args[1], dtype=float),
-            np.asarray([20.0 + expected_delta[1]], dtype=float),
-        )
-
-    def test_unobservable_predicted_response_stops_without_motor_move(self):
+    def test_zeroed_axes_are_not_sent_to_motor_move(self):
         jacobian = np.array(
             [
-                [[100.0, 0.0, 0.0], [0.0, 10.0, 0.0]],
+                [[100.0, 0.0, 0.0], [0.0, 100.0, 0.0]],
                 [[0.0, 0.0, 100.0], [0.0, 0.0, 0.0]],
             ],
             dtype=float,
@@ -1789,60 +1510,6 @@ class CorrectionTests(unittest.TestCase):
             path = Path(tmpdir) / "calibration.h5"
             calibration = calibration_dataset(jacobian)
             save_calibration_dataset(calibration, path)
-            offset_mm = np.array([0.0, 0.080, 0.0], dtype=float)
-            p0 = (
-                jacobian.reshape(len(CAMERAS) * len(PIXEL_AXES), len(COMMAND_AXES))
-                @ offset_mm
-            ).reshape(len(CAMERAS), len(PIXEL_AXES))
-            hardware_patches = self.patch_hardware([shift_dataset(p0)])
-            with (
-                hardware_patches[0],
-                hardware_patches[1],
-                hardware_patches[2],
-                patch(
-                    "merlin_track_position.tracking.correct.move_motors_and_wait",
-                    Mock(),
-                ) as move,
-            ):
-                result = do_correction(
-                    path,
-                    capture_count=1,
-                    gain=TEST_CORRECTION_GAIN,
-                    damping_mu=TEST_CORRECTION_DAMPING_MU,
-                    min_axis_predicted_shift_px=0.0,
-                    min_total_predicted_shift_px=0.6,
-                    max_moves=1,
-                    weights=TEST_CORRECTION_WEIGHTS,
-                )
-
-        move.assert_not_called()
-        self.assertFalse(result.attrs["correction_converged"])
-        self.assertIn("observable feedback threshold", result.attrs["warnings"])
-
-    def test_correction_command_deadband_uses_correction_specific_constants(self):
-        deadbands = {"x": 0.002, "y": 0.010, "z": 0.005}
-        with patch.object(
-            constants,
-            "DAMPED_WLS_CORRECTION_COMMAND_DEADBAND_MM_BY_AXIS",
-            deadbands,
-        ):
-            correction = correct_module._zero_deadband_axis_corrections(
-                np.array(
-                    [
-                        0.5 * deadbands["x"],
-                        1.1 * deadbands["y"],
-                        -1.02 * deadbands["z"],
-                    ],
-                    dtype=float,
-                )
-            )
-
-        np.testing.assert_allclose(correction, [0.0, 0.011, -0.0051])
-
-    def test_zeroed_axes_are_not_sent_to_motor_move(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = self.save_calibration(tmpdir)
-            calibration = calibration_dataset()
             offset_mm = np.array([0.020, 0.0, 0.0], dtype=float)
             p0 = (
                 calibration["px_per_cmd_mm"].values.reshape(
@@ -1868,7 +1535,9 @@ class CorrectionTests(unittest.TestCase):
                     capture_count=1,
                     max_moves=1,
                     gain=TEST_CORRECTION_GAIN,
-                    damping_mu=TEST_CORRECTION_DAMPING_MU,
+                    lqr_image_scale_px=TEST_LQR_IMAGE_SCALE_PX,
+                    lqr_motor_penalty=TEST_LQR_MOTOR_PENALTY,
+                    lqr_svd_relative_tolerance=TEST_LQR_SVD_RELATIVE_TOLERANCE,
                     weights=TEST_CORRECTION_WEIGHTS,
                 )
 
@@ -1890,13 +1559,25 @@ class CorrectionTests(unittest.TestCase):
                 @ offset_mm
             ).reshape(len(CAMERAS), len(PIXEL_AXES))
             p1 = np.zeros((len(CAMERAS), len(PIXEL_AXES)), dtype=float)
-            expected_delta = solve_damped_command_correction(
+            expected_delta = solve_lqr_command_correction(
                 calibration["px_per_cmd_mm"].values,
                 shift_dataset(p0),
                 calibration["axis_scale_cmd_mm"].values,
                 gain=TEST_CORRECTION_GAIN,
-                damping_mu=TEST_CORRECTION_DAMPING_MU,
+                image_scale_px=TEST_LQR_IMAGE_SCALE_PX,
+                motor_penalty=TEST_LQR_MOTOR_PENALTY,
+                svd_relative_tolerance=TEST_LQR_SVD_RELATIVE_TOLERANCE,
+                max_normalized_step=TEST_CORRECTION_MAX_NORMALIZED_STEP,
                 weights=TEST_CORRECTION_WEIGHTS,
+            )
+            active_indices = tuple(
+                index for index, value in enumerate(expected_delta) if value != 0.0
+            )
+            active_axes = tuple(COMMAND_AXES[index] for index in active_indices)
+            active_goals = tuple(
+                np.array([0.5, 0.0, 0.0], dtype=float)[index]
+                + expected_delta[index]
+                for index in active_indices
             )
             self.assertLess(abs(expected_delta[0]), 0.1)
             hardware_patches = self.patch_hardware(
@@ -1909,7 +1590,7 @@ class CorrectionTests(unittest.TestCase):
                 hardware_patches[2],
                 patch(
                     "merlin_track_position.tracking.correct.move_motors_and_wait",
-                    return_value=(0.5 + expected_delta[0],),
+                    return_value=active_goals,
                 ) as move,
             ):
                 do_correction(
@@ -1917,120 +1598,19 @@ class CorrectionTests(unittest.TestCase):
                     capture_count=1,
                     max_moves=1,
                     gain=TEST_CORRECTION_GAIN,
-                    damping_mu=TEST_CORRECTION_DAMPING_MU,
+                    max_normalized_step=TEST_CORRECTION_MAX_NORMALIZED_STEP,
+                    lqr_image_scale_px=TEST_LQR_IMAGE_SCALE_PX,
+                    lqr_motor_penalty=TEST_LQR_MOTOR_PENALTY,
+                    lqr_svd_relative_tolerance=TEST_LQR_SVD_RELATIVE_TOLERANCE,
                     weights=TEST_CORRECTION_WEIGHTS,
                 )
 
-        self.assertEqual(move.call_args.args[0], ("x",))
+        self.assertEqual(move.call_args.args[0], active_axes)
         np.testing.assert_allclose(
             np.asarray(move.call_args.args[1], dtype=float),
-            np.asarray([0.5 + expected_delta[0]], dtype=float),
+            np.asarray(active_goals, dtype=float),
         )
         self.assertEqual(move.call_args.kwargs["backlash_correction"], {})
-
-    def test_invalid_small_antialigned_feedback_stops_without_stacking_moves(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = self.save_calibration(tmpdir)
-            calibration = calibration_dataset()
-            offset_mm = np.array([0.0, 0.014, 0.0], dtype=float)
-            p0 = (
-                calibration["px_per_cmd_mm"].values.reshape(
-                    len(CAMERAS) * len(PIXEL_AXES), len(COMMAND_AXES)
-                )
-                @ offset_mm
-            ).reshape(len(CAMERAS), len(PIXEL_AXES))
-            raw_delta = solve_damped_command_correction(
-                calibration["px_per_cmd_mm"].values,
-                shift_dataset(p0),
-                calibration["axis_scale_cmd_mm"].values,
-                gain=0.3,
-                damping_mu=TEST_CORRECTION_DAMPING_MU,
-                weights=TEST_CORRECTION_WEIGHTS,
-            )
-            predicted_delta = (
-                calibration["px_per_cmd_mm"].values.reshape(
-                    len(CAMERAS) * len(PIXEL_AXES), len(COMMAND_AXES)
-                )
-                @ raw_delta
-            ).reshape(len(CAMERAS), len(PIXEL_AXES))
-            p1 = p0 - 0.1 * predicted_delta
-            hardware_patches = self.patch_hardware(
-                [shift_dataset(p0), shift_dataset(p1)]
-            )
-            with (
-                hardware_patches[0],
-                hardware_patches[1],
-                hardware_patches[2],
-                patch(
-                    "merlin_track_position.tracking.correct.move_motors_and_wait",
-                    return_value=(10.0, 20.0, 30.0),
-                ) as move,
-            ):
-                result = do_correction(
-                    path,
-                    capture_count=1,
-                    max_moves=3,
-                    gain=0.3,
-                    damping_mu=TEST_CORRECTION_DAMPING_MU,
-                    weights=TEST_CORRECTION_WEIGHTS,
-                )
-
-            reloaded = load_calibration_dataset(path)
-
-        self.assertEqual(move.call_count, 1)
-        self.assertEqual(result.sizes["move"], 1)
-        self.assertFalse(bool(result["move_feedback_valid"].values[0]))
-        self.assertLess(float(result["move_feedback_alpha"].values[0]), 0.0)
-        self.assertFalse(bool(result["move_jacobian_refined"].values[0]))
-        self.assertEqual(int(reloaded.attrs["jacobian_refinement_count"]), 0)
-        self.assertIn("post-move image response", result.attrs["warnings"])
-
-    def test_residual_improvement_refines_jacobian_and_updates_file(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = self.save_calibration(tmpdir)
-            p0 = x_shift(300.0)
-            p1 = x_shift(100.0)
-            hardware_patches = self.patch_hardware(
-                [shift_dataset(p0), shift_dataset(p1)]
-            )
-            with (
-                hardware_patches[0],
-                hardware_patches[1],
-                hardware_patches[2],
-                patch(
-                    "merlin_track_position.tracking.correct.move_motors_and_wait",
-                    return_value=(10.0, 20.0, 30.0),
-                ),
-            ):
-                result = do_correction(path, capture_count=1, max_moves=1)
-
-            reloaded = load_calibration_dataset(path)
-
-        self.assertTrue(bool(result["move_jacobian_refined"].values[0]))
-        self.assertEqual(int(reloaded.attrs["jacobian_refinement_count"]), 1)
-        self.assertFalse(
-            np.allclose(
-                reloaded["px_per_cmd_mm"].values,
-                px_per_cmd_mm(),
-            )
-        )
-
-    def test_jacobian_refinement_keeps_tiny_move_low_leverage(self):
-        calibration = calibration_dataset()
-        tiny_delta = np.array([[0.001, 0.0, 0.0]])
-        bad_tiny_measurement = np.full((1, len(CAMERAS), len(PIXEL_AXES)), 5.0)
-
-        refined = refine_jacobian_from_observations(
-            calibration,
-            tiny_delta,
-            bad_tiny_measurement,
-        )
-
-        np.testing.assert_allclose(
-            refined["px_per_cmd_mm"].values,
-            calibration["px_per_cmd_mm"].values,
-            atol=0.1,
-        )
 
     def test_correction_history_file_records_move_diagnostics(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2088,8 +1668,6 @@ class CorrectionTests(unittest.TestCase):
         self.assertIn("move_feedback_alpha", saved)
         self.assertIn("move_feedback_parallel_px", saved)
         self.assertIn("move_feedback_valid", saved)
-        self.assertIn("move_px_per_cmd_mm_before", saved)
-        self.assertIn("move_px_per_cmd_mm_after", saved)
         self.assertTrue(bool(saved["move_feedback_valid"].values[0]))
 
     def test_correction_history_compresses_current_images_and_preserves_dtype(self):
@@ -2198,81 +1776,6 @@ class CorrectionTests(unittest.TestCase):
             self.assertTrue(loaded.attrs["correction_history_completed"])
             self.assertEqual(loaded.sizes["move"], 1)
 
-    def test_pending_history_is_used_for_refinement_before_flush(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp_path = Path(tmpdir)
-            path = self.save_calibration(tmpdir)
-            history_path = correction_history_path(path)
-            spool_path = tmp_path / "spool"
-            with h5py.File(history_path, "w") as history_file:
-                history_file.attrs["format"] = (
-                    "merlin_track_position_correction_history"
-                )
-            history_reader = h5py.File(history_path, "r")
-            try:
-                p0 = x_shift(30.0)
-                p1 = x_shift(10.0)
-                first_patches = self.patch_hardware(
-                    [shift_dataset(p0), shift_dataset(p1)]
-                )
-                with (
-                    patch.dict(
-                        os.environ,
-                        {"MERLIN_TRACK_POSITION_SPOOL_DIR": str(spool_path)},
-                    ),
-                    first_patches[0],
-                    first_patches[1],
-                    first_patches[2],
-                    patch(
-                        "merlin_track_position.tracking.correct.move_motors_and_wait",
-                        return_value=(10.0, 20.0, 30.0),
-                    ),
-                ):
-                    do_correction(path, capture_count=1, max_moves=1)
-
-                observed_refinement_rows: list[int] = []
-                original_refine = (
-                    correct_module.refine_jacobian_from_observations
-                )
-
-                def spy_refine(calibration, correction_delta, measured_delta, **kwargs):
-                    observed_refinement_rows.append(
-                        np.asarray(correction_delta).shape[0]
-                    )
-                    return original_refine(
-                        calibration,
-                        correction_delta,
-                        measured_delta,
-                        **kwargs,
-                    )
-
-                second_patches = self.patch_hardware(
-                    [shift_dataset(p0), shift_dataset(p1)]
-                )
-                with (
-                    patch.dict(
-                        os.environ,
-                        {"MERLIN_TRACK_POSITION_SPOOL_DIR": str(spool_path)},
-                    ),
-                    second_patches[0],
-                    second_patches[1],
-                    second_patches[2],
-                    patch(
-                        "merlin_track_position.tracking.correct.move_motors_and_wait",
-                        return_value=(10.0, 20.0, 30.0),
-                    ),
-                    patch(
-                        "merlin_track_position.tracking.correct."
-                        "refine_jacobian_from_observations",
-                        side_effect=spy_refine,
-                    ),
-                ):
-                    do_correction(path, capture_count=1, max_moves=1)
-            finally:
-                history_reader.close()
-
-        self.assertEqual(observed_refinement_rows[0], 2)
-
     def test_progress_callback_receives_intermediate_correction_result(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = self.save_calibration(tmpdir)
@@ -2341,59 +1844,7 @@ class CorrectionTests(unittest.TestCase):
         self.assertTrue(loaded.attrs["correction_history_completed"])
         self.assertTrue(loaded.attrs["correction_applied"])
         self.assertEqual(loaded.sizes["move"], 1)
-        self.assertEqual(loaded["move_jacobian_refined"].dtype, bool)
         self.assertEqual(loaded["move_feedback_valid"].dtype, bool)
-
-    def test_residual_increase_reduces_gain_increases_damping_and_skips_update(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = self.save_calibration(tmpdir)
-            calibration = calibration_dataset()
-            p0 = x_shift(30.0)
-            correction_delta = solve_damped_command_correction(
-                calibration["px_per_cmd_mm"].values,
-                shift_dataset(p0),
-                calibration["axis_scale_cmd_mm"].values,
-                gain=TEST_CORRECTION_GAIN,
-                damping_mu=TEST_CORRECTION_DAMPING_MU,
-                weights=TEST_CORRECTION_WEIGHTS,
-            )
-            predicted_delta = (
-                calibration["px_per_cmd_mm"].values.reshape(
-                    len(CAMERAS) * len(PIXEL_AXES), len(COMMAND_AXES)
-                )
-                @ correction_delta
-            ).reshape(len(CAMERAS), len(PIXEL_AXES))
-            p1 = p0 + 7.0 * predicted_delta
-            hardware_patches = self.patch_hardware(
-                [shift_dataset(p0), shift_dataset(p1)]
-            )
-            with (
-                hardware_patches[0],
-                hardware_patches[1],
-                hardware_patches[2],
-                patch(
-                    "merlin_track_position.tracking.correct.move_motors_and_wait",
-                    return_value=(10.0, 20.0, 30.0),
-                ),
-            ):
-                result = do_correction(
-                    path,
-                    capture_count=1,
-                    max_moves=1,
-                    gain=TEST_CORRECTION_GAIN,
-                    damping_mu=TEST_CORRECTION_DAMPING_MU,
-                    weights=TEST_CORRECTION_WEIGHTS,
-                )
-
-            reloaded = load_calibration_dataset(path)
-
-        self.assertFalse(bool(result["move_jacobian_refined"].values[0]))
-        self.assertAlmostEqual(
-            float(result.attrs["correction_final_gain"]),
-            TEST_CORRECTION_GAIN / 2.0,
-        )
-        self.assertAlmostEqual(float(result.attrs["correction_final_damping_mu"]), 2.0)
-        self.assertEqual(int(reloaded.attrs["jacobian_refinement_count"]), 0)
 
     def test_non_convergence_returns_false_without_raising_after_motion(self):
         with tempfile.TemporaryDirectory() as tmpdir:

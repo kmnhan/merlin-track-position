@@ -29,8 +29,6 @@ from merlin_track_position.tracking.calibration_core import (
     lqr_projected_residual_from_design,
     measure_image_error,
     predict_lqr_kalman_state,
-    refine_jacobian_from_observations,
-    solve_damped_command_correction,
     solve_lqr_command_correction,
     solve_lqr_state_command_correction,
     update_lqr_kalman_state,
@@ -52,8 +50,8 @@ from merlin_track_position.tracking.roi import matching_reference_and_stack
 
 logger = logging.getLogger("merlin_track_position.tracking.correct")
 
-CORRECTION_ALGORITHMS = ("damped_wls", "lqr")
-_USE_ALGORITHM_DEFAULT = object()
+CORRECTION_CRITERION = "lqr_projected_normalized_error"
+_USE_DEFAULT = object()
 
 
 class CorrectionFeedback(NamedTuple):
@@ -108,24 +106,9 @@ def do_correction(
     calibration_path: str | Path | None = None,
     max_retries: int = 4,
     capture_count: int = constants.DEFAULT_CAPTURE_COUNT,
-    damped_wls_pixel_tolerance_px: float | object = _USE_ALGORITHM_DEFAULT,
-    lqr_projected_tolerance: float | object = _USE_ALGORITHM_DEFAULT,
-    gain: float | object = _USE_ALGORITHM_DEFAULT,
-    min_gain: float | object = _USE_ALGORITHM_DEFAULT,
-    damping_mu: float = constants.DEFAULT_DAMPED_WLS_CORRECTION_DAMPING_MU,
-    max_normalized_step: float | None | object = _USE_ALGORITHM_DEFAULT,
-    min_axis_predicted_shift_px: float = (
-        constants.DEFAULT_DAMPED_WLS_CORRECTION_MIN_AXIS_PREDICTED_SHIFT_PX
-    ),
-    min_total_predicted_shift_px: float = (
-        constants.DEFAULT_DAMPED_WLS_CORRECTION_MIN_TOTAL_PREDICTED_SHIFT_PX
-    ),
-    min_feedback_alpha: float = (
-        constants.DEFAULT_DAMPED_WLS_CORRECTION_MIN_FEEDBACK_ALPHA
-    ),
-    min_feedback_parallel_shift_px: float = (
-        constants.DEFAULT_DAMPED_WLS_CORRECTION_MIN_FEEDBACK_PARALLEL_SHIFT_PX
-    ),
+    lqr_projected_tolerance: Any = _USE_DEFAULT,
+    gain: Any = _USE_DEFAULT,
+    max_normalized_step: Any = _USE_DEFAULT,
     min_command_norm_mm: float = constants.DEFAULT_CORRECTION_MIN_COMMAND_NORM_MM,
     max_moves: int = constants.DEFAULT_CORRECTION_MAX_MOVES,
     lqr_image_scale_px: float = constants.DEFAULT_LQR_CORRECTION_IMAGE_SCALE_PX,
@@ -138,11 +121,7 @@ def do_correction(
     motor_backend: CorrectionMotorBackend | None = None,
     **shift_kwargs: Any,
 ) -> xr.Dataset:
-    """Run guarded closed-loop visual-servo correction in commanded-mm space.
-
-    The calibration must have a backing file. Accepted Jacobian refinements rewrite that
-    calibration file so future corrections continue from the refined Jacobian.
-    """
+    """Run LQR closed-loop visual-servo correction in commanded-mm space."""
 
     calibration, resolved_path = _resolve_calibration_and_path(
         calibration,
@@ -155,79 +134,30 @@ def do_correction(
         camera_pair = default_camera_pair()
     if motor_backend is None:
         motor_backend = DirectBCSMotorBackend()
-    correction_algorithm = _correction_algorithm()
     weights = _correction_weights(weights)
-    min_gain_uses_default = min_gain is _USE_ALGORITHM_DEFAULT
-    if gain is _USE_ALGORITHM_DEFAULT:
-        gain = _default_gain_for_algorithm(correction_algorithm)
-    if max_normalized_step is _USE_ALGORITHM_DEFAULT:
-        max_normalized_step = _default_max_normalized_step_for_algorithm(
-            correction_algorithm
-        )
-    if min_gain is _USE_ALGORITHM_DEFAULT:
-        min_gain = (
-            constants.DEFAULT_DAMPED_WLS_CORRECTION_MIN_GAIN
-            if correction_algorithm == "damped_wls"
-            else np.nan
-        )
-
-    damped_wls_pixel_tolerance_px = _resolve_damped_wls_pixel_tolerance(
-        damped_wls_pixel_tolerance_px
-    )
+    if gain is _USE_DEFAULT:
+        gain = constants.DEFAULT_LQR_CORRECTION_GAIN
+    if max_normalized_step is _USE_DEFAULT:
+        max_normalized_step = constants.DEFAULT_LQR_CORRECTION_MAX_NORMALIZED_STEP
     lqr_projected_tolerance = _resolve_lqr_projected_tolerance(
         lqr_projected_tolerance
     )
-    correction_tolerance = _correction_tolerance_for_algorithm(
-        correction_algorithm,
-        damped_wls_pixel_tolerance_px=damped_wls_pixel_tolerance_px,
-        lqr_projected_tolerance=lqr_projected_tolerance,
-    )
-    correction_criterion = _correction_criterion_for_algorithm(correction_algorithm)
+    correction_tolerance = lqr_projected_tolerance
+    correction_criterion = CORRECTION_CRITERION
     current_gain = float(gain)
-    min_gain = float(min_gain)
-    current_mu = float(damping_mu)
-    min_total_predicted_shift_px = float(min_total_predicted_shift_px)
-    min_feedback_alpha = float(min_feedback_alpha)
-    min_feedback_parallel_shift_px = float(min_feedback_parallel_shift_px)
     min_command_norm_mm = float(min_command_norm_mm)
     max_moves = int(max_moves)
     if not np.isfinite(current_gain) or current_gain <= 0.0:
         raise ValueError("gain must be finite and positive")
-    if correction_algorithm == "damped_wls":
-        if not np.isfinite(min_gain) or min_gain <= 0.0:
-            raise ValueError("min_gain must be finite and positive")
-        if current_gain < min_gain:
-            current_gain = min_gain
-    elif not min_gain_uses_default and (
-        not np.isfinite(min_gain) or min_gain <= 0.0
-    ):
-        raise ValueError("min_gain must be finite and positive when provided")
-    if not np.isfinite(current_mu) or current_mu < 0.0:
-        raise ValueError("damping_mu must be finite and non-negative")
-    if (
-        not np.isfinite(min_total_predicted_shift_px)
-        or min_total_predicted_shift_px < 0.0
-    ):
-        raise ValueError(
-            "min_total_predicted_shift_px must be finite and non-negative"
-        )
-    if not np.isfinite(min_feedback_alpha) or min_feedback_alpha < 0.0:
-        raise ValueError("min_feedback_alpha must be finite and non-negative")
-    if (
-        not np.isfinite(min_feedback_parallel_shift_px)
-        or min_feedback_parallel_shift_px < 0.0
-    ):
-        raise ValueError(
-            "min_feedback_parallel_shift_px must be finite and non-negative"
-        )
+    if max_normalized_step is not None:
+        max_normalized_step = float(max_normalized_step)
+        if np.isnan(max_normalized_step) or max_normalized_step <= 0.0:
+            raise ValueError("max_normalized_step must be positive or None")
     if not np.isfinite(min_command_norm_mm) or min_command_norm_mm < 0.0:
         raise ValueError("min_command_norm_mm must be finite and non-negative")
     if max_moves < 0:
         raise ValueError("max_moves must be >= 0")
-    lqr_kalman_filter_enabled = (
-        correction_algorithm == "lqr"
-        and bool(constants.DEFAULT_LQR_CORRECTION_USE_KALMAN_FILTER)
-    )
+    lqr_kalman_filter_enabled = bool(constants.DEFAULT_LQR_CORRECTION_USE_KALMAN_FILTER)
     lqr_kalman_process_noise = constants.DEFAULT_LQR_CORRECTION_KALMAN_PROCESS_NOISE
     lqr_kalman_measurement_noise = (
         constants.DEFAULT_LQR_CORRECTION_KALMAN_MEASUREMENT_NOISE
@@ -242,20 +172,12 @@ def do_correction(
         constants.DEFAULT_LQR_CORRECTION_KALMAN_INNOVATION_GATE
     )
     logger.info(
-        "Correction parameters: algorithm=%s, capture_count=%d, criterion=%s, "
-        "tolerance=%g, gain=%g, min_gain=%g, damping_mu=%g, "
-        "min_total_predicted_shift_px=%g, min_feedback_alpha=%g, "
-        "min_feedback_parallel_shift_px=%g, max_moves=%d",
-        correction_algorithm,
+        "Correction parameters: capture_count=%d, criterion=%s, tolerance=%g, "
+        "gain=%g, max_moves=%d",
         capture_count,
         correction_criterion,
         correction_tolerance,
         current_gain,
-        min_gain,
-        current_mu,
-        min_total_predicted_shift_px,
-        min_feedback_alpha,
-        min_feedback_parallel_shift_px,
         max_moves,
     )
 
@@ -266,16 +188,14 @@ def do_correction(
         calibration["px_per_cmd_mm"].values,
         dtype=np.float64,
     )
-    lqr_design: dict[str, Any] | None = None
-    if correction_algorithm == "lqr":
-        lqr_design = compute_lqr_correction_design(
-            jacobian.reshape(len(CAMERAS) * len(PIXEL_AXES), len(COMMAND_AXES)),
-            axis_scale,
-            image_scale_px=lqr_image_scale_px,
-            motor_penalty=lqr_motor_penalty,
-            svd_relative_tolerance=lqr_svd_relative_tolerance,
-            weights=weights,
-        )
+    lqr_design = compute_lqr_correction_design(
+        jacobian.reshape(len(CAMERAS) * len(PIXEL_AXES), len(COMMAND_AXES)),
+        axis_scale,
+        image_scale_px=lqr_image_scale_px,
+        motor_penalty=lqr_motor_penalty,
+        svd_relative_tolerance=lqr_svd_relative_tolerance,
+        weights=weights,
+    )
     logger.info("Reading initial commanded x/y/z positions.")
     commanded_position_mm = np.asarray(
         motor_backend.get_positions(COMMAND_AXES),
@@ -301,11 +221,9 @@ def do_correction(
         **shift_kwargs,
     )
     weighted_residual = weighted_pixel_residual(measurement, weights=weights)
-    criterion_residual = _correction_criterion_residual(
-        correction_algorithm,
+    criterion_residual = lqr_projected_residual_from_design(
+        lqr_design,
         measurement,
-        weighted_residual=weighted_residual,
-        lqr_design=lqr_design,
     )
     logger.info(
         "Initial correction criterion residual: %.6g (%s); weighted residual: %.6g px",
@@ -321,7 +239,6 @@ def do_correction(
     move_requested_position_mm: list[np.ndarray] = []
     move_final_readback_position_mm: list[np.ndarray] = []
     move_gain: list[float] = []
-    move_damping_mu: list[float] = []
     move_pre_weighted_residuals: list[float] = []
     move_post_weighted_residuals: list[float] = []
     move_predicted_delta_px: list[np.ndarray] = []
@@ -332,11 +249,8 @@ def do_correction(
     move_feedback_alpha: list[float] = []
     move_feedback_parallel_px: list[float] = []
     move_feedback_valid: list[bool] = []
-    move_jacobian_before: list[np.ndarray] = []
-    move_jacobian_after: list[np.ndarray] = []
     move_max_normalized_component: list[float] = []
     move_active_axis_mask: list[np.ndarray] = []
-    move_jacobian_refined: list[bool] = []
     iteration_lqr_kalman_state: list[np.ndarray] = []
     iteration_lqr_kalman_predicted_state: list[np.ndarray] = []
     iteration_lqr_kalman_innovation: list[np.ndarray] = []
@@ -387,14 +301,11 @@ def do_correction(
             ),
             next_correction=_reported_next_correction(
                 converged=converged,
-                algorithm=correction_algorithm,
                 jacobian=jacobian,
                 measurement=measurement,
                 axis_scale=axis_scale,
                 gain=current_gain,
-                damping_mu=current_mu,
                 max_normalized_step=max_normalized_step,
-                min_axis_predicted_shift_px=min_axis_predicted_shift_px,
                 lqr_image_scale_px=lqr_image_scale_px,
                 lqr_motor_penalty=lqr_motor_penalty,
                 lqr_svd_relative_tolerance=lqr_svd_relative_tolerance,
@@ -421,7 +332,6 @@ def do_correction(
             move_requested_position_mm=move_requested_position_mm,
             move_final_readback_position_mm=move_final_readback_position_mm,
             move_gain=move_gain,
-            move_damping_mu=move_damping_mu,
             move_pre_weighted_residuals=move_pre_weighted_residuals,
             move_post_weighted_residuals=move_post_weighted_residuals,
             move_predicted_delta_px=move_predicted_delta_px,
@@ -434,11 +344,8 @@ def do_correction(
             move_feedback_alpha=move_feedback_alpha,
             move_feedback_parallel_px=move_feedback_parallel_px,
             move_feedback_valid=move_feedback_valid,
-            move_jacobian_before=move_jacobian_before,
-            move_jacobian_after=move_jacobian_after,
             move_max_normalized_component=move_max_normalized_component,
             move_active_axis_mask=move_active_axis_mask,
-            move_jacobian_refined=move_jacobian_refined,
             calibration_path=resolved_path,
             correction_history_path=correction_log_path,
             correction_run_id=correction_run_id,
@@ -448,20 +355,12 @@ def do_correction(
             correction_history_completed=completed,
             converged=converged,
             move_count=move_count,
-            damped_wls_pixel_tolerance_px=damped_wls_pixel_tolerance_px,
             lqr_projected_tolerance=lqr_projected_tolerance,
             correction_tolerance=correction_tolerance,
             correction_criterion=correction_criterion,
             gain=gain,
-            min_gain=min_gain,
-            damping_mu=damping_mu,
             current_gain=current_gain,
-            current_mu=current_mu,
             max_normalized_step=max_normalized_step,
-            min_axis_predicted_shift_px=min_axis_predicted_shift_px,
-            min_total_predicted_shift_px=min_total_predicted_shift_px,
-            min_feedback_alpha=min_feedback_alpha,
-            min_feedback_parallel_shift_px=min_feedback_parallel_shift_px,
             min_command_norm_mm=min_command_norm_mm,
             max_moves=max_moves,
             lqr_image_scale_px=lqr_image_scale_px,
@@ -473,7 +372,6 @@ def do_correction(
             lqr_kalman_measurement_covariance=lqr_kalman_measurement_covariance,
             lqr_kalman_initial_covariance=lqr_kalman_initial_covariance,
             lqr_kalman_innovation_gate=lqr_kalman_innovation_gate,
-            algorithm=correction_algorithm,
             initial_commanded_position_mm=initial_commanded_position_mm,
             commanded_position_mm=commanded_position_mm,
             warnings=warnings,
@@ -507,15 +405,13 @@ def do_correction(
     while not converged and move_count < max_moves:
         logger.info(
             "Correction iteration %d starting: criterion_residual=%.6g, "
-            "weighted_residual=%.6g px, gain=%g, mu=%g",
+            "weighted_residual=%.6g px, gain=%g",
             move_count + 1,
             criterion_residual,
             weighted_residual,
             current_gain,
-            current_mu,
         )
         gain_used = float(current_gain)
-        mu_used = float(current_mu)
         jacobian_before = jacobian.copy()
         estimated_offset_mm = estimate_command_offset(
             jacobian,
@@ -532,25 +428,18 @@ def do_correction(
                 max_normalized_step=max_normalized_step,
             )
         else:
-            raw_correction_cmd_mm = _solve_command_correction(
-                algorithm=correction_algorithm,
-                jacobian=jacobian,
-                measurement=measurement,
-                axis_scale=axis_scale,
+            raw_correction_cmd_mm = solve_lqr_command_correction(
+                jacobian,
+                measurement,
+                axis_scale,
                 gain=gain_used,
-                damping_mu=mu_used,
                 max_normalized_step=max_normalized_step,
-                min_axis_predicted_shift_px=min_axis_predicted_shift_px,
-                lqr_image_scale_px=lqr_image_scale_px,
-                lqr_motor_penalty=lqr_motor_penalty,
-                lqr_svd_relative_tolerance=lqr_svd_relative_tolerance,
+                image_scale_px=lqr_image_scale_px,
+                motor_penalty=lqr_motor_penalty,
+                svd_relative_tolerance=lqr_svd_relative_tolerance,
                 weights=weights,
             )
-        correction_cmd_mm = _prune_command_correction(
-            correction_algorithm,
-            raw_correction_cmd_mm,
-            reference_cmd_mm=estimated_offset_mm,
-        )
+        correction_cmd_mm = _validate_command_correction(raw_correction_cmd_mm)
         correction_norm_mm = float(np.linalg.norm(correction_cmd_mm))
         active_indices = _active_correction_indices(correction_cmd_mm)
         logger.info(
@@ -567,7 +456,6 @@ def do_correction(
                 _correction_stop_warning(
                     raw_correction_cmd_mm=raw_correction_cmd_mm,
                     correction_cmd_mm=correction_cmd_mm,
-                    estimated_offset_mm=estimated_offset_mm,
                     min_command_norm_mm=min_command_norm_mm,
                 )
             )
@@ -593,28 +481,6 @@ def do_correction(
             jacobian_before.reshape(len(CAMERAS) * len(PIXEL_AXES), len(COMMAND_AXES))
             @ correction_cmd_mm
         ).reshape(len(CAMERAS), len(PIXEL_AXES))
-        predicted_weighted_response_px = _weighted_shift_norm(
-            predicted_delta_px,
-            weights=weights,
-        )
-        if (
-            _algorithm_uses_predicted_response_stop(correction_algorithm)
-            and predicted_weighted_response_px < min_total_predicted_shift_px
-        ):
-            warnings.append(
-                _below_observable_feedback_warning(
-                    predicted_weighted_response_px=predicted_weighted_response_px,
-                    min_total_predicted_shift_px=min_total_predicted_shift_px,
-                )
-            )
-            logger.info(
-                "Stopping correction before move because predicted response "
-                "%.6g px is below observable feedback threshold %.6g px.",
-                predicted_weighted_response_px,
-                min_total_predicted_shift_px,
-            )
-            break
-
         normalized_component = correction_cmd_mm / axis_scale
         requested_position_mm = commanded_position_mm + correction_cmd_mm
         active_axes = tuple(COMMAND_AXES[index] for index in active_indices)
@@ -660,11 +526,9 @@ def do_correction(
             after_measurement,
             weights=weights,
         )
-        after_criterion_residual = _correction_criterion_residual(
-            correction_algorithm,
+        after_criterion_residual = lqr_projected_residual_from_design(
+            lqr_design,
             after_measurement,
-            weighted_residual=after_weighted_residual,
-            lqr_design=lqr_design,
         )
         decreased = bool(after_criterion_residual < criterion_residual)
         logger.info(
@@ -710,7 +574,6 @@ def do_correction(
                         innovation_gate=lqr_kalman_innovation_gate,
                     )
                 )
-        jacobian_refined = False
         measured_delta_px = np.asarray(
             after_measurement["shift_px"].values, dtype=np.float64
         ) - np.asarray(measurement["shift_px"].values, dtype=np.float64)
@@ -720,17 +583,7 @@ def do_correction(
             measured_delta_px,
             weights=weights,
         )
-        feedback_valid = _correction_feedback_is_valid(
-            feedback,
-            min_total_predicted_shift_px=min_total_predicted_shift_px,
-            min_feedback_alpha=min_feedback_alpha,
-            min_feedback_parallel_shift_px=min_feedback_parallel_shift_px,
-        )
-        stop_after_invalid_feedback = (
-            _algorithm_stops_after_invalid_feedback(correction_algorithm)
-            and not feedback_valid
-            and after_criterion_residual > correction_tolerance
-        )
+        feedback_valid = _correction_feedback_is_valid(feedback)
         logger.info(
             "Post-move feedback metrics: predicted_response=%.6g px, "
             "measured_response=%.6g px, alpha=%.6g, parallel=%.6g px, "
@@ -741,77 +594,15 @@ def do_correction(
             feedback.parallel_px,
             feedback_valid,
         )
-        if (
-            feedback_valid
-            and decreased
-            and _algorithm_refines_jacobian(correction_algorithm)
-        ):
-            try:
-                logger.info("Attempting Jacobian refinement from accepted move.")
-                refinement_delta, refinement_measured = (
-                    _jacobian_refinement_observations(
-                        correction_log_path,
-                        move_command_delta_mm,
-                        move_measured_delta_px,
-                        move_jacobian_refined,
-                        correction_cmd_mm,
-                        measured_delta_px,
-                        exclude_run_id=correction_run_id,
-                    )
-                )
-                calibration = refine_jacobian_from_observations(
-                    calibration,
-                    refinement_delta,
-                    refinement_measured,
-                    save_path=resolved_path,
-                )
-            except ValueError as exc:
-                warnings.append(f"skipped Jacobian refinement: {exc}")
-                logger.info("Skipped Jacobian refinement: %s", exc)
-            else:
-                jacobian = np.asarray(
-                    calibration["px_per_cmd_mm"].values,
-                    dtype=np.float64,
-                )
-                jacobian_refined = True
-                logger.info("Jacobian refinement accepted and saved.")
-        elif feedback_valid and decreased:
-            logger.info(
-                "Residual decreased; keeping %s nominal Jacobian fixed.",
-                correction_algorithm,
-            )
-        elif feedback_valid and _algorithm_adapts_gain_after_non_decrease(
-            correction_algorithm
-        ):
-            current_gain = max(min_gain, 0.5 * current_gain)
-            current_mu = 2.0 * current_mu if current_mu > 0.0 else 1e-12
-            logger.info(
-                "Residual did not decrease; reducing gain to %g and increasing "
-                "mu to %g.",
-                current_gain,
-                current_mu,
-            )
+        if feedback_valid and decreased:
+            logger.info("Residual decreased; keeping nominal Jacobian fixed.")
         elif feedback_valid:
-            logger.info(
-                "Residual did not decrease; keeping %s gain fixed at %g.",
-                correction_algorithm,
-                current_gain,
-            )
-        elif stop_after_invalid_feedback:
-            warnings.append(
-                _invalid_feedback_warning(
-                    feedback,
-                    min_feedback_alpha=min_feedback_alpha,
-                    min_feedback_parallel_shift_px=min_feedback_parallel_shift_px,
-                )
-            )
-            logger.info("Stopping correction after invalid image feedback.")
+            logger.info("Residual did not decrease; keeping gain fixed at %g.", current_gain)
 
         move_command_delta_mm.append(correction_cmd_mm)
         move_requested_position_mm.append(requested_position_mm.copy())
         move_final_readback_position_mm.append(final_readback_mm)
         move_gain.append(gain_used)
-        move_damping_mu.append(mu_used)
         move_pre_weighted_residuals.append(float(weighted_residual))
         move_post_weighted_residuals.append(float(after_weighted_residual))
         move_predicted_delta_px.append(predicted_delta_px)
@@ -826,15 +617,12 @@ def do_correction(
         move_feedback_alpha.append(feedback.alpha)
         move_feedback_parallel_px.append(feedback.parallel_px)
         move_feedback_valid.append(feedback_valid)
-        move_jacobian_before.append(jacobian_before)
-        move_jacobian_after.append(jacobian.copy())
         move_max_normalized_component.append(
             float(np.max(np.abs(normalized_component)))
         )
         active_axis_mask = np.zeros(len(COMMAND_AXES), dtype=bool)
         active_axis_mask[list(active_indices)] = True
         move_active_axis_mask.append(active_axis_mask)
-        move_jacobian_refined.append(jacobian_refined)
 
         measurement = after_measurement
         weighted_residual = after_weighted_residual
@@ -860,8 +648,6 @@ def do_correction(
             converged,
         )
         save_progress(completed=False)
-        if stop_after_invalid_feedback:
-            break
 
     if not converged:
         warnings.append(
@@ -897,8 +683,7 @@ def _resolve_calibration_and_path(
         )
         if path_value is None or not str(path_value).strip():
             raise ValueError(
-                "correction requires a calibration file path so refined "
-                "Jacobians can be persisted"
+                "correction requires a calibration file path for correction history"
             )
         path = Path(path_value)
         if not path.exists():
@@ -931,137 +716,7 @@ def _apply_calibration_persistence_attrs(
         if key.startswith("calibration_persistence_")
         or key == "calibration_pending_spool_path"
     }
-    if "jacobian_refinement_count" in calibration.attrs:
-        attrs["calibration_jacobian_refinement_count"] = int(
-            calibration.attrs["jacobian_refinement_count"]
-        )
     return result.assign_attrs(attrs) if attrs else result
-
-
-def _jacobian_refinement_observations(
-    history_path: Path,
-    run_command_delta_mm: Sequence[np.ndarray],
-    run_measured_delta_px: Sequence[np.ndarray],
-    run_jacobian_refined: Sequence[bool],
-    current_command_delta_mm: np.ndarray,
-    current_measured_delta_px: np.ndarray,
-    *,
-    exclude_run_id: int | None = None,
-) -> tuple[np.ndarray, np.ndarray]:
-    history_delta, history_measured = _load_jacobian_refinement_history(
-        history_path,
-        exclude_run_id=exclude_run_id,
-    )
-    rows: list[np.ndarray] = [*history_delta]
-    measurements: list[np.ndarray] = [*history_measured]
-    rows.extend(
-        np.asarray(delta, dtype=np.float64)
-        for delta, updated in zip(
-            run_command_delta_mm,
-            run_jacobian_refined,
-            strict=True,
-        )
-        if updated
-    )
-    measurements.extend(
-        np.asarray(measured, dtype=np.float64)
-        for measured, updated in zip(
-            run_measured_delta_px,
-            run_jacobian_refined,
-            strict=True,
-        )
-        if updated
-    )
-    rows.append(np.asarray(current_command_delta_mm, dtype=np.float64))
-    measurements.append(np.asarray(current_measured_delta_px, dtype=np.float64))
-    return np.stack(rows, axis=0), np.stack(measurements, axis=0)
-
-
-def _load_jacobian_refinement_history(
-    path: Path,
-    *,
-    exclude_run_id: int | None = None,
-) -> tuple[np.ndarray, np.ndarray]:
-    command_rows: list[np.ndarray] = []
-    measured_rows: list[np.ndarray] = []
-    if path.exists():
-        with h5py.File(path, "r") as history_file:
-            for group_name in sorted(history_file.keys()):
-                run_id = _correction_history_run_id(group_name)
-                if run_id is not None and run_id == exclude_run_id:
-                    continue
-                _extend_refinement_rows_from_group(
-                    history_file[group_name],
-                    command_rows,
-                    measured_rows,
-                )
-
-    for dataset in _pending_correction_history_datasets(
-        path,
-        exclude_run_id=exclude_run_id,
-    ):
-        _extend_refinement_rows_from_dataset(dataset, command_rows, measured_rows)
-
-    if not command_rows:
-        return _empty_refinement_observations()
-    return np.stack(command_rows, axis=0), np.stack(measured_rows, axis=0)
-
-
-def _extend_refinement_rows_from_group(
-    group: h5py.Group,
-    command_rows: list[np.ndarray],
-    measured_rows: list[np.ndarray],
-) -> None:
-    required = (
-        "move_command_delta_mm",
-        "move_measured_delta_px",
-        "move_jacobian_refined",
-    )
-    if not all(name in group for name in required):
-        return
-    updated = np.asarray(group["move_jacobian_refined"], dtype=bool)
-    if updated.size == 0 or not np.any(updated):
-        return
-    command_rows.extend(
-        np.asarray(row, dtype=np.float64)
-        for row in np.asarray(group["move_command_delta_mm"])[updated]
-    )
-    measured_rows.extend(
-        np.asarray(row, dtype=np.float64)
-        for row in np.asarray(group["move_measured_delta_px"])[updated]
-    )
-
-
-def _extend_refinement_rows_from_dataset(
-    dataset: xr.Dataset,
-    command_rows: list[np.ndarray],
-    measured_rows: list[np.ndarray],
-) -> None:
-    required = (
-        "move_command_delta_mm",
-        "move_measured_delta_px",
-        "move_jacobian_refined",
-    )
-    if not all(name in dataset for name in required):
-        return
-    updated = np.asarray(dataset["move_jacobian_refined"].values, dtype=bool)
-    if updated.size == 0 or not np.any(updated):
-        return
-    command_rows.extend(
-        np.asarray(row, dtype=np.float64)
-        for row in np.asarray(dataset["move_command_delta_mm"].values)[updated]
-    )
-    measured_rows.extend(
-        np.asarray(row, dtype=np.float64)
-        for row in np.asarray(dataset["move_measured_delta_px"].values)[updated]
-    )
-
-
-def _empty_refinement_observations() -> tuple[np.ndarray, np.ndarray]:
-    return (
-        np.empty((0, len(COMMAND_AXES)), dtype=np.float64),
-        np.empty((0, len(CAMERAS), len(PIXEL_AXES)), dtype=np.float64),
-    )
 
 
 def save_correction_history_dataset(
@@ -1251,7 +906,6 @@ def _restore_netcdf_safe_correction_result(result: xr.Dataset) -> xr.Dataset:
     restored = result.copy(deep=True)
     for name in (
         "move_active_axis_mask",
-        "move_jacobian_refined",
         "move_feedback_valid",
     ):
         if name in restored:
@@ -1424,17 +1078,11 @@ def _correction_feedback_metrics(
 
 def _correction_feedback_is_valid(
     feedback: CorrectionFeedback,
-    *,
-    min_total_predicted_shift_px: float,
-    min_feedback_alpha: float,
-    min_feedback_parallel_shift_px: float,
 ) -> bool:
     return bool(
-        feedback.predicted_weighted_response_px >= min_total_predicted_shift_px
+        feedback.predicted_weighted_response_px > 0.0
         and np.isfinite(feedback.alpha)
-        and feedback.alpha >= min_feedback_alpha
         and np.isfinite(feedback.parallel_px)
-        and feedback.parallel_px >= min_feedback_parallel_shift_px
     )
 
 
@@ -1474,16 +1122,6 @@ def _observation_weight_values(
     return values
 
 
-def _correction_algorithm() -> str:
-    algorithm = str(constants.CORRECTION_ALGORITHM).strip().lower()
-    if algorithm not in CORRECTION_ALGORITHMS:
-        allowed = ", ".join(CORRECTION_ALGORITHMS)
-        raise ValueError(
-            f"unsupported correction algorithm {algorithm!r}; expected one of {allowed}"
-        )
-    return algorithm
-
-
 def _correction_weights(
     weights: Sequence[float] | np.ndarray | None,
 ) -> Sequence[float] | np.ndarray | None:
@@ -1492,166 +1130,13 @@ def _correction_weights(
     return constants.CORRECTION_OBSERVATION_WEIGHTS
 
 
-def _resolve_damped_wls_pixel_tolerance(value: float | object) -> float:
-    if value is _USE_ALGORITHM_DEFAULT:
-        value = constants.DEFAULT_DAMPED_WLS_CORRECTION_PIXEL_TOLERANCE_PX
-    tolerance = float(value)
-    if not np.isfinite(tolerance) or tolerance < 0.0:
-        raise ValueError(
-            "damped_wls_pixel_tolerance_px must be finite and non-negative"
-        )
-    return tolerance
-
-
-def _resolve_lqr_projected_tolerance(value: float | object) -> float:
-    if value is _USE_ALGORITHM_DEFAULT:
+def _resolve_lqr_projected_tolerance(value: Any) -> float:
+    if value is _USE_DEFAULT:
         value = constants.DEFAULT_LQR_CORRECTION_PROJECTED_TOLERANCE
     tolerance = float(value)
     if not np.isfinite(tolerance) or tolerance < 0.0:
         raise ValueError("lqr_projected_tolerance must be finite and non-negative")
     return tolerance
-
-
-def _correction_tolerance_for_algorithm(
-    algorithm: str,
-    *,
-    damped_wls_pixel_tolerance_px: float,
-    lqr_projected_tolerance: float,
-) -> float:
-    if algorithm == "damped_wls":
-        return float(damped_wls_pixel_tolerance_px)
-    if algorithm == "lqr":
-        return float(lqr_projected_tolerance)
-    raise ValueError(f"unsupported correction algorithm {algorithm!r}")
-
-
-def _correction_criterion_for_algorithm(algorithm: str) -> str:
-    if algorithm == "damped_wls":
-        return "weighted_pixel_residual_px"
-    if algorithm == "lqr":
-        return "lqr_projected_normalized_error"
-    raise ValueError(f"unsupported correction algorithm {algorithm!r}")
-
-
-def _correction_criterion_residual(
-    algorithm: str,
-    measurement: xr.Dataset,
-    *,
-    weighted_residual: float,
-    lqr_design: dict[str, Any] | None,
-) -> float:
-    if algorithm == "damped_wls":
-        return float(weighted_residual)
-    if algorithm == "lqr":
-        if lqr_design is None:
-            raise RuntimeError("LQR design was not initialized")
-        return lqr_projected_residual_from_design(lqr_design, measurement)
-    raise ValueError(f"unsupported correction algorithm {algorithm!r}")
-
-
-def _default_gain_for_algorithm(algorithm: str) -> float:
-    if algorithm == "damped_wls":
-        return constants.DEFAULT_DAMPED_WLS_CORRECTION_GAIN
-    if algorithm == "lqr":
-        return constants.DEFAULT_LQR_CORRECTION_GAIN
-    raise ValueError(f"unsupported correction algorithm {algorithm!r}")
-
-
-def _default_max_normalized_step_for_algorithm(algorithm: str) -> float | None:
-    if algorithm == "damped_wls":
-        return constants.DEFAULT_DAMPED_WLS_CORRECTION_MAX_NORMALIZED_STEP
-    if algorithm == "lqr":
-        return constants.DEFAULT_LQR_CORRECTION_MAX_NORMALIZED_STEP
-    raise ValueError(f"unsupported correction algorithm {algorithm!r}")
-
-
-def _algorithm_uses_command_deadband(algorithm: str) -> bool:
-    return algorithm == "damped_wls"
-
-
-def _algorithm_uses_predicted_response_stop(algorithm: str) -> bool:
-    return algorithm == "damped_wls"
-
-
-def _algorithm_stops_after_invalid_feedback(algorithm: str) -> bool:
-    return algorithm == "damped_wls"
-
-
-def _algorithm_adapts_gain_after_non_decrease(algorithm: str) -> bool:
-    return algorithm == "damped_wls"
-
-
-def _algorithm_refines_jacobian(algorithm: str) -> bool:
-    return algorithm == "damped_wls"
-
-
-def _solve_command_correction(
-    *,
-    algorithm: str,
-    jacobian: np.ndarray,
-    measurement: xr.Dataset,
-    axis_scale: np.ndarray,
-    gain: float,
-    damping_mu: float,
-    max_normalized_step: float | None,
-    min_axis_predicted_shift_px: float,
-    lqr_image_scale_px: float,
-    lqr_motor_penalty: float,
-    lqr_svd_relative_tolerance: float,
-    weights: Sequence[float] | np.ndarray | None,
-) -> np.ndarray:
-    if algorithm == "damped_wls":
-        return solve_damped_command_correction(
-            jacobian,
-            measurement,
-            axis_scale,
-            gain=gain,
-            damping_mu=damping_mu,
-            max_normalized_step=max_normalized_step,
-            min_axis_predicted_shift_px=min_axis_predicted_shift_px,
-            weights=weights,
-        )
-    if algorithm == "lqr":
-        return solve_lqr_command_correction(
-            jacobian,
-            measurement,
-            axis_scale,
-            gain=gain,
-            image_scale_px=lqr_image_scale_px,
-            motor_penalty=lqr_motor_penalty,
-            svd_relative_tolerance=lqr_svd_relative_tolerance,
-            max_normalized_step=max_normalized_step,
-            min_axis_predicted_shift_px=0.0,
-            weights=weights,
-        )
-    raise ValueError(f"unsupported correction algorithm {algorithm!r}")
-
-
-def _below_observable_feedback_warning(
-    *,
-    predicted_weighted_response_px: float,
-    min_total_predicted_shift_px: float,
-) -> str:
-    return (
-        "predicted correction response is below the observable feedback "
-        f"threshold: predicted={predicted_weighted_response_px:.4g} px, "
-        f"threshold={min_total_predicted_shift_px:.4g} px; stopping before "
-        "another move"
-    )
-
-
-def _invalid_feedback_warning(
-    feedback: CorrectionFeedback,
-    *,
-    min_feedback_alpha: float,
-    min_feedback_parallel_shift_px: float,
-) -> str:
-    return (
-        "post-move image response below effective feedback threshold: "
-        f"alpha={feedback.alpha:.4g} < {min_feedback_alpha:.4g} or "
-        f"parallel={feedback.parallel_px:.4g} px < "
-        f"{min_feedback_parallel_shift_px:.4g} px; stopping before another move"
-    )
 
 
 def _lqr_kalman_gated_measurement_warning(
@@ -1710,14 +1195,11 @@ def _attrs_safe_numeric_config(value: Any) -> str | float:
 def _reported_next_correction(
     *,
     converged: bool,
-    algorithm: str,
     jacobian: np.ndarray,
     measurement: xr.Dataset,
     axis_scale: np.ndarray,
     gain: float,
-    damping_mu: float,
     max_normalized_step: float | None,
-    min_axis_predicted_shift_px: float,
     lqr_image_scale_px: float,
     lqr_motor_penalty: float,
     lqr_svd_relative_tolerance: float,
@@ -1728,13 +1210,8 @@ def _reported_next_correction(
 ) -> np.ndarray:
     if converged:
         return np.zeros(len(COMMAND_AXES), dtype=np.float64)
-    estimated_offset = estimate_command_offset(
-        jacobian,
-        measurement,
-        weights=weights,
-    )
     if lqr_kalman_filter_enabled:
-        if algorithm != "lqr" or lqr_design is None or lqr_kalman_state is None:
+        if lqr_design is None or lqr_kalman_state is None:
             raise RuntimeError("LQR Kalman state was not initialized")
         raw_correction = solve_lqr_state_command_correction(
             lqr_design,
@@ -1743,25 +1220,18 @@ def _reported_next_correction(
             max_normalized_step=max_normalized_step,
         )
     else:
-        raw_correction = _solve_command_correction(
-            algorithm=algorithm,
-            jacobian=jacobian,
-            measurement=measurement,
-            axis_scale=axis_scale,
+        raw_correction = solve_lqr_command_correction(
+            jacobian,
+            measurement,
+            axis_scale,
             gain=gain,
-            damping_mu=damping_mu,
             max_normalized_step=max_normalized_step,
-            min_axis_predicted_shift_px=min_axis_predicted_shift_px,
-            lqr_image_scale_px=lqr_image_scale_px,
-            lqr_motor_penalty=lqr_motor_penalty,
-            lqr_svd_relative_tolerance=lqr_svd_relative_tolerance,
+            image_scale_px=lqr_image_scale_px,
+            motor_penalty=lqr_motor_penalty,
+            svd_relative_tolerance=lqr_svd_relative_tolerance,
             weights=weights,
         )
-    return _prune_command_correction(
-        algorithm,
-        raw_correction,
-        reference_cmd_mm=estimated_offset,
-    )
+    return _validate_command_correction(raw_correction)
 
 
 def _build_correction_result(
@@ -1783,7 +1253,6 @@ def _build_correction_result(
     move_requested_position_mm: Sequence[np.ndarray],
     move_final_readback_position_mm: Sequence[np.ndarray],
     move_gain: Sequence[float],
-    move_damping_mu: Sequence[float],
     move_pre_weighted_residuals: Sequence[float],
     move_post_weighted_residuals: Sequence[float],
     move_predicted_delta_px: Sequence[np.ndarray],
@@ -1794,11 +1263,8 @@ def _build_correction_result(
     move_feedback_alpha: Sequence[float],
     move_feedback_parallel_px: Sequence[float],
     move_feedback_valid: Sequence[bool],
-    move_jacobian_before: Sequence[np.ndarray],
-    move_jacobian_after: Sequence[np.ndarray],
     move_max_normalized_component: Sequence[float],
     move_active_axis_mask: Sequence[np.ndarray],
-    move_jacobian_refined: Sequence[bool],
     calibration_path: Path,
     correction_history_path: Path,
     correction_run_id: int,
@@ -1808,20 +1274,12 @@ def _build_correction_result(
     correction_history_completed: bool,
     converged: bool,
     move_count: int,
-    damped_wls_pixel_tolerance_px: float,
     lqr_projected_tolerance: float,
     correction_tolerance: float,
     correction_criterion: str,
     gain: float,
-    min_gain: float,
-    damping_mu: float,
     current_gain: float,
-    current_mu: float,
     max_normalized_step: float | None,
-    min_axis_predicted_shift_px: float,
-    min_total_predicted_shift_px: float,
-    min_feedback_alpha: float,
-    min_feedback_parallel_shift_px: float,
     min_command_norm_mm: float,
     max_moves: int,
     lqr_image_scale_px: float,
@@ -1833,7 +1291,6 @@ def _build_correction_result(
     lqr_kalman_measurement_covariance: Any,
     lqr_kalman_initial_covariance: float,
     lqr_kalman_innovation_gate: float | None,
-    algorithm: str,
     initial_commanded_position_mm: np.ndarray,
     commanded_position_mm: np.ndarray,
     warnings: Sequence[str],
@@ -1947,23 +1404,9 @@ def _build_correction_result(
                 ("move",),
                 np.asarray(move_feedback_valid, dtype=bool),
             ),
-            "move_px_per_cmd_mm_before": (
-                ("move", "camera", "pixel_axis", "command_axis"),
-                _stack_jacobian_or_empty(move_jacobian_before),
-                {"units": "px/commanded-mm"},
-            ),
-            "move_px_per_cmd_mm_after": (
-                ("move", "camera", "pixel_axis", "command_axis"),
-                _stack_jacobian_or_empty(move_jacobian_after),
-                {"units": "px/commanded-mm"},
-            ),
             "move_gain": (
                 ("move",),
                 np.asarray(move_gain, dtype=np.float64),
-            ),
-            "move_damping_mu": (
-                ("move",),
-                np.asarray(move_damping_mu, dtype=np.float64),
             ),
             "move_max_normalized_component": (
                 ("move",),
@@ -1972,10 +1415,6 @@ def _build_correction_result(
             "move_active_axis_mask": (
                 ("move", "command_axis"),
                 _stack_bool_or_empty(move_active_axis_mask),
-            ),
-            "move_jacobian_refined": (
-                ("move",),
-                np.asarray(move_jacobian_refined, dtype=bool),
             ),
         }
     ).assign_coords(
@@ -2032,28 +1471,11 @@ def _build_correction_result(
         "correction_started_at_utc": correction_started_at_utc,
         "correction_converged": bool(converged),
         "correction_iterations": int(move_count),
-        "correction_algorithm": algorithm,
         "correction_criterion": correction_criterion,
         "correction_tolerance": float(correction_tolerance),
-        "correction_damped_wls_pixel_tolerance_px": float(
-            damped_wls_pixel_tolerance_px
-        ),
         "correction_gain": float(gain),
-        "correction_min_gain": float(min_gain),
-        "correction_damping_mu": float(damping_mu),
         "correction_final_gain": float(current_gain),
-        "correction_final_damping_mu": float(current_mu),
         "correction_max_normalized_step": max_normalized_attr,
-        "correction_min_axis_predicted_shift_px": float(
-            min_axis_predicted_shift_px
-        ),
-        "correction_min_total_predicted_shift_px": float(
-            min_total_predicted_shift_px
-        ),
-        "correction_min_feedback_alpha": float(min_feedback_alpha),
-        "correction_min_feedback_parallel_shift_px": float(
-            min_feedback_parallel_shift_px
-        ),
         "correction_min_command_norm_mm": float(min_command_norm_mm),
         "max_correction_moves": int(max_moves),
         "correction_applied": move_count > 0,
@@ -2068,35 +1490,32 @@ def _build_correction_result(
             "correction_move_started_at": correction_move_started_at,
             "correction_move_finished_at": correction_move_finished_at,
         }
-    if algorithm == "lqr":
-        attrs |= {
-            "correction_lqr_image_scale_px": float(lqr_image_scale_px),
-            "correction_lqr_motor_penalty": float(lqr_motor_penalty),
-            "correction_lqr_svd_relative_tolerance": float(
-                lqr_svd_relative_tolerance
-            ),
-            "correction_lqr_projected_tolerance": float(lqr_projected_tolerance),
-            "correction_lqr_kalman_filter_enabled": bool(
-                lqr_kalman_filter_enabled
-            ),
-            "correction_lqr_kalman_process_noise": _attrs_safe_numeric_config(
-                lqr_kalman_process_noise
-            ),
-            "correction_lqr_kalman_measurement_noise": float(
-                lqr_kalman_measurement_noise
-            ),
-            "correction_lqr_kalman_measurement_covariance": (
-                _attrs_safe_numeric_config(lqr_kalman_measurement_covariance)
-            ),
-            "correction_lqr_kalman_initial_covariance": float(
-                lqr_kalman_initial_covariance
-            ),
-            "correction_lqr_kalman_innovation_gate": (
-                np.inf
-                if lqr_kalman_innovation_gate is None
-                else float(lqr_kalman_innovation_gate)
-            ),
-        }
+    attrs |= {
+        "correction_lqr_image_scale_px": float(lqr_image_scale_px),
+        "correction_lqr_motor_penalty": float(lqr_motor_penalty),
+        "correction_lqr_svd_relative_tolerance": float(
+            lqr_svd_relative_tolerance
+        ),
+        "correction_lqr_projected_tolerance": float(lqr_projected_tolerance),
+        "correction_lqr_kalman_filter_enabled": bool(lqr_kalman_filter_enabled),
+        "correction_lqr_kalman_process_noise": _attrs_safe_numeric_config(
+            lqr_kalman_process_noise
+        ),
+        "correction_lqr_kalman_measurement_noise": float(
+            lqr_kalman_measurement_noise
+        ),
+        "correction_lqr_kalman_measurement_covariance": (
+            _attrs_safe_numeric_config(lqr_kalman_measurement_covariance)
+        ),
+        "correction_lqr_kalman_initial_covariance": float(
+            lqr_kalman_initial_covariance
+        ),
+        "correction_lqr_kalman_innovation_gate": (
+            np.inf
+            if lqr_kalman_innovation_gate is None
+            else float(lqr_kalman_innovation_gate)
+        ),
+    }
     return result.assign_attrs(attrs)
 
 
@@ -2176,26 +1595,7 @@ def _lqr_state_count(rows: Sequence[np.ndarray]) -> int:
     return int(np.asarray(rows[0]).size)
 
 
-def _stack_jacobian_or_empty(rows: Sequence[np.ndarray]) -> np.ndarray:
-    if not rows:
-        return np.empty(
-            (0, len(CAMERAS), len(PIXEL_AXES), len(COMMAND_AXES)),
-            dtype=np.float64,
-        )
-    return np.stack(rows, axis=0).astype(np.float64, copy=False)
-
-
-def _prune_command_correction(
-    algorithm: str,
-    correction_cmd_mm: np.ndarray,
-    *,
-    reference_cmd_mm: np.ndarray,
-) -> np.ndarray:
-    if _algorithm_uses_command_deadband(algorithm):
-        return _zero_deadband_axis_corrections(
-            correction_cmd_mm,
-            reference_cmd_mm=reference_cmd_mm,
-        )
+def _validate_command_correction(correction_cmd_mm: np.ndarray) -> np.ndarray:
     correction = np.asarray(correction_cmd_mm, dtype=np.float64).copy()
     if correction.shape != (len(COMMAND_AXES),):
         raise ValueError("correction_cmd_mm must have one value for x/y/z")
@@ -2204,43 +1604,10 @@ def _prune_command_correction(
     return correction
 
 
-def _zero_deadband_axis_corrections(
-    correction_cmd_mm: np.ndarray,
-    *,
-    reference_cmd_mm: np.ndarray | None = None,
-) -> np.ndarray:
-    correction = np.asarray(correction_cmd_mm, dtype=np.float64).copy()
-    if correction.shape != (len(COMMAND_AXES),):
-        raise ValueError("correction_cmd_mm must have one value for x/y/z")
-    if reference_cmd_mm is None:
-        reference = correction
-    else:
-        reference = np.asarray(reference_cmd_mm, dtype=np.float64)
-    if reference.shape != (len(COMMAND_AXES),):
-        raise ValueError("reference_cmd_mm must have one value for x/y/z")
-    if not np.isfinite(reference).all():
-        raise ValueError("reference_cmd_mm must contain finite values")
-    for index, axis in enumerate(COMMAND_AXES):
-        deadband = _correction_command_deadband(axis)
-        if abs(reference[index]) <= deadband:
-            correction[index] = 0.0
-    return correction
-
-
-def _correction_command_deadband(axis: str) -> float:
-    deadband = float(
-        constants.DAMPED_WLS_CORRECTION_COMMAND_DEADBAND_MM_BY_AXIS.get(axis, 0.0)
-    )
-    if not np.isfinite(deadband) or deadband < 0.0:
-        raise ValueError("correction command deadbands must be finite and non-negative")
-    return deadband
-
-
 def _correction_stop_warning(
     *,
     raw_correction_cmd_mm: np.ndarray,
     correction_cmd_mm: np.ndarray,
-    estimated_offset_mm: np.ndarray,
     min_command_norm_mm: float,
 ) -> str:
     raw_norm_mm = float(np.linalg.norm(raw_correction_cmd_mm))
@@ -2249,35 +1616,7 @@ def _correction_stop_warning(
             "computed correction step is below the minimum command norm "
             f"{min_command_norm_mm:.4g} mm; stopping before another move"
         )
-    if not _active_correction_indices(
-        correction_cmd_mm
-    ) and _estimated_offset_within_deadbands(estimated_offset_mm):
-        deadband_text = ", ".join(
-            f"{axis}={1000.0 * _correction_command_deadband(axis):.4g} um"
-            for axis in COMMAND_AXES
-        )
-        offset_text = ", ".join(
-            f"{axis}={1000.0 * value:.4g} um"
-            for axis, value in zip(COMMAND_AXES, estimated_offset_mm, strict=True)
-        )
-        return (
-            "estimated command offset is within correction deadbands "
-            f"({deadband_text}); offset=({offset_text}); stopping before another move"
-        )
-    return (
-        "computed correction step has no active axes after pruning; "
-        "stopping before another move"
-    )
-
-
-def _estimated_offset_within_deadbands(estimated_offset_mm: np.ndarray) -> bool:
-    offset = np.asarray(estimated_offset_mm, dtype=np.float64)
-    if offset.shape != (len(COMMAND_AXES),):
-        raise ValueError("estimated_offset_mm must have one value for x/y/z")
-    return all(
-        abs(offset[index]) <= _correction_command_deadband(axis)
-        for index, axis in enumerate(COMMAND_AXES)
-    )
+    return "computed correction step has no active axes; stopping before another move"
 
 
 def _active_correction_indices(correction_cmd_mm: np.ndarray) -> tuple[int, ...]:

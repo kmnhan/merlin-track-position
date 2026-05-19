@@ -134,7 +134,6 @@ def build_sample_calibration_dataset(
         attrs={
             "capture_count": 1,
             "warnings": "",
-            "jacobian_refinement_count": 0,
         },
     )
 
