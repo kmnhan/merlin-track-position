@@ -879,10 +879,10 @@ run_000001
 ...
 ```
 
-During active correction, the run group is rewritten after every completed
-motor move. Thus the file contains the latest available residual trace, motor
-commands, measured image response, feedback diagnostics, and Kalman diagnostics
-when enabled.
+During active correction, the run group is updated after every completed motor
+move without rewriting previous correction runs. Thus the file contains the
+latest available residual trace, motor commands, measured image response,
+feedback diagnostics, and Kalman diagnostics when enabled.
 
 At result assembly, the reported command offset is computed from the final image
 residual and the current Jacobian as a diagnostic estimate:

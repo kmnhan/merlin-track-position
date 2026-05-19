@@ -1716,6 +1716,153 @@ class CorrectionTests(unittest.TestCase):
         np.testing.assert_array_equal(loaded["current_cam0"].values, current_cam0)
         np.testing.assert_array_equal(loaded["current_cam1"].values, current_cam1)
 
+    def test_correction_history_updates_existing_run_in_place(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            calibration_path = Path(tmpdir) / "calibration.h5"
+            history_path = correction_history_path(calibration_path)
+
+            def result(move_count: int, image_value: int) -> xr.Dataset:
+                iteration_count = move_count + 1
+                move_values = (
+                    np.arange(move_count * len(COMMAND_AXES), dtype=float).reshape(
+                        move_count,
+                        len(COMMAND_AXES),
+                    )
+                    / 1000.0
+                )
+                iteration_values = np.stack(
+                    [x_shift(float(index)) for index in range(iteration_count)],
+                    axis=0,
+                )
+                current_cam0 = np.full((4, 5), image_value, dtype=np.uint16)
+                current_cam1 = np.full((6, 7), image_value + 1, dtype=np.uint16)
+                updated = shift_dataset(x_shift(float(image_value))).assign(
+                    current_cam0=(("y_cam0", "x_cam0"), current_cam0),
+                    current_cam1=(("y_cam1", "x_cam1"), current_cam1),
+                    move_command_delta_mm=(
+                        ("move", "command_axis"),
+                        move_values,
+                        {"units": "commanded-mm"},
+                    ),
+                    move_feedback_valid=(
+                        ("move",),
+                        np.ones(move_count, dtype=bool),
+                    ),
+                    iteration_shift_px=(
+                        ("iteration", "camera", "pixel_axis"),
+                        iteration_values,
+                        {"units": "px"},
+                    ),
+                    iteration_weighted_residual_px=(
+                        ("iteration",),
+                        np.linspace(2.0, 1.0, iteration_count),
+                        {"units": "px"},
+                    ),
+                ).assign_coords(
+                    move=np.arange(move_count, dtype=np.int64),
+                    iteration=np.arange(iteration_count, dtype=np.int64),
+                    command_axis=list(COMMAND_AXES),
+                )
+                return updated.assign_attrs(
+                    {
+                        "calibration_path": str(calibration_path),
+                        "correction_history_completed": move_count > 1,
+                    }
+                )
+
+            correct_module.save_correction_history_dataset(
+                result(1, 4),
+                history_path,
+                run_id=0,
+            )
+            correct_module.save_correction_history_dataset(
+                result(2, 9),
+                history_path,
+                run_id=0,
+            )
+
+            with h5py.File(history_path, "r") as history_file:
+                self.assertEqual(int(history_file.attrs["latest_run_id"]), 0)
+                group = history_file["run_000000"]
+                self.assertEqual(group["move"].maxshape, (None,))
+                self.assertEqual(group["iteration"].maxshape, (None,))
+                self.assertIsNone(group["move_command_delta_mm"].maxshape[0])
+                self.assertIsNone(group["iteration_shift_px"].maxshape[0])
+                self.assertEqual(group["move_command_delta_mm"].shape[0], 2)
+                self.assertEqual(group["iteration_shift_px"].shape[0], 3)
+
+            loaded = load_latest_correction_history_dataset(calibration_path)
+
+        self.assertIsNotNone(loaded)
+        assert loaded is not None
+        self.assertTrue(loaded.attrs["correction_history_completed"])
+        self.assertEqual(loaded.sizes["move"], 2)
+        self.assertEqual(loaded.sizes["iteration"], 3)
+        np.testing.assert_allclose(
+            loaded["move_command_delta_mm"].values,
+            np.array([[0.0, 0.001, 0.002], [0.003, 0.004, 0.005]]),
+        )
+        np.testing.assert_array_equal(
+            loaded["current_cam0"].values,
+            np.full((4, 5), 9, dtype=np.uint16),
+        )
+        self.assertEqual(loaded["move_feedback_valid"].dtype, bool)
+
+    def test_successful_deferred_correction_history_save_does_not_stage(self):
+        result = shift_dataset(x_shift(1.0)).assign_attrs(
+            {
+                "calibration_path": "calibration.h5",
+                "correction_history_completed": True,
+            }
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            history_path = Path(tmpdir) / "correction-history.h5"
+            with patch(
+                "merlin_track_position.tracking.correct.stage_dataset",
+            ) as stage:
+                persistence = correct_module.save_correction_history_dataset_deferred(
+                    result,
+                    history_path,
+                    run_id=0,
+                )
+
+        stage.assert_not_called()
+        self.assertTrue(persistence.flushed)
+        self.assertFalse(persistence.pending)
+        self.assertIsNone(persistence.spool_path)
+
+    def test_next_correction_history_run_id_uses_latest_attr_with_fallback(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fast_path = Path(tmpdir) / "fast.h5"
+            with h5py.File(fast_path, "w") as history_file:
+                history_file.create_group("run_000003")
+                history_file.create_group("run_999999")
+                history_file.attrs["latest_run_id"] = 3
+
+            legacy_path = Path(tmpdir) / "legacy.h5"
+            with h5py.File(legacy_path, "w") as history_file:
+                history_file.create_group("run_000002")
+                history_file.create_group("run_000005")
+
+            broken_attr_path = Path(tmpdir) / "broken-attr.h5"
+            with h5py.File(broken_attr_path, "w") as history_file:
+                history_file.create_group("run_000004")
+                history_file.attrs["latest_run_id"] = 10
+
+            self.assertEqual(
+                correct_module._next_correction_history_run_id(fast_path),
+                4,
+            )
+            self.assertEqual(
+                correct_module._next_correction_history_run_id(legacy_path),
+                6,
+            )
+            self.assertEqual(
+                correct_module._next_correction_history_run_id(broken_attr_path),
+                5,
+            )
+
     def test_correction_timestamps_from_history_extracts_run_attrs(self):
         first = shift_dataset(x_shift(1.0)).assign_attrs(
             {
@@ -1962,6 +2109,7 @@ class CorrectionTests(unittest.TestCase):
                         "pending",
                     )
                     self.assertTrue(pending.attrs["correction_history_completed"])
+                    self.assertEqual(pending_entry_count(), 1)
             finally:
                 history_reader.close()
 

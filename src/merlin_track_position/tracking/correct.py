@@ -52,6 +52,8 @@ logger = logging.getLogger("merlin_track_position.tracking.correct")
 
 CORRECTION_CRITERION = "lqr_projected_normalized_error"
 _USE_DEFAULT = object()
+_CORRECTION_HISTORY_FORMAT = "merlin_track_position_correction_history"
+_CORRECTION_HISTORY_RESIZABLE_DIMS = ("move", "iteration")
 
 
 class CorrectionFeedback(NamedTuple):
@@ -905,12 +907,19 @@ def save_correction_history_dataset(
 
     with h5py.File(output_path, "a") as history_file:
         if group_name in history_file:
+            if _update_correction_history_group_in_place(
+                history_file,
+                group_name,
+                saved,
+                run_id=int(run_id),
+            ):
+                return output_path
             del history_file[group_name]
-        history_file.attrs["format"] = "merlin_track_position_correction_history"
-        history_file.attrs["latest_run_group"] = group_name
-        history_file.attrs["latest_run_id"] = int(run_id)
-        history_file.attrs["calibration_path"] = str(
-            saved.attrs.get("calibration_path", "")
+        _update_correction_history_root_attrs(
+            history_file,
+            group_name,
+            saved,
+            run_id=int(run_id),
         )
 
     saved.to_netcdf(
@@ -919,6 +928,7 @@ def save_correction_history_dataset(
         mode="a",
         group=group_name,
         encoding=hdf5_image_encoding(saved),
+        unlimited_dims=_correction_history_unlimited_dims(saved),
     )
     return output_path
 
@@ -929,25 +939,32 @@ def save_correction_history_dataset_deferred(
     *,
     run_id: int,
 ) -> PersistenceResult:
-    """Save correction history through a local spool before appending to HDF5."""
+    """Save correction history, queueing the latest snapshot if HDF5 is locked."""
 
     output_path = normalize_target_path(path)
-    group_name = _correction_history_group_name(run_id)
-    saved = _netcdf_safe_correction_result(result.load().copy(deep=True))
-    entry = stage_dataset(
-        saved,
-        output_path,
-        operation="correction_history",
-        metadata={
-            "run_id": int(run_id),
-            "group_name": group_name,
-            "calibration_path": str(saved.attrs.get("calibration_path", "")),
-            "completed": bool(saved.attrs.get("correction_history_completed", False)),
-        },
-    )
     try:
         save_correction_history_dataset(result, output_path, run_id=run_id)
     except Exception as exc:
+        group_name = _correction_history_group_name(run_id)
+        saved = _netcdf_safe_correction_result(result.load().copy(deep=True))
+        entry = stage_dataset(
+            saved,
+            output_path,
+            operation="correction_history",
+            metadata={
+                "run_id": int(run_id),
+                "group_name": group_name,
+                "calibration_path": str(saved.attrs.get("calibration_path", "")),
+                "completed": bool(
+                    saved.attrs.get("correction_history_completed", False)
+                ),
+            },
+        )
+        _discard_pending_correction_history_run(
+            output_path,
+            int(run_id),
+            keep_entry=entry,
+        )
         return PersistenceResult(
             target_path=output_path,
             spool_path=entry.path,
@@ -958,11 +975,10 @@ def save_correction_history_dataset_deferred(
             ),
         )
 
-    discard_spool_entry(entry)
     _discard_pending_correction_history_run(output_path, int(run_id))
     return PersistenceResult(
         target_path=output_path,
-        spool_path=entry.path,
+        spool_path=None,
         flushed=True,
         pending=False,
         message="correction history write flushed to target",
@@ -1091,18 +1107,129 @@ def _restore_netcdf_safe_correction_result(result: xr.Dataset) -> xr.Dataset:
     return restored
 
 
+def _update_correction_history_group_in_place(
+    history_file: h5py.File,
+    group_name: str,
+    saved: xr.Dataset,
+    *,
+    run_id: int,
+) -> bool:
+    group = history_file[group_name]
+    if not _correction_history_group_can_update(group, saved):
+        return False
+
+    _update_correction_history_root_attrs(
+        history_file,
+        group_name,
+        saved,
+        run_id=run_id,
+    )
+    _update_hdf5_attrs(group.attrs, saved.attrs)
+
+    for dim_name in _CORRECTION_HISTORY_RESIZABLE_DIMS:
+        if dim_name in saved.coords:
+            _update_hdf5_dataset(group[dim_name], saved.coords[dim_name])
+    for name, variable in saved.data_vars.items():
+        _update_hdf5_dataset(group[name], variable)
+    return True
+
+
+def _correction_history_group_can_update(
+    group: h5py.Group,
+    saved: xr.Dataset,
+) -> bool:
+    if any(name not in saved.variables for name in group.keys()):
+        return False
+
+    required_names = set(saved.data_vars)
+    required_names.update(
+        dim_name
+        for dim_name in _CORRECTION_HISTORY_RESIZABLE_DIMS
+        if dim_name in saved.coords
+    )
+    for name in required_names:
+        if name not in group:
+            return False
+        if not isinstance(group[name], h5py.Dataset):
+            return False
+        if not _hdf5_dataset_can_store_variable(group[name], saved[name]):
+            return False
+    return True
+
+
+def _hdf5_dataset_can_store_variable(
+    dataset: h5py.Dataset,
+    variable: xr.DataArray,
+) -> bool:
+    shape = tuple(int(size) for size in variable.shape)
+    if len(dataset.shape) != len(shape):
+        return False
+
+    for axis, (current_size, target_size) in enumerate(
+        zip(dataset.shape, shape, strict=True)
+    ):
+        dim_name = variable.dims[axis]
+        if dim_name in _CORRECTION_HISTORY_RESIZABLE_DIMS:
+            max_size = dataset.maxshape[axis]
+            if max_size is not None and target_size > max_size:
+                return False
+            continue
+        if current_size != target_size:
+            return False
+    return True
+
+
+def _update_hdf5_dataset(
+    dataset: h5py.Dataset,
+    variable: xr.DataArray,
+) -> None:
+    values = np.asarray(variable.values)
+    shape = tuple(int(size) for size in values.shape)
+    if dataset.shape != shape:
+        dataset.resize(shape)
+    if shape:
+        dataset[...] = values
+    else:
+        dataset[()] = values
+    _update_hdf5_attrs(dataset.attrs, variable.attrs)
+
+
+def _update_hdf5_attrs(
+    attrs: h5py.AttributeManager,
+    values: dict[Any, Any],
+) -> None:
+    for key, value in values.items():
+        attrs[str(key)] = value
+
+
+def _update_correction_history_root_attrs(
+    history_file: h5py.File,
+    group_name: str,
+    saved: xr.Dataset,
+    *,
+    run_id: int,
+) -> None:
+    history_file.attrs["format"] = _CORRECTION_HISTORY_FORMAT
+    history_file.attrs["latest_run_group"] = group_name
+    history_file.attrs["latest_run_id"] = int(run_id)
+    history_file.attrs["calibration_path"] = str(
+        saved.attrs.get("calibration_path", "")
+    )
+
+
+def _correction_history_unlimited_dims(saved: xr.Dataset) -> tuple[str, ...]:
+    return tuple(
+        dim_name
+        for dim_name in _CORRECTION_HISTORY_RESIZABLE_DIMS
+        if dim_name in saved.dims
+    )
+
+
 def _latest_correction_history_run_id(path: Path) -> int | None:
     if not path.exists():
         return None
     with h5py.File(path, "r") as history_file:
-        latest_attr = history_file.attrs.get("latest_run_group")
-        if isinstance(latest_attr, bytes):
-            latest_attr = latest_attr.decode()
-        latest_run_id = (
-            _correction_history_run_id(latest_attr)
-            if isinstance(latest_attr, str) and latest_attr in history_file
-            else None
-        )
+        latest_run_id = _latest_correction_history_run_id_from_attrs(history_file)
         if latest_run_id is not None:
             return latest_run_id
 
@@ -1120,13 +1247,17 @@ def _next_correction_history_run_id(path: Path) -> int:
     run_ids: list[int] = []
     if path.exists():
         with h5py.File(path, "r") as history_file:
-            run_ids.extend(
-                run_id
-                for run_id in (
-                    _correction_history_run_id(name) for name in history_file.keys()
+            latest_run_id = _latest_correction_history_run_id_from_attrs(history_file)
+            if latest_run_id is not None:
+                run_ids.append(latest_run_id)
+            else:
+                run_ids.extend(
+                    run_id
+                    for run_id in (
+                        _correction_history_run_id(name) for name in history_file.keys()
+                    )
+                    if run_id is not None
                 )
-                if run_id is not None
-            )
     run_ids.extend(
         int(entry.metadata["run_id"])
         for entry in iter_pending_entries(
@@ -1135,6 +1266,38 @@ def _next_correction_history_run_id(path: Path) -> int:
         )
     )
     return max(run_ids, default=-1) + 1
+
+
+def _latest_correction_history_run_id_from_attrs(
+    history_file: h5py.File,
+) -> int | None:
+    latest_run_id = _attr_as_int(history_file.attrs.get("latest_run_id"))
+    if latest_run_id is not None:
+        group_name = _correction_history_group_name(latest_run_id)
+        if group_name in history_file:
+            return latest_run_id
+
+    latest_attr = history_file.attrs.get("latest_run_group")
+    if isinstance(latest_attr, bytes):
+        latest_attr = latest_attr.decode()
+    latest_group_run_id = (
+        _correction_history_run_id(latest_attr)
+        if isinstance(latest_attr, str) and latest_attr in history_file
+        else None
+    )
+    return latest_group_run_id
+
+
+def _attr_as_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bytes):
+        value = value.decode()
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 0 else None
 
 
 def _correction_history_group_name(run_id: int) -> str:
@@ -1208,11 +1371,15 @@ def _superseded_pending_correction_history_entries(
 def _discard_pending_correction_history_run(
     path: Path | str,
     run_id: int,
+    *,
+    keep_entry: PendingEntry | None = None,
 ) -> None:
     for entry in iter_pending_entries(
         operation="correction_history",
         target_path=path,
     ):
+        if keep_entry is not None and entry.path == keep_entry.path:
+            continue
         if int(entry.metadata["run_id"]) == int(run_id):
             discard_spool_entry(entry)
 
