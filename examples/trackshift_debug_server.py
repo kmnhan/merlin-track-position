@@ -14,6 +14,7 @@ import zmq
 
 DEFAULT_BIND = "tcp://127.0.0.1:6554"
 DEFAULT_TIMEOUT_MS = 60_000
+DEFAULT_BCS_API_CORRECTING_STATUSES = 1
 XYZ_AXES = ("x", "y", "z")
 
 
@@ -156,7 +157,7 @@ def _validate_move_result(
     expected_move_id: int,
 ) -> list[str]:
     problems: list[str] = []
-    if request.get("command") != "MOVE_RESULT":
+    if str(request.get("command", "")).upper() != "MOVE_RESULT":
         problems.append("command is not MOVE_RESULT")
     if str(request.get("session_id", "")) != expected_session_id:
         problems.append(
@@ -190,13 +191,22 @@ def _validate_move_result(
 
 def run_server(args: argparse.Namespace) -> int:
     moves = [_parse_move(spec, timeout_ms=args.timeout_ms) for spec in args.move]
+    bcs_api_correcting_statuses = max(0, int(args.bcs_api_correcting_statuses))
     ctx = zmq.Context.instance()
     socket = ctx.socket(zmq.REP)
     socket.setsockopt(zmq.LINGER, 0)
     socket.bind(args.bind)
 
     print(f"Track Shift polling debug server listening on {args.bind}")
-    if moves:
+    if args.use_bcs_api_backend:
+        print("Backend mode: BCS API (no pending_move responses).")
+        print(
+            "BCS API correction completes after "
+            f"{bcs_api_correcting_statuses} correcting STATUS response(s)."
+        )
+        if moves:
+            print("Ignoring --move entries because BCS API mode owns motor moves.")
+    elif moves:
         print("Scripted STATUS moves:")
         for index, move in enumerate(moves, start=1):
             print(
@@ -213,6 +223,7 @@ def run_server(args: argparse.Namespace) -> int:
     message = ""
     next_move_index = 0
     pending_move: dict[str, Any] | None = None
+    bcs_api_correcting_status_count = 0
     current_positions_mm = {axis: 0.0 for axis in XYZ_AXES}
 
     try:
@@ -238,6 +249,25 @@ def run_server(args: argparse.Namespace) -> int:
 
             command = str(request.get("command", "")).upper()
             if command == "START":
+                if state in {"correcting", "move_pending"}:
+                    _send(
+                        socket,
+                        "ERROR",
+                        _status_payload(
+                            ok=False,
+                            state=state,
+                            session_id=session_id,
+                            target=target,
+                            message=(
+                                "a Track Shift correction session is already active"
+                            ),
+                            pending_move=(
+                                None if args.use_bcs_api_backend else pending_move
+                            ),
+                        ),
+                    )
+                    continue
+
                 session_id = str(request.get("session_id") or session_id)
                 target = request.get("target")
                 positions = request.get("positions_mm")
@@ -249,8 +279,12 @@ def run_server(args: argparse.Namespace) -> int:
                             current_positions_mm[axis] = 0.0
                 next_move_index = 0
                 pending_move = None
+                bcs_api_correcting_status_count = 0
                 state = "correcting"
-                message = "debug server: correction started"
+                if args.use_bcs_api_backend:
+                    message = "debug server: BCS API correction started"
+                else:
+                    message = "debug server: correction started"
                 print(f"START target={target!r}")
                 print(f"START positions_mm={request.get('positions_mm')!r}")
                 _send(
@@ -267,7 +301,21 @@ def run_server(args: argparse.Namespace) -> int:
                 continue
 
             if command == "STATUS":
-                if state == "correcting" and pending_move is None:
+                if args.use_bcs_api_backend and state == "correcting":
+                    if (
+                        bcs_api_correcting_status_count
+                        < bcs_api_correcting_statuses
+                    ):
+                        bcs_api_correcting_status_count += 1
+                        message = (
+                            "debug server: BCS API correction running "
+                            f"({bcs_api_correcting_status_count}/"
+                            f"{bcs_api_correcting_statuses})"
+                        )
+                    else:
+                        state = "complete"
+                        message = "debug server: BCS API correction complete"
+                elif state == "correcting" and pending_move is None:
                     if next_move_index < len(moves):
                         move_id = next_move_index + 1
                         pending_move = _move_payload(
@@ -293,12 +341,31 @@ def run_server(args: argparse.Namespace) -> int:
                         session_id=session_id,
                         target=target,
                         message=message,
-                        pending_move=pending_move,
+                        pending_move=(
+                            None if args.use_bcs_api_backend else pending_move
+                        ),
                     ),
                 )
                 continue
 
             if command == "MOVE_RESULT":
+                if args.use_bcs_api_backend:
+                    _send(
+                        socket,
+                        "ERROR",
+                        _status_payload(
+                            ok=False,
+                            state=state,
+                            session_id=session_id,
+                            target=target,
+                            message=(
+                                "MOVE_RESULT received while using BCS API backend; "
+                                "no pending LabVIEW move was published"
+                            ),
+                        ),
+                    )
+                    continue
+
                 if pending_move is None:
                     _send(
                         socket,
@@ -369,6 +436,31 @@ def run_server(args: argparse.Namespace) -> int:
                 continue
 
             if command == "ABORT":
+                requested_session_id = request.get("session_id")
+                if (
+                    requested_session_id
+                    and session_id
+                    and str(requested_session_id) != session_id
+                ):
+                    _send(
+                        socket,
+                        "ERROR",
+                        _status_payload(
+                            ok=False,
+                            state=state,
+                            session_id=session_id,
+                            target=target,
+                            message=(
+                                f"ABORT session_id {requested_session_id!r} "
+                                f"did not match active session {session_id!r}"
+                            ),
+                            pending_move=(
+                                None if args.use_bcs_api_backend else pending_move
+                            ),
+                        ),
+                    )
+                    continue
+
                 pending_move = None
                 state = "error"
                 message = str(request.get("message") or "debug server: aborted")
@@ -394,7 +486,7 @@ def run_server(args: argparse.Namespace) -> int:
                     session_id=session_id,
                     target=target,
                     message=f"unknown command {command!r}",
-                    pending_move=pending_move,
+                    pending_move=None if args.use_bcs_api_backend else pending_move,
                 ),
             )
     except KeyboardInterrupt:
@@ -430,6 +522,25 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--max-retries", type=int, default=4)
     parser.add_argument("--session-id", default="")
+    parser.add_argument(
+        "--use-bcs-api-backend",
+        action="store_true",
+        help=(
+            "emulate MOTOR_SERVER_USE_BCS_API_BACKEND=True: STATUS never includes "
+            "pending_move and MOVE_RESULT is rejected"
+        ),
+    )
+    parser.add_argument(
+        "--bcs-api-correcting-statuses",
+        type=int,
+        default=DEFAULT_BCS_API_CORRECTING_STATUSES,
+        metavar="N",
+        help=(
+            "in --use-bcs-api-backend mode, return N correcting STATUS replies "
+            "after START before reporting complete; default "
+            f"{DEFAULT_BCS_API_CORRECTING_STATUSES}"
+        ),
+    )
     return run_server(parser.parse_args(argv))
 
 
