@@ -48,9 +48,7 @@ def _parse_move(spec: str, *, timeout_ms: int) -> Move:
                 f"target for axis {axis!r} must be numeric"
             ) from exc
         if not math.isfinite(target):
-            raise argparse.ArgumentTypeError(
-                f"target for axis {axis!r} must be finite"
-            )
+            raise argparse.ArgumentTypeError(f"target for axis {axis!r} must be finite")
         targets[axis] = target
     if not targets:
         raise argparse.ArgumentTypeError("move must contain at least one axis=value")
@@ -138,15 +136,23 @@ def _status_payload(
     message: str,
     pending_move: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    try:
+        target_value = float(target)
+    except (TypeError, ValueError):
+        target_value = 0.0
     payload = {
         "ok": ok,
         "state": state,
         "session_id": session_id,
-        "target": target,
+        "target": target_value,
         "message": message,
+        "pending_move": ""
+        if pending_move is None
+        else json.dumps(
+            pending_move,
+            separators=(",", ":"),
+        ),
     }
-    if pending_move is not None:
-        payload["pending_move"] = pending_move
     return payload
 
 
@@ -199,7 +205,7 @@ def run_server(args: argparse.Namespace) -> int:
 
     print(f"Track Shift polling debug server listening on {args.bind}")
     if args.use_bcs_api_backend:
-        print("Backend mode: BCS API (no pending_move responses).")
+        print("Backend mode: BCS API (pending_move is always an empty string).")
         print(
             "BCS API correction completes after "
             f"{bcs_api_correcting_statuses} correcting STATUS response(s)."
@@ -218,7 +224,7 @@ def run_server(args: argparse.Namespace) -> int:
     print("Press Ctrl-C to stop.\n")
 
     session_id = args.session_id or uuid.uuid4().hex
-    target: Any = None
+    target: Any = 0.0
     state = "idle"
     message = ""
     next_move_index = 0
@@ -302,10 +308,7 @@ def run_server(args: argparse.Namespace) -> int:
 
             if command == "STATUS":
                 if args.use_bcs_api_backend and state == "correcting":
-                    if (
-                        bcs_api_correcting_status_count
-                        < bcs_api_correcting_statuses
-                    ):
+                    if bcs_api_correcting_status_count < bcs_api_correcting_statuses:
                         bcs_api_correcting_status_count += 1
                         message = (
                             "debug server: BCS API correction running "
@@ -526,8 +529,8 @@ def main(argv: list[str] | None = None) -> int:
         "--use-bcs-api-backend",
         action="store_true",
         help=(
-            "emulate MOTOR_SERVER_USE_BCS_API_BACKEND=True: STATUS never includes "
-            "pending_move and MOVE_RESULT is rejected"
+            "emulate MOTOR_SERVER_USE_BCS_API_BACKEND=True: STATUS returns "
+            "pending_move as an empty string and MOVE_RESULT is rejected"
         ),
     )
     parser.add_argument(

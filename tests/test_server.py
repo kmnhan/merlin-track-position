@@ -84,6 +84,25 @@ class MotorServerDialogueTests(unittest.TestCase):
         status, payload = response
         return status, json.loads(payload)
 
+    def _decoded_pending_move(self, payload):
+        self.assertIsInstance(payload["pending_move"], str)
+        self.assertNotEqual(payload["pending_move"], "")
+        return json.loads(payload["pending_move"])
+
+    def test_idle_status_is_labview_safe(self):
+        server = MotorServer(use_bcs_api_backend=False)
+        try:
+            status, payload = self._decoded_response(
+                server._handle_request({"command": "STATUS"})
+            )
+            self.assertEqual(status, "OK")
+            self.assertEqual(payload["state"], "idle")
+            self.assertIsInstance(payload["target"], float)
+            self.assertEqual(payload["target"], 0.0)
+            self.assertEqual(payload["pending_move"], "")
+        finally:
+            server.stop()
+
     def _wait_for_state(self, server, expected_state, *, timeout_s=2.0):
         deadline = time.monotonic() + timeout_s
         last_payload = None
@@ -96,10 +115,12 @@ class MotorServerDialogueTests(unittest.TestCase):
             if payload["state"] == expected_state:
                 return payload
             time.sleep(0.01)
-        self.fail(f"state {expected_state!r} not reached; last payload={last_payload!r}")
+        self.fail(
+            f"state {expected_state!r} not reached; last payload={last_payload!r}"
+        )
 
     def test_start_creates_backend_and_returns_correcting_immediately(self):
-        server = MotorServer()
+        server = MotorServer(use_bcs_api_backend=False)
         server._running.set()
         targets = []
         server.sigMoveDetected.connect(lambda target: targets.append(target))
@@ -118,7 +139,9 @@ class MotorServerDialogueTests(unittest.TestCase):
             self.assertEqual(status, "OK")
             self.assertEqual(payload["state"], "correcting")
             self.assertEqual(payload["session_id"], "session-1")
-            self.assertEqual(payload["target"], 1)
+            self.assertIsInstance(payload["target"], float)
+            self.assertEqual(payload["target"], 1.0)
+            self.assertEqual(payload["pending_move"], "")
             self.assertEqual(targets, [1])
             self.assertIsNotNone(server.current_motor_backend())
         finally:
@@ -127,7 +150,7 @@ class MotorServerDialogueTests(unittest.TestCase):
     def test_status_returns_pending_move_idempotently_and_move_result_unblocks_move(
         self,
     ):
-        server = MotorServer()
+        server = MotorServer(use_bcs_api_backend=False)
         server._running.set()
         try:
             server._handle_request(
@@ -153,8 +176,8 @@ class MotorServerDialogueTests(unittest.TestCase):
             pending = self._wait_for_state(server, "move_pending")
             repeated = self._wait_for_state(server, "move_pending")
 
-            pending_move = pending["pending_move"]
-            repeated_move = repeated["pending_move"]
+            pending_move = self._decoded_pending_move(pending)
+            repeated_move = self._decoded_pending_move(repeated)
             self.assertEqual(pending_move, repeated_move)
             self.assertEqual(pending_move["session_id"], "session-1")
             self.assertEqual(pending_move["move_id"], 1)
@@ -190,13 +213,16 @@ class MotorServerDialogueTests(unittest.TestCase):
             )
             self.assertEqual(status, "OK")
             self.assertEqual(payload["state"], "complete")
-            self.assertEqual(payload["message"], "Correction converged after 1 move(s).")
+            self.assertEqual(
+                payload["message"], "Correction converged after 1 move(s)."
+            )
+            self.assertEqual(payload["pending_move"], "")
             self.assertIsNone(server.current_motor_backend())
         finally:
             server.stop()
 
     def test_session_mismatch_does_not_consume_pending_move(self):
-        server = MotorServer()
+        server = MotorServer(use_bcs_api_backend=False)
         server._running.set()
         try:
             server._handle_request(
@@ -221,7 +247,7 @@ class MotorServerDialogueTests(unittest.TestCase):
             thread = threading.Thread(target=request_move)
             thread.start()
             pending = self._wait_for_state(server, "move_pending")
-            move_id = pending["pending_move"]["move_id"]
+            move_id = self._decoded_pending_move(pending)["move_id"]
 
             status, payload = self._decoded_response(
                 server._handle_request(
@@ -257,7 +283,7 @@ class MotorServerDialogueTests(unittest.TestCase):
             server.stop()
 
     def test_abort_marks_error_and_unblocks_pending_move(self):
-        server = MotorServer()
+        server = MotorServer(use_bcs_api_backend=False)
         server._running.set()
         try:
             server._handle_request(
@@ -323,8 +349,9 @@ class MotorServerDialogueTests(unittest.TestCase):
             self.assertEqual(status, "OK")
             self.assertEqual(payload["state"], "correcting")
             self.assertEqual(payload["session_id"], "session-1")
-            self.assertEqual(payload["target"], 1)
-            self.assertNotIn("pending_move", payload)
+            self.assertIsInstance(payload["target"], float)
+            self.assertEqual(payload["target"], 1.0)
+            self.assertEqual(payload["pending_move"], "")
             self.assertEqual(targets, [1])
             self.assertIsNone(server.current_motor_backend())
 
@@ -333,7 +360,7 @@ class MotorServerDialogueTests(unittest.TestCase):
             )
             self.assertEqual(status, "OK")
             self.assertEqual(repeated["state"], "correcting")
-            self.assertNotIn("pending_move", repeated)
+            self.assertEqual(repeated["pending_move"], "")
         finally:
             server.stop()
 
@@ -360,7 +387,7 @@ class MotorServerDialogueTests(unittest.TestCase):
                 payload["message"],
                 "Correction converged after 0 move(s).",
             )
-            self.assertNotIn("pending_move", payload)
+            self.assertEqual(payload["pending_move"], "")
             self.assertIsNone(server.current_motor_backend())
 
             server._handle_request(
@@ -379,7 +406,7 @@ class MotorServerDialogueTests(unittest.TestCase):
             self.assertFalse(payload["ok"])
             self.assertEqual(payload["state"], "error")
             self.assertEqual(payload["message"], "BCS API move failed")
-            self.assertNotIn("pending_move", payload)
+            self.assertEqual(payload["pending_move"], "")
         finally:
             server.stop()
 
@@ -456,7 +483,7 @@ class MotorServerDialogueTests(unittest.TestCase):
             self.assertFalse(payload["ok"])
             self.assertEqual(payload["state"], "error")
             self.assertEqual(payload["message"], "operator abort")
-            self.assertNotIn("pending_move", payload)
+            self.assertEqual(payload["pending_move"], "")
             self.assertIsNone(server.current_motor_backend())
         finally:
             server.stop()

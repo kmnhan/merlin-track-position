@@ -60,8 +60,7 @@ def _coerce_axis_positions(
     missing = [axis for axis in required_axes if axis not in coerced]
     if missing:
         raise TrackShiftProtocolError(
-            "positions_mm is missing required axis readbacks: "
-            + ", ".join(missing)
+            "positions_mm is missing required axis readbacks: " + ", ".join(missing)
         )
     return coerced
 
@@ -279,8 +278,8 @@ class TrackShiftMotorBackend:
             return dict(self._pending_payload)
 
     def _wait_for_move_result(self, timeout_ms: int) -> _MoveResult:
-        deadline = time.monotonic() + timeout_ms / 1000.0 + (
-            _MOVE_RESULT_TIMEOUT_MARGIN_S
+        deadline = (
+            time.monotonic() + timeout_ms / 1000.0 + (_MOVE_RESULT_TIMEOUT_MARGIN_S)
         )
         with self._condition:
             while self._pending_result is _UNSET:
@@ -387,8 +386,7 @@ class MotorServer(QtCore.QThread):
                                             "ok": False,
                                             "state": "error",
                                             "message": (
-                                                "Track Shift protocol error: "
-                                                f"{exc}"
+                                                f"Track Shift protocol error: {exc}"
                                             ),
                                         }
                                     ).encode(),
@@ -576,15 +574,18 @@ class MotorServer(QtCore.QThread):
             elif state not in {"complete", "error"}:
                 state = "idle"
 
+            target = 0.0 if self._target is None else float(self._target)
+            pending_move_json = (
+                "" if pending_move is None else _json_payload(pending_move)
+            )
             payload: dict[str, typing.Any] = {
                 "ok": state != "error",
                 "state": state,
                 "session_id": self._session_id or "",
-                "target": self._target,
+                "target": target,
                 "message": self._message,
+                "pending_move": pending_move_json,
             }
-            if pending_move is not None:
-                payload["pending_move"] = pending_move
             return payload
 
     def _error_response(self, message: str) -> tuple[str, str]:
