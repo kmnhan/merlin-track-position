@@ -65,7 +65,7 @@ DEFAULT_AXIS_SCALE_BOUNDS_CMD_MM_BY_AXIS: dict[str, tuple[float, float]] = {
 DEFAULT_VISUAL_CALIBRATION_REPEATS_PER_DIRECTION: int = 3
 
 # Minimum two-camera image response accepted for a calibration probe.
-DEFAULT_VISUAL_CALIBRATION_MIN_SHIFT_PX: float = 2.0
+DEFAULT_VISUAL_CALIBRATION_MIN_SHIFT_PX: float = 0.3
 
 # Calibration condition number threshold above which the fit is rejected.
 DEFAULT_JACOBIAN_CONDITION_WARNING: float = 100.0
