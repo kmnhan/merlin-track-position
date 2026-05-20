@@ -49,9 +49,9 @@ CALIBRATION_FIT_N_JOBS: int = 1
 
 # Default commanded-mm probe steps for calibration.
 DEFAULT_VISUAL_CALIBRATION_STEP_MM_BY_AXIS: dict[str, float] = {
-    "x": 0.02,
-    "y": 0.02,
-    "z": 0.02,
+    "x": 0.03,
+    "y": 0.03,
+    "z": 0.03,
 }
 
 # Bounds used when deriving correction command normalization scales.
@@ -65,7 +65,7 @@ DEFAULT_AXIS_SCALE_BOUNDS_CMD_MM_BY_AXIS: dict[str, tuple[float, float]] = {
 DEFAULT_VISUAL_CALIBRATION_REPEATS_PER_DIRECTION: int = 3
 
 # Minimum two-camera image response accepted for a calibration probe.
-DEFAULT_VISUAL_CALIBRATION_MIN_SHIFT_PX: float = 0.3
+DEFAULT_VISUAL_CALIBRATION_MIN_SHIFT_PX: float = 0.2
 
 # Calibration condition number threshold above which the fit is rejected.
 DEFAULT_JACOBIAN_CONDITION_WARNING: float = 100.0
