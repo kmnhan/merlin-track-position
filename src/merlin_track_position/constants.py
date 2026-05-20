@@ -49,9 +49,9 @@ CALIBRATION_FIT_N_JOBS: int = 1
 
 # Default commanded-mm probe steps for calibration.
 DEFAULT_VISUAL_CALIBRATION_STEP_MM_BY_AXIS: dict[str, float] = {
-    "x": 0.2,
-    "y": 0.2,
-    "z": 0.2,
+    "x": 0.02,
+    "y": 0.02,
+    "z": 0.02,
 }
 
 # Bounds used when deriving correction command normalization scales.
