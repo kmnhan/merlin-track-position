@@ -75,10 +75,10 @@ DEFAULT_JACOBIAN_CONDITION_WARNING: float = 100.0
 # Shared closed-loop LQR correction defaults in command-mm visual-servo space.
 # Observation weights are ordered as cam0_du, cam0_dv, cam1_du, cam1_dv.
 CORRECTION_OBSERVATION_WEIGHTS: tuple[float, float, float, float] | None = (
-    2.12,
-    0.45,
-    0.32,
-    1.11,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
 )
 DEFAULT_CORRECTION_MIN_COMMAND_NORM_MM: float = 1e-9
 DEFAULT_CORRECTION_MOVE_DELTA_DEADBAND_UM: float = 0.1
