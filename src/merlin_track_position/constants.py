@@ -27,7 +27,7 @@ MOTOR_BACKLASH_CORRECTION: dict[str, float] = {
 # Apply MOTOR_BACKLASH_CORRECTION to correction moves when Python is moving
 # motors directly through the BCS API. Delegated LabVIEW moves keep their own
 # motor behavior.
-CORRECTION_USE_BCS_API_BACKLASH: bool = True
+CORRECTION_USE_BCS_API_BACKLASH: bool = False
 
 # Stale-status readback fallback for motor moves. Values are keyed by motor alias
 # and are in each motor's command units. For x/y/z this is mm.
@@ -81,6 +81,7 @@ CORRECTION_OBSERVATION_WEIGHTS: tuple[float, float, float, float] | None = (
     1.11,
 )
 DEFAULT_CORRECTION_MIN_COMMAND_NORM_MM: float = 1e-9
+DEFAULT_CORRECTION_MOVE_DELTA_DEADBAND_UM: float = 0.1
 DEFAULT_CORRECTION_MAX_MOVES: int = 12
 
 # LQR solver weights and numerical tolerance.

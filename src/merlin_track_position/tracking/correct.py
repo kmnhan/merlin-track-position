@@ -141,18 +141,14 @@ def do_correction(
         and constants.CORRECTION_USE_BCS_API_BACKLASH
     )
     correction_backlash = (
-        dict(constants.MOTOR_BACKLASH_CORRECTION)
-        if correction_backlash_enabled
-        else {}
+        dict(constants.MOTOR_BACKLASH_CORRECTION) if correction_backlash_enabled else {}
     )
     weights = _correction_weights(weights)
     if gain is _USE_DEFAULT:
         gain = constants.DEFAULT_LQR_CORRECTION_GAIN
     if max_normalized_step is _USE_DEFAULT:
         max_normalized_step = constants.DEFAULT_LQR_CORRECTION_MAX_NORMALIZED_STEP
-    lqr_projected_tolerance = _resolve_lqr_projected_tolerance(
-        lqr_projected_tolerance
-    )
+    lqr_projected_tolerance = _resolve_lqr_projected_tolerance(lqr_projected_tolerance)
     correction_tolerance = lqr_projected_tolerance
     correction_criterion = CORRECTION_CRITERION
     current_gain = float(gain)
@@ -179,9 +175,7 @@ def do_correction(
     lqr_kalman_initial_covariance = (
         constants.DEFAULT_LQR_CORRECTION_KALMAN_INITIAL_COVARIANCE
     )
-    lqr_kalman_innovation_gate = (
-        constants.DEFAULT_LQR_CORRECTION_KALMAN_INNOVATION_GATE
-    )
+    lqr_kalman_innovation_gate = constants.DEFAULT_LQR_CORRECTION_KALMAN_INNOVATION_GATE
     logger.info(
         "Correction parameters: capture_count=%d, criterion=%s, tolerance=%g, "
         "gain=%g, max_moves=%d",
@@ -285,9 +279,7 @@ def do_correction(
         _append_lqr_kalman_diagnostics(
             lqr_kalman_state,
             iteration_lqr_kalman_state=iteration_lqr_kalman_state,
-            iteration_lqr_kalman_predicted_state=(
-                iteration_lqr_kalman_predicted_state
-            ),
+            iteration_lqr_kalman_predicted_state=(iteration_lqr_kalman_predicted_state),
             iteration_lqr_kalman_innovation=iteration_lqr_kalman_innovation,
             iteration_lqr_kalman_innovation_mahalanobis=(
                 iteration_lqr_kalman_innovation_mahalanobis
@@ -330,9 +322,7 @@ def do_correction(
             iteration_weighted_residuals=iteration_weighted_residuals,
             iteration_criterion_residuals=iteration_criterion_residuals,
             iteration_lqr_kalman_state=iteration_lqr_kalman_state,
-            iteration_lqr_kalman_predicted_state=(
-                iteration_lqr_kalman_predicted_state
-            ),
+            iteration_lqr_kalman_predicted_state=(iteration_lqr_kalman_predicted_state),
             iteration_lqr_kalman_innovation=iteration_lqr_kalman_innovation,
             iteration_lqr_kalman_innovation_mahalanobis=(
                 iteration_lqr_kalman_innovation_mahalanobis
@@ -349,9 +339,7 @@ def do_correction(
             move_predicted_delta_px=move_predicted_delta_px,
             move_measured_delta_px=move_measured_delta_px,
             move_model_residual_delta_px=move_model_residual_delta_px,
-            move_predicted_weighted_response_px=(
-                move_predicted_weighted_response_px
-            ),
+            move_predicted_weighted_response_px=(move_predicted_weighted_response_px),
             move_measured_weighted_response_px=move_measured_weighted_response_px,
             move_feedback_alpha=move_feedback_alpha,
             move_feedback_parallel_px=move_feedback_parallel_px,
@@ -613,7 +601,9 @@ def do_correction(
         if feedback_valid and decreased:
             logger.info("Residual decreased; keeping nominal Jacobian fixed.")
         elif feedback_valid:
-            logger.info("Residual did not decrease; keeping gain fixed at %g.", current_gain)
+            logger.info(
+                "Residual did not decrease; keeping gain fixed at %g.", current_gain
+            )
 
         move_command_delta_mm.append(correction_cmd_mm)
         move_requested_position_mm.append(requested_position_mm.copy())
@@ -1522,9 +1512,7 @@ def _append_lqr_kalman_diagnostics(
     iteration_lqr_kalman_innovation_mahalanobis: list[float],
     iteration_lqr_kalman_measurement_accepted: list[bool],
 ) -> None:
-    iteration_lqr_kalman_state.append(
-        np.asarray(update["state"], dtype=np.float64)
-    )
+    iteration_lqr_kalman_state.append(np.asarray(update["state"], dtype=np.float64))
     iteration_lqr_kalman_predicted_state.append(
         np.asarray(update["predicted_state"], dtype=np.float64)
     )
@@ -1793,9 +1781,7 @@ def _build_correction_result(
                 ),
                 "iteration_lqr_kalman_predicted_state": (
                     ("iteration", "lqr_state"),
-                    _stack_lqr_state_or_empty(
-                        iteration_lqr_kalman_predicted_state
-                    ),
+                    _stack_lqr_state_or_empty(iteration_lqr_kalman_predicted_state),
                 ),
                 "iteration_lqr_kalman_innovation": (
                     ("iteration", "camera", "pixel_axis"),
@@ -1839,6 +1825,9 @@ def _build_correction_result(
         "correction_final_gain": float(current_gain),
         "correction_max_normalized_step": max_normalized_attr,
         "correction_min_command_norm_mm": float(min_command_norm_mm),
+        "correction_move_delta_deadband_um": float(
+            constants.DEFAULT_CORRECTION_MOVE_DELTA_DEADBAND_UM
+        ),
         "correction_backlash_enabled": bool(correction_backlash_enabled),
         "max_correction_moves": int(max_moves),
         "correction_applied": move_count > 0,
@@ -1856,17 +1845,13 @@ def _build_correction_result(
     attrs |= {
         "correction_lqr_image_scale_px": float(lqr_image_scale_px),
         "correction_lqr_motor_penalty": float(lqr_motor_penalty),
-        "correction_lqr_svd_relative_tolerance": float(
-            lqr_svd_relative_tolerance
-        ),
+        "correction_lqr_svd_relative_tolerance": float(lqr_svd_relative_tolerance),
         "correction_lqr_projected_tolerance": float(lqr_projected_tolerance),
         "correction_lqr_kalman_filter_enabled": bool(lqr_kalman_filter_enabled),
         "correction_lqr_kalman_process_noise": _attrs_safe_numeric_config(
             lqr_kalman_process_noise
         ),
-        "correction_lqr_kalman_measurement_noise": float(
-            lqr_kalman_measurement_noise
-        ),
+        "correction_lqr_kalman_measurement_noise": float(lqr_kalman_measurement_noise),
         "correction_lqr_kalman_measurement_covariance": (
             _attrs_safe_numeric_config(lqr_kalman_measurement_covariance)
         ),
@@ -1964,6 +1949,14 @@ def _validate_command_correction(correction_cmd_mm: np.ndarray) -> np.ndarray:
         raise ValueError("correction_cmd_mm must have one value for x/y/z")
     if not np.isfinite(correction).all():
         raise ValueError("correction_cmd_mm must contain finite values")
+    deadband_um = float(constants.DEFAULT_CORRECTION_MOVE_DELTA_DEADBAND_UM)
+    if not np.isfinite(deadband_um) or deadband_um < 0.0:
+        raise ValueError(
+            "DEFAULT_CORRECTION_MOVE_DELTA_DEADBAND_UM must be finite and non-negative"
+        )
+    deadband_mm = deadband_um / 1000.0
+    if deadband_mm > 0.0:
+        correction[np.abs(correction) < deadband_mm] = 0.0
     return correction
 
 
@@ -1979,7 +1972,11 @@ def _correction_stop_warning(
             "computed correction step is below the minimum command norm "
             f"{min_command_norm_mm:.4g} mm; stopping before another move"
         )
-    return "computed correction step has no active axes; stopping before another move"
+    return (
+        "computed correction step has no active axes after applying the "
+        f"{constants.DEFAULT_CORRECTION_MOVE_DELTA_DEADBAND_UM:.4g} um "
+        "move-delta deadband; stopping before another move"
+    )
 
 
 def _active_correction_indices(correction_cmd_mm: np.ndarray) -> tuple[int, ...]:

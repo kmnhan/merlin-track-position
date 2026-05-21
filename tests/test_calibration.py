@@ -1894,6 +1894,59 @@ class CorrectionTests(unittest.TestCase):
             [[True, False, False]],
         )
 
+    def test_tiny_correction_components_are_zeroed_before_motor_move(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self.save_calibration(tmpdir)
+            hardware_patches = self.patch_hardware(
+                [shift_dataset(x_shift(10.0)), shift_dataset(np.zeros((2, 2)))],
+                positions=(10.0, 20.0, 30.0),
+            )
+            raw_delta_mm = np.array([0.0002, 0.000099, -0.00005], dtype=float)
+            with (
+                hardware_patches[0],
+                hardware_patches[1],
+                hardware_patches[2],
+                patch(
+                    "merlin_track_position.tracking.correct.solve_lqr_command_correction",
+                    return_value=raw_delta_mm,
+                ),
+                patch(
+                    "merlin_track_position.tracking.correct.move_motors_and_wait",
+                    return_value=(10.0002,),
+                ) as move,
+                patch.object(
+                    constants,
+                    "DEFAULT_LQR_CORRECTION_USE_KALMAN_FILTER",
+                    False,
+                ),
+            ):
+                result = do_correction(
+                    path,
+                    capture_count=1,
+                    max_moves=1,
+                    gain=TEST_CORRECTION_GAIN,
+                    max_normalized_step=TEST_CORRECTION_MAX_NORMALIZED_STEP,
+                    lqr_image_scale_px=TEST_LQR_IMAGE_SCALE_PX,
+                    lqr_motor_penalty=TEST_LQR_MOTOR_PENALTY,
+                    lqr_svd_relative_tolerance=TEST_LQR_SVD_RELATIVE_TOLERANCE,
+                    weights=TEST_CORRECTION_WEIGHTS,
+                )
+
+        self.assertEqual(move.call_args.args[0], ("x",))
+        np.testing.assert_allclose(
+            np.asarray(move.call_args.args[1], dtype=float),
+            np.array([10.0002], dtype=float),
+        )
+        np.testing.assert_allclose(
+            result["move_command_delta_mm"].values,
+            [[0.0002, 0.0, 0.0]],
+        )
+        self.assertEqual(
+            result["move_active_axis_mask"].values.tolist(),
+            [[True, False, False]],
+        )
+        self.assertEqual(result.attrs["correction_move_delta_deadband_um"], 0.1)
+
     def test_bcs_api_correction_move_uses_motor_backlash_constant(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = self.save_calibration(tmpdir)
@@ -1917,13 +1970,14 @@ class CorrectionTests(unittest.TestCase):
                 max_normalized_step=TEST_CORRECTION_MAX_NORMALIZED_STEP,
                 weights=TEST_CORRECTION_WEIGHTS,
             )
+            sanitized_delta = correct_module._validate_command_correction(expected_delta)
             active_indices = tuple(
-                index for index, value in enumerate(expected_delta) if value != 0.0
+                index for index, value in enumerate(sanitized_delta) if value != 0.0
             )
             active_axes = tuple(COMMAND_AXES[index] for index in active_indices)
             active_goals = tuple(
                 np.array([0.5, 0.0, 0.0], dtype=float)[index]
-                + expected_delta[index]
+                + sanitized_delta[index]
                 for index in active_indices
             )
             self.assertLess(abs(expected_delta[0]), 0.1)
@@ -1939,6 +1993,7 @@ class CorrectionTests(unittest.TestCase):
                     "merlin_track_position.tracking.correct.move_motors_and_wait",
                     return_value=active_goals,
                 ) as move,
+                patch.object(constants, "CORRECTION_USE_BCS_API_BACKLASH", True),
             ):
                 result = do_correction(
                     path,
