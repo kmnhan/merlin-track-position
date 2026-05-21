@@ -243,6 +243,13 @@ def image_parent_rect(window, camera):
     return image_item.mapRectToParent(image_item.boundingRect())
 
 
+def roi_display_geometry(window, camera):
+    roi = window.image_rois[camera]
+    position = roi.pos()
+    size = roi.size()
+    return (position.x(), position.y(), size.x(), size.y())
+
+
 def assert_rect_close(testcase, rect, expected):
     actual = (rect.x(), rect.y(), rect.width(), rect.height())
     for actual_value, expected_value in zip(actual, expected, strict=True):
@@ -629,6 +636,29 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                 self.assertFalse(window.show_reference_images_button.isEnabled())
                 self.assertTrue(roi_handles_visible(window))
                 self.assertTrue(roi_editing_enabled(window))
+                self.assertEqual(
+                    window.image_plots["cam0"].getAxis("bottom").labelText,
+                    "u",
+                )
+                self.assertEqual(
+                    window.image_plots["cam0"].getAxis("left").labelText,
+                    "v",
+                )
+                self.assertEqual(
+                    window.image_plots["cam1"].getAxis("bottom").labelText,
+                    "v",
+                )
+                self.assertEqual(
+                    window.image_plots["cam1"].getAxis("left").labelText,
+                    "u",
+                )
+
+                cam1_width, cam1_height = main_window.CAMERA_IMAGE_SIZES["cam1"]
+                assert_rect_close(
+                    self,
+                    image_parent_rect(window, "cam1"),
+                    (0.0, 0.0, float(cam1_height), float(cam1_width)),
+                )
             finally:
                 window.close()
 
@@ -792,6 +822,16 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
             try:
                 window._on_image_capture_ready("cam0", current_cam0)
                 window._on_image_capture_ready("cam1", current_cam1)
+                np.testing.assert_array_equal(
+                    window.image_items["cam1"].image,
+                    current_cam1,
+                )
+                image_width, image_height = main_window.CAMERA_IMAGE_SIZES["cam1"]
+                assert_rect_close(
+                    self,
+                    image_parent_rect(window, "cam1"),
+                    (0.0, 0.0, float(image_height), float(image_width)),
+                )
                 window._on_new_calibration_ready(calibration)
 
                 window.show_reference_images_button.pressed.emit()
@@ -812,7 +852,7 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                 assert_rect_close(
                     self,
                     image_parent_rect(window, "cam1"),
-                    (14.0, 16.0, 8.0, 7.0),
+                    (16.0, 14.0, 7.0, 8.0),
                 )
 
                 window._on_image_capture_ready("cam0", refreshed_cam0)
@@ -836,6 +876,12 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                     self,
                     image_parent_rect(window, "cam0"),
                     (0.0, 0.0, float(image_width), float(image_height)),
+                )
+                image_width, image_height = main_window.CAMERA_IMAGE_SIZES["cam1"]
+                assert_rect_close(
+                    self,
+                    image_parent_rect(window, "cam1"),
+                    (0.0, 0.0, float(image_height), float(image_width)),
                 )
             finally:
                 window.close()
@@ -1042,8 +1088,49 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                     window._get_roi_geometry("cam0"),
                     (10.0, 12.0, 30.0, 32.0),
                 )
+                self.assertEqual(
+                    window._get_roi_geometry("cam1"),
+                    (14.0, 16.0, 34.0, 36.0),
+                )
+                self.assertEqual(
+                    roi_display_geometry(window, "cam1"),
+                    (16.0, 14.0, 36.0, 34.0),
+                )
                 self.assertFalse(roi_handles_visible(window))
                 self.assertEqual(settings.set_calls, [])
+            finally:
+                window.close()
+
+    def test_cam1_roi_change_persists_raw_coordinates(self):
+        get_qapp()
+        with patched_main_window_runtime() as settings:
+            window = MainWindow()
+            try:
+                was_blocked = window.image_rois["cam1"].blockSignals(True)
+                try:
+                    window.image_rois["cam1"].setPos((22.0, 11.0), update=False)
+                    window.image_rois["cam1"].setSize((44.0, 33.0), update=True)
+                finally:
+                    window.image_rois["cam1"].blockSignals(was_blocked)
+                window._on_roi_region_change_finished("cam1")
+
+                self.assertEqual(
+                    window._get_roi_geometry("cam1"),
+                    (11.0, 22.0, 33.0, 44.0),
+                )
+                self.assertEqual(
+                    roi_display_geometry(window, "cam1"),
+                    (22.0, 11.0, 44.0, 33.0),
+                )
+                self.assertEqual(
+                    settings.set_calls,
+                    [
+                        ("roi/cam1/x", 11.0),
+                        ("roi/cam1/y", 22.0),
+                        ("roi/cam1/width", 33.0),
+                        ("roi/cam1/height", 44.0),
+                    ],
+                )
             finally:
                 window.close()
 
@@ -1490,7 +1577,10 @@ class CalibrationStartDialogTests(unittest.TestCase):
         self.assertIsNotNone(
             dialog.findChild(QtWidgets.QDoubleSpinBox, "calibration_step_um_spin")
         )
-        self.assertEqual(dialog.parameters(), (5, 15.0))
+        self.assertEqual(
+            dialog.parameters(),
+            (5, main_window.DEFAULT_VISUAL_CALIBRATION_STEP_UM),
+        )
         self.assertTrue(str(dialog.output_path()).endswith(".h5"))
 
     def test_dialog_uses_supplied_default_output_path(self):

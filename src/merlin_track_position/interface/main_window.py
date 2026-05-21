@@ -87,6 +87,7 @@ CAMERA_IMAGE_SIZES: dict[str, tuple[int, int]] = {
     "cam0": (IMAGE_WIDTH_CAM0, IMAGE_HEIGHT_CAM0),
     "cam1": (IMAGE_WIDTH_CAM1, IMAGE_HEIGHT_CAM1),
 }
+TRANSPOSED_IMAGE_DISPLAY_CAMERAS = frozenset({"cam1"})
 IMAGE_REFRESH_INTERVAL_MS = 400
 PERSISTENCE_FLUSH_INTERVAL_MS = 5000
 DEFAULT_AUTO_CORRECTION_INTERVAL_SECONDS = 180.0
@@ -158,6 +159,77 @@ def _clamp_roi_geometry(
     x = min(max(x, 0.0), image_width - width)
     y = min(max(y, 0.0), image_height - height)
     return (x, y, width, height)
+
+
+def _display_geometry(
+    camera: str,
+    geometry: tuple[float, float, float, float],
+) -> tuple[float, float, float, float]:
+    x, y, width, height = geometry
+    if camera in TRANSPOSED_IMAGE_DISPLAY_CAMERAS:
+        return (y, x, height, width)
+    return (x, y, width, height)
+
+
+def _raw_geometry_from_display(
+    camera: str,
+    geometry: tuple[float, float, float, float],
+) -> tuple[float, float, float, float]:
+    return _display_geometry(camera, geometry)
+
+
+def _display_image_size(
+    camera: str,
+    image_width: float,
+    image_height: float,
+) -> tuple[float, float]:
+    _x, _y, display_width, display_height = _display_geometry(
+        camera,
+        (0.0, 0.0, image_width, image_height),
+    )
+    return display_width, display_height
+
+
+def _raw_rect_from_display_rect(camera: str, rect: QtCore.QRectF) -> QtCore.QRectF:
+    return QtCore.QRectF(
+        *_raw_geometry_from_display(
+            camera,
+            (rect.x(), rect.y(), rect.width(), rect.height()),
+        )
+    )
+
+
+def _full_raw_image_rect(camera: str) -> QtCore.QRectF:
+    image_width, image_height = CAMERA_IMAGE_SIZES[camera]
+    return QtCore.QRectF(0.0, 0.0, float(image_width), float(image_height))
+
+
+def _set_image_item_raw_rect(
+    camera: str,
+    image_item: pg.ImageItem,
+    raw_rect: QtCore.QRectF,
+) -> None:
+    image_width = float(image_item.width() or 1.0)
+    image_height = float(image_item.height() or 1.0)
+    u_scale = raw_rect.width() / image_width
+    v_scale = raw_rect.height() / image_height
+    if camera in TRANSPOSED_IMAGE_DISPLAY_CAMERAS:
+        image_item.setTransform(
+            QtGui.QTransform(
+                0.0,
+                u_scale,
+                v_scale,
+                0.0,
+                raw_rect.y(),
+                raw_rect.x(),
+            )
+        )
+        return
+
+    transform = QtGui.QTransform()
+    transform.translate(raw_rect.x(), raw_rect.y())
+    transform.scale(u_scale, v_scale)
+    image_item.setTransform(transform)
 
 
 def _roi_metadata_from_geometries(
@@ -384,32 +456,64 @@ class _MainWindowGUI(QtWidgets.QMainWindow):
         self.image_plots: dict[str, pg.PlotItem] = {}
         self.image_items: dict[str, pg.ImageItem] = {}
         self.image_rois: dict[str, pg.ROI] = {}
+        self._image_raw_rects: dict[str, QtCore.QRectF] = {}
         for row, (camera, (image_width, image_height)) in enumerate(
             CAMERA_IMAGE_SIZES.items()
         ):
             image_plot = self.image_graphics_layout.addPlot(row=row, col=0)
             image_plot.setTitle(camera)
             image_plot.setAspectLocked(True)
-            image_plot.setLabel("bottom", "x", units="px", siPrefixEnableRanges=())
-            image_plot.setLabel("left", "y", units="px", siPrefixEnableRanges=())
+            bottom_label, left_label = (
+                ("v", "u")
+                if camera in TRANSPOSED_IMAGE_DISPLAY_CAMERAS
+                else ("u", "v")
+            )
+            image_plot.setLabel(
+                "bottom",
+                bottom_label,
+                units="px",
+                siPrefixEnableRanges=(),
+            )
+            image_plot.setLabel(
+                "left",
+                left_label,
+                units="px",
+                siPrefixEnableRanges=(),
+            )
             image_plot.showGrid(x=True, y=True, alpha=0.2)
             image_plot.invertY(True)
 
             image_item = pg.ImageItem(axisOrder="row-major")
-            sample_img = np.ones((int(image_height), int(image_width)), dtype=np.int64)
+            sample_img = np.ones(
+                (int(image_height), int(image_width)),
+                dtype=np.int64,
+            )
             sample_img[0, 0] = 0
             image_item.setImage(sample_img)
+            raw_rect = _full_raw_image_rect(camera)
+            _set_image_item_raw_rect(camera, image_item, raw_rect)
             image_plot.addItem(image_item)
+            display_width, display_height = _display_image_size(
+                camera,
+                image_width,
+                image_height,
+            )
             image_plot.vb.setRange(
-                rect=QtCore.QRectF(0, 0, image_width, image_height),
+                rect=QtCore.QRectF(0, 0, display_width, display_height),
                 padding=0,
             )
 
             roi_geometry = _default_roi_geometry(image_width, image_height)
+            display_roi_geometry = _display_geometry(camera, roi_geometry)
             image_roi = pg.ROI(
-                roi_geometry[:2],
-                roi_geometry[2:],
-                maxBounds=QtCore.QRectF(0.0, 0.0, image_width, image_height),
+                display_roi_geometry[:2],
+                display_roi_geometry[2:],
+                maxBounds=QtCore.QRectF(
+                    0.0,
+                    0.0,
+                    display_width,
+                    display_height,
+                ),
                 pen=pg.mkPen("#008c99", width=2),
                 hoverPen=pg.mkPen("#00c2d1", width=2),
             )
@@ -420,6 +524,7 @@ class _MainWindowGUI(QtWidgets.QMainWindow):
             self.image_plots[camera] = image_plot
             self.image_items[camera] = image_item
             self.image_rois[camera] = image_roi
+            self._image_raw_rects[camera] = QtCore.QRectF(raw_rect)
 
         splitter.addWidget(image_widget)
 
@@ -850,13 +955,17 @@ class MainWindow(_MainWindowGUI):
         roi = self.image_rois[camera]
         position = roi.pos()
         size = roi.size()
-        geometry = _clamp_roi_geometry(
+        raw_geometry = _raw_geometry_from_display(
+            camera,
             (
                 float(position.x()),
                 float(position.y()),
                 float(size.x()),
                 float(size.y()),
             ),
+        )
+        geometry = _clamp_roi_geometry(
+            raw_geometry,
             image_width,
             image_height,
         )
@@ -997,22 +1106,28 @@ class MainWindow(_MainWindowGUI):
     ) -> None:
         image_item = self.image_items[camera]
         image_item.setImage(image)
-        image_item.setRect(rect)
+        raw_rect = QtCore.QRectF(rect)
+        _set_image_item_raw_rect(camera, image_item, raw_rect)
+        self._image_raw_rects[camera] = raw_rect
 
-    def _current_image_item_state(self) -> dict[str, tuple[np.ndarray, QtCore.QRectF]]:
+    def _current_image_item_state(
+        self,
+    ) -> dict[str, tuple[np.ndarray, QtCore.QRectF]]:
         state: dict[str, tuple[np.ndarray, QtCore.QRectF]] = {}
         for camera, image_item in self.image_items.items():
             image = image_item.image
             if image is None:
                 continue
-            rect = image_item.mapRectToParent(image_item.boundingRect())
-            state[camera] = (np.asarray(image).copy(), QtCore.QRectF(rect))
+            raw_rect = self._image_raw_rects.get(camera)
+            if raw_rect is None:
+                display_rect = image_item.mapRectToParent(image_item.boundingRect())
+                raw_rect = _raw_rect_from_display_rect(camera, display_rect)
+            state[camera] = (np.asarray(image).copy(), QtCore.QRectF(raw_rect))
         return state
 
     @staticmethod
     def _full_image_rect(camera: str) -> QtCore.QRectF:
-        image_width, image_height = CAMERA_IMAGE_SIZES[camera]
-        return QtCore.QRectF(0.0, 0.0, float(image_width), float(image_height))
+        return _full_raw_image_rect(camera)
 
     def _reference_image_rect(
         self,
@@ -1562,19 +1677,25 @@ class MainWindow(_MainWindowGUI):
         image_roi = self.image_rois[camera]
         position = image_roi.pos()
         size = image_roi.size()
-        return _clamp_roi_geometry(
+        raw_geometry = _raw_geometry_from_display(
+            camera,
             (
                 float(position.x()),
                 float(position.y()),
                 float(size.x()),
                 float(size.y()),
             ),
+        )
+        return _clamp_roi_geometry(
+            raw_geometry,
             image_width,
             image_height,
         )
 
     def _current_roi_geometries(self) -> dict[str, RoiGeometry]:
-        return {camera: self._get_roi_geometry(camera) for camera in CAMERA_IMAGE_SIZES}
+        return {
+            camera: self._get_roi_geometry(camera) for camera in CAMERA_IMAGE_SIZES
+        }
 
     def _camera_pair_for_current_images(self) -> CameraPairPlugin:
         return CameraPairPlugin(
@@ -1593,9 +1714,10 @@ class MainWindow(_MainWindowGUI):
             image_width,
             image_height,
         )
+        display_geometry = _display_geometry(camera, (x, y, width, height))
         image_roi = self.image_rois[camera]
-        image_roi.setPos((x, y), update=False, finish=False)
-        image_roi.setSize((width, height), update=True, finish=False)
+        image_roi.setPos(display_geometry[:2], update=False, finish=False)
+        image_roi.setSize(display_geometry[2:], update=True, finish=False)
 
     def _persist_roi_geometry(
         self,
