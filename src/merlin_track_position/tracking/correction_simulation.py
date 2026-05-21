@@ -791,6 +791,10 @@ def _command_model(
             constants.DEFAULT_LQR_CORRECTION_USE_KALMAN_FILTER,
         )
     )
+    lqr_kalman_measurement_covariance = config.get(
+        "lqr_kalman_measurement_covariance",
+        constants.DEFAULT_LQR_CORRECTION_KALMAN_MEASUREMENT_COVARIANCE,
+    )
 
     max_step = _optional_positive_float(max_normalized_step, "max_normalized_step")
     model = {
@@ -820,9 +824,9 @@ def _command_model(
             ),
             "lqr_kalman_measurement_covariance": (
                 None
-                if config.get("lqr_kalman_measurement_covariance", None) is None
+                if lqr_kalman_measurement_covariance is None
                 else _simulation_kalman_covariance_config(
-                    config["lqr_kalman_measurement_covariance"],
+                    lqr_kalman_measurement_covariance,
                     len(OBSERVATION_AXES),
                     "lqr_kalman_measurement_covariance",
                     allow_zero=False,

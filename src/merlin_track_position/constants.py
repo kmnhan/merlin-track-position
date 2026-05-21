@@ -73,25 +73,25 @@ DEFAULT_JACOBIAN_CONDITION_WARNING: float = 100.0
 # Shared closed-loop LQR correction defaults in command-mm visual-servo space.
 # Observation weights are ordered as cam0_du, cam0_dv, cam1_du, cam1_dv.
 CORRECTION_OBSERVATION_WEIGHTS: tuple[float, float, float, float] | None = (
-    0.80,
-    1.33,
-    1.21,
-    0.66,
+    2.12,
+    0.45,
+    0.32,
+    1.11,
 )
 DEFAULT_CORRECTION_MIN_COMMAND_NORM_MM: float = 1e-9
 DEFAULT_CORRECTION_MAX_MOVES: int = 12
 
 # LQR solver weights and numerical tolerance.
-DEFAULT_LQR_CORRECTION_GAIN: float = 0.95
-DEFAULT_LQR_CORRECTION_MAX_NORMALIZED_STEP: float = 0.5
+DEFAULT_LQR_CORRECTION_GAIN: float = 0.50
+DEFAULT_LQR_CORRECTION_MAX_NORMALIZED_STEP: float = 0.25
 DEFAULT_LQR_CORRECTION_IMAGE_SCALE_PX: float = 0.1
-DEFAULT_LQR_CORRECTION_MOTOR_PENALTY: float = 100.0
+DEFAULT_LQR_CORRECTION_MOTOR_PENALTY: float = 25.0
 DEFAULT_LQR_CORRECTION_SVD_RELATIVE_TOLERANCE: float = 1e-6
-DEFAULT_LQR_CORRECTION_PROJECTED_TOLERANCE: float = 2.0
+DEFAULT_LQR_CORRECTION_PROJECTED_TOLERANCE: float = 0.75
 
-# LQR-only Kalman observer. Disabled by default so the nominal LQR command law
-# is unchanged unless this is explicitly enabled.
-DEFAULT_LQR_CORRECTION_USE_KALMAN_FILTER: bool = False
+# LQR-only Kalman observer. Measurement covariance is ordered as
+# cam0_du, cam0_dv, cam1_du, cam1_dv.
+DEFAULT_LQR_CORRECTION_USE_KALMAN_FILTER: bool = True
 DEFAULT_LQR_CORRECTION_KALMAN_PROCESS_NOISE: float = 0.05
 DEFAULT_LQR_CORRECTION_KALMAN_MEASUREMENT_NOISE: float = 1.0
 DEFAULT_LQR_CORRECTION_KALMAN_MEASUREMENT_COVARIANCE: (
@@ -102,9 +102,14 @@ DEFAULT_LQR_CORRECTION_KALMAN_MEASUREMENT_COVARIANCE: (
         tuple[float, float, float, float],
     ]
     | None
-) = None
-DEFAULT_LQR_CORRECTION_KALMAN_INITIAL_COVARIANCE: float = 100.0
-DEFAULT_LQR_CORRECTION_KALMAN_INNOVATION_GATE: float = 16.0
+) = (
+    (7.768352e-04, -2.612795e-04, -5.777776e-04, -1.457239e-04),
+    (-2.612795e-04, 4.261280e-03, 4.355556e-03, -1.190572e-03),
+    (-5.777776e-04, 4.355556e-03, 8.296296e-03, -1.940741e-03),
+    (-1.457239e-04, -1.190572e-03, -1.940741e-03, 1.724983e-03),
+)
+DEFAULT_LQR_CORRECTION_KALMAN_INITIAL_COVARIANCE: float = 1.0
+DEFAULT_LQR_CORRECTION_KALMAN_INNOVATION_GATE: float = 25.0
 
 # Image size for initial crop from each camera array.
 IMAGE_WIDTH_CAM0: int = 704

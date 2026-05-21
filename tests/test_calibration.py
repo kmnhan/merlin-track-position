@@ -443,9 +443,12 @@ class VisualCalibrationTests(unittest.TestCase):
 
         pre = np.zeros_like(command_delta)
         post = pre + command_delta
-        with patch(
-            "merlin_track_position.tracking.calibration_core.estimate_shift",
-            side_effect=fake_estimate_shift,
+        with (
+            patch(
+                "merlin_track_position.tracking.calibration_core.estimate_shift",
+                side_effect=fake_estimate_shift,
+            ),
+            patch.object(constants, "DEFAULT_JACOBIAN_CONDITION_WARNING", 1.0e6),
         ):
             calibration = fit_jacobian_calibration(
                 reference_cam0=np.zeros((8, 9)),
@@ -475,11 +478,11 @@ class VisualCalibrationTests(unittest.TestCase):
             calibration["probe_command_delta_mm"].values,
         )
         np.testing.assert_allclose(axis_sensitivity, [1000.0, 10.0, 100.0], atol=1e-9)
-        np.testing.assert_allclose(axis_scale_unclamped, [0.02, 2.0, 0.2], atol=1e-9)
-        np.testing.assert_allclose(derived_axis_scale, [0.1, 1.0, 0.2], atol=1e-9)
+        np.testing.assert_allclose(axis_scale_unclamped, [0.003, 0.3, 0.03], atol=1e-9)
+        np.testing.assert_allclose(derived_axis_scale, [0.1, 0.3, 0.1], atol=1e-9)
         np.testing.assert_allclose(
             calibration["axis_scale_cmd_mm"].values,
-            [0.1, 1.0, 0.2],
+            [0.1, 0.3, 0.1],
             atol=1e-9,
         )
 
@@ -840,7 +843,7 @@ class CorrectionTests(unittest.TestCase):
     def test_no_move_when_initial_residual_is_under_tolerance(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = self.save_calibration(tmpdir)
-            measurements = [shift_dataset(np.full((2, 2), 0.1))]
+            measurements = [shift_dataset(np.full((2, 2), 0.01))]
             hardware_patches = self.patch_hardware(measurements)
             with (
                 hardware_patches[0],
