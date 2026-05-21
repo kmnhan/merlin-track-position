@@ -652,6 +652,10 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                     window.image_plots["cam1"].getAxis("left").labelText,
                     "u",
                 )
+                self.assertFalse(window.image_plots["cam0"].vb.state["xInverted"])
+                self.assertTrue(window.image_plots["cam0"].vb.state["yInverted"])
+                self.assertTrue(window.image_plots["cam1"].vb.state["xInverted"])
+                self.assertTrue(window.image_plots["cam1"].vb.state["yInverted"])
 
                 cam1_width, cam1_height = main_window.CAMERA_IMAGE_SIZES["cam1"]
                 assert_rect_close(

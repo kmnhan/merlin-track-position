@@ -481,6 +481,7 @@ class _MainWindowGUI(QtWidgets.QMainWindow):
                 siPrefixEnableRanges=(),
             )
             image_plot.showGrid(x=True, y=True, alpha=0.2)
+            image_plot.invertX(camera in TRANSPOSED_IMAGE_DISPLAY_CAMERAS)
             image_plot.invertY(True)
 
             image_item = pg.ImageItem(axisOrder="row-major")
