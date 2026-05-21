@@ -207,15 +207,11 @@ def fit_jacobian_calibration(
             f"{min_shift_px:.4g} px for probe(s): {probe_text}"
         )
 
-    fit_command_delta, fit_observation, _ = _median_probe_observations_by_command(
-        command_delta,
-        observation,
-    )
-    command_rank = int(np.linalg.matrix_rank(fit_command_delta))
+    command_rank = int(np.linalg.matrix_rank(command_delta))
     if command_rank < len(COMMAND_AXES):
         raise ValueError("probe command deltas must span x/y/z command space")
 
-    coef = _fit_robust_calibration_response(fit_command_delta, fit_observation)
+    coef = _fit_robust_calibration_response(command_delta, observation)
     px_per_cmd_mm = coef.T.reshape(len(CAMERAS), len(PIXEL_AXES), len(COMMAND_AXES))
     jacobian_observation = px_per_cmd_mm.reshape(
         len(OBSERVATION_AXES),
@@ -1799,33 +1795,6 @@ def _format_command_warning_context(command_row: np.ndarray) -> str:
 
 def _format_warning_number(value: float) -> str:
     return f"{float(value):.4g}"
-
-
-def _median_probe_observations_by_command(
-    command_delta: np.ndarray,
-    observation: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, tuple[tuple[int, ...], ...]]:
-    command_values = np.asarray(command_delta, dtype=np.float64)
-    observation_values = np.asarray(observation, dtype=np.float64)
-    if command_values.ndim != 2 or command_values.shape[1] != len(COMMAND_AXES):
-        raise ValueError("command_delta must have shape (probe, command_axis)")
-    if observation_values.shape != (command_values.shape[0], len(OBSERVATION_AXES)):
-        raise ValueError("observation must have shape (probe, observation_axis)")
-
-    grouped_commands: list[np.ndarray] = []
-    grouped_observations: list[np.ndarray] = []
-    grouped_indices: list[tuple[int, ...]] = []
-    for command_row, indices in _probe_command_groups(command_values):
-        grouped_commands.append(command_row)
-        grouped_observations.append(
-            np.median(observation_values[list(indices)], axis=0)
-        )
-        grouped_indices.append(indices)
-    return (
-        np.stack(grouped_commands, axis=0),
-        np.stack(grouped_observations, axis=0),
-        tuple(grouped_indices),
-    )
 
 
 def _probe_command_groups(

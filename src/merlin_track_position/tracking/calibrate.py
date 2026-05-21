@@ -35,22 +35,24 @@ logger = logging.getLogger("merlin_track_position.tracking.calibrate")
 
 
 def visual_calibration_probe_count(
-    repeats_per_direction: int = constants.DEFAULT_VISUAL_CALIBRATION_REPEATS_PER_DIRECTION,
+    n: int = constants.DEFAULT_VISUAL_CALIBRATION_N,
 ) -> int:
     """Return the number of commanded-mm probes in the visual calibration."""
 
-    repeats = int(repeats_per_direction)
-    if repeats < 1:
-        raise ValueError("repeats_per_direction must be >= 1")
-    return repeats * len(COMMAND_AXES) * 2
+    return len(
+        _make_visual_probe_deltas(
+            n,
+            constants.DEFAULT_VISUAL_CALIBRATION_STEP_UM,
+        )
+    )
 
 
 def run_calibration(
     camera_pair: CameraPairPlugin | None = None,
     *,
     output_path: str | Path,
-    step_mm_by_axis: Mapping[str, float] | None = None,
-    repeats_per_direction: int = constants.DEFAULT_VISUAL_CALIBRATION_REPEATS_PER_DIRECTION,
+    n: int = constants.DEFAULT_VISUAL_CALIBRATION_N,
+    step_um: float = constants.DEFAULT_VISUAL_CALIBRATION_STEP_UM,
     min_shift_px: float = constants.DEFAULT_VISUAL_CALIBRATION_MIN_SHIFT_PX,
     capture_count: int = constants.DEFAULT_CALIBRATION_CAPTURE_COUNT,
     additional_context: Mapping[str, Any] | None = None,
@@ -70,7 +72,7 @@ def run_calibration(
 
     capture_count = normalize_capture_count(capture_count)
     output_path = Path(output_path)
-    probe_deltas = _make_visual_probe_deltas(step_mm_by_axis, repeats_per_direction)
+    probe_deltas = _make_visual_probe_deltas(n, step_um)
 
     if camera_pair is None:
         camera_pair = default_camera_pair()
@@ -269,49 +271,70 @@ def _replace_reference_images(
 
 
 def _make_visual_probe_deltas(
-    step_mm_by_axis: Mapping[str, float] | None,
-    repeats_per_direction: int,
+    n: int,
+    step_um: float,
 ) -> list[np.ndarray]:
-    repeats = int(repeats_per_direction)
-    if repeats < 1:
-        raise ValueError("repeats_per_direction must be >= 1")
-
-    steps = _step_mm_by_axis_from_config(step_mm_by_axis)
-    probe_cycles = (
-        ((0, 1.0), (0, -1.0), (1, 1.0), (1, -1.0), (2, 1.0), (2, -1.0)),
-        ((1, -1.0), (1, 1.0), (2, -1.0), (2, 1.0), (0, -1.0), (0, 1.0)),
-        ((2, 1.0), (2, -1.0), (0, 1.0), (0, -1.0), (1, 1.0), (1, -1.0)),
-        ((0, -1.0), (0, 1.0), (1, -1.0), (1, 1.0), (2, -1.0), (2, 1.0)),
-        ((1, 1.0), (1, -1.0), (2, 1.0), (2, -1.0), (0, 1.0), (0, -1.0)),
-    )
-    deltas: list[np.ndarray] = []
-    for repeat_index in range(repeats):
-        for axis_index, sign in probe_cycles[repeat_index % len(probe_cycles)]:
-            delta = np.zeros(len(COMMAND_AXES), dtype=np.float64)
-            delta[axis_index] = sign * steps[axis_index]
-            deltas.append(delta)
-    return deltas
+    offsets_um = _make_visual_probe_offsets_um(n, step_um)
+    origin_um = np.zeros((1, len(COMMAND_AXES)), dtype=np.float64)
+    delta_um = np.diff(np.vstack((origin_um, offsets_um)), axis=0)
+    return [row.astype(np.float64, copy=True) / 1000.0 for row in delta_um]
 
 
-def _step_mm_by_axis_from_config(
-    step_mm_by_axis: Mapping[str, float] | None,
-) -> np.ndarray:
-    config = (
-        constants.DEFAULT_VISUAL_CALIBRATION_STEP_MM_BY_AXIS
-        if step_mm_by_axis is None
-        else step_mm_by_axis
-    )
-    values: list[float] = []
-    for axis in COMMAND_AXES:
-        if axis not in config:
-            raise ValueError(f"missing visual calibration step for axis {axis!r}")
-        value = float(config[axis])
-        if not np.isfinite(value) or value <= 0.0:
-            raise ValueError(
-                f"visual calibration step for axis {axis!r} must be finite and positive"
+def _make_visual_probe_offsets_um(n: int, step_um: float) -> np.ndarray:
+    points = int(n)
+    if points < 2:
+        raise ValueError("n must be >= 2")
+    step = float(step_um)
+    if not np.isfinite(step) or step <= 0.0:
+        raise ValueError("step_um must be finite and positive")
+
+    offsets = (np.arange(points, dtype=np.float64) - (points - 1) / 2.0) * step
+    offsets = offsets[~np.isclose(offsets, 0.0)]
+    positive_offsets = sorted(float(offset) for offset in offsets if offset > 0.0)
+    negative_offsets = sorted(float(offset) for offset in offsets if offset < 0.0)
+    corner_step = step
+
+    rows: list[list[float]] = []
+    for z_offset in (*positive_offsets, *negative_offsets):
+        rows.append([0.0, 0.0, z_offset])
+
+    positive_y_levels = sorted({*positive_offsets, corner_step})
+    for y_offset in positive_y_levels:
+        if _contains_offset(positive_offsets, y_offset):
+            rows.append([0.0, y_offset, 0.0])
+        if np.isclose(y_offset, corner_step):
+            rows.extend(
+                [
+                    [corner_step, y_offset, corner_step],
+                    [-corner_step, y_offset, corner_step],
+                    [-corner_step, y_offset, -corner_step],
+                    [corner_step, y_offset, -corner_step],
+                ]
             )
-        values.append(value)
-    return np.asarray(values, dtype=np.float64)
+
+    negative_y_levels = sorted({*negative_offsets, -corner_step})
+    for y_offset in negative_y_levels:
+        if np.isclose(y_offset, -corner_step):
+            rows.extend(
+                [
+                    [corner_step, y_offset, -corner_step],
+                    [corner_step, y_offset, corner_step],
+                    [-corner_step, y_offset, corner_step],
+                    [-corner_step, y_offset, -corner_step],
+                ]
+            )
+        if _contains_offset(negative_offsets, y_offset):
+            rows.append([0.0, y_offset, 0.0])
+
+    for x_offset in (*positive_offsets, *negative_offsets):
+        rows.append([x_offset, 0.0, 0.0])
+
+    rows.append([0.0, 0.0, 0.0])
+    return np.asarray(rows, dtype=np.float64)
+
+
+def _contains_offset(offsets: Sequence[float], value: float) -> bool:
+    return any(np.isclose(offset, value) for offset in offsets)
 
 
 def _representative_image(images: Sequence[Any]) -> np.ndarray:

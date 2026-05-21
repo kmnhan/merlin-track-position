@@ -15,9 +15,9 @@ import xarray as xr
 from qtpy import QtCore, QtGui, QtWidgets
 
 from merlin_track_position.constants import (
+    DEFAULT_VISUAL_CALIBRATION_N,
     DEFAULT_VISUAL_CALIBRATION_MIN_SHIFT_PX,
-    DEFAULT_VISUAL_CALIBRATION_REPEATS_PER_DIRECTION,
-    DEFAULT_VISUAL_CALIBRATION_STEP_MM_BY_AXIS,
+    DEFAULT_VISUAL_CALIBRATION_STEP_UM,
     IMAGE_HEIGHT_CAM0,
     IMAGE_HEIGHT_CAM1,
     IMAGE_WIDTH_CAM0,
@@ -224,15 +224,21 @@ class CalibrationStartDialog(QtWidgets.QDialog):
         layout = QtWidgets.QVBoxLayout(self)
         form_layout = QtWidgets.QFormLayout()
 
-        step_text = ", ".join(
-            f"{axis}={value:g} mm"
-            for axis, value in DEFAULT_VISUAL_CALIBRATION_STEP_MM_BY_AXIS.items()
-        )
-        form_layout.addRow("Probe steps (cmd mm)", QtWidgets.QLabel(step_text))
-        form_layout.addRow(
-            "Repeats",
-            QtWidgets.QLabel(str(DEFAULT_VISUAL_CALIBRATION_REPEATS_PER_DIRECTION)),
-        )
+        self.n_spin = QtWidgets.QSpinBox()
+        self.n_spin.setObjectName("calibration_n_spin")
+        self.n_spin.setRange(2, 101)
+        self.n_spin.setValue(DEFAULT_VISUAL_CALIBRATION_N)
+        form_layout.addRow("N", self.n_spin)
+
+        self.step_um_spin = QtWidgets.QDoubleSpinBox()
+        self.step_um_spin.setObjectName("calibration_step_um_spin")
+        self.step_um_spin.setRange(0.001, 1_000_000.0)
+        self.step_um_spin.setDecimals(3)
+        self.step_um_spin.setSingleStep(1.0)
+        self.step_um_spin.setSuffix(" um")
+        self.step_um_spin.setValue(DEFAULT_VISUAL_CALIBRATION_STEP_UM)
+        form_layout.addRow("Step", self.step_um_spin)
+
         form_layout.addRow(
             "Minimum image response",
             QtWidgets.QLabel(f"{DEFAULT_VISUAL_CALIBRATION_MIN_SHIFT_PX:g} px"),
@@ -282,6 +288,9 @@ class CalibrationStartDialog(QtWidgets.QDialog):
 
     def output_path(self) -> Path:
         return Path(self.path_edit.text()).expanduser()
+
+    def parameters(self) -> tuple[int, float]:
+        return int(self.n_spin.value()), float(self.step_um_spin.value())
 
 
 class _ImageCaptureThread(QtCore.QThread):
@@ -1187,16 +1196,19 @@ class MainWindow(_MainWindowGUI):
         if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
             return
 
+        n, step_um = dialog.parameters()
         output_path = dialog.output_path()
         roi_geometries = self._current_roi_geometries()
         roi_metadata = _roi_metadata_from_geometries(roi_geometries)
         camera_pair = self._camera_pair_for_current_images()
         try:
-            self._calibration_total_steps = visual_calibration_probe_count()
+            self._calibration_total_steps = visual_calibration_probe_count(n)
             self._calibration_thread.configure(
                 camera_pair,
                 roi_metadata,
                 output_path,
+                n=n,
+                step_um=step_um,
             )
         except Exception as exc:
             QtWidgets.QMessageBox.critical(

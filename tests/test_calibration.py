@@ -33,6 +33,7 @@ import merlin_track_position.tracking.calibration_core as calibration_core
 import merlin_track_position.tracking.correct as correct_module
 from merlin_track_position.tracking.calibrate import (
     _make_visual_probe_deltas,
+    _make_visual_probe_offsets_um,
     run_calibration,
     visual_calibration_probe_count,
 )
@@ -68,7 +69,7 @@ def px_per_cmd_mm():
 def probe_deltas():
     rows = []
     for axis in COMMAND_AXES:
-        step = constants.DEFAULT_VISUAL_CALIBRATION_STEP_MM_BY_AXIS[axis]
+        step = 0.03
         for sign in (1.0, -1.0, 1.0):
             row = np.zeros(len(COMMAND_AXES), dtype=float)
             row[COMMAND_AXES.index(axis)] = sign * step
@@ -240,67 +241,57 @@ class VisualCalibrationTests(unittest.TestCase):
             constants.DEFAULT_CORRECTION_CAPTURE_COUNT,
         )
 
-    def test_visual_calibration_probe_count_uses_default_repeats(self):
-        self.assertEqual(visual_calibration_probe_count(), 30)
+    def test_visual_calibration_probe_count_uses_default_n(self):
+        self.assertEqual(visual_calibration_probe_count(), 21)
 
-    def test_visual_calibration_probe_order_is_balanced_and_cycles(self):
-        steps = {"x": 0.1, "y": 0.2, "z": 0.3}
-        deltas = np.asarray(_make_visual_probe_deltas(steps, 6), dtype=float)
-        expected_cycles = np.asarray(
+    def test_visual_calibration_probe_deltas_minimize_negative_y_moves(self):
+        deltas = np.asarray(_make_visual_probe_deltas(3, 10.0), dtype=float)
+        expected_um = np.asarray(
             [
-                [
-                    [0.1, 0.0, 0.0],
-                    [-0.1, 0.0, 0.0],
-                    [0.0, 0.2, 0.0],
-                    [0.0, -0.2, 0.0],
-                    [0.0, 0.0, 0.3],
-                    [0.0, 0.0, -0.3],
-                ],
-                [
-                    [0.0, -0.2, 0.0],
-                    [0.0, 0.2, 0.0],
-                    [0.0, 0.0, -0.3],
-                    [0.0, 0.0, 0.3],
-                    [-0.1, 0.0, 0.0],
-                    [0.1, 0.0, 0.0],
-                ],
-                [
-                    [0.0, 0.0, 0.3],
-                    [0.0, 0.0, -0.3],
-                    [0.1, 0.0, 0.0],
-                    [-0.1, 0.0, 0.0],
-                    [0.0, 0.2, 0.0],
-                    [0.0, -0.2, 0.0],
-                ],
-                [
-                    [-0.1, 0.0, 0.0],
-                    [0.1, 0.0, 0.0],
-                    [0.0, -0.2, 0.0],
-                    [0.0, 0.2, 0.0],
-                    [0.0, 0.0, -0.3],
-                    [0.0, 0.0, 0.3],
-                ],
-                [
-                    [0.0, 0.2, 0.0],
-                    [0.0, -0.2, 0.0],
-                    [0.0, 0.0, 0.3],
-                    [0.0, 0.0, -0.3],
-                    [0.1, 0.0, 0.0],
-                    [-0.1, 0.0, 0.0],
-                ],
-                [
-                    [0.1, 0.0, 0.0],
-                    [-0.1, 0.0, 0.0],
-                    [0.0, 0.2, 0.0],
-                    [0.0, -0.2, 0.0],
-                    [0.0, 0.0, 0.3],
-                    [0.0, 0.0, -0.3],
-                ],
+                [0.0, 0.0, 10.0],
+                [0.0, 0.0, -20.0],
+                [0.0, 10.0, 10.0],
+                [10.0, 0.0, 10.0],
+                [-20.0, 0.0, 0.0],
+                [0.0, 0.0, -20.0],
+                [20.0, 0.0, 0.0],
+                [0.0, -20.0, 0.0],
+                [0.0, 0.0, 20.0],
+                [-20.0, 0.0, 0.0],
+                [0.0, 0.0, -20.0],
+                [10.0, 0.0, 10.0],
+                [10.0, 10.0, 0.0],
+                [-20.0, 0.0, 0.0],
+                [10.0, 0.0, 0.0],
             ],
             dtype=float,
-        ).reshape(-1, 3)
+        )
 
-        np.testing.assert_allclose(deltas, expected_cycles)
+        np.testing.assert_allclose(deltas, expected_um / 1000.0)
+        np.testing.assert_allclose(np.sum(deltas, axis=0), 0.0, atol=1e-15)
+        self.assertEqual(np.count_nonzero(deltas[:, 1] < 0.0), 1)
+
+    def test_visual_calibration_probe_offsets_match_old_backlash_path(self):
+        offsets = _make_visual_probe_offsets_um(5, 10.0)
+        deltas = np.asarray(_make_visual_probe_deltas(5, 10.0), dtype=float)
+        cumulative_offsets = np.cumsum(1000.0 * deltas, axis=0)
+        expected_offsets = (-20.0, -10.0, 10.0, 20.0)
+        expected_rows = {
+            (0.0, 0.0, z_offset) for z_offset in expected_offsets
+        } | {
+            (0.0, y_offset, 0.0) for y_offset in expected_offsets
+        } | {
+            (x_offset, 0.0, 0.0) for x_offset in expected_offsets
+        } | {
+            (x_offset, y_offset, z_offset)
+            for x_offset in (-10.0, 10.0)
+            for y_offset in (-10.0, 10.0)
+            for z_offset in (-10.0, 10.0)
+        } | {(0.0, 0.0, 0.0)}
+
+        np.testing.assert_allclose(cumulative_offsets, offsets)
+        self.assertEqual({tuple(row) for row in offsets}, expected_rows)
+        self.assertEqual(offsets.shape[0], len(expected_rows))
 
     def test_run_calibration_stores_full_references_and_fits_cropped_images(self):
         full_cam0 = np.arange(5 * 6, dtype=np.uint16).reshape(5, 6)
@@ -373,7 +364,8 @@ class VisualCalibrationTests(unittest.TestCase):
                 calibration = run_calibration(
                     camera_pair,
                     output_path=output_path,
-                    repeats_per_direction=1,
+                    n=3,
+                    step_um=10.0,
                     capture_count=1,
                     additional_context=roi_metadata,
                 )
@@ -432,15 +424,22 @@ class VisualCalibrationTests(unittest.TestCase):
             atol=1e-10,
         )
 
-    def test_fitted_px_per_cmd_mm_uses_grouped_medians_for_transient_repeats(self):
-        command_delta = np.asarray(_make_visual_probe_deltas(None, 5), dtype=float)
+    def test_fitted_px_per_cmd_mm_uses_raw_repeats_and_warns_on_transient_spread(
+        self,
+    ):
+        command_delta = np.asarray(_make_visual_probe_deltas(5, 15.0), dtype=float)
         expected = px_per_cmd_mm()
         measured = measured_from_jacobian(command_delta, expected)
         biased_observation = measured.reshape(command_delta.shape[0], 4).copy()
-        y_probe_indices = np.nonzero(command_delta[:, 1] != 0.0)[0][:2]
+        command_groups: dict[tuple[float, ...], list[int]] = {}
+        for probe_index, command_row in enumerate(command_delta):
+            command_groups.setdefault(tuple(command_row), []).append(probe_index)
+        repeated_probe_indices = next(
+            indices for indices in command_groups.values() if len(indices) >= 2
+        )
         transient = np.array([3.2, 1.6, 2.8, -8.0], dtype=float)
-        biased_observation[y_probe_indices[0]] += transient
-        biased_observation[y_probe_indices[1]] -= transient
+        biased_observation[repeated_probe_indices[0]] += transient
+        biased_observation[repeated_probe_indices[1]] -= transient
         biased_measured = biased_observation.reshape(command_delta.shape[0], 2, 2)
         shift_values = iter(
             biased_measured[probe_index, camera_index]
@@ -478,19 +477,14 @@ class VisualCalibrationTests(unittest.TestCase):
                 n_jobs=1,
             )
 
-        raw_fit, _, _, _ = np.linalg.lstsq(
+        raw_fit = calibration_core._fit_robust_calibration_response(
             command_delta,
             biased_observation,
-            rcond=None,
         )
         raw_px_per_cmd_mm = raw_fit.T.reshape(len(CAMERAS), len(PIXEL_AXES), 3)
-        self.assertGreater(
-            np.linalg.norm(raw_px_per_cmd_mm - expected),
-            5.0,
-        )
         np.testing.assert_allclose(
             calibration["px_per_cmd_mm"].values,
-            expected,
+            raw_px_per_cmd_mm,
             atol=1e-10,
         )
         np.testing.assert_allclose(

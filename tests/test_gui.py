@@ -602,6 +602,87 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
             finally:
                 window.close()
 
+    def test_new_calibration_passes_selected_path_parameters_and_roi(self):
+        get_qapp()
+
+        class FakeCalibrationThread:
+            def __init__(self):
+                self.configured = None
+                self.started = False
+
+            def isRunning(self):
+                return False
+
+            def configure(
+                self,
+                camera_pair,
+                roi_metadata,
+                output_path,
+                *,
+                n,
+                step_um,
+            ):
+                self.configured = (
+                    camera_pair,
+                    dict(roi_metadata),
+                    Path(output_path),
+                    int(n),
+                    float(step_um),
+                )
+
+            def start(self):
+                self.started = True
+
+            def stop(self):
+                pass
+
+            def wait(self):
+                pass
+
+        output_path = Path("/tmp/scan/calibration.h5")
+        with patched_main_window_runtime():
+            window = MainWindow()
+            fake_thread = FakeCalibrationThread()
+            window._calibration_thread = fake_thread
+            try:
+                window._set_roi_geometry("cam0", (1.0, 2.0, 30.0, 40.0))
+                window._set_roi_geometry("cam1", (3.0, 4.0, 50.0, 60.0))
+                with (
+                    patch.object(
+                        main_window,
+                        "_default_calibration_path",
+                        return_value=output_path,
+                    ),
+                    patch.object(
+                        CalibrationStartDialog,
+                        "exec",
+                        return_value=QtWidgets.QDialog.DialogCode.Accepted,
+                    ),
+                    patch.object(
+                        CalibrationStartDialog,
+                        "parameters",
+                        return_value=(3, 10.0),
+                    ),
+                    patch.object(
+                        CalibrationStartDialog,
+                        "output_path",
+                        return_value=output_path,
+                    ),
+                ):
+                    window._on_new_calibration_clicked()
+
+                self.assertTrue(fake_thread.started)
+                self.assertEqual(window._calibration_total_steps, 15)
+                camera_pair, roi_metadata, path, n, step_um = fake_thread.configured
+                self.assertEqual(path, output_path)
+                self.assertEqual(n, 3)
+                self.assertEqual(step_um, 10.0)
+                self.assertEqual(roi_metadata["roi_cam0_x"], 1.0)
+                self.assertEqual(roi_metadata["roi_cam1_y"], 4.0)
+                self.assertIsNotNone(camera_pair)
+            finally:
+                window.close()
+
     def test_loaded_calibration_locks_roi_and_button_clears_without_dialog(self):
         get_qapp()
         calibration = build_sample_calibration_dataset(
@@ -1373,6 +1454,13 @@ class CalibrationStartDialogTests(unittest.TestCase):
         self.assertIsNotNone(
             dialog.findChild(QtWidgets.QLineEdit, "calibration_output_path_edit")
         )
+        self.assertIsNotNone(
+            dialog.findChild(QtWidgets.QSpinBox, "calibration_n_spin")
+        )
+        self.assertIsNotNone(
+            dialog.findChild(QtWidgets.QDoubleSpinBox, "calibration_step_um_spin")
+        )
+        self.assertEqual(dialog.parameters(), (5, 15.0))
         self.assertTrue(str(dialog.output_path()).endswith(".h5"))
 
     def test_dialog_uses_supplied_default_output_path(self):

@@ -23,6 +23,7 @@ from merlin_track_position.tracking.calibration_core import (
     derive_axis_scale_from_jacobian,
     save_calibration_dataset,
 )
+from merlin_track_position.tracking.calibrate import _make_visual_probe_deltas
 
 DEFAULT_SAMPLE_CALIBRATION_PATH = Path(
     "/Users/khan/Downloads/calibration.h5"
@@ -147,15 +148,13 @@ def write_sample_calibration_dataset(
 
 
 def _sample_probe_deltas() -> np.ndarray:
-    rows: list[list[float]] = []
-    for _ in range(constants.DEFAULT_VISUAL_CALIBRATION_REPEATS_PER_DIRECTION):
-        for axis in COMMAND_AXES:
-            step = constants.DEFAULT_VISUAL_CALIBRATION_STEP_MM_BY_AXIS[axis]
-            for sign in (1.0, -1.0):
-                row = [0.0, 0.0, 0.0]
-                row[COMMAND_AXES.index(axis)] = sign * step
-                rows.append(row)
-    return np.asarray(rows, dtype=np.float64)
+    return np.asarray(
+        _make_visual_probe_deltas(
+            constants.DEFAULT_VISUAL_CALIBRATION_N,
+            constants.DEFAULT_VISUAL_CALIBRATION_STEP_UM,
+        ),
+        dtype=np.float64,
+    )
 
 
 def _command_positions(

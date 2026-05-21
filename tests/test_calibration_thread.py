@@ -46,11 +46,13 @@ class CalibrationThreadTests(unittest.TestCase):
             pair,
             *,
             output_path,
+            n,
+            step_um,
             additional_context,
             step_callback,
             processing_callback,
         ):
-            calls.append((pair, Path(output_path), dict(additional_context)))
+            calls.append((pair, Path(output_path), n, step_um, dict(additional_context)))
             captured_cam0, captured_cam1 = pair.capture_pair()
             step_callback(0, 1.0, 2.0, 3.0, captured_cam0, captured_cam1)
             processing_callback(0, 2)
@@ -91,6 +93,8 @@ class CalibrationThreadTests(unittest.TestCase):
                 camera_pair,
                 roi_metadata,
                 output_path,
+                n=3,
+                step_um=10.0,
             )
             with patch(
                 "merlin_track_position.interface.calibration_thread.run_calibration",
@@ -98,7 +102,7 @@ class CalibrationThreadTests(unittest.TestCase):
             ):
                 thread.run()
 
-        self.assertEqual(calls, [(camera_pair, output_path, roi_metadata)])
+        self.assertEqual(calls, [(camera_pair, output_path, 3, 10.0, roi_metadata)])
         self.assertEqual(len(steps), 1)
         self.assertEqual(steps[0][:4], (0, 1.0, 2.0, 3.0))
         np.testing.assert_array_equal(steps[0][4], image_cam0)
@@ -115,6 +119,8 @@ class CalibrationThreadTests(unittest.TestCase):
             camera_pair,
             *,
             output_path,
+            n,
+            step_um,
             additional_context,
             step_callback,
             processing_callback,
@@ -122,6 +128,8 @@ class CalibrationThreadTests(unittest.TestCase):
             del (
                 camera_pair,
                 output_path,
+                n,
+                step_um,
                 additional_context,
                 step_callback,
                 processing_callback,
