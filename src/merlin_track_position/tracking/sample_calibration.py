@@ -20,10 +20,12 @@ from merlin_track_position.tracking.calibration_core import (
     COMMAND_AXES,
     OBSERVATION_AXES,
     PIXEL_AXES,
+    PROBE_COMMAND_DELTA_MODE_ABSOLUTE_CENTER,
+    PROBE_COMMAND_DELTA_MODE_ATTR,
     derive_axis_scale_from_jacobian,
     save_calibration_dataset,
 )
-from merlin_track_position.tracking.calibrate import _make_visual_probe_deltas
+from merlin_track_position.tracking.calibrate import _make_visual_probe_offsets_um
 
 DEFAULT_SAMPLE_CALIBRATION_PATH = Path(
     "/Users/khan/Downloads/calibration.h5"
@@ -134,6 +136,10 @@ def build_sample_calibration_dataset(
         coords=coords,
         attrs={
             "capture_count": 1,
+            "initial_x_mm": 1.0,
+            "initial_y_mm": 2.0,
+            "initial_z_mm": 3.0,
+            PROBE_COMMAND_DELTA_MODE_ATTR: PROBE_COMMAND_DELTA_MODE_ABSOLUTE_CENTER,
             "warnings": "",
         },
     )
@@ -149,10 +155,11 @@ def write_sample_calibration_dataset(
 
 def _sample_probe_deltas() -> np.ndarray:
     return np.asarray(
-        _make_visual_probe_deltas(
+        _make_visual_probe_offsets_um(
             constants.DEFAULT_VISUAL_CALIBRATION_N,
             constants.DEFAULT_VISUAL_CALIBRATION_STEP_UM,
-        ),
+        )
+        / 1000.0,
         dtype=np.float64,
     )
 
@@ -160,12 +167,13 @@ def _sample_probe_deltas() -> np.ndarray:
 def _command_positions(
     command_delta: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
-    current = np.array([1.0, 2.0, 3.0], dtype=np.float64)
+    center = np.array([1.0, 2.0, 3.0], dtype=np.float64)
+    current = center.copy()
     pre_rows: list[np.ndarray] = []
     post_rows: list[np.ndarray] = []
-    for delta in command_delta:
+    for offset in command_delta:
         pre_rows.append(current.copy())
-        current = current + delta
+        current = center + offset
         post_rows.append(current.copy())
     return np.stack(pre_rows, axis=0), np.stack(post_rows, axis=0)
 

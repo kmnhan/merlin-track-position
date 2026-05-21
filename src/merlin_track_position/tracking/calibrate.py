@@ -20,6 +20,8 @@ from merlin_track_position.instruments.motors import get_positions, move_motors_
 from merlin_track_position.tracking.calibration_core import (
     CAMERAS,
     COMMAND_AXES,
+    PROBE_COMMAND_DELTA_MODE_ABSOLUTE_CENTER,
+    PROBE_COMMAND_DELTA_MODE_ATTR,
     fit_jacobian_calibration,
     load_calibration_dataset,
     save_calibration_dataset_deferred,
@@ -40,7 +42,7 @@ def visual_calibration_probe_count(
     """Return the number of commanded-mm probes in the visual calibration."""
 
     return len(
-        _make_visual_probe_deltas(
+        _make_visual_probe_offsets_um(
             n,
             constants.DEFAULT_VISUAL_CALIBRATION_STEP_UM,
         )
@@ -72,7 +74,7 @@ def run_calibration(
 
     capture_count = normalize_capture_count(capture_count)
     output_path = Path(output_path)
-    probe_deltas = _make_visual_probe_deltas(n, step_um)
+    probe_offsets = _make_visual_probe_offsets_um(n, step_um) / 1000.0
 
     if camera_pair is None:
         camera_pair = default_camera_pair()
@@ -83,7 +85,8 @@ def run_calibration(
     }
 
     x0, y0, z0, polar, tilt, cam = get_positions(("x", "y", "z", "p", "t", "cam"))
-    commanded_position = np.asarray([x0, y0, z0], dtype=np.float64)
+    initial_commanded_position = np.asarray([x0, y0, z0], dtype=np.float64)
+    commanded_position = initial_commanded_position.copy()
 
     if not np.isclose(cam, 5.0):
         # Camera 5 is the sample-view video-switch position used for alignment.
@@ -92,7 +95,7 @@ def run_calibration(
 
     logger.info(
         "Starting calibration with %d probes",
-        len(probe_deltas),
+        len(probe_offsets),
     )
     reference_stacks, _ = capture_image_and_display_stacks(
         camera_pair,
@@ -121,22 +124,18 @@ def run_calibration(
     pre_readback_position_mm: list[np.ndarray] = []
     post_readback_position_mm: list[np.ndarray] = []
 
-    for probe_index, delta in enumerate(probe_deltas):
+    for probe_index, offset in enumerate(probe_offsets):
         pre_commanded = commanded_position.copy()
         pre_readback = np.asarray(get_positions(COMMAND_AXES), dtype=np.float64)
         logger.info(
-            "Probe %d/%d: commanded delta mm=(%.4g, %.4g, %.4g)",
+            "Probe %d/%d: commanded offset mm=(%.4g, %.4g, %.4g)",
             probe_index + 1,
-            len(probe_deltas),
-            delta[0],
-            delta[1],
-            delta[2],
+            len(probe_offsets),
+            offset[0],
+            offset[1],
+            offset[2],
         )
-        before_stacks, _ = capture_image_and_display_stacks(
-            camera_pair,
-            capture_count,
-        )
-        target_position = commanded_position + delta
+        target_position = initial_commanded_position + offset
         final_readback = np.asarray(
             move_motors_and_wait(
                 COMMAND_AXES,
@@ -149,20 +148,16 @@ def run_calibration(
             camera_pair,
             capture_count,
         )
-        before_processing_stacks = _crop_stacks_for_calibration(
-            before_stacks,
-            roi_geometries,
-        )
         after_processing_stacks = _crop_stacks_for_calibration(
             after_stacks,
             roi_geometries,
         )
 
-        before_images_cam0.append(before_processing_stacks[0])
-        before_images_cam1.append(before_processing_stacks[1])
+        before_images_cam0.append(processing_reference_stacks[0])
+        before_images_cam1.append(processing_reference_stacks[1])
         after_images_cam0.append(after_processing_stacks[0])
         after_images_cam1.append(after_processing_stacks[1])
-        command_delta_mm.append(delta.copy())
+        command_delta_mm.append(offset.copy())
         pre_commanded_position_mm.append(pre_commanded)
         post_commanded_position_mm.append(target_position.copy())
         pre_readback_position_mm.append(pre_readback)
@@ -173,9 +168,9 @@ def run_calibration(
             display_cam0, display_cam1 = after_display_stacks
             step_callback(
                 probe_index,
-                float(delta[0]),
-                float(delta[1]),
-                float(delta[2]),
+                float(offset[0]),
+                float(offset[1]),
+                float(offset[2]),
                 _representative_image(display_cam0),
                 _representative_image(display_cam1),
             )
@@ -187,6 +182,7 @@ def run_calibration(
         "polar": float(polar),
         "tilt": float(tilt),
         "calibration_path": str(output_path),
+        PROBE_COMMAND_DELTA_MODE_ATTR: PROBE_COMMAND_DELTA_MODE_ABSOLUTE_CENTER,
     }
     if additional_context is not None:
         context |= {str(key): value for key, value in additional_context.items()}

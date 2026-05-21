@@ -12,6 +12,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from merlin_track_position.interface.calibration_panel import (  # noqa: E402
     CalibrationPanel,
+    _calibration_arrays,
     _calibration_summary,
 )
 import merlin_track_position.interface.main_window as main_window  # noqa: E402
@@ -442,10 +443,39 @@ class CalibrationPanelTests(unittest.TestCase):
         )
         self.assertEqual(summary["residual_rms_px"], 0.0)
         self.assertEqual(summary["residual_max_cmd_mm"], 0.0)
+        self.assertEqual(summary["readback_command_rms_mm"], 0.0)
         np.testing.assert_allclose(
             summary["px_per_cmd_mm"],
             calibration["px_per_cmd_mm"].values,
         )
+
+    def test_readback_disagreement_uses_actual_trajectory_motion(self):
+        calibration = build_sample_calibration_dataset(
+            image_shape_cam0=(4, 5),
+            image_shape_cam1=(6, 7),
+        )
+
+        arrays = _calibration_arrays(calibration)
+
+        np.testing.assert_allclose(arrays["readback_disagreement"], 0.0, atol=1e-15)
+
+    def test_calibration_progress_reports_command_offset(self):
+        get_qapp()
+        panel = CalibrationPanel()
+
+        panel.show_calibration_in_progress(total_steps=3)
+        panel.show_calibration_step(
+            idx=0,
+            total_steps=3,
+            dx=0.01,
+            dy=0.0,
+            dz=-0.01,
+            elapsed_s=1.0,
+            eta_s=2.0,
+        )
+
+        self.assertIn("Command offset", panel.calibration_status_label.text())
+        self.assertNotIn("Command delta", panel.calibration_status_label.text())
 
     def test_panel_loads_dataset_and_builds_details_dialog(self):
         get_qapp()
@@ -472,7 +502,7 @@ class CalibrationPanelTests(unittest.TestCase):
         self.assertEqual(axes_table.rowCount(), len(COMMAND_AXES))
         self.assertEqual(table.rowCount(), calibration.sizes["probe"])
         self.assertIn(
-            "dx_cmd_mm",
+            "x_offset_cmd_mm",
             [table.horizontalHeaderItem(i).text() for i in range(table.columnCount())],
         )
 

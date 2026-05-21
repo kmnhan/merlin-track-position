@@ -75,6 +75,8 @@ REDUNDANT_CALIBRATION_ATTRS: tuple[str, ...] = (
     "residual_max_px",
     "calibration_path",
 )
+PROBE_COMMAND_DELTA_MODE_ATTR = "probe_command_delta_mode"
+PROBE_COMMAND_DELTA_MODE_ABSOLUTE_CENTER = "absolute_center_offset"
 
 
 def fit_jacobian_calibration(
@@ -104,6 +106,10 @@ def fit_jacobian_calibration(
     The fitted model is linear through the local command point:
 
     ``[du0, dv0, du1, dv1] = J @ [dx_mm, dy_mm, dz_mm]``.
+
+    ``command_delta_mm`` may be either legacy move deltas or center-relative
+    absolute commanded offsets. The corresponding commanded-position arrays are
+    used to validate which convention is present.
     """
 
     if "reference_index" in shift_kwargs:
@@ -172,11 +178,12 @@ def fit_jacobian_calibration(
             raise ValueError(
                 f"{name} must have {probe_count} rows, got {values.shape[0]}"
             )
-    if not np.allclose(post_commanded - pre_commanded, command_delta):
-        raise ValueError(
-            "post_commanded_position_mm - pre_commanded_position_mm must equal "
-            "probe_command_delta_mm"
-        )
+    _validate_probe_command_delta_position_semantics(
+        command_delta,
+        pre_commanded,
+        post_commanded,
+        additional_context or {},
+    )
 
     measured_delta_px, capture_shift_mad_px, measurement_warnings = (
         _estimate_probe_capture_shifts(
@@ -199,7 +206,10 @@ def fit_jacobian_calibration(
     if not np.isfinite(min_shift_px) or min_shift_px < 0.0:
         raise ValueError("min_shift_px must be finite and non-negative")
     response_norms = np.linalg.norm(observation, axis=1)
-    small_probe_indices = np.nonzero(response_norms < min_shift_px)[0]
+    fit_probe_rows = _nonzero_command_rows(command_delta)
+    small_probe_indices = np.nonzero(
+        (response_norms < min_shift_px) & fit_probe_rows
+    )[0]
     if small_probe_indices.size:
         probe_text = ", ".join(str(int(index)) for index in small_probe_indices)
         raise ValueError(
@@ -207,11 +217,13 @@ def fit_jacobian_calibration(
             f"{min_shift_px:.4g} px for probe(s): {probe_text}"
         )
 
-    command_rank = int(np.linalg.matrix_rank(command_delta))
+    fit_command_delta = command_delta[fit_probe_rows]
+    fit_observation = observation[fit_probe_rows]
+    command_rank = int(np.linalg.matrix_rank(fit_command_delta))
     if command_rank < len(COMMAND_AXES):
         raise ValueError("probe command deltas must span x/y/z command space")
 
-    coef = _fit_robust_calibration_response(command_delta, observation)
+    coef = _fit_robust_calibration_response(fit_command_delta, fit_observation)
     px_per_cmd_mm = coef.T.reshape(len(CAMERAS), len(PIXEL_AXES), len(COMMAND_AXES))
     jacobian_observation = px_per_cmd_mm.reshape(
         len(OBSERVATION_AXES),
@@ -239,7 +251,7 @@ def fit_jacobian_calibration(
             f"{condition_number:.4g} > {condition_warning_threshold:.4g}"
         )
 
-    axis_scale, *_ = derive_axis_scale_from_jacobian(px_per_cmd_mm, command_delta)
+    axis_scale, *_ = derive_axis_scale_from_jacobian(px_per_cmd_mm, fit_command_delta)
     warnings = list(format_probe_warning_lines(measurement_warnings, command_delta))
     warnings.extend(
         format_probe_repeatability_warning_lines(
@@ -435,11 +447,12 @@ def validate_visual_calibration_dataset(dataset: xr.Dataset) -> None:
     ):
         if values.shape != expected_probe_shape:
             raise ValueError(f"{name} must have shape (probe, command_axis)")
-    if not np.allclose(post_commanded - pre_commanded, command_delta):
-        raise ValueError(
-            "post_commanded_position_mm - pre_commanded_position_mm must equal "
-            "probe_command_delta_mm"
-        )
+    _validate_probe_command_delta_position_semantics(
+        command_delta,
+        pre_commanded,
+        post_commanded,
+        dataset.attrs,
+    )
     command_rank = int(np.linalg.matrix_rank(command_delta))
     if command_rank < len(COMMAND_AXES):
         raise ValueError("probe_command_delta_mm must span x/y/z command space")
@@ -1587,6 +1600,45 @@ def _as_probe_command_matrix(
     if not np.isfinite(matrix).all():
         raise ValueError(f"{name} must contain only finite values")
     return matrix
+
+
+def _nonzero_command_rows(command_delta: np.ndarray) -> np.ndarray:
+    return np.linalg.norm(command_delta, axis=1) > 1e-12
+
+
+def _validate_probe_command_delta_position_semantics(
+    command_delta: np.ndarray,
+    pre_commanded: np.ndarray,
+    post_commanded: np.ndarray,
+    attrs: Mapping[Any, Any],
+) -> None:
+    if np.allclose(post_commanded - pre_commanded, command_delta):
+        return
+    center = _initial_commanded_position_from_attrs(attrs)
+    if center is not None and np.allclose(post_commanded - center, command_delta):
+        return
+    raise ValueError(
+        "probe_command_delta_mm must equal either "
+        "post_commanded_position_mm - pre_commanded_position_mm or "
+        "post_commanded_position_mm - initial commanded center"
+    )
+
+
+def _initial_commanded_position_from_attrs(
+    attrs: Mapping[Any, Any],
+) -> np.ndarray | None:
+    values: list[float] = []
+    for name in ("initial_x_mm", "initial_y_mm", "initial_z_mm"):
+        if name not in attrs:
+            return None
+        try:
+            value = np.asarray(attrs[name], dtype=np.float64).reshape(-1)
+        except (TypeError, ValueError):
+            return None
+        if value.size != 1 or not np.isfinite(value[0]):
+            return None
+        values.append(float(value[0]))
+    return np.asarray(values, dtype=np.float64)
 
 
 def _common_capture_count(

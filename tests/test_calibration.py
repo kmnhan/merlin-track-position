@@ -86,6 +86,18 @@ def measured_from_jacobian(command_delta, jacobian):
     )
 
 
+def absolute_command_positions(command_delta, center=(1.0, 2.0, 3.0)):
+    center_array = np.asarray(center, dtype=float)
+    current = center_array.copy()
+    pre_rows = []
+    post_rows = []
+    for offset in np.asarray(command_delta, dtype=float):
+        pre_rows.append(current.copy())
+        current = center_array + offset
+        post_rows.append(current.copy())
+    return np.asarray(pre_rows, dtype=float), np.asarray(post_rows, dtype=float)
+
+
 def empty_capture_stacks(probe_count, shape=(8, 9)):
     return [np.zeros((1, *shape), dtype=np.float32) for _ in range(probe_count)]
 
@@ -244,37 +256,39 @@ class VisualCalibrationTests(unittest.TestCase):
     def test_visual_calibration_probe_count_uses_default_n(self):
         self.assertEqual(visual_calibration_probe_count(), 21)
 
-    def test_visual_calibration_probe_deltas_minimize_negative_y_moves(self):
-        deltas = np.asarray(_make_visual_probe_deltas(3, 10.0), dtype=float)
+    def test_visual_calibration_probe_offsets_match_old_backlash_path(self):
+        offsets = _make_visual_probe_offsets_um(3, 10.0)
         expected_um = np.asarray(
             [
                 [0.0, 0.0, 10.0],
-                [0.0, 0.0, -20.0],
-                [0.0, 10.0, 10.0],
-                [10.0, 0.0, 10.0],
-                [-20.0, 0.0, 0.0],
-                [0.0, 0.0, -20.0],
-                [20.0, 0.0, 0.0],
-                [0.0, -20.0, 0.0],
-                [0.0, 0.0, 20.0],
-                [-20.0, 0.0, 0.0],
-                [0.0, 0.0, -20.0],
-                [10.0, 0.0, 10.0],
-                [10.0, 10.0, 0.0],
-                [-20.0, 0.0, 0.0],
+                [0.0, 0.0, -10.0],
+                [0.0, 10.0, 0.0],
+                [10.0, 10.0, 10.0],
+                [-10.0, 10.0, 10.0],
+                [-10.0, 10.0, -10.0],
+                [10.0, 10.0, -10.0],
+                [10.0, -10.0, -10.0],
+                [10.0, -10.0, 10.0],
+                [-10.0, -10.0, 10.0],
+                [-10.0, -10.0, -10.0],
+                [0.0, -10.0, 0.0],
                 [10.0, 0.0, 0.0],
+                [-10.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0],
             ],
             dtype=float,
         )
 
-        np.testing.assert_allclose(deltas, expected_um / 1000.0)
+        np.testing.assert_allclose(offsets, expected_um)
+        np.testing.assert_allclose(offsets[-1], 0.0, atol=1e-15)
+
+    def test_visual_calibration_movement_deltas_minimize_negative_y_moves(self):
+        deltas = np.asarray(_make_visual_probe_deltas(3, 10.0), dtype=float)
         np.testing.assert_allclose(np.sum(deltas, axis=0), 0.0, atol=1e-15)
         self.assertEqual(np.count_nonzero(deltas[:, 1] < 0.0), 1)
 
-    def test_visual_calibration_probe_offsets_match_old_backlash_path(self):
+    def test_visual_calibration_probe_offsets_cover_old_backlash_path(self):
         offsets = _make_visual_probe_offsets_um(5, 10.0)
-        deltas = np.asarray(_make_visual_probe_deltas(5, 10.0), dtype=float)
-        cumulative_offsets = np.cumsum(1000.0 * deltas, axis=0)
         expected_offsets = (-20.0, -10.0, 10.0, 20.0)
         expected_rows = {
             (0.0, 0.0, z_offset) for z_offset in expected_offsets
@@ -289,7 +303,6 @@ class VisualCalibrationTests(unittest.TestCase):
             for z_offset in (-10.0, 10.0)
         } | {(0.0, 0.0, 0.0)}
 
-        np.testing.assert_allclose(cumulative_offsets, offsets)
         self.assertEqual({tuple(row) for row in offsets}, expected_rows)
         self.assertEqual(offsets.shape[0], len(expected_rows))
 
@@ -329,11 +342,21 @@ class VisualCalibrationTests(unittest.TestCase):
             CallableCameraPlugin("cam1", lambda: full_cam1),
         )
         fit_calls = []
+        expected_offsets = _make_visual_probe_offsets_um(3, 10.0) / 1000.0
 
         def fake_fit_jacobian_calibration(**kwargs):
             fit_calls.append(kwargs)
             np.testing.assert_array_equal(kwargs["reference_cam0"], expected_crop_cam0)
             np.testing.assert_array_equal(kwargs["reference_cam1"], expected_crop_cam1)
+            np.testing.assert_allclose(kwargs["command_delta_mm"], expected_offsets)
+            np.testing.assert_allclose(
+                kwargs["post_commanded_position_mm"],
+                expected_offsets,
+            )
+            self.assertEqual(
+                kwargs["additional_context"]["probe_command_delta_mode"],
+                "absolute_center_offset",
+            )
             for name, expected_shape in (
                 ("before_images_cam0", (1, *expected_crop_cam0.shape)),
                 ("after_images_cam0", (1, *expected_crop_cam0.shape)),
@@ -342,6 +365,10 @@ class VisualCalibrationTests(unittest.TestCase):
             ):
                 for stack in kwargs[name]:
                     self.assertEqual(stack.shape, expected_shape)
+            for stack in kwargs["before_images_cam0"]:
+                np.testing.assert_array_equal(stack[0], expected_crop_cam0)
+            for stack in kwargs["before_images_cam1"]:
+                np.testing.assert_array_equal(stack[0], expected_crop_cam1)
             return calibration_dataset().assign_attrs(kwargs["additional_context"])
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -422,6 +449,67 @@ class VisualCalibrationTests(unittest.TestCase):
             calibration["px_per_cmd_mm"].values,
             expected,
             atol=1e-10,
+        )
+
+    def test_fitted_absolute_center_offsets_accept_zero_closure_row(self):
+        command_delta = _make_visual_probe_offsets_um(3, 10.0) / 1000.0
+        expected = px_per_cmd_mm()
+        measured = measured_from_jacobian(command_delta, expected)
+        shift_values = iter(
+            measured[probe_index, camera_index]
+            for probe_index in range(command_delta.shape[0])
+            for camera_index in range(len(CAMERAS))
+        )
+
+        def fake_estimate_shift(reference, current, **kwargs):
+            del reference, current, kwargs
+            return xr.Dataset(
+                {"shift_px": (("pixel_axis",), next(shift_values))},
+                coords={"pixel_axis": list(PIXEL_AXES)},
+                attrs={"warnings": ""},
+            )
+
+        pre, post = absolute_command_positions(command_delta)
+        with patch(
+            "merlin_track_position.tracking.calibration_core.estimate_shift",
+            side_effect=fake_estimate_shift,
+        ):
+            calibration = fit_jacobian_calibration(
+                reference_cam0=np.zeros((8, 9)),
+                reference_cam1=np.zeros((8, 9)),
+                before_images_cam0=empty_capture_stacks(len(command_delta)),
+                after_images_cam0=empty_capture_stacks(len(command_delta)),
+                before_images_cam1=empty_capture_stacks(len(command_delta)),
+                after_images_cam1=empty_capture_stacks(len(command_delta)),
+                command_delta_mm=command_delta,
+                pre_commanded_position_mm=pre,
+                post_commanded_position_mm=post,
+                pre_readback_position_mm=pre,
+                post_readback_position_mm=post,
+                min_shift_px=0.2,
+                additional_context={
+                    "initial_x_mm": 1.0,
+                    "initial_y_mm": 2.0,
+                    "initial_z_mm": 3.0,
+                    "probe_command_delta_mode": "absolute_center_offset",
+                },
+                n_jobs=1,
+            )
+
+        self.assertEqual(
+            calibration.attrs["probe_command_delta_mode"],
+            "absolute_center_offset",
+        )
+        np.testing.assert_allclose(command_delta[-1], 0.0, atol=1e-15)
+        np.testing.assert_allclose(
+            calibration["px_per_cmd_mm"].values,
+            expected,
+            atol=1e-10,
+        )
+        np.testing.assert_allclose(
+            calibration["probe_measured_delta_px"].values[-1],
+            0.0,
+            atol=1e-15,
         )
 
     def test_fitted_px_per_cmd_mm_uses_raw_repeats_and_warns_on_transient_spread(
@@ -853,6 +941,36 @@ class VisualCalibrationTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "must equal"):
             validate_visual_calibration_dataset(bad)
+
+    def test_absolute_center_command_offsets_validate(self):
+        dataset = calibration_dataset().assign_attrs(
+            {
+                "initial_x_mm": 1.0,
+                "initial_y_mm": 2.0,
+                "initial_z_mm": 3.0,
+                "probe_command_delta_mode": "absolute_center_offset",
+            }
+        )
+        command_delta = dataset["probe_command_delta_mm"].values
+        pre, post = absolute_command_positions(command_delta)
+        dataset["pre_commanded_position_mm"] = (
+            ("probe", "command_axis"),
+            pre,
+        )
+        dataset["post_commanded_position_mm"] = (
+            ("probe", "command_axis"),
+            post,
+        )
+        dataset["pre_readback_position_mm"] = (
+            ("probe", "command_axis"),
+            pre,
+        )
+        dataset["post_readback_position_mm"] = (
+            ("probe", "command_axis"),
+            post,
+        )
+
+        validate_visual_calibration_dataset(dataset)
 
     def test_axis_scale_outside_configured_bounds_is_rejected(self):
         bad = calibration_dataset()

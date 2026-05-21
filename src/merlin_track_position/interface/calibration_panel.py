@@ -132,7 +132,9 @@ METRIC_ROWS: tuple[tuple[str, str, str], ...] = (
         "readback_command_rms_mm",
         "Readback disagreement RMS mm",
         _tooltip_html(
-            ("RMS of <tt>(post_readback - pre_readback) - commanded_delta</tt>.",),
+            (
+                "RMS of readback motion minus commanded trajectory motion.",
+            ),
             ("Readback is diagnostic only and does not affect the fitted Jacobian.",),
         ),
     ),
@@ -151,7 +153,7 @@ REPEATABILITY_ROWS: tuple[tuple[str, str, str], ...] = (
         "Mean RMS std px",
         _tooltip_html(
             (
-                "Repeated probes with identical commanded-mm deltas are grouped.",
+                "Repeated probes with identical commanded-mm offsets are grouped.",
                 "The four camera/pixel components are RMS-combined after sample std.",
             ),
             (
@@ -266,11 +268,15 @@ def _calibration_arrays(dataset: xr.Dataset) -> dict[str, np.ndarray]:
         )
         @ pixel_to_command.T
     )
-    readback_disagreement = (
+    commanded_motion = (
+        np.asarray(dataset["post_commanded_position_mm"].values, dtype=float)
+        - np.asarray(dataset["pre_commanded_position_mm"].values, dtype=float)
+    )
+    readback_motion = (
         np.asarray(dataset["post_readback_position_mm"].values, dtype=float)
         - np.asarray(dataset["pre_readback_position_mm"].values, dtype=float)
-        - command_delta
     )
+    readback_disagreement = readback_motion - commanded_motion
     return {
         "command_delta": command_delta,
         "measured_shift": measured_shift,
@@ -656,7 +662,7 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.calibration_progress_bar.setFormat(f"{completed} / {total_steps} probes")
         self.calibration_status_label.setText(
             "New calibration in progress. "
-            f"Command delta ({_format_number(dx)}, {_format_number(dy)}, "
+            f"Command offset ({_format_number(dx)}, {_format_number(dy)}, "
             f"{_format_number(dz)}) mm. "
             f"Elapsed {_format_duration(elapsed_s)}, ETA {_format_duration(eta_s)}."
         )
@@ -1058,9 +1064,9 @@ class CalibrationPanel(QtWidgets.QWidget):
 
         headers = (
             "probe",
-            "dx_cmd_mm",
-            "dy_cmd_mm",
-            "dz_cmd_mm",
+            "x_offset_cmd_mm",
+            "y_offset_cmd_mm",
+            "z_offset_cmd_mm",
             "measured_cam0_du_px",
             "measured_cam0_dv_px",
             "measured_cam1_du_px",
