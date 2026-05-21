@@ -40,8 +40,9 @@ MOTOR_STALE_READBACK_DEADBAND: dict[str, float] = {
 }
 MOTOR_STALE_READBACK_DELAY_S: float = 10.0
 
-# Default number of image pairs captured at each calibration/correction position.
-DEFAULT_CAPTURE_COUNT: int = 3
+# Default number of image pairs captured at each measurement position.
+DEFAULT_CALIBRATION_CAPTURE_COUNT: int = 1
+DEFAULT_CORRECTION_CAPTURE_COUNT: int = 1
 
 # Default number of worker threads for calibration fitting. 1 works best on the DAQ PC.
 CALIBRATION_FIT_N_JOBS: int = 1
@@ -62,7 +63,8 @@ DEFAULT_AXIS_SCALE_BOUNDS_CMD_MM_BY_AXIS: dict[str, tuple[float, float]] = {
 }
 
 # Number of repeated +axis/-axis probes per command axis.
-DEFAULT_VISUAL_CALIBRATION_REPEATS_PER_DIRECTION: int = 3
+DEFAULT_VISUAL_CALIBRATION_REPEATS_PER_DIRECTION: int = 5
+DEFAULT_VISUAL_CALIBRATION_REPEATABILITY_WARNING_FRACTION: float = 0.10
 
 # Minimum two-camera image response accepted for a calibration probe.
 DEFAULT_VISUAL_CALIBRATION_MIN_SHIFT_PX: float = 0.2

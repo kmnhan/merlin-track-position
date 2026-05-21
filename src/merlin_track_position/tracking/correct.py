@@ -107,7 +107,7 @@ def do_correction(
     *,
     calibration_path: str | Path | None = None,
     max_retries: int = 4,
-    capture_count: int = constants.DEFAULT_CAPTURE_COUNT,
+    capture_count: int = constants.DEFAULT_CORRECTION_CAPTURE_COUNT,
     lqr_projected_tolerance: Any = _USE_DEFAULT,
     gain: Any = _USE_DEFAULT,
     max_normalized_step: Any = _USE_DEFAULT,

@@ -207,11 +207,15 @@ def fit_jacobian_calibration(
             f"{min_shift_px:.4g} px for probe(s): {probe_text}"
         )
 
-    command_rank = int(np.linalg.matrix_rank(command_delta))
+    fit_command_delta, fit_observation, _ = _median_probe_observations_by_command(
+        command_delta,
+        observation,
+    )
+    command_rank = int(np.linalg.matrix_rank(fit_command_delta))
     if command_rank < len(COMMAND_AXES):
         raise ValueError("probe command deltas must span x/y/z command space")
 
-    coef = _fit_robust_calibration_response(command_delta, observation)
+    coef = _fit_robust_calibration_response(fit_command_delta, fit_observation)
     px_per_cmd_mm = coef.T.reshape(len(CAMERAS), len(PIXEL_AXES), len(COMMAND_AXES))
     jacobian_observation = px_per_cmd_mm.reshape(
         len(OBSERVATION_AXES),
@@ -241,6 +245,13 @@ def fit_jacobian_calibration(
 
     axis_scale, *_ = derive_axis_scale_from_jacobian(px_per_cmd_mm, command_delta)
     warnings = list(format_probe_warning_lines(measurement_warnings, command_delta))
+    warnings.extend(
+        format_probe_repeatability_warning_lines(
+            command_delta,
+            observation,
+            min_response_px=min_shift_px,
+        )
+    )
     attrs: dict[str, Any] = {
         "capture_count": capture_count,
         "min_shift_px": min_shift_px,
@@ -1729,6 +1740,55 @@ def format_probe_warning_lines(
     return tuple(lines)
 
 
+def format_probe_repeatability_warning_lines(
+    command_delta_mm: Sequence[Sequence[float]],
+    observation: Sequence[Sequence[float]] | np.ndarray,
+    *,
+    min_response_px: float,
+    relative_threshold: float = (
+        constants.DEFAULT_VISUAL_CALIBRATION_REPEATABILITY_WARNING_FRACTION
+    ),
+) -> tuple[str, ...]:
+    """Return warning lines for repeated commands with inconsistent image response."""
+
+    command_delta = np.asarray(command_delta_mm, dtype=np.float64)
+    observations = np.asarray(observation, dtype=np.float64)
+    if command_delta.ndim != 2 or command_delta.shape[1] != len(COMMAND_AXES):
+        raise ValueError("command_delta_mm must have shape (probe, command_axis)")
+    if observations.shape != (command_delta.shape[0], len(OBSERVATION_AXES)):
+        raise ValueError("observation must have shape (probe, observation_axis)")
+
+    relative_threshold = float(relative_threshold)
+    if not np.isfinite(relative_threshold) or relative_threshold <= 0.0:
+        raise ValueError("relative_threshold must be finite and positive")
+    response_floor = float(min_response_px)
+    if not np.isfinite(response_floor) or response_floor < 0.0:
+        raise ValueError("min_response_px must be finite and non-negative")
+
+    lines: list[str] = []
+    for command_row, indices in _probe_command_groups(command_delta):
+        if len(indices) < 2:
+            continue
+        values = observations[list(indices)]
+        spread = np.std(values, axis=0, ddof=1)
+        rms_spread = float(np.sqrt(np.mean(spread * spread)))
+        median_response = np.median(values, axis=0)
+        median_norm = float(np.linalg.norm(median_response))
+        denominator = max(median_norm, response_floor, 1e-12)
+        relative_spread = rms_spread / denominator
+        if relative_spread <= relative_threshold:
+            continue
+        command_text = _format_command_warning_context(command_row)
+        lines.append(
+            "repeated probe response spread for "
+            f"({command_text}) is {_format_warning_number(rms_spread)} px "
+            f"({_format_warning_number(100.0 * relative_spread)}% of median "
+            f"response {_format_warning_number(median_norm)} px across "
+            f"{len(indices)} repeats)"
+        )
+    return tuple(lines)
+
+
 def _format_command_warning_context(command_row: np.ndarray) -> str:
     axis_values = ", ".join(
         f"{axis}={_format_warning_number(value)}"
@@ -1739,6 +1799,50 @@ def _format_command_warning_context(command_row: np.ndarray) -> str:
 
 def _format_warning_number(value: float) -> str:
     return f"{float(value):.4g}"
+
+
+def _median_probe_observations_by_command(
+    command_delta: np.ndarray,
+    observation: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, tuple[tuple[int, ...], ...]]:
+    command_values = np.asarray(command_delta, dtype=np.float64)
+    observation_values = np.asarray(observation, dtype=np.float64)
+    if command_values.ndim != 2 or command_values.shape[1] != len(COMMAND_AXES):
+        raise ValueError("command_delta must have shape (probe, command_axis)")
+    if observation_values.shape != (command_values.shape[0], len(OBSERVATION_AXES)):
+        raise ValueError("observation must have shape (probe, observation_axis)")
+
+    grouped_commands: list[np.ndarray] = []
+    grouped_observations: list[np.ndarray] = []
+    grouped_indices: list[tuple[int, ...]] = []
+    for command_row, indices in _probe_command_groups(command_values):
+        grouped_commands.append(command_row)
+        grouped_observations.append(
+            np.median(observation_values[list(indices)], axis=0)
+        )
+        grouped_indices.append(indices)
+    return (
+        np.stack(grouped_commands, axis=0),
+        np.stack(grouped_observations, axis=0),
+        tuple(grouped_indices),
+    )
+
+
+def _probe_command_groups(
+    command_delta: np.ndarray,
+) -> tuple[tuple[np.ndarray, tuple[int, ...]], ...]:
+    groups: dict[tuple[float, ...], list[int]] = {}
+    command_values = np.asarray(command_delta, dtype=np.float64)
+    for index, command_row in enumerate(command_values):
+        key = tuple(float(value) for value in command_row)
+        groups.setdefault(key, []).append(index)
+    return tuple(
+        (
+            np.asarray(command_key, dtype=np.float64),
+            tuple(indices),
+        )
+        for command_key, indices in groups.items()
+    )
 
 
 def _fit_robust_calibration_response(

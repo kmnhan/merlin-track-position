@@ -32,6 +32,7 @@ from merlin_track_position.tracking.calibration_core import (
 import merlin_track_position.tracking.calibration_core as calibration_core
 import merlin_track_position.tracking.correct as correct_module
 from merlin_track_position.tracking.calibrate import (
+    _make_visual_probe_deltas,
     run_calibration,
     visual_calibration_probe_count,
 )
@@ -223,11 +224,83 @@ class ShiftDetectionTests(unittest.TestCase):
 
 
 class VisualCalibrationTests(unittest.TestCase):
-    def test_visual_calibration_probe_count_uses_default_repeats(self):
+    def test_capture_count_defaults_are_split_by_workflow(self):
+        self.assertEqual(constants.DEFAULT_CALIBRATION_CAPTURE_COUNT, 3)
+        self.assertEqual(constants.DEFAULT_CORRECTION_CAPTURE_COUNT, 1)
         self.assertEqual(
-            visual_calibration_probe_count(),
-            constants.DEFAULT_VISUAL_CALIBRATION_REPEATS_PER_DIRECTION * 6,
+            run_calibration.__kwdefaults__["capture_count"],
+            constants.DEFAULT_CALIBRATION_CAPTURE_COUNT,
         )
+        self.assertEqual(
+            do_correction.__kwdefaults__["capture_count"],
+            constants.DEFAULT_CORRECTION_CAPTURE_COUNT,
+        )
+        self.assertEqual(
+            detect_shift.__kwdefaults__["capture_count"],
+            constants.DEFAULT_CORRECTION_CAPTURE_COUNT,
+        )
+
+    def test_visual_calibration_probe_count_uses_default_repeats(self):
+        self.assertEqual(visual_calibration_probe_count(), 30)
+
+    def test_visual_calibration_probe_order_is_balanced_and_cycles(self):
+        steps = {"x": 0.1, "y": 0.2, "z": 0.3}
+        deltas = np.asarray(_make_visual_probe_deltas(steps, 6), dtype=float)
+        expected_cycles = np.asarray(
+            [
+                [
+                    [0.1, 0.0, 0.0],
+                    [-0.1, 0.0, 0.0],
+                    [0.0, 0.2, 0.0],
+                    [0.0, -0.2, 0.0],
+                    [0.0, 0.0, 0.3],
+                    [0.0, 0.0, -0.3],
+                ],
+                [
+                    [0.0, -0.2, 0.0],
+                    [0.0, 0.2, 0.0],
+                    [0.0, 0.0, -0.3],
+                    [0.0, 0.0, 0.3],
+                    [-0.1, 0.0, 0.0],
+                    [0.1, 0.0, 0.0],
+                ],
+                [
+                    [0.0, 0.0, 0.3],
+                    [0.0, 0.0, -0.3],
+                    [0.1, 0.0, 0.0],
+                    [-0.1, 0.0, 0.0],
+                    [0.0, 0.2, 0.0],
+                    [0.0, -0.2, 0.0],
+                ],
+                [
+                    [-0.1, 0.0, 0.0],
+                    [0.1, 0.0, 0.0],
+                    [0.0, -0.2, 0.0],
+                    [0.0, 0.2, 0.0],
+                    [0.0, 0.0, -0.3],
+                    [0.0, 0.0, 0.3],
+                ],
+                [
+                    [0.0, 0.2, 0.0],
+                    [0.0, -0.2, 0.0],
+                    [0.0, 0.0, 0.3],
+                    [0.0, 0.0, -0.3],
+                    [0.1, 0.0, 0.0],
+                    [-0.1, 0.0, 0.0],
+                ],
+                [
+                    [0.1, 0.0, 0.0],
+                    [-0.1, 0.0, 0.0],
+                    [0.0, 0.2, 0.0],
+                    [0.0, -0.2, 0.0],
+                    [0.0, 0.0, 0.3],
+                    [0.0, 0.0, -0.3],
+                ],
+            ],
+            dtype=float,
+        ).reshape(-1, 3)
+
+        np.testing.assert_allclose(deltas, expected_cycles)
 
     def test_run_calibration_stores_full_references_and_fits_cropped_images(self):
         full_cam0 = np.arange(5 * 6, dtype=np.uint16).reshape(5, 6)
@@ -357,6 +430,77 @@ class VisualCalibrationTests(unittest.TestCase):
             calibration["px_per_cmd_mm"].values,
             expected,
             atol=1e-10,
+        )
+
+    def test_fitted_px_per_cmd_mm_uses_grouped_medians_for_transient_repeats(self):
+        command_delta = np.asarray(_make_visual_probe_deltas(None, 5), dtype=float)
+        expected = px_per_cmd_mm()
+        measured = measured_from_jacobian(command_delta, expected)
+        biased_observation = measured.reshape(command_delta.shape[0], 4).copy()
+        y_probe_indices = np.nonzero(command_delta[:, 1] != 0.0)[0][:2]
+        transient = np.array([3.2, 1.6, 2.8, -8.0], dtype=float)
+        biased_observation[y_probe_indices[0]] += transient
+        biased_observation[y_probe_indices[1]] -= transient
+        biased_measured = biased_observation.reshape(command_delta.shape[0], 2, 2)
+        shift_values = iter(
+            biased_measured[probe_index, camera_index]
+            for probe_index in range(command_delta.shape[0])
+            for camera_index in range(len(CAMERAS))
+        )
+
+        def fake_estimate_shift(reference, current, **kwargs):
+            del reference, current, kwargs
+            return xr.Dataset(
+                {"shift_px": (("pixel_axis",), next(shift_values))},
+                coords={"pixel_axis": list(PIXEL_AXES)},
+                attrs={"warnings": ""},
+            )
+
+        pre = np.zeros_like(command_delta)
+        post = pre + command_delta
+        with patch(
+            "merlin_track_position.tracking.calibration_core.estimate_shift",
+            side_effect=fake_estimate_shift,
+        ):
+            calibration = fit_jacobian_calibration(
+                reference_cam0=np.zeros((8, 9)),
+                reference_cam1=np.zeros((8, 9)),
+                before_images_cam0=empty_capture_stacks(len(command_delta)),
+                after_images_cam0=empty_capture_stacks(len(command_delta)),
+                before_images_cam1=empty_capture_stacks(len(command_delta)),
+                after_images_cam1=empty_capture_stacks(len(command_delta)),
+                command_delta_mm=command_delta,
+                pre_commanded_position_mm=pre,
+                post_commanded_position_mm=post,
+                pre_readback_position_mm=pre,
+                post_readback_position_mm=post,
+                min_shift_px=0.0,
+                n_jobs=1,
+            )
+
+        raw_fit, _, _, _ = np.linalg.lstsq(
+            command_delta,
+            biased_observation,
+            rcond=None,
+        )
+        raw_px_per_cmd_mm = raw_fit.T.reshape(len(CAMERAS), len(PIXEL_AXES), 3)
+        self.assertGreater(
+            np.linalg.norm(raw_px_per_cmd_mm - expected),
+            5.0,
+        )
+        np.testing.assert_allclose(
+            calibration["px_per_cmd_mm"].values,
+            expected,
+            atol=1e-10,
+        )
+        np.testing.assert_allclose(
+            calibration["probe_measured_delta_px"].values,
+            biased_measured,
+            atol=1e-12,
+        )
+        self.assertIn(
+            "repeated probe response spread",
+            calibration.attrs["warnings"],
         )
 
     def test_fitted_visual_calibration_preserves_reference_image_dtype(self):

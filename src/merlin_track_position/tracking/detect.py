@@ -30,7 +30,7 @@ def detect_shift(
     calibration: xr.Dataset,
     camera_pair: CameraPairPlugin | None = None,
     *,
-    capture_count: int = constants.DEFAULT_CAPTURE_COUNT,
+    capture_count: int = constants.DEFAULT_CORRECTION_CAPTURE_COUNT,
     weights: Sequence[float] | np.ndarray | None = None,
     **shift_kwargs: Any,
 ) -> xr.Dataset:

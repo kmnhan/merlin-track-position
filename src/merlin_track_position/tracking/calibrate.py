@@ -52,7 +52,7 @@ def run_calibration(
     step_mm_by_axis: Mapping[str, float] | None = None,
     repeats_per_direction: int = constants.DEFAULT_VISUAL_CALIBRATION_REPEATS_PER_DIRECTION,
     min_shift_px: float = constants.DEFAULT_VISUAL_CALIBRATION_MIN_SHIFT_PX,
-    capture_count: int = constants.DEFAULT_CAPTURE_COUNT,
+    capture_count: int = constants.DEFAULT_CALIBRATION_CAPTURE_COUNT,
     additional_context: Mapping[str, Any] | None = None,
     processing_callback: Callable[[int, int], None] | None = None,
     step_callback: Callable[
@@ -277,13 +277,19 @@ def _make_visual_probe_deltas(
         raise ValueError("repeats_per_direction must be >= 1")
 
     steps = _step_mm_by_axis_from_config(step_mm_by_axis)
+    probe_cycles = (
+        ((0, 1.0), (0, -1.0), (1, 1.0), (1, -1.0), (2, 1.0), (2, -1.0)),
+        ((1, -1.0), (1, 1.0), (2, -1.0), (2, 1.0), (0, -1.0), (0, 1.0)),
+        ((2, 1.0), (2, -1.0), (0, 1.0), (0, -1.0), (1, 1.0), (1, -1.0)),
+        ((0, -1.0), (0, 1.0), (1, -1.0), (1, 1.0), (2, -1.0), (2, 1.0)),
+        ((1, 1.0), (1, -1.0), (2, 1.0), (2, -1.0), (0, 1.0), (0, -1.0)),
+    )
     deltas: list[np.ndarray] = []
-    for _ in range(repeats):
-        for axis_index in range(len(COMMAND_AXES)):
-            for sign in (1.0, -1.0):
-                delta = np.zeros(len(COMMAND_AXES), dtype=np.float64)
-                delta[axis_index] = sign * steps[axis_index]
-                deltas.append(delta)
+    for repeat_index in range(repeats):
+        for axis_index, sign in probe_cycles[repeat_index % len(probe_cycles)]:
+            delta = np.zeros(len(COMMAND_AXES), dtype=np.float64)
+            delta[axis_index] = sign * steps[axis_index]
+            deltas.append(delta)
     return deltas
 
 
