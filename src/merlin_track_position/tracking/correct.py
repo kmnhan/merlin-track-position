@@ -290,6 +290,7 @@ def do_correction(
 
     move_count = 0
     converged = criterion_residual <= correction_tolerance
+    stop_reason: str | None = None
 
     def build_result(completed: bool) -> xr.Dataset:
         return _build_correction_result(
@@ -461,6 +462,7 @@ def do_correction(
                     min_command_norm_mm=min_command_norm_mm,
                 )
             )
+            stop_reason = warnings[-1]
             logger.info(
                 "Stopping correction before move: %s",
                 warnings[-1],
@@ -576,6 +578,10 @@ def do_correction(
                         innovation_gate=lqr_kalman_innovation_gate,
                     )
                 )
+                stop_reason = (
+                    "Kalman innovation gating rejected the post-move measurement"
+                )
+                logger.info("Stopping correction after gated Kalman measurement.")
         measured_delta_px = np.asarray(
             after_measurement["shift_px"].values, dtype=np.float64
         ) - np.asarray(measurement["shift_px"].values, dtype=np.float64)
@@ -650,13 +656,22 @@ def do_correction(
             converged,
         )
         save_progress(completed=False)
+        if stop_reason is not None:
+            break
 
     if not converged:
-        warnings.append(
-            "correction did not converge within "
-            f"{max_moves} move(s); final {correction_criterion} "
-            f"{criterion_residual:.4g} exceeds {correction_tolerance:.4g}"
-        )
+        if stop_reason is None:
+            warnings.append(
+                "correction did not converge within "
+                f"{max_moves} move(s); final {correction_criterion} "
+                f"{criterion_residual:.4g} exceeds {correction_tolerance:.4g}"
+            )
+        else:
+            warnings.append(
+                "correction did not converge; stopped before convergence: "
+                f"{stop_reason}; final {correction_criterion} "
+                f"{criterion_residual:.4g} exceeds {correction_tolerance:.4g}"
+            )
         logger.info(
             "Correction finished without convergence: moves=%d, "
             "criterion_residual=%.6g",
@@ -1486,7 +1501,7 @@ def _lqr_kalman_gated_measurement_warning(
     return (
         "LQR Kalman measurement rejected by innovation gate: "
         f"mahalanobis={innovation_mahalanobis:.4g}, gate={gate_text}; "
-        "using predicted state"
+        "using predicted state and stopping correction"
     )
 
 

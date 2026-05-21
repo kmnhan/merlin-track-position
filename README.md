@@ -439,13 +439,13 @@ S_m\tilde a_k =
 The default feedback multiplier is
 
 ```text
-DEFAULT_LQR_CORRECTION_GAIN = 0.95
+DEFAULT_LQR_CORRECTION_GAIN = 0.50
 ```
 
 Before motion, the normalized command is capped:
 
 ```text
-DEFAULT_LQR_CORRECTION_MAX_NORMALIZED_STEP = 0.5
+DEFAULT_LQR_CORRECTION_MAX_NORMALIZED_STEP = 0.25
 ```
 
 The cap limits `max(abs(tilde_a_k))`. The final hardware request is an absolute
@@ -471,10 +471,10 @@ LQR convergence is evaluated in the controllable normalized image subspace:
 The default tolerance is
 
 ```text
-DEFAULT_LQR_CORRECTION_PROJECTED_TOLERANCE = 2.0
+DEFAULT_LQR_CORRECTION_PROJECTED_TOLERANCE = 0.75
 ```
 
-This means the controllable image error is within roughly two normalized image
+This means the controllable image error is within `0.75` normalized image
 tolerance units. The pixel residual
 
 ```math
@@ -590,7 +590,7 @@ If `gamma_k` exceeds the innovation gate, the measurement is rejected and the
 predicted state is used. The default gate is
 
 ```text
-DEFAULT_LQR_CORRECTION_KALMAN_INNOVATION_GATE = 16.0
+DEFAULT_LQR_CORRECTION_KALMAN_INNOVATION_GATE = 25.0
 ```
 
 This catches correlation failures, images outside the local linear regime, and
@@ -618,13 +618,14 @@ R_e =
 (e_i - \bar e)(e_i - \bar e)^\mathsf{T}.
 ```
 
-Then normalize it:
+Pass this raw pixel covariance to the correction code. The implementation
+normalizes it internally:
 
 ```math
 R = S_e^{-1}R_eS_e^{-1}.
 ```
 
-Use the full `4 x 4` covariance. Do not force `R` to be diagonal when the
+Use the full `4 x 4` raw covariance. Do not force `R_e` to be diagonal when the
 camera channels are correlated. Off-diagonal terms such as
 `cov(du_cam0, dv_cam0)` or `cov(du_cam0, du_cam1)` tell the filter which
 directions should be trusted together or discounted together.

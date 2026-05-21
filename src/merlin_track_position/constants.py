@@ -50,7 +50,7 @@ CALIBRATION_FIT_N_JOBS: int = 1
 
 # Default backlash-aware calibration trajectory controls.
 DEFAULT_VISUAL_CALIBRATION_N: int = 5
-DEFAULT_VISUAL_CALIBRATION_STEP_UM: float = 15.0
+DEFAULT_VISUAL_CALIBRATION_STEP_UM: float = 50.0
 
 # Bounds used when deriving correction command normalization scales.
 DEFAULT_AXIS_SCALE_BOUNDS_CMD_MM_BY_AXIS: dict[str, tuple[float, float]] = {
@@ -62,7 +62,7 @@ DEFAULT_AXIS_SCALE_BOUNDS_CMD_MM_BY_AXIS: dict[str, tuple[float, float]] = {
 DEFAULT_VISUAL_CALIBRATION_REPEATABILITY_WARNING_FRACTION: float = 0.10
 
 # Minimum two-camera image response accepted for a calibration probe.
-DEFAULT_VISUAL_CALIBRATION_MIN_SHIFT_PX: float = 0.2
+DEFAULT_VISUAL_CALIBRATION_MIN_SHIFT_PX: float = 0.1
 
 # Calibration condition number threshold above which the fit is rejected.
 DEFAULT_JACOBIAN_CONDITION_WARNING: float = 100.0
@@ -86,9 +86,10 @@ DEFAULT_LQR_CORRECTION_MOTOR_PENALTY: float = 25.0
 DEFAULT_LQR_CORRECTION_SVD_RELATIVE_TOLERANCE: float = 1e-6
 DEFAULT_LQR_CORRECTION_PROJECTED_TOLERANCE: float = 0.75
 
-# LQR-only Kalman observer. Measurement covariance is ordered as
-# cam0_du, cam0_dv, cam1_du, cam1_dv.
-DEFAULT_LQR_CORRECTION_USE_KALMAN_FILTER: bool = True
+# LQR-only Kalman observer. Measurement covariance is in raw pixel units and is
+# ordered as cam0_du, cam0_dv, cam1_du, cam1_dv. The correction code normalizes
+# it by the LQR image scale before updating/gating.
+DEFAULT_LQR_CORRECTION_USE_KALMAN_FILTER: bool = False
 DEFAULT_LQR_CORRECTION_KALMAN_PROCESS_NOISE: float = 0.05
 DEFAULT_LQR_CORRECTION_KALMAN_MEASUREMENT_NOISE: float = 1.0
 DEFAULT_LQR_CORRECTION_KALMAN_MEASUREMENT_COVARIANCE: (

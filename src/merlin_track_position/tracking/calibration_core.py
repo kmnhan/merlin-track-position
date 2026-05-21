@@ -1147,7 +1147,12 @@ def update_lqr_kalman_state(
         constants.DEFAULT_LQR_CORRECTION_KALMAN_INNOVATION_GATE
     ),
 ) -> dict[str, np.ndarray | float | bool]:
-    """Update the LQR Kalman observer from a full 4-channel image measurement."""
+    """Update the LQR Kalman observer from a full 4-channel image measurement.
+
+    ``measurement_covariance`` and scalar ``measurement_noise`` are specified in
+    raw pixel units. They are converted to normalized measurement units using
+    the LQR image scale before the Kalman update.
+    """
 
     rank = int(lqr_design["rank"])
     state_pred = _state_vector(predicted_state, rank, "predicted_state")
@@ -1167,6 +1172,7 @@ def update_lqr_kalman_state(
     measurement_cov = _measurement_covariance_matrix(
         measurement_covariance,
         measurement_noise,
+        image_scale,
     )
 
     innovation = normalized_measurement - controllable_basis @ state_pred
@@ -1298,18 +1304,32 @@ def _covariance_matrix(
 def _measurement_covariance_matrix(
     measurement_covariance: Sequence[Sequence[float]] | np.ndarray | None,
     measurement_noise: float,
+    image_scale: Sequence[float] | np.ndarray,
 ) -> np.ndarray:
+    scale = np.asarray(image_scale, dtype=np.float64)
+    if scale.shape != (len(OBSERVATION_AXES),):
+        raise ValueError(
+            "image_scale must have one value for each camera/pixel observation"
+        )
+    if not np.isfinite(scale).all() or np.any(scale <= 0.0):
+        raise ValueError("image_scale must contain finite positive values")
+
     if measurement_covariance is None:
         measurement_noise = float(measurement_noise)
         if not np.isfinite(measurement_noise) or measurement_noise <= 0.0:
             raise ValueError("measurement_noise must be finite and positive")
-        return measurement_noise * np.eye(len(OBSERVATION_AXES), dtype=np.float64)
-    return _covariance_matrix(
-        measurement_covariance,
-        len(OBSERVATION_AXES),
-        "measurement_covariance",
-        allow_zero=False,
-    )
+        raw_covariance = measurement_noise * np.eye(
+            len(OBSERVATION_AXES),
+            dtype=np.float64,
+        )
+    else:
+        raw_covariance = _covariance_matrix(
+            measurement_covariance,
+            len(OBSERVATION_AXES),
+            "measurement_covariance",
+            allow_zero=False,
+        )
+    return raw_covariance / np.outer(scale, scale)
 
 
 def _lqr_image_scale_from_weights(
