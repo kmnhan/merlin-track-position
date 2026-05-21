@@ -24,6 +24,11 @@ MOTOR_BACKLASH_CORRECTION: dict[str, float] = {
     "z": 0.1,
 }
 
+# Apply MOTOR_BACKLASH_CORRECTION to correction moves when Python is moving
+# motors directly through the BCS API. Delegated LabVIEW moves keep their own
+# motor behavior.
+CORRECTION_USE_BCS_API_BACKLASH: bool = True
+
 # Stale-status readback fallback for motor moves. Values are keyed by motor alias
 # and are in each motor's command units. For x/y/z this is mm.
 MOTOR_STALE_READBACK_DEADBAND: dict[str, float] = {
@@ -42,7 +47,7 @@ MOTOR_STALE_READBACK_DELAY_S: float = 10.0
 
 # Default number of image pairs captured at each measurement position.
 DEFAULT_CALIBRATION_CAPTURE_COUNT: int = 3
-DEFAULT_CORRECTION_CAPTURE_COUNT: int = 1
+DEFAULT_CORRECTION_CAPTURE_COUNT: int = 3
 
 # Default number of worker threads for calibration fitting. 1 works best on the DAQ PC.
 CALIBRATION_FIT_N_JOBS: int = 1

@@ -1184,6 +1184,7 @@ class CorrectionTests(unittest.TestCase):
             def __init__(self):
                 self.positions = np.array([10.0, 20.0, 30.0], dtype=float)
                 self.moves = []
+                self.backlash_corrections = []
 
             def get_positions(self, motor_aliases):
                 events.append(("get", tuple(motor_aliases)))
@@ -1202,6 +1203,7 @@ class CorrectionTests(unittest.TestCase):
             ):
                 events.append(("move", tuple(motor_aliases)))
                 self.moves.append((tuple(motor_aliases), tuple(goals)))
+                self.backlash_corrections.append(backlash_correction)
                 for axis, goal in zip(motor_aliases, goals, strict=True):
                     self.positions[COMMAND_AXES.index(axis)] = float(goal)
                 return tuple(goals)
@@ -1265,6 +1267,8 @@ class CorrectionTests(unittest.TestCase):
 
         self.assertTrue(result.attrs["correction_converged"])
         self.assertEqual(len(backend.moves), 2)
+        self.assertEqual(backend.backlash_corrections, [{}, {}])
+        self.assertFalse(result.attrs["correction_backlash_enabled"])
         self.assertEqual(
             result.attrs["correction_move_started_at"],
             "2026-01-01T00:00:01-08:00",
@@ -1890,7 +1894,7 @@ class CorrectionTests(unittest.TestCase):
             [[True, False, False]],
         )
 
-    def test_correction_move_disables_motor_backlash_prepositioning(self):
+    def test_bcs_api_correction_move_uses_motor_backlash_constant(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = self.save_calibration(tmpdir)
             calibration = calibration_dataset()
@@ -1936,7 +1940,7 @@ class CorrectionTests(unittest.TestCase):
                     return_value=active_goals,
                 ) as move,
             ):
-                do_correction(
+                result = do_correction(
                     path,
                     capture_count=1,
                     max_moves=1,
@@ -1953,7 +1957,52 @@ class CorrectionTests(unittest.TestCase):
             np.asarray(move.call_args.args[1], dtype=float),
             np.asarray(active_goals, dtype=float),
         )
+        self.assertEqual(
+            move.call_args.kwargs["backlash_correction"],
+            constants.MOTOR_BACKLASH_CORRECTION,
+        )
+        self.assertTrue(result.attrs["correction_backlash_enabled"])
+
+    def test_bcs_api_correction_backlash_can_be_disabled_by_constant(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self.save_calibration(tmpdir)
+            calibration = calibration_dataset()
+            offset_mm = np.array([0.020, 0.0, 0.0], dtype=float)
+            p0 = (
+                calibration["px_per_cmd_mm"].values.reshape(
+                    len(CAMERAS) * len(PIXEL_AXES), len(COMMAND_AXES)
+                )
+                @ offset_mm
+            ).reshape(len(CAMERAS), len(PIXEL_AXES))
+            p1 = np.zeros((len(CAMERAS), len(PIXEL_AXES)), dtype=float)
+            hardware_patches = self.patch_hardware(
+                [shift_dataset(p0), shift_dataset(p1)],
+                positions=(0.5, 0.0, 0.0),
+            )
+            with (
+                hardware_patches[0],
+                hardware_patches[1],
+                hardware_patches[2],
+                patch(
+                    "merlin_track_position.tracking.correct.move_motors_and_wait",
+                    return_value=(0.5, 0.0, 0.0),
+                ) as move,
+                patch.object(constants, "CORRECTION_USE_BCS_API_BACKLASH", False),
+            ):
+                result = do_correction(
+                    path,
+                    capture_count=1,
+                    max_moves=1,
+                    gain=TEST_CORRECTION_GAIN,
+                    max_normalized_step=TEST_CORRECTION_MAX_NORMALIZED_STEP,
+                    lqr_image_scale_px=TEST_LQR_IMAGE_SCALE_PX,
+                    lqr_motor_penalty=TEST_LQR_MOTOR_PENALTY,
+                    lqr_svd_relative_tolerance=TEST_LQR_SVD_RELATIVE_TOLERANCE,
+                    weights=TEST_CORRECTION_WEIGHTS,
+                )
+
         self.assertEqual(move.call_args.kwargs["backlash_correction"], {})
+        self.assertFalse(result.attrs["correction_backlash_enabled"])
 
     def test_correction_history_file_records_move_diagnostics(self):
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -136,6 +136,15 @@ def do_correction(
         camera_pair = default_camera_pair()
     if motor_backend is None:
         motor_backend = DirectBCSMotorBackend()
+    correction_backlash_enabled = (
+        isinstance(motor_backend, DirectBCSMotorBackend)
+        and constants.CORRECTION_USE_BCS_API_BACKLASH
+    )
+    correction_backlash = (
+        dict(constants.MOTOR_BACKLASH_CORRECTION)
+        if correction_backlash_enabled
+        else {}
+    )
     weights = _correction_weights(weights)
     if gain is _USE_DEFAULT:
         gain = constants.DEFAULT_LQR_CORRECTION_GAIN
@@ -375,6 +384,7 @@ def do_correction(
             lqr_kalman_measurement_covariance=lqr_kalman_measurement_covariance,
             lqr_kalman_initial_covariance=lqr_kalman_initial_covariance,
             lqr_kalman_innovation_gate=lqr_kalman_innovation_gate,
+            correction_backlash_enabled=correction_backlash_enabled,
             initial_commanded_position_mm=initial_commanded_position_mm,
             commanded_position_mm=commanded_position_mm,
             warnings=warnings,
@@ -502,9 +512,7 @@ def do_correction(
             active_axes,
             active_requested_position_mm,
             max_retries=max_retries,
-            # Correction moves are already closed-loop and can be micron-scale.
-            # Do not expand a small correction into a large backlash pre-position.
-            backlash_correction={},
+            backlash_correction=correction_backlash,
         )
         correction_move_finished_at = _local_timestamp_iso()
         logger.info("Correction motor move returned; reading final x/y/z positions.")
@@ -1644,6 +1652,7 @@ def _build_correction_result(
     lqr_kalman_measurement_covariance: Any,
     lqr_kalman_initial_covariance: float,
     lqr_kalman_innovation_gate: float | None,
+    correction_backlash_enabled: bool,
     initial_commanded_position_mm: np.ndarray,
     commanded_position_mm: np.ndarray,
     warnings: Sequence[str],
@@ -1830,6 +1839,7 @@ def _build_correction_result(
         "correction_final_gain": float(current_gain),
         "correction_max_normalized_step": max_normalized_attr,
         "correction_min_command_norm_mm": float(min_command_norm_mm),
+        "correction_backlash_enabled": bool(correction_backlash_enabled),
         "max_correction_moves": int(max_moves),
         "correction_applied": move_count > 0,
         "warnings": "\n".join(tuple(dict.fromkeys(warnings))),
