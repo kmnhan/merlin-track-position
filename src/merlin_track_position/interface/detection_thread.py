@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import logging
 import threading
+from collections.abc import Mapping
+from typing import Any
 
 import xarray as xr
 from qtpy import QtCore
@@ -26,17 +28,21 @@ class DetectShiftThread(QtCore.QThread):
         self._running = threading.Event()
         self._calibration: xr.Dataset | None = None
         self._camera_pair: CameraPairPlugin | None = None
+        self._shift_kwargs: dict[str, Any] = {}
 
     def configure(
         self,
         calibration: xr.Dataset,
         camera_pair: CameraPairPlugin,
+        *,
+        shift_kwargs: Mapping[str, Any] | None = None,
     ) -> None:
         """Set the parameters for the next no-move shift detection."""
         if self.isRunning():
             raise RuntimeError("cannot configure shift detection while it is running")
         self._calibration = calibration
         self._camera_pair = camera_pair
+        self._shift_kwargs = {} if shift_kwargs is None else dict(shift_kwargs)
 
     def run(self) -> None:
         self._running.set()
@@ -48,7 +54,11 @@ class DetectShiftThread(QtCore.QThread):
             try:
                 if self._calibration is None or self._camera_pair is None:
                     raise RuntimeError("shift detection thread has not been configured")
-                result = detect_shift(self._calibration, self._camera_pair)
+                result = detect_shift(
+                    self._calibration,
+                    self._camera_pair,
+                    **self._shift_kwargs,
+                )
             except Exception as exc:
                 logger.exception("Shift detection failed.")
                 if self._running.is_set() and not self.isInterruptionRequested():

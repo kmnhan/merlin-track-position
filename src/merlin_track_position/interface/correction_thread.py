@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +34,7 @@ class CorrectionThread(QtCore.QThread):
         self._calibration_path: Path | None = None
         self._motor_backend: Any | None = None
         self._correction_mode = constants.DEFAULT_CORRECTION_MODE
+        self._shift_kwargs: dict[str, Any] = {}
 
     def configure(
         self,
@@ -41,6 +43,7 @@ class CorrectionThread(QtCore.QThread):
         calibration_path: str | Path,
         motor_backend: Any | None = None,
         correction_mode: str = constants.DEFAULT_CORRECTION_MODE,
+        shift_kwargs: Mapping[str, Any] | None = None,
     ) -> None:
         """Set the parameters for the next correction run."""
         if self.isRunning():
@@ -50,6 +53,7 @@ class CorrectionThread(QtCore.QThread):
         self._calibration_path = Path(calibration_path)
         self._motor_backend = motor_backend
         self._correction_mode = str(correction_mode)
+        self._shift_kwargs = {} if shift_kwargs is None else dict(shift_kwargs)
         logger.info(
             "Configured correction thread: calibration_path=%s, correction_mode=%s",
             calibration_path,
@@ -81,6 +85,7 @@ class CorrectionThread(QtCore.QThread):
                     progress_callback=self._emit_progress,
                     motor_backend=self._motor_backend,
                     correction_mode=self._correction_mode,
+                    **self._shift_kwargs,
                 )
             except Exception as exc:
                 logger.exception("Correction thread failed.")

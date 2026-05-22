@@ -24,6 +24,16 @@ from merlin_track_position.interface.main_window import (  # noqa: E402
     _roi_geometries_from_calibration_metadata,
     _roi_metadata_from_geometries,
 )
+from merlin_track_position.interface.registration_settings import (  # noqa: E402
+    REGISTRATION_CLIP_HIGH_SETTINGS_KEY,
+    REGISTRATION_CLIP_LOW_SETTINGS_KEY,
+    REGISTRATION_NORMALIZATION_SETTINGS_KEY,
+    REGISTRATION_UPSAMPLE_FACTOR_SETTINGS_KEY,
+    registration_config_to_shift_kwargs,
+)
+from merlin_track_position.interface.shift_monitor_window import (  # noqa: E402
+    ShiftMonitorWindow,
+)
 from merlin_track_position.tracking.calibration_core import (  # noqa: E402
     COMMAND_AXES,
     derive_axis_scale_from_jacobian,
@@ -124,6 +134,7 @@ class FakeCorrectionThread(QtCore.QObject):
         self.calibration_path = None
         self.motor_backend = None
         self.correction_mode = None
+        self.shift_kwargs = None
         self.started = False
         self.running = False
 
@@ -134,12 +145,14 @@ class FakeCorrectionThread(QtCore.QObject):
         calibration_path,
         motor_backend=None,
         correction_mode="camera",
+        shift_kwargs=None,
     ):
         self.calibration = calibration
         self.camera_pair = camera_pair
         self.calibration_path = Path(calibration_path)
         self.motor_backend = motor_backend
         self.correction_mode = correction_mode
+        self.shift_kwargs = {} if shift_kwargs is None else dict(shift_kwargs)
 
     def start(self):
         self.started = True
@@ -163,6 +176,7 @@ class FakeDetectShiftThread(QtCore.QObject):
         super().__init__(parent)
         self.calibration = None
         self.camera_pair = None
+        self.shift_kwargs = None
         self.started = False
         self.running = False
 
@@ -170,9 +184,12 @@ class FakeDetectShiftThread(QtCore.QObject):
         self,
         calibration,
         camera_pair,
+        *,
+        shift_kwargs=None,
     ):
         self.calibration = calibration
         self.camera_pair = camera_pair
+        self.shift_kwargs = {} if shift_kwargs is None else dict(shift_kwargs)
 
     def start(self):
         self.started = True
@@ -388,6 +405,187 @@ def write_sample_calibration(path: Path) -> xr.Dataset:
     )
     save_calibration_dataset(calibration, path)
     return calibration.assign_attrs({"calibration_path": str(path)})
+
+
+class FakeShiftRegistrationThread(QtCore.QObject):
+    sigShiftReady = QtCore.Signal(str, float, object, str)
+    sigShiftFailed = QtCore.Signal(str, str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.submissions = []
+        self.started = False
+        self.stopped = False
+
+    def start(self):
+        self.started = True
+
+    def submit(self, camera, reference, current, config, elapsed_s):
+        self.submissions.append(
+            (
+                camera,
+                np.asarray(reference).copy(),
+                np.asarray(current).copy(),
+                dict(config),
+                float(elapsed_s),
+            )
+        )
+
+    def clear_pending(self):
+        pass
+
+    def stop(self):
+        self.stopped = True
+
+    def wait(self):
+        pass
+
+
+@contextmanager
+def patched_shift_monitor_worker():
+    with patch(
+        "merlin_track_position.interface.shift_monitor_window._ShiftRegistrationThread",
+        FakeShiftRegistrationThread,
+    ):
+        yield
+
+
+class ShiftMonitorWindowTests(unittest.TestCase):
+    def test_monitor_is_top_level_window_even_with_parent(self):
+        get_qapp()
+        parent = QtWidgets.QWidget()
+        with patched_shift_monitor_worker():
+            window = ShiftMonitorWindow(FakeSettings(), parent=parent)
+            try:
+                self.assertTrue(window.isWindow())
+            finally:
+                window.close()
+                parent.close()
+
+    def test_first_live_frame_becomes_reference_per_camera(self):
+        get_qapp()
+        settings = FakeSettings()
+        first = np.arange(4 * 5, dtype=float).reshape(4, 5)
+        second = first + 10.0
+
+        with patched_shift_monitor_worker():
+            window = ShiftMonitorWindow(settings)
+            try:
+                window.submit_frame("cam0", first)
+                self.assertEqual(window._worker.submissions, [])
+                self.assertIn("cam0", window.reference_label.text())
+
+                window.submit_frame("cam0", second)
+
+                self.assertEqual(len(window._worker.submissions), 1)
+                camera, reference, current, _config, _elapsed_s = (
+                    window._worker.submissions[0]
+                )
+                self.assertEqual(camera, "cam0")
+                np.testing.assert_array_equal(reference, first)
+                np.testing.assert_array_equal(current, second)
+
+                window.submit_frame("cam1", np.ones((3, 4)))
+
+                self.assertEqual(len(window._worker.submissions), 1)
+            finally:
+                window.close()
+
+    def test_calibration_reference_is_roi_matched_to_live_frame(self):
+        get_qapp()
+        settings = FakeSettings()
+        metadata = _roi_metadata_from_geometries(
+            {
+                "cam0": (2.0, 3.0, 4.0, 5.0),
+                "cam1": (0.0, 0.0, 6.0, 7.0),
+            }
+        )
+        width0, height0 = main_window.CAMERA_IMAGE_SIZES["cam0"]
+        width1, height1 = main_window.CAMERA_IMAGE_SIZES["cam1"]
+        reference_cam0 = np.arange(height0 * width0, dtype=float).reshape(
+            height0,
+            width0,
+        )
+        reference_cam1 = np.arange(height1 * width1, dtype=float).reshape(
+            height1,
+            width1,
+        )
+        calibration = xr.Dataset(
+            data_vars={
+                "reference_cam0": (("cam0_v", "cam0_u"), reference_cam0),
+                "reference_cam1": (("cam1_v", "cam1_u"), reference_cam1),
+            },
+            attrs=metadata,
+        )
+        current_cam0 = reference_cam0 + 1000.0
+
+        with patched_shift_monitor_worker():
+            window = ShiftMonitorWindow(settings)
+            try:
+                window.set_calibration(calibration)
+                window.submit_frame("cam0", current_cam0)
+
+                self.assertEqual(len(window._worker.submissions), 1)
+                camera, reference, current, _config, _elapsed_s = (
+                    window._worker.submissions[0]
+                )
+                self.assertEqual(camera, "cam0")
+                np.testing.assert_array_equal(reference, reference_cam0[3:8, 2:6])
+                np.testing.assert_array_equal(current, current_cam0[3:8, 2:6])
+            finally:
+                window.close()
+
+    def test_shift_ready_appends_plot_history_and_updates_stats(self):
+        get_qapp()
+        with patched_shift_monitor_worker():
+            window = ShiftMonitorWindow(FakeSettings())
+            try:
+                window._on_shift_ready("cam0", 1.25, np.asarray([0.25, -0.5]), "")
+
+                self.assertEqual(window._history["cam0"]["t"], [1.25])
+                self.assertEqual(window._history["cam0"]["du_px"], [0.25])
+                self.assertEqual(window._history["cam0"]["dv_px"], [-0.5])
+                self.assertEqual(window.stats_table.item(0, 1).text(), "1")
+                self.assertEqual(window.stats_table.item(0, 2).text(), "0.25")
+                self.assertEqual(window.stats_table.item(1, 2).text(), "-0.5")
+            finally:
+                window.close()
+
+    def test_save_persists_registration_controls(self):
+        get_qapp()
+        settings = FakeSettings()
+        saved_configs = []
+        with patched_shift_monitor_worker():
+            window = ShiftMonitorWindow(settings)
+            try:
+                window.sigRegistrationConfigSaved.connect(saved_configs.append)
+                window.clip_low_spin.setValue(10.0)
+                window.clip_high_spin.setValue(90.0)
+                window.normalization_combo.setCurrentIndex(
+                    window.normalization_combo.findData("none")
+                )
+                window.upsample_spin.setValue(51)
+
+                window.save_button.click()
+
+                self.assertEqual(settings.values[REGISTRATION_CLIP_LOW_SETTINGS_KEY], 10.0)
+                self.assertEqual(settings.values[REGISTRATION_CLIP_HIGH_SETTINGS_KEY], 90.0)
+                self.assertEqual(
+                    settings.values[REGISTRATION_NORMALIZATION_SETTINGS_KEY],
+                    "none",
+                )
+                self.assertEqual(
+                    settings.values[REGISTRATION_UPSAMPLE_FACTOR_SETTINGS_KEY],
+                    51,
+                )
+                self.assertEqual(
+                    registration_config_to_shift_kwargs(saved_configs[-1])[
+                        "clip_percentiles"
+                    ],
+                    (10.0, 90.0),
+                )
+            finally:
+                window.close()
 
 
 class GUIHelperTests(unittest.TestCase):
@@ -669,6 +867,65 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
             finally:
                 window.close()
 
+    def test_shift_monitor_menu_opens_singleton_and_receives_frames(self):
+        get_qapp()
+        created = []
+
+        class FakeShiftMonitorWindow(QtCore.QObject):
+            sigRegistrationConfigSaved = QtCore.Signal(object)
+
+            def __init__(self, settings, *, registration_config=None, parent=None):
+                super().__init__(parent)
+                self.settings = settings
+                self.registration_config = dict(registration_config)
+                self.calibration_calls = []
+                self.frames = []
+                self.show_count = 0
+                created.append(self)
+
+            def set_calibration(self, calibration):
+                self.calibration_calls.append(calibration)
+
+            def submit_frame(self, camera, image):
+                self.frames.append((camera, image))
+
+            def show(self):
+                self.show_count += 1
+
+            def raise_(self):
+                pass
+
+            def activateWindow(self):
+                pass
+
+            def close(self):
+                pass
+
+        with (
+            patched_main_window_runtime(),
+            patch(
+                "merlin_track_position.interface.main_window.ShiftMonitorWindow",
+                FakeShiftMonitorWindow,
+            ),
+        ):
+            window = MainWindow()
+            try:
+                self.assertEqual(window.shift_monitor_action.text(), "Shift Monitor")
+
+                window.shift_monitor_action.trigger()
+                window.shift_monitor_action.trigger()
+
+                self.assertEqual(len(created), 1)
+                self.assertEqual(created[0].show_count, 2)
+                self.assertEqual(created[0].calibration_calls, [None])
+
+                image = full_camera_image("cam0", 2.0)
+                window._on_image_capture_ready("cam0", image)
+
+                self.assertEqual(created[0].frames, [("cam0", image)])
+            finally:
+                window.close()
+
     def test_new_calibration_passes_selected_path_parameters_and_roi(self):
         get_qapp()
 
@@ -688,6 +945,7 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                 *,
                 n,
                 step_um,
+                shift_kwargs=None,
             ):
                 self.configured = (
                     camera_pair,
@@ -695,6 +953,7 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                     Path(output_path),
                     int(n),
                     float(step_um),
+                    {} if shift_kwargs is None else dict(shift_kwargs),
                 )
 
             def start(self):
@@ -740,10 +999,21 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
 
                 self.assertTrue(fake_thread.started)
                 self.assertEqual(window._calibration_total_steps, 15)
-                camera_pair, roi_metadata, path, n, step_um = fake_thread.configured
+                (
+                    camera_pair,
+                    roi_metadata,
+                    path,
+                    n,
+                    step_um,
+                    shift_kwargs,
+                ) = fake_thread.configured
                 self.assertEqual(path, output_path)
                 self.assertEqual(n, 3)
                 self.assertEqual(step_um, 10.0)
+                self.assertEqual(
+                    shift_kwargs,
+                    registration_config_to_shift_kwargs(window._registration_config),
+                )
                 self.assertEqual(roi_metadata["roi_cam0_x"], 1.0)
                 self.assertEqual(roi_metadata["roi_cam1_y"], 4.0)
                 self.assertIsNotNone(camera_pair)
@@ -1013,6 +1283,10 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                     self.assertIs(thread.calibration, window._calibration)
                     self.assertEqual(thread.calibration_path, path)
                     self.assertEqual(thread.correction_mode, "beam")
+                    self.assertEqual(
+                        thread.shift_kwargs,
+                        registration_config_to_shift_kwargs(window._registration_config),
+                    )
                     self.assertTrue(
                         window.calibration_panel.auto_correction_checkbox.isEnabled()
                     )
@@ -1244,6 +1518,10 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                     self.assertIs(thread.calibration, window._calibration)
                     self.assertEqual(thread.calibration_path, path)
                     self.assertEqual(thread.correction_mode, "beam")
+                    self.assertEqual(
+                        thread.shift_kwargs,
+                        registration_config_to_shift_kwargs(window._registration_config),
+                    )
                     self.assertIsNotNone(thread.camera_pair)
                     self.assertIn(
                         "Correction in progress",
@@ -1254,6 +1532,42 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                     )
                     self.assertFalse(
                         window.calibration_panel.new_calibration_button.isEnabled()
+                    )
+                finally:
+                    window.close()
+
+    def test_saved_registration_config_updates_correction_kwargs(self):
+        get_qapp()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "calibration.h5"
+            calibration = write_sample_calibration(path)
+            with patched_main_window_runtime():
+                window = MainWindow()
+                try:
+                    window._on_registration_config_saved(
+                        {
+                            "clip_enabled": True,
+                            "clip_low": 20.0,
+                            "clip_high": 80.0,
+                            "normalization": "none",
+                            "upsample_factor": 51,
+                            "use_window": True,
+                            "high_error_threshold": 0.25,
+                        }
+                    )
+                    window._on_new_calibration_ready(calibration)
+
+                    window._start_correction()
+
+                    self.assertEqual(
+                        window._correction_thread.shift_kwargs,
+                        {
+                            "clip_percentiles": (20.0, 80.0),
+                            "use_window": True,
+                            "upsample_factor": 51,
+                            "normalization": None,
+                            "high_error_threshold": 0.25,
+                        },
                     )
                 finally:
                     window.close()
@@ -1273,6 +1587,10 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                     thread = window._detect_shift_thread
                     self.assertTrue(thread.started)
                     self.assertIs(thread.calibration, window._calibration)
+                    self.assertEqual(
+                        thread.shift_kwargs,
+                        registration_config_to_shift_kwargs(window._registration_config),
+                    )
                     self.assertIsNotNone(thread.camera_pair)
                     self.assertIsNone(window._last_correction_result)
                     self.assertFalse(window._server_correction_pending)
@@ -1347,6 +1665,10 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                     self.assertEqual(thread.calibration_path, path)
                     self.assertIs(thread.motor_backend, motor_backend)
                     self.assertEqual(thread.correction_mode, "beam")
+                    self.assertEqual(
+                        thread.shift_kwargs,
+                        registration_config_to_shift_kwargs(window._registration_config),
+                    )
                     self.assertIsNotNone(thread.camera_pair)
                     self.assertEqual(window._server.result_calls, [])
                     self.assertTrue(window._server_correction_pending)

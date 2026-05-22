@@ -51,8 +51,18 @@ class CalibrationThreadTests(unittest.TestCase):
             additional_context,
             step_callback,
             processing_callback,
+            **shift_kwargs,
         ):
-            calls.append((pair, Path(output_path), n, step_um, dict(additional_context)))
+            calls.append(
+                (
+                    pair,
+                    Path(output_path),
+                    n,
+                    step_um,
+                    dict(additional_context),
+                    dict(shift_kwargs),
+                )
+            )
             captured_cam0, captured_cam1 = pair.capture_pair()
             step_callback(0, 1.0, 2.0, 3.0, captured_cam0, captured_cam1)
             processing_callback(0, 2)
@@ -95,6 +105,7 @@ class CalibrationThreadTests(unittest.TestCase):
                 output_path,
                 n=3,
                 step_um=10.0,
+                shift_kwargs={"upsample_factor": 25},
             )
             with patch(
                 "merlin_track_position.interface.calibration_thread.run_calibration",
@@ -102,7 +113,19 @@ class CalibrationThreadTests(unittest.TestCase):
             ):
                 thread.run()
 
-        self.assertEqual(calls, [(camera_pair, output_path, 3, 10.0, roi_metadata)])
+        self.assertEqual(
+            calls,
+            [
+                (
+                    camera_pair,
+                    output_path,
+                    3,
+                    10.0,
+                    roi_metadata,
+                    {"upsample_factor": 25},
+                )
+            ],
+        )
         self.assertEqual(len(steps), 1)
         self.assertEqual(steps[0][:4], (0, 1.0, 2.0, 3.0))
         np.testing.assert_array_equal(steps[0][4], image_cam0)
@@ -124,6 +147,7 @@ class CalibrationThreadTests(unittest.TestCase):
             additional_context,
             step_callback,
             processing_callback,
+            **shift_kwargs,
         ):
             del (
                 camera_pair,
@@ -133,6 +157,7 @@ class CalibrationThreadTests(unittest.TestCase):
                 additional_context,
                 step_callback,
                 processing_callback,
+                shift_kwargs,
             )
             raise RuntimeError("boom")
 
@@ -188,6 +213,7 @@ class CorrectionThreadTests(unittest.TestCase):
             progress_callback,
             motor_backend,
             correction_mode,
+            **shift_kwargs,
         ):
             calls.append(
                 (
@@ -196,6 +222,7 @@ class CorrectionThreadTests(unittest.TestCase):
                     Path(calibration_path),
                     motor_backend,
                     correction_mode,
+                    dict(shift_kwargs),
                 )
             )
             progress_callback(progress)
@@ -213,14 +240,32 @@ class CorrectionThreadTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "calibration.h5"
-            thread.configure(calibration, camera_pair, path, correction_mode="beam")
+            thread.configure(
+                calibration,
+                camera_pair,
+                path,
+                correction_mode="beam",
+                shift_kwargs={"clip_percentiles": (1.0, 99.0)},
+            )
             with patch(
                 "merlin_track_position.interface.correction_thread.do_correction",
                 side_effect=fake_do_correction,
             ):
                 thread.run()
 
-        self.assertEqual(calls, [(calibration, camera_pair, path, None, "beam")])
+        self.assertEqual(
+            calls,
+            [
+                (
+                    calibration,
+                    camera_pair,
+                    path,
+                    None,
+                    "beam",
+                    {"clip_percentiles": (1.0, 99.0)},
+                )
+            ],
+        )
         self.assertEqual(progress_results, [progress])
         self.assertEqual(ready, [result])
         self.assertEqual(failed, [])
@@ -271,8 +316,8 @@ class DetectShiftThreadTests(unittest.TestCase):
         result = xr.Dataset(attrs={"warnings": ""})
         calls = []
 
-        def fake_detect_shift(passed_calibration, passed_camera_pair):
-            calls.append((passed_calibration, passed_camera_pair))
+        def fake_detect_shift(passed_calibration, passed_camera_pair, **shift_kwargs):
+            calls.append((passed_calibration, passed_camera_pair, dict(shift_kwargs)))
             return result
 
         thread = DetectShiftThread()
@@ -281,14 +326,18 @@ class DetectShiftThreadTests(unittest.TestCase):
         thread.sigDetectionReady.connect(lambda value: ready.append(value))
         thread.sigDetectionFailed.connect(lambda message: failed.append(message))
 
-        thread.configure(calibration, camera_pair)
+        thread.configure(
+            calibration,
+            camera_pair,
+            shift_kwargs={"normalization": "phase"},
+        )
         with patch(
             "merlin_track_position.interface.detection_thread.detect_shift",
             side_effect=fake_detect_shift,
         ):
             thread.run()
 
-        self.assertEqual(calls, [(calibration, camera_pair)])
+        self.assertEqual(calls, [(calibration, camera_pair, {"normalization": "phase"})])
         self.assertEqual(ready, [result])
         self.assertEqual(failed, [])
 

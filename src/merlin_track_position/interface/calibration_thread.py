@@ -3,6 +3,7 @@ from __future__ import annotations
 import threading
 from collections.abc import Mapping
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 from qtpy import QtCore
@@ -34,6 +35,7 @@ class CalibrationThread(QtCore.QThread):
         self._output_path: Path | None = None
         self._n: int = constants.DEFAULT_VISUAL_CALIBRATION_N
         self._step_um: float = constants.DEFAULT_VISUAL_CALIBRATION_STEP_UM
+        self._shift_kwargs: dict[str, Any] = {}
 
     def configure(
         self,
@@ -43,6 +45,7 @@ class CalibrationThread(QtCore.QThread):
         *,
         n: int = constants.DEFAULT_VISUAL_CALIBRATION_N,
         step_um: float = constants.DEFAULT_VISUAL_CALIBRATION_STEP_UM,
+        shift_kwargs: Mapping[str, Any] | None = None,
     ) -> None:
         """Set the parameters for the next calibration run."""
         if self.isRunning():
@@ -54,6 +57,7 @@ class CalibrationThread(QtCore.QThread):
         self._output_path = Path(output_path)
         self._n = int(n)
         self._step_um = float(step_um)
+        self._shift_kwargs = {} if shift_kwargs is None else dict(shift_kwargs)
 
     def run(self) -> None:
         self._running.set()
@@ -72,6 +76,7 @@ class CalibrationThread(QtCore.QThread):
                     additional_context=self._roi_metadata,
                     step_callback=self._emit_step,
                     processing_callback=self._emit_processing_step,
+                    **self._shift_kwargs,
                 )
                 validate_visual_calibration_dataset(calibration)
             except Exception as exc:

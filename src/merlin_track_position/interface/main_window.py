@@ -40,6 +40,12 @@ from merlin_track_position.interface.calibration_panel import CalibrationPanel
 from merlin_track_position.interface.calibration_thread import CalibrationThread
 from merlin_track_position.interface.correction_thread import CorrectionThread
 from merlin_track_position.interface.detection_thread import DetectShiftThread
+from merlin_track_position.interface.registration_settings import (
+    normalized_registration_config,
+    registration_config_from_settings,
+    registration_config_to_shift_kwargs,
+)
+from merlin_track_position.interface.shift_monitor_window import ShiftMonitorWindow
 from merlin_track_position.server import MotorServer
 from merlin_track_position.tracking.calibrate import visual_calibration_probe_count
 from merlin_track_position.tracking.calibration_core import (
@@ -429,6 +435,10 @@ class _MainWindowGUI(QtWidgets.QMainWindow):
         super().__init__(parent)
 
         self.setWindowTitle("Track Positions")
+        tools_menu = self.menuBar().addMenu("Tools")
+        self.shift_monitor_action = QtGui.QAction("Shift Monitor", self)
+        self.shift_monitor_action.setObjectName("shift_monitor_action")
+        tools_menu.addAction(self.shift_monitor_action)
 
         central_widget = QtWidgets.QWidget()
         self.setCentralWidget(central_widget)
@@ -546,6 +556,8 @@ class MainWindow(_MainWindowGUI):
         super().__init__(parent)
 
         self._settings = QtCore.QSettings("merlin-track-position", "Track Positions")
+        self._registration_config = registration_config_from_settings(self._settings)
+        self._shift_monitor_window: ShiftMonitorWindow | None = None
         self.calibration_panel.auto_correction_interval_spinbox.setValue(
             self._stored_auto_correction_interval_seconds()
         )
@@ -645,6 +657,7 @@ class MainWindow(_MainWindowGUI):
         self.calibration_panel.new_calibration_button.clicked.connect(
             self._on_new_calibration_clicked
         )
+        self.shift_monitor_action.triggered.connect(self._on_shift_monitor_triggered)
         self._calibration_thread.sigCalibrationReady.connect(
             self._on_new_calibration_ready
         )
@@ -758,6 +771,44 @@ class MainWindow(_MainWindowGUI):
         self._auto_correction_timer.setInterval(interval_ms)
         self._auto_correction_timer.start()
         logger.info("Automatic timed correction enabled every %d ms.", interval_ms)
+
+    def _registration_shift_kwargs(self) -> dict[str, object]:
+        return registration_config_to_shift_kwargs(self._registration_config)
+
+    @QtCore.Slot()
+    def _on_shift_monitor_triggered(self) -> None:
+        if self._shift_monitor_window is None:
+            monitor = ShiftMonitorWindow(
+                self._settings,
+                registration_config=self._registration_config,
+                parent=self,
+            )
+            monitor.sigRegistrationConfigSaved.connect(
+                self._on_registration_config_saved
+            )
+            monitor.destroyed.connect(self._on_shift_monitor_destroyed)
+            monitor.set_calibration(self._calibration)
+            self._shift_monitor_window = monitor
+
+        self._shift_monitor_window.show()
+        self._shift_monitor_window.raise_()
+        self._shift_monitor_window.activateWindow()
+
+    @QtCore.Slot(object)
+    def _on_registration_config_saved(self, config: object) -> None:
+        if isinstance(config, Mapping):
+            self._registration_config = normalized_registration_config(config)
+        else:
+            self._registration_config = registration_config_from_settings(
+                self._settings
+            )
+
+    def _on_shift_monitor_destroyed(self, _object: object | None = None) -> None:
+        self._shift_monitor_window = None
+
+    def _set_shift_monitor_calibration(self) -> None:
+        if self._shift_monitor_window is not None:
+            self._shift_monitor_window.set_calibration(self._calibration)
 
     def _stop_auto_correction(self, *, uncheck: bool) -> None:
         if hasattr(self, "_auto_correction_timer"):
@@ -907,6 +958,7 @@ class MainWindow(_MainWindowGUI):
             self._calibration_path,
             motor_backend=motor_backend,
             correction_mode=self.calibration_panel.correction_mode(),
+            shift_kwargs=self._registration_shift_kwargs(),
         )
 
         ui_marked_busy = False
@@ -1013,6 +1065,8 @@ class MainWindow(_MainWindowGUI):
             )
         if not self._reference_preview_active:
             self._show_current_image(camera, image)
+        if self._shift_monitor_window is not None:
+            self._shift_monitor_window.submit_frame(camera, image)
 
     @QtCore.Slot(str, str)
     def _on_image_capture_failed(self, camera: str, error_message: str) -> None:
@@ -1252,6 +1306,7 @@ class MainWindow(_MainWindowGUI):
         self.calibration_panel.show_loaded_calibration(calibration, path.name)
         self._restore_latest_correction_result(path)
         self._set_reference_preview_button_enabled(True)
+        self._set_shift_monitor_calibration()
         self._schedule_persistence_flush_if_needed()
 
     @QtCore.Slot()
@@ -1303,6 +1358,7 @@ class MainWindow(_MainWindowGUI):
 
         self._calibration_path = path
         self._set_roi_editing_enabled(False)
+        self._set_shift_monitor_calibration()
         if persistence.pending:
             self.calibration_panel.show_loaded_calibration(self._calibration, path.name)
             self.calibration_panel.calibration_status_label.setText(
@@ -1351,6 +1407,7 @@ class MainWindow(_MainWindowGUI):
                 output_path,
                 n=n,
                 step_um=step_um,
+                shift_kwargs=self._registration_shift_kwargs(),
             )
         except Exception as exc:
             QtWidgets.QMessageBox.critical(
@@ -1432,7 +1489,11 @@ class MainWindow(_MainWindowGUI):
 
         camera_pair = self._camera_pair_for_current_images()
         try:
-            self._detect_shift_thread.configure(self._calibration, camera_pair)
+            self._detect_shift_thread.configure(
+                self._calibration,
+                camera_pair,
+                shift_kwargs=self._registration_shift_kwargs(),
+            )
         except Exception as exc:
             QtWidgets.QMessageBox.critical(
                 self,
@@ -1535,6 +1596,7 @@ class MainWindow(_MainWindowGUI):
         )
         self.calibration_panel.show_loaded_calibration(calibration, display_name)
         self._set_reference_preview_button_enabled(True)
+        self._set_shift_monitor_calibration()
         self._schedule_persistence_flush_if_needed()
 
     @QtCore.Slot(str)
@@ -1573,6 +1635,7 @@ class MainWindow(_MainWindowGUI):
             self.calibration_panel.show_loaded_calibration(calibration, display_name)
             self.calibration_panel.show_correction_result(result)
             self._set_reference_preview_button_enabled(True)
+            self._set_shift_monitor_calibration()
             self._flush_pending_persistence()
         except Exception as exc:
             self._restore_calibration_idle_state()
@@ -1698,6 +1761,7 @@ class MainWindow(_MainWindowGUI):
         self._last_correction_result = None
         self._set_reference_preview_button_enabled(False)
         self._restore_calibration_idle_state()
+        self._set_shift_monitor_calibration()
 
     def _get_roi_geometry(self, camera: str) -> RoiGeometry:
         image_width, image_height = CAMERA_IMAGE_SIZES[camera]
@@ -1771,6 +1835,10 @@ class MainWindow(_MainWindowGUI):
         return True
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        if self._shift_monitor_window is not None:
+            self._shift_monitor_window.close()
+            self._shift_monitor_window = None
+
         if hasattr(self, "_auto_correction_timer"):
             self._auto_correction_timer.stop()
 
