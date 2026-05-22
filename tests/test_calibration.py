@@ -351,6 +351,7 @@ class VisualCalibrationTests(unittest.TestCase):
                 kwargs["post_commanded_position_mm"],
                 expected_offsets,
             )
+            self.assertIs(kwargs["check_tiles"], True)
             self.assertEqual(
                 kwargs["additional_context"]["probe_command_delta_mode"],
                 "absolute_center_offset",
@@ -1093,6 +1094,7 @@ class CorrectionTests(unittest.TestCase):
         np.testing.assert_array_equal(args[1], expected_current_cam0[np.newaxis, :, :])
         np.testing.assert_array_equal(args[2], expected_reference_cam1)
         np.testing.assert_array_equal(args[3], expected_current_cam1[np.newaxis, :, :])
+        self.assertNotIn("check_tiles", measure.call_args.kwargs)
 
     def test_no_move_when_initial_residual_is_under_tolerance(self):
         with tempfile.TemporaryDirectory() as tmpdir:

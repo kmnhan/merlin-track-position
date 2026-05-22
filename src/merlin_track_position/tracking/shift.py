@@ -49,12 +49,14 @@ def estimate_shift(
     use_window: bool = False,
     upsample_factor: int = 50,
     normalization: str | None = None,
-    check_tiles: bool = True,
+    check_tiles: bool = False,
     high_error_threshold: float = 0.5,
 ) -> xr.Dataset:
     """Estimate subpixel translation between two grayscale images.
 
     Pass ``use_window=True`` to apply a Hanning taper before registration.
+    Pass ``check_tiles=True`` to compare local tile shifts against the full-frame
+    estimate.
     """
 
     reference_image = np.asarray(reference, dtype=np.float64)

@@ -16,8 +16,11 @@ def textured_image(seed=1, shape=(192, 224)):
 
 
 class ShiftTests(unittest.TestCase):
-    def test_hanning_window_is_disabled_by_default(self):
-        self.assertIs(signature(estimate_shift).parameters["use_window"].default, False)
+    def test_optional_registration_checks_are_disabled_by_default(self):
+        parameters = signature(estimate_shift).parameters
+
+        self.assertIs(parameters["use_window"].default, False)
+        self.assertIs(parameters["check_tiles"].default, False)
 
     def test_integer_shift(self):
         reference = textured_image()
