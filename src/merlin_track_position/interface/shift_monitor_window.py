@@ -24,6 +24,7 @@ logger = logging.getLogger("merlin_track_position.interface.shift_monitor_window
 
 CAMERAS = ("cam0", "cam1")
 DEFAULT_MONITOR_SAMPLE_PERIOD_S = 2.0
+SIDE_PANEL_MAX_WIDTH = 360
 PLOT_CHANNELS = (
     ("cam0", "du_px", "du"),
     ("cam0", "dv_px", "dv"),
@@ -155,7 +156,13 @@ class ShiftMonitorWindow(QtWidgets.QWidget):
         self._update_stats()
 
     def _build_ui(self) -> None:
-        layout = QtWidgets.QVBoxLayout(self)
+        layout = QtWidgets.QHBoxLayout(self)
+
+        side_panel = QtWidgets.QWidget()
+        side_panel.setObjectName("shift_monitor_side_panel")
+        side_panel.setMaximumWidth(SIDE_PANEL_MAX_WIDTH)
+        side_layout = QtWidgets.QVBoxLayout(side_panel)
+        side_layout.setContentsMargins(0, 0, 0, 0)
 
         controls_group = QtWidgets.QGroupBox("Registration")
         controls_layout = QtWidgets.QGridLayout(controls_group)
@@ -169,53 +176,53 @@ class ShiftMonitorWindow(QtWidgets.QWidget):
         self.clip_low_spin.setRange(0.0, 100.0)
         self.clip_low_spin.setDecimals(2)
         self.clip_low_spin.setSuffix(" %")
-        controls_layout.addWidget(QtWidgets.QLabel("Low"), 0, 1)
-        controls_layout.addWidget(self.clip_low_spin, 0, 2)
+        controls_layout.addWidget(QtWidgets.QLabel("Low"), 1, 0)
+        controls_layout.addWidget(self.clip_low_spin, 1, 1)
 
         self.clip_high_spin = QtWidgets.QDoubleSpinBox()
         self.clip_high_spin.setObjectName("shift_monitor_clip_high_spin")
         self.clip_high_spin.setRange(0.0, 100.0)
         self.clip_high_spin.setDecimals(2)
         self.clip_high_spin.setSuffix(" %")
-        controls_layout.addWidget(QtWidgets.QLabel("High"), 0, 3)
-        controls_layout.addWidget(self.clip_high_spin, 0, 4)
+        controls_layout.addWidget(QtWidgets.QLabel("High"), 2, 0)
+        controls_layout.addWidget(self.clip_high_spin, 2, 1)
 
         self.normalization_combo = QtWidgets.QComboBox()
         self.normalization_combo.setObjectName("shift_monitor_normalization_combo")
         self.normalization_combo.addItem("Phase", "phase")
         self.normalization_combo.addItem("None", "none")
-        controls_layout.addWidget(QtWidgets.QLabel("Normalization"), 1, 0)
-        controls_layout.addWidget(self.normalization_combo, 1, 1, 1, 2)
+        controls_layout.addWidget(QtWidgets.QLabel("Normalization"), 3, 0)
+        controls_layout.addWidget(self.normalization_combo, 3, 1)
 
         self.upsample_spin = QtWidgets.QSpinBox()
         self.upsample_spin.setObjectName("shift_monitor_upsample_spin")
         self.upsample_spin.setRange(1, 1000)
-        controls_layout.addWidget(QtWidgets.QLabel("Upsample"), 1, 3)
-        controls_layout.addWidget(self.upsample_spin, 1, 4)
+        controls_layout.addWidget(QtWidgets.QLabel("Upsample"), 4, 0)
+        controls_layout.addWidget(self.upsample_spin, 4, 1)
 
         self.window_checkbox = QtWidgets.QCheckBox("Hanning window")
         self.window_checkbox.setObjectName("shift_monitor_window_checkbox")
-        controls_layout.addWidget(self.window_checkbox, 2, 0, 1, 2)
+        controls_layout.addWidget(self.window_checkbox, 5, 0, 1, 2)
 
         self.high_error_spin = QtWidgets.QDoubleSpinBox()
         self.high_error_spin.setObjectName("shift_monitor_high_error_spin")
         self.high_error_spin.setRange(0.001, 1000.0)
         self.high_error_spin.setDecimals(3)
         self.high_error_spin.setSingleStep(0.05)
-        controls_layout.addWidget(QtWidgets.QLabel("Error threshold"), 2, 2)
-        controls_layout.addWidget(self.high_error_spin, 2, 3)
+        controls_layout.addWidget(QtWidgets.QLabel("Error threshold"), 6, 0)
+        controls_layout.addWidget(self.high_error_spin, 6, 1)
 
         self.save_button = QtWidgets.QPushButton("Save")
         self.save_button.setObjectName("shift_monitor_save_button")
         self.reset_button = QtWidgets.QPushButton("Reset")
         self.reset_button.setObjectName("shift_monitor_reset_button")
-        controls_layout.addWidget(self.save_button, 2, 4)
-        controls_layout.addWidget(self.reset_button, 2, 5)
+        controls_layout.addWidget(self.save_button, 9, 0)
+        controls_layout.addWidget(self.reset_button, 9, 1)
 
         self.live_checkbox = QtWidgets.QCheckBox("Live")
         self.live_checkbox.setObjectName("shift_monitor_live_checkbox")
         self.live_checkbox.setChecked(True)
-        controls_layout.addWidget(self.live_checkbox, 3, 0)
+        controls_layout.addWidget(self.live_checkbox, 7, 0, 1, 2)
 
         self.sample_period_spin = QtWidgets.QDoubleSpinBox()
         self.sample_period_spin.setObjectName("shift_monitor_sample_period_spin")
@@ -224,23 +231,22 @@ class ShiftMonitorWindow(QtWidgets.QWidget):
         self.sample_period_spin.setSingleStep(0.5)
         self.sample_period_spin.setSuffix(" s")
         self.sample_period_spin.setValue(DEFAULT_MONITOR_SAMPLE_PERIOD_S)
-        controls_layout.addWidget(QtWidgets.QLabel("Monitor period"), 3, 1)
-        controls_layout.addWidget(self.sample_period_spin, 3, 2)
-        controls_layout.setColumnStretch(6, 1)
-        layout.addWidget(controls_group)
+        controls_layout.addWidget(QtWidgets.QLabel("Monitor period"), 8, 0)
+        controls_layout.addWidget(self.sample_period_spin, 8, 1)
+        controls_layout.setColumnStretch(1, 1)
+        side_layout.addWidget(controls_group)
 
-        status_layout = QtWidgets.QHBoxLayout()
         self.reference_label = QtWidgets.QLabel()
         self.reference_label.setObjectName("shift_monitor_reference_label")
-        status_layout.addWidget(self.reference_label, stretch=1)
+        self.reference_label.setWordWrap(True)
+        side_layout.addWidget(self.reference_label)
         self.warning_label = QtWidgets.QLabel()
         self.warning_label.setObjectName("shift_monitor_warning_label")
-        status_layout.addWidget(self.warning_label, stretch=2)
-        layout.addLayout(status_layout)
+        self.warning_label.setWordWrap(True)
+        side_layout.addWidget(self.warning_label)
 
         self.graphics_layout = pg.GraphicsLayoutWidget()
         self.graphics_layout.setObjectName("shift_monitor_graphics_layout")
-        layout.addWidget(self.graphics_layout, stretch=1)
 
         self.plots: dict[tuple[str, str], pg.PlotItem] = {}
         self.curves: dict[tuple[str, str], pg.PlotDataItem] = {}
@@ -250,8 +256,20 @@ class ShiftMonitorWindow(QtWidgets.QWidget):
             ):
                 plot = self.graphics_layout.addPlot(row=row, col=col)
                 plot.setTitle(f"{camera} {axis_label}")
-                plot.setLabel("bottom", "elapsed", units="s")
-                plot.setLabel("left", axis_label, units="px")
+                plot.setLabel(
+                    "bottom",
+                    "elapsed",
+                    units="s",
+                    siPrefixEnableRanges=(),
+                )
+                plot.setLabel(
+                    "left",
+                    axis_label,
+                    units="px",
+                    siPrefixEnableRanges=(),
+                )
+                plot.getAxis("bottom").enableAutoSIPrefix(False)
+                plot.getAxis("left").enableAutoSIPrefix(False)
                 plot.showGrid(x=True, y=True, alpha=0.25)
                 curve = plot.plot(pen=pg.mkPen("#0072b2", width=2))
                 self.plots[(camera, axis_key)] = plot
@@ -263,6 +281,9 @@ class ShiftMonitorWindow(QtWidgets.QWidget):
             ["Channel", "Count", "Latest", "Mean", "Std", "RMS"]
         )
         self.stats_table.verticalHeader().setVisible(False)
+        self.stats_table.setHorizontalScrollBarPolicy(
+            QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
         self.stats_table.horizontalHeader().setStretchLastSection(True)
         for row, (camera, axis_key, axis_label) in enumerate(PLOT_CHANNELS):
             self.stats_table.setItem(
@@ -275,7 +296,9 @@ class ShiftMonitorWindow(QtWidgets.QWidget):
                 & ~QtCore.Qt.ItemFlag.ItemIsEditable
             )
             del axis_key
-        layout.addWidget(self.stats_table)
+        side_layout.addWidget(self.stats_table, stretch=1)
+        layout.addWidget(self.graphics_layout, stretch=1)
+        layout.addWidget(side_panel)
 
         for widget in (
             self.clip_checkbox,

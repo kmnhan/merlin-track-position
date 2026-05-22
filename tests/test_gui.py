@@ -32,6 +32,7 @@ from merlin_track_position.interface.registration_settings import (  # noqa: E40
     registration_config_to_shift_kwargs,
 )
 from merlin_track_position.interface.shift_monitor_window import (  # noqa: E402
+    SIDE_PANEL_MAX_WIDTH,
     ShiftMonitorWindow,
 )
 from merlin_track_position.tracking.calibration_core import (  # noqa: E402
@@ -461,6 +462,34 @@ class ShiftMonitorWindowTests(unittest.TestCase):
             finally:
                 window.close()
                 parent.close()
+
+    def test_monitor_keeps_controls_in_narrow_right_column(self):
+        get_qapp()
+        with patched_shift_monitor_worker():
+            window = ShiftMonitorWindow(FakeSettings())
+            try:
+                layout = window.layout()
+                side_panel = window.findChild(
+                    QtWidgets.QWidget,
+                    "shift_monitor_side_panel",
+                )
+
+                self.assertIs(layout.itemAt(0).widget(), window.graphics_layout)
+                self.assertIs(layout.itemAt(1).widget(), side_panel)
+                self.assertEqual(side_panel.maximumWidth(), SIDE_PANEL_MAX_WIDTH)
+            finally:
+                window.close()
+
+    def test_monitor_plot_axes_do_not_use_si_prefixes(self):
+        get_qapp()
+        with patched_shift_monitor_worker():
+            window = ShiftMonitorWindow(FakeSettings())
+            try:
+                for plot in window.plots.values():
+                    self.assertFalse(plot.getAxis("bottom").autoSIPrefix)
+                    self.assertFalse(plot.getAxis("left").autoSIPrefix)
+            finally:
+                window.close()
 
     def test_first_live_frame_becomes_reference_per_camera(self):
         get_qapp()
