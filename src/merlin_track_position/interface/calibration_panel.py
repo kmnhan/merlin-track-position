@@ -8,6 +8,7 @@ import pyqtgraph as pg
 import xarray as xr
 from qtpy import QtCore, QtWidgets
 
+from merlin_track_position import constants
 from merlin_track_position.tracking.calibration_core import (
     CAMERAS,
     COMMAND_AXES,
@@ -229,6 +230,23 @@ def _correction_move_residuals(
             constant_values=math.nan,
         )
     return values[:move_count]
+
+
+def _correction_status_residual(result: xr.Dataset) -> tuple[float, str, str]:
+    if result.attrs.get("correction_mode") == "beam":
+        name = "iteration_correction_criterion_residual"
+        label = "normalized beam residual"
+        suffix = ""
+    else:
+        name = "iteration_weighted_residual_px"
+        label = "residual"
+        suffix = " px"
+    residual = math.nan
+    if name in result:
+        values = np.asarray(result[name].values, dtype=float)
+        if values.size:
+            residual = float(values.reshape(-1)[-1])
+    return residual, label, suffix
 
 
 def _format_duration(seconds: float | None) -> str:
@@ -477,6 +495,11 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.auto_correction_interval_spinbox.setValue(180.0)
         self.auto_correction_interval_spinbox.setSuffix(" s")
         self.auto_correction_interval_spinbox.setEnabled(False)
+        self.correction_mode_combo = QtWidgets.QComboBox()
+        self.correction_mode_combo.setObjectName("correction_mode_combo")
+        self.correction_mode_combo.addItem("Camera", "camera")
+        self.correction_mode_combo.addItem("Beam", "beam")
+        self.correction_mode_combo.setEnabled(False)
         self.detect_shift_button = QtWidgets.QPushButton("Detect shift")
         self.detect_shift_button.setEnabled(False)
         self.new_calibration_button = QtWidgets.QPushButton("New calibration")
@@ -591,6 +614,7 @@ class CalibrationPanel(QtWidgets.QWidget):
         correction_button_layout = QtWidgets.QHBoxLayout()
         correction_button_layout.addWidget(self.detect_shift_button)
         correction_button_layout.addWidget(self.correct_sample_button)
+        correction_button_layout.addWidget(self.correction_mode_combo)
         correction_button_layout.addWidget(self.auto_correction_checkbox)
         correction_button_layout.addWidget(self.auto_correction_interval_spinbox)
         correction_button_layout.addStretch(1)
@@ -598,11 +622,27 @@ class CalibrationPanel(QtWidgets.QWidget):
 
         self.reset()
 
+    def correction_mode(self) -> str:
+        mode = self.correction_mode_combo.currentData()
+        if mode in {"camera", "beam"}:
+            return str(mode)
+        return constants.DEFAULT_CORRECTION_MODE
+
+    def set_correction_mode(self, mode: str) -> None:
+        mode = str(mode).strip().lower()
+        index = self.correction_mode_combo.findData(mode)
+        if index < 0:
+            index = self.correction_mode_combo.findData(
+                constants.DEFAULT_CORRECTION_MODE
+            )
+        self.correction_mode_combo.setCurrentIndex(max(index, 0))
+
     def reset(self) -> None:
         self.load_calibration_button.setEnabled(True)
         self.save_calibration_button.setEnabled(False)
         self.calibration_details_button.setEnabled(False)
         self.correct_sample_button.setEnabled(False)
+        self.correction_mode_combo.setEnabled(False)
         self.auto_correction_checkbox.setChecked(False)
         self.auto_correction_checkbox.setEnabled(False)
         self.auto_correction_interval_spinbox.setEnabled(False)
@@ -628,6 +668,7 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.save_calibration_button.setEnabled(False)
         self.calibration_details_button.setEnabled(False)
         self.correct_sample_button.setEnabled(False)
+        self.correction_mode_combo.setEnabled(False)
         self.auto_correction_checkbox.setChecked(False)
         self.auto_correction_checkbox.setEnabled(False)
         self.auto_correction_interval_spinbox.setEnabled(False)
@@ -696,6 +737,7 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.save_calibration_button.setEnabled(True)
         self.calibration_details_button.setEnabled(True)
         self.correct_sample_button.setEnabled(True)
+        self.correction_mode_combo.setEnabled(True)
         self.auto_correction_checkbox.setEnabled(True)
         self.auto_correction_interval_spinbox.setEnabled(True)
         self.detect_shift_button.setEnabled(True)
@@ -807,6 +849,7 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.save_calibration_button.setEnabled(False)
         self.calibration_details_button.setEnabled(False)
         self.correct_sample_button.setEnabled(False)
+        self.correction_mode_combo.setEnabled(False)
         self.auto_correction_checkbox.setEnabled(True)
         self.auto_correction_interval_spinbox.setEnabled(True)
         self.detect_shift_button.setEnabled(False)
@@ -821,24 +864,18 @@ class CalibrationPanel(QtWidgets.QWidget):
         moves = int(
             result.attrs.get("correction_iterations", result.sizes.get("move", 0))
         )
-        residual = math.nan
-        if "iteration_weighted_residual_px" in result:
-            residual_values = np.asarray(
-                result["iteration_weighted_residual_px"].values,
-                dtype=float,
-            )
-            if residual_values.size:
-                residual = float(residual_values[-1])
+        residual, residual_label, residual_suffix = _correction_status_residual(result)
 
         if moves == 0:
             self.calibration_status_label.setText(
-                "Correction in progress before first move; current residual "
-                f"{_format_number(residual)} px."
+                "Correction in progress before first move; current "
+                f"{residual_label} {_format_number(residual)}{residual_suffix}."
             )
         else:
             self.calibration_status_label.setText(
                 "Correction in progress after "
-                f"{moves} move(s); current residual {_format_number(residual)} px."
+                f"{moves} move(s); current {residual_label} "
+                f"{_format_number(residual)}{residual_suffix}."
             )
         warning_lines = [
             line.strip()
@@ -856,20 +893,13 @@ class CalibrationPanel(QtWidgets.QWidget):
         moves = int(
             result.attrs.get("correction_iterations", result.sizes.get("move", 0))
         )
-        residual = math.nan
-        if "iteration_weighted_residual_px" in result:
-            residual_values = np.asarray(
-                result["iteration_weighted_residual_px"].values,
-                dtype=float,
-            )
-            if residual_values.size:
-                residual = float(residual_values[-1])
+        residual, residual_label, residual_suffix = _correction_status_residual(result)
 
         status = "converged" if converged else "did not converge"
         self.calibration_status_label.setText(
             "Correction "
-            f"{status} after {moves} move(s); final residual "
-            f"{_format_number(residual)} px."
+            f"{status} after {moves} move(s); final {residual_label} "
+            f"{_format_number(residual)}{residual_suffix}."
         )
         warning_lines = [
             line.strip()
@@ -887,6 +917,7 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.save_calibration_button.setEnabled(False)
         self.calibration_details_button.setEnabled(False)
         self.correct_sample_button.setEnabled(False)
+        self.correction_mode_combo.setEnabled(False)
         self.auto_correction_checkbox.setEnabled(True)
         self.auto_correction_interval_spinbox.setEnabled(True)
         self.detect_shift_button.setEnabled(False)
@@ -901,6 +932,7 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.save_calibration_button.setEnabled(True)
         self.calibration_details_button.setEnabled(True)
         self.correct_sample_button.setEnabled(True)
+        self.correction_mode_combo.setEnabled(True)
         self.auto_correction_checkbox.setEnabled(True)
         self.auto_correction_interval_spinbox.setEnabled(True)
         self.detect_shift_button.setEnabled(True)

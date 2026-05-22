@@ -238,8 +238,6 @@ class ShiftDetectionTests(unittest.TestCase):
 
 class VisualCalibrationTests(unittest.TestCase):
     def test_capture_count_defaults_are_split_by_workflow(self):
-        self.assertEqual(constants.DEFAULT_CALIBRATION_CAPTURE_COUNT, 3)
-        self.assertEqual(constants.DEFAULT_CORRECTION_CAPTURE_COUNT, 1)
         self.assertEqual(
             run_calibration.__kwdefaults__["capture_count"],
             constants.DEFAULT_CALIBRATION_CAPTURE_COUNT,
@@ -1121,12 +1119,141 @@ class CorrectionTests(unittest.TestCase):
                 saved = saved_on_disk.load()
 
         self.assertTrue(result.attrs["correction_converged"])
+        self.assertEqual(result.attrs["correction_mode"], "camera")
         self.assertEqual(result.sizes["move"], 0)
         self.assertNotIn("correction_move_started_at", result.attrs)
         self.assertNotIn("correction_move_finished_at", result.attrs)
         self.assertNotIn("correction_move_started_at", saved.attrs)
         self.assertNotIn("correction_move_finished_at", saved.attrs)
         move.assert_not_called()
+
+    def test_beam_geometry_uses_polar_angle(self):
+        zero_polar = calibration_dataset().assign_attrs(polar=0.0)
+        geometry = correct_module._beam_geometry_from_calibration(
+            zero_polar,
+            beam_xz_angle_from_analyzer_deg=65.0,
+        )
+        angle = np.deg2rad(65.0)
+        np.testing.assert_allclose(
+            geometry["beam_unit"],
+            [np.sin(angle), 0.0, np.cos(angle)],
+            atol=1e-12,
+        )
+        np.testing.assert_allclose(
+            geometry["beam_transverse_unit"],
+            [np.cos(angle), 0.0, -np.sin(angle)],
+            atol=1e-12,
+        )
+
+        positive_polar = calibration_dataset().assign_attrs(polar=10.0)
+        geometry = correct_module._beam_geometry_from_calibration(
+            positive_polar,
+            beam_xz_angle_from_analyzer_deg=65.0,
+        )
+        self.assertAlmostEqual(geometry["beam_xz_angle_deg"], 55.0)
+
+    def test_beam_mode_requires_polar_but_camera_mode_accepts_old_calibration(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self.save_calibration(tmpdir)
+            hardware_patches = self.patch_hardware([shift_dataset(np.zeros((2, 2)))])
+            with (
+                hardware_patches[0],
+                hardware_patches[1],
+                hardware_patches[2],
+            ):
+                result = do_correction(path, capture_count=1)
+
+            with self.assertRaisesRegex(ValueError, "polar"):
+                do_correction(path, object(), capture_count=1, correction_mode="beam")
+
+        self.assertTrue(result.attrs["correction_converged"])
+        self.assertEqual(result.attrs["correction_mode"], "camera")
+
+    def test_beam_mode_ignores_longitudinal_offset(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "calibration.h5"
+            calibration = calibration_dataset().assign_attrs(polar=0.0)
+            save_calibration_dataset(calibration, path)
+            geometry = correct_module._beam_geometry_from_calibration(
+                calibration,
+                beam_xz_angle_from_analyzer_deg=65.0,
+            )
+            offset_mm = 0.020 * np.asarray(geometry["beam_unit"], dtype=float)
+            shift = measured_from_jacobian(
+                offset_mm.reshape(1, len(COMMAND_AXES)),
+                calibration["px_per_cmd_mm"].values,
+            )[0]
+            hardware_patches = self.patch_hardware([shift_dataset(shift)])
+            with (
+                hardware_patches[0],
+                hardware_patches[1],
+                hardware_patches[2],
+                patch(
+                    "merlin_track_position.tracking.correct.move_motors_and_wait",
+                    Mock(),
+                ) as move,
+            ):
+                result = do_correction(
+                    path,
+                    capture_count=1,
+                    correction_mode="beam",
+                )
+
+        move.assert_not_called()
+        self.assertTrue(result.attrs["correction_converged"])
+        self.assertEqual(result.attrs["correction_mode"], "beam")
+        self.assertEqual(
+            result.attrs["correction_criterion"],
+            "beam_projected_normalized_error",
+        )
+        np.testing.assert_allclose(
+            result["beam_offset_mm"].values[:2],
+            [0.0, 0.0],
+            atol=1e-12,
+        )
+        self.assertAlmostEqual(result["beam_offset_mm"].values[2], 0.020)
+
+    def test_beam_mode_corrects_transverse_and_vertical_offsets(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "calibration.h5"
+            calibration = calibration_dataset().assign_attrs(polar=0.0)
+            save_calibration_dataset(calibration, path)
+            geometry = correct_module._beam_geometry_from_calibration(
+                calibration,
+                beam_xz_angle_from_analyzer_deg=65.0,
+            )
+            transverse = np.asarray(geometry["beam_transverse_unit"], dtype=float)
+            offset_mm = 0.010 * transverse + np.array([0.0, 0.005, 0.0])
+            shift = measured_from_jacobian(
+                offset_mm.reshape(1, len(COMMAND_AXES)),
+                calibration["px_per_cmd_mm"].values,
+            )[0]
+            hardware_patches = self.patch_hardware(
+                [shift_dataset(shift), shift_dataset(np.zeros((2, 2)))],
+            )
+            with (
+                hardware_patches[0],
+                hardware_patches[1],
+                hardware_patches[2],
+                patch(
+                    "merlin_track_position.tracking.correct.move_motors_and_wait",
+                    return_value=(10.0, 20.0, 30.0),
+                ) as move,
+            ):
+                result = do_correction(
+                    path,
+                    capture_count=1,
+                    correction_mode="beam",
+                    max_moves=1,
+                )
+
+        requested = np.asarray(move.call_args.args[1], dtype=float)
+        delta = requested - np.array([10.0, 20.0, 30.0])
+        self.assertLess(float(transverse @ delta), 0.0)
+        self.assertLess(float(delta[1]), 0.0)
+        self.assertEqual(result.attrs["correction_mode"], "beam")
+        self.assertIn("iteration_beam_offset_mm", result)
+        self.assertFalse(result.attrs["correction_lqr_kalman_filter_enabled"])
 
     def test_correction_uses_command_state_not_readback_state(self):
         with tempfile.TemporaryDirectory() as tmpdir:

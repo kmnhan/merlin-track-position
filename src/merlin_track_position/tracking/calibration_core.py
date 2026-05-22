@@ -812,6 +812,44 @@ def solve_lqr_command_correction(
         _as_jacobian(px_per_cmd_mm)
     )
     observation = _shift_to_observation(_shift_values(shift))
+    return solve_lqr_observation_command_correction(
+        jacobian_observation,
+        observation,
+        axis_scale_cmd_mm,
+        gain=gain,
+        image_scale=image_scale_px,
+        motor_penalty=motor_penalty,
+        svd_relative_tolerance=svd_relative_tolerance,
+        max_normalized_step=max_normalized_step,
+        weights=weights,
+    )
+
+
+def solve_lqr_observation_command_correction(
+    observation_model: np.ndarray,
+    observation: Sequence[float] | np.ndarray,
+    axis_scale_cmd_mm: Sequence[float],
+    *,
+    gain: float = constants.DEFAULT_LQR_CORRECTION_GAIN,
+    image_scale: float | Sequence[float] | np.ndarray = (
+        constants.DEFAULT_LQR_CORRECTION_IMAGE_SCALE_PX
+    ),
+    motor_penalty: float = constants.DEFAULT_LQR_CORRECTION_MOTOR_PENALTY,
+    svd_relative_tolerance: float = (
+        constants.DEFAULT_LQR_CORRECTION_SVD_RELATIVE_TOLERANCE
+    ),
+    max_normalized_step: float | None = (
+        constants.DEFAULT_LQR_CORRECTION_MAX_NORMALIZED_STEP
+    ),
+    weights: Sequence[float] | np.ndarray | None = None,
+) -> np.ndarray:
+    """Solve an LQR correction for a generic linear observation model."""
+
+    observation_model = _as_observation_model(observation_model)
+    observation_values = _lqr_observation_values(
+        observation,
+        observation_model.shape[0],
+    )
     axis_scale = np.asarray(axis_scale_cmd_mm, dtype=np.float64)
     if axis_scale.shape != (len(COMMAND_AXES),):
         raise ValueError("axis_scale_cmd_mm must have one value for x/y/z")
@@ -827,15 +865,14 @@ def solve_lqr_command_correction(
             raise ValueError("max_normalized_step must be positive or None")
 
     design = compute_lqr_correction_design(
-        jacobian_observation,
+        observation_model,
         axis_scale,
-        image_scale_px=image_scale_px,
+        image_scale_px=image_scale,
         motor_penalty=motor_penalty,
         svd_relative_tolerance=svd_relative_tolerance,
         weights=weights,
     )
-    normalized_observation = observation / np.asarray(design["image_scale"])
-    state = np.asarray(design["controllable_basis"]).T @ normalized_observation
+    state = lqr_observation_state_from_design(design, observation_values)
     correction_cmd_mm = solve_lqr_state_command_correction(
         design,
         state,
@@ -884,35 +921,51 @@ def lqr_projected_residual_from_design(
 ) -> float:
     """Return the projected normalized error norm for an existing LQR design."""
 
+    return lqr_projected_observation_residual_from_design(lqr_design, shift)
+
+
+def lqr_projected_observation_residual_from_design(
+    lqr_design: Mapping[str, Any],
+    observation: xr.Dataset | xr.DataArray | Sequence[float] | np.ndarray,
+) -> float:
+    """Return the projected normalized residual for a generic observation."""
+
+    projected_state = lqr_observation_state_from_design(lqr_design, observation)
+    return float(np.linalg.norm(projected_state))
+
+
+def lqr_observation_state_from_design(
+    lqr_design: Mapping[str, Any],
+    observation: xr.Dataset | xr.DataArray | Sequence[float] | np.ndarray,
+) -> np.ndarray:
+    """Project a generic observation into the LQR controllable state."""
+
     rank = int(lqr_design["rank"])
+    observation_count = _lqr_design_observation_count(lqr_design)
     controllable_basis = _lqr_design_matrix(
         lqr_design,
         "controllable_basis",
-        (len(OBSERVATION_AXES), rank),
+        (observation_count, rank),
     )
-    image_scale = _lqr_design_vector(lqr_design, "image_scale", len(OBSERVATION_AXES))
-    observation = _shift_to_observation(_shift_values(shift))
-    normalized_observation = observation / image_scale
-    projected_state = controllable_basis.T @ normalized_observation
-    return float(np.linalg.norm(projected_state))
+    image_scale = _lqr_design_vector(lqr_design, "image_scale", observation_count)
+    observation_values = _lqr_observation_values(observation, observation_count)
+    normalized_observation = observation_values / image_scale
+    return controllable_basis.T @ normalized_observation
 
 
 def compute_lqr_correction_design(
     jacobian_observation: np.ndarray,
     axis_scale_cmd_mm: Sequence[float],
     *,
-    image_scale_px: float,
+    image_scale_px: float | Sequence[float] | np.ndarray,
     motor_penalty: float,
     svd_relative_tolerance: float,
     weights: Sequence[float] | np.ndarray | None,
 ) -> dict[str, np.ndarray | float | int]:
     """Return the normalized LQR design matrices for correction control."""
 
-    jacobian = np.asarray(jacobian_observation, dtype=np.float64)
-    if jacobian.shape != (len(OBSERVATION_AXES), len(COMMAND_AXES)):
-        raise ValueError("jacobian_observation must have shape (4, 3)")
-    if not np.isfinite(jacobian).all():
-        raise ValueError("jacobian_observation must contain only finite values")
+    jacobian = _as_observation_model(jacobian_observation)
+    observation_count = jacobian.shape[0]
 
     axis_scale = np.asarray(axis_scale_cmd_mm, dtype=np.float64)
     if axis_scale.shape != (len(COMMAND_AXES),):
@@ -930,7 +983,11 @@ def compute_lqr_correction_design(
     ):
         raise ValueError("svd_relative_tolerance must be finite and positive")
 
-    image_scale = _lqr_image_scale_from_weights(image_scale_px, weights)
+    image_scale = _lqr_image_scale_from_weights(
+        image_scale_px,
+        weights,
+        observation_count,
+    )
     normalized_jacobian = (
         jacobian * axis_scale[np.newaxis, :]
     ) / image_scale[:, np.newaxis]
@@ -990,6 +1047,7 @@ def compute_lqr_correction_design(
         "singular_values": singular_values,
         "motor_penalty": motor_penalty,
         "svd_relative_tolerance": svd_relative_tolerance,
+        "observation_count": observation_count,
     }
 
 
@@ -1243,6 +1301,16 @@ def _lqr_design_vector(
     return values
 
 
+def _lqr_design_observation_count(lqr_design: Mapping[str, Any]) -> int:
+    if "observation_count" in lqr_design:
+        count = int(lqr_design["observation_count"])
+    else:
+        count = len(OBSERVATION_AXES)
+    if count < 1:
+        raise ValueError("LQR design observation_count must be positive")
+    return count
+
+
 def _lqr_design_matrix(
     lqr_design: Mapping[str, Any],
     key: str,
@@ -1333,16 +1401,23 @@ def _measurement_covariance_matrix(
 
 
 def _lqr_image_scale_from_weights(
-    image_scale_px: float,
+    image_scale_px: float | Sequence[float] | np.ndarray,
     weights: Sequence[float] | np.ndarray | None,
+    observation_count: int = len(OBSERVATION_AXES),
 ) -> np.ndarray:
-    image_scale_px = float(image_scale_px)
-    if not np.isfinite(image_scale_px) or image_scale_px <= 0.0:
-        raise ValueError("image_scale_px must be finite and positive")
-    weight_values = _observation_weight_values(weights)
+    image_scale = np.asarray(image_scale_px, dtype=np.float64)
+    if image_scale.ndim == 0:
+        image_scale = np.full(observation_count, float(image_scale), dtype=np.float64)
+    elif image_scale.shape != (observation_count,):
+        raise ValueError(
+            "image_scale_px must be scalar or have one value per observation"
+        )
+    if not np.isfinite(image_scale).all() or np.any(image_scale <= 0.0):
+        raise ValueError("image_scale_px must contain finite positive values")
+    weight_values = _observation_weight_values(weights, observation_count)
     if np.any(weight_values <= 0.0):
         raise ValueError("LQR observation weights must all be positive")
-    return image_scale_px / np.sqrt(weight_values)
+    return image_scale / np.sqrt(weight_values)
 
 
 def weighted_pixel_residual(
@@ -2018,6 +2093,17 @@ def _as_jacobian(values: np.ndarray) -> np.ndarray:
     return jacobian
 
 
+def _as_observation_model(values: np.ndarray) -> np.ndarray:
+    model = np.asarray(values, dtype=np.float64)
+    if model.ndim != 2 or model.shape[1] != len(COMMAND_AXES):
+        raise ValueError("observation model must have shape (observation, command_axis)")
+    if model.shape[0] < 1:
+        raise ValueError("observation model must include at least one observation")
+    if not np.isfinite(model).all():
+        raise ValueError("observation model must contain only finite values")
+    return model
+
+
 def _jacobian_to_observation(jacobian: np.ndarray) -> np.ndarray:
     return _as_jacobian(jacobian).reshape(
         len(OBSERVATION_AXES),
@@ -2033,18 +2119,37 @@ def _observation_weight_matrix(
 
 def _observation_weight_values(
     weights: Sequence[float] | np.ndarray | None,
+    observation_count: int = len(OBSERVATION_AXES),
 ) -> np.ndarray:
     if weights is None:
-        return np.ones(len(OBSERVATION_AXES), dtype=np.float64)
+        return np.ones(observation_count, dtype=np.float64)
     values = np.asarray(weights, dtype=np.float64)
-    if values.shape == (len(CAMERAS), len(PIXEL_AXES)):
+    if observation_count == len(OBSERVATION_AXES) and values.shape == (
+        len(CAMERAS),
+        len(PIXEL_AXES),
+    ):
         values = values.reshape(-1)
-    if values.shape != (len(OBSERVATION_AXES),):
-        raise ValueError("weights must have four observation values")
+    if values.shape != (observation_count,):
+        raise ValueError("weights must have one value per observation")
     if not np.isfinite(values).all() or np.any(values < 0.0):
         raise ValueError("weights must contain finite non-negative values")
     if not np.any(values > 0.0):
         raise ValueError("weights must include at least one positive value")
+    return values
+
+
+def _lqr_observation_values(
+    observation: xr.Dataset | xr.DataArray | Sequence[float] | np.ndarray,
+    observation_count: int,
+) -> np.ndarray:
+    values = _shift_values(observation)
+    if observation_count == len(OBSERVATION_AXES):
+        return _shift_to_observation(values)
+    values = np.asarray(values, dtype=np.float64)
+    if values.shape != (observation_count,):
+        raise ValueError("observation must have one value per LQR observation")
+    if not np.isfinite(values).all():
+        raise ValueError("observation must contain only finite values")
     return values
 
 

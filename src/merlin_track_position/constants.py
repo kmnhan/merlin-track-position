@@ -83,6 +83,14 @@ CORRECTION_OBSERVATION_WEIGHTS: tuple[float, float, float, float] | None = (
 DEFAULT_CORRECTION_MIN_COMMAND_NORM_MM: float = 1e-9
 DEFAULT_CORRECTION_MOVE_DELTA_DEADBAND_UM: float = 0.1
 DEFAULT_CORRECTION_MAX_MOVES: int = 20
+DEFAULT_CORRECTION_MODE: str = "beam"
+
+# Beam-frame correction geometry. At polar=0, the beam is +65 degrees from +z
+# toward +x in the sample xz plane. Beam-frame tolerances are correction
+# residual scales, in microns, for transverse-in-xz and vertical-y offsets.
+DEFAULT_BEAM_XZ_ANGLE_FROM_ANALYZER_DEG: float = 65.0
+DEFAULT_BEAM_TRANSVERSE_TOLERANCE_UM: float = 10.0
+DEFAULT_BEAM_VERTICAL_TOLERANCE_UM: float = 5.0
 
 # LQR solver weights and numerical tolerance.
 DEFAULT_LQR_CORRECTION_GAIN: float = 0.50

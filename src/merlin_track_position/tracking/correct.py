@@ -26,10 +26,12 @@ from merlin_track_position.tracking.calibration_core import (
     estimate_command_offset,
     initialize_lqr_kalman_state,
     load_calibration_dataset,
+    lqr_projected_observation_residual_from_design,
     lqr_projected_residual_from_design,
     measure_image_error,
     predict_lqr_kalman_state,
     solve_lqr_command_correction,
+    solve_lqr_observation_command_correction,
     solve_lqr_state_command_correction,
     update_lqr_kalman_state,
     validate_visual_calibration_dataset,
@@ -51,6 +53,11 @@ from merlin_track_position.tracking.roi import matching_reference_and_stack
 logger = logging.getLogger("merlin_track_position.tracking.correct")
 
 CORRECTION_CRITERION = "lqr_projected_normalized_error"
+BEAM_CORRECTION_CRITERION = "beam_projected_normalized_error"
+CORRECTION_MODE_CAMERA = "camera"
+CORRECTION_MODE_BEAM = "beam"
+CORRECTION_MODES = (CORRECTION_MODE_CAMERA, CORRECTION_MODE_BEAM)
+BEAM_AXES = ("beam_transverse", "beam_vertical", "beam_longitudinal")
 _USE_DEFAULT = object()
 _CORRECTION_HISTORY_FORMAT = "merlin_track_position_correction_history"
 _CORRECTION_HISTORY_RESIZABLE_DIMS = ("move", "iteration")
@@ -118,6 +125,14 @@ def do_correction(
     lqr_svd_relative_tolerance: float = (
         constants.DEFAULT_LQR_CORRECTION_SVD_RELATIVE_TOLERANCE
     ),
+    correction_mode: str = constants.DEFAULT_CORRECTION_MODE,
+    beam_xz_angle_from_analyzer_deg: float = (
+        constants.DEFAULT_BEAM_XZ_ANGLE_FROM_ANALYZER_DEG
+    ),
+    beam_transverse_tolerance_um: float = (
+        constants.DEFAULT_BEAM_TRANSVERSE_TOLERANCE_UM
+    ),
+    beam_vertical_tolerance_um: float = constants.DEFAULT_BEAM_VERTICAL_TOLERANCE_UM,
     weights: Sequence[float] | np.ndarray | None = None,
     progress_callback: Callable[[xr.Dataset], None] | None = None,
     motor_backend: CorrectionMotorBackend | None = None,
@@ -149,8 +164,13 @@ def do_correction(
     if max_normalized_step is _USE_DEFAULT:
         max_normalized_step = constants.DEFAULT_LQR_CORRECTION_MAX_NORMALIZED_STEP
     lqr_projected_tolerance = _resolve_lqr_projected_tolerance(lqr_projected_tolerance)
+    correction_mode = _resolve_correction_mode(correction_mode)
+    correction_criterion = (
+        BEAM_CORRECTION_CRITERION
+        if correction_mode == CORRECTION_MODE_BEAM
+        else CORRECTION_CRITERION
+    )
     correction_tolerance = lqr_projected_tolerance
-    correction_criterion = CORRECTION_CRITERION
     current_gain = float(gain)
     min_command_norm_mm = float(min_command_norm_mm)
     max_moves = int(max_moves)
@@ -164,7 +184,18 @@ def do_correction(
         raise ValueError("min_command_norm_mm must be finite and non-negative")
     if max_moves < 0:
         raise ValueError("max_moves must be >= 0")
-    lqr_kalman_filter_enabled = bool(constants.DEFAULT_LQR_CORRECTION_USE_KALMAN_FILTER)
+    beam_transverse_tolerance_mm = _positive_um_to_mm(
+        beam_transverse_tolerance_um,
+        "beam_transverse_tolerance_um",
+    )
+    beam_vertical_tolerance_mm = _positive_um_to_mm(
+        beam_vertical_tolerance_um,
+        "beam_vertical_tolerance_um",
+    )
+    lqr_kalman_filter_enabled = (
+        bool(constants.DEFAULT_LQR_CORRECTION_USE_KALMAN_FILTER)
+        and correction_mode == CORRECTION_MODE_CAMERA
+    )
     lqr_kalman_process_noise = constants.DEFAULT_LQR_CORRECTION_KALMAN_PROCESS_NOISE
     lqr_kalman_measurement_noise = (
         constants.DEFAULT_LQR_CORRECTION_KALMAN_MEASUREMENT_NOISE
@@ -176,16 +207,6 @@ def do_correction(
         constants.DEFAULT_LQR_CORRECTION_KALMAN_INITIAL_COVARIANCE
     )
     lqr_kalman_innovation_gate = constants.DEFAULT_LQR_CORRECTION_KALMAN_INNOVATION_GATE
-    logger.info(
-        "Correction parameters: capture_count=%d, criterion=%s, tolerance=%g, "
-        "gain=%g, max_moves=%d",
-        capture_count,
-        correction_criterion,
-        correction_tolerance,
-        current_gain,
-        max_moves,
-    )
-
     reference_cam0 = np.asarray(calibration["reference_cam0"].values)
     reference_cam1 = np.asarray(calibration["reference_cam1"].values)
     axis_scale = np.asarray(calibration["axis_scale_cmd_mm"].values, dtype=np.float64)
@@ -193,13 +214,50 @@ def do_correction(
         calibration["px_per_cmd_mm"].values,
         dtype=np.float64,
     )
+    beam_geometry: dict[str, np.ndarray | float] | None = None
+    beam_lqr_weights: np.ndarray | None = None
+    lqr_image_scale: float | np.ndarray = lqr_image_scale_px
+    lqr_weights = weights
+    if correction_mode == CORRECTION_MODE_BEAM:
+        beam_geometry = _beam_geometry_from_calibration(
+            calibration,
+            beam_xz_angle_from_analyzer_deg=beam_xz_angle_from_analyzer_deg,
+        )
+        beam_lqr_weights = np.asarray(
+            [
+                1.0 / (beam_transverse_tolerance_mm**2),
+                1.0 / (beam_vertical_tolerance_mm**2),
+            ],
+            dtype=np.float64,
+        )
+        lqr_observation_model = np.asarray(
+            beam_geometry["projection_matrix"],
+            dtype=np.float64,
+        )
+        lqr_image_scale = 1.0
+        lqr_weights = beam_lqr_weights
+    else:
+        lqr_observation_model = jacobian.reshape(
+            len(CAMERAS) * len(PIXEL_AXES),
+            len(COMMAND_AXES),
+        )
     lqr_design = compute_lqr_correction_design(
-        jacobian.reshape(len(CAMERAS) * len(PIXEL_AXES), len(COMMAND_AXES)),
+        lqr_observation_model,
         axis_scale,
-        image_scale_px=lqr_image_scale_px,
+        image_scale_px=lqr_image_scale,
         motor_penalty=lqr_motor_penalty,
         svd_relative_tolerance=lqr_svd_relative_tolerance,
-        weights=weights,
+        weights=lqr_weights,
+    )
+    logger.info(
+        "Correction parameters: mode=%s, capture_count=%d, criterion=%s, "
+        "tolerance=%g, gain=%g, max_moves=%d",
+        correction_mode,
+        capture_count,
+        correction_criterion,
+        correction_tolerance,
+        current_gain,
+        max_moves,
     )
     logger.info("Reading initial commanded x/y/z positions.")
     commanded_position_mm = np.asarray(
@@ -226,9 +284,20 @@ def do_correction(
         **shift_kwargs,
     )
     weighted_residual = weighted_pixel_residual(measurement, weights=weights)
-    criterion_residual = lqr_projected_residual_from_design(
-        lqr_design,
+    estimated_offset_mm = estimate_command_offset(
+        jacobian,
         measurement,
+        weights=weights,
+    )
+    beam_offset_mm = _beam_offset_from_estimated_offset(
+        estimated_offset_mm,
+        beam_geometry,
+    )
+    criterion_residual = _correction_criterion_residual(
+        correction_mode=correction_mode,
+        lqr_design=lqr_design,
+        measurement=measurement,
+        beam_offset_mm=beam_offset_mm,
     )
     logger.info(
         "Initial correction criterion residual: %.6g (%s); weighted residual: %.6g px",
@@ -240,6 +309,9 @@ def do_correction(
     iteration_shift_px = [np.asarray(measurement["shift_px"].values, dtype=np.float64)]
     iteration_weighted_residuals = [weighted_residual]
     iteration_criterion_residuals = [criterion_residual]
+    iteration_beam_offset_mm: list[np.ndarray] = []
+    if beam_offset_mm is not None:
+        iteration_beam_offset_mm.append(beam_offset_mm)
     move_command_delta_mm: list[np.ndarray] = []
     move_requested_position_mm: list[np.ndarray] = []
     move_final_readback_position_mm: list[np.ndarray] = []
@@ -298,16 +370,20 @@ def do_correction(
             measurement=measurement,
             jacobian=jacobian,
             axis_scale=axis_scale,
-            estimated_offset=estimate_command_offset(
-                jacobian,
-                measurement,
-                weights=weights,
-            ),
+            estimated_offset=estimated_offset_mm,
             next_correction=_reported_next_correction(
                 converged=converged,
                 jacobian=jacobian,
                 measurement=measurement,
                 axis_scale=axis_scale,
+                correction_mode=correction_mode,
+                beam_observation=None if beam_offset_mm is None else beam_offset_mm[:2],
+                beam_projection_matrix=(
+                    None
+                    if beam_geometry is None
+                    else np.asarray(beam_geometry["projection_matrix"], dtype=np.float64)
+                ),
+                beam_lqr_weights=beam_lqr_weights,
                 gain=current_gain,
                 max_normalized_step=max_normalized_step,
                 lqr_image_scale_px=lqr_image_scale_px,
@@ -321,6 +397,8 @@ def do_correction(
             iteration_shift_px=iteration_shift_px,
             iteration_weighted_residuals=iteration_weighted_residuals,
             iteration_criterion_residuals=iteration_criterion_residuals,
+            beam_offset_mm=beam_offset_mm,
+            iteration_beam_offset_mm=iteration_beam_offset_mm,
             iteration_lqr_kalman_state=iteration_lqr_kalman_state,
             iteration_lqr_kalman_predicted_state=(iteration_lqr_kalman_predicted_state),
             iteration_lqr_kalman_innovation=iteration_lqr_kalman_innovation,
@@ -358,6 +436,20 @@ def do_correction(
             lqr_projected_tolerance=lqr_projected_tolerance,
             correction_tolerance=correction_tolerance,
             correction_criterion=correction_criterion,
+            correction_mode=correction_mode,
+            beam_xz_angle_from_analyzer_deg=beam_xz_angle_from_analyzer_deg,
+            beam_polar_deg=(
+                None
+                if beam_geometry is None
+                else float(beam_geometry["polar_deg"])
+            ),
+            beam_runtime_xz_angle_deg=(
+                None
+                if beam_geometry is None
+                else float(beam_geometry["beam_xz_angle_deg"])
+            ),
+            beam_transverse_tolerance_um=beam_transverse_tolerance_um,
+            beam_vertical_tolerance_um=beam_vertical_tolerance_um,
             gain=gain,
             current_gain=current_gain,
             max_normalized_step=max_normalized_step,
@@ -419,7 +511,25 @@ def do_correction(
             measurement,
             weights=weights,
         )
-        if lqr_kalman_filter_enabled:
+        beam_offset_mm = _beam_offset_from_estimated_offset(
+            estimated_offset_mm,
+            beam_geometry,
+        )
+        if correction_mode == CORRECTION_MODE_BEAM:
+            if beam_geometry is None or beam_offset_mm is None:
+                raise RuntimeError("beam correction geometry was not initialized")
+            raw_correction_cmd_mm = solve_lqr_observation_command_correction(
+                np.asarray(beam_geometry["projection_matrix"], dtype=np.float64),
+                beam_offset_mm[:2],
+                axis_scale,
+                gain=gain_used,
+                image_scale=1.0,
+                motor_penalty=lqr_motor_penalty,
+                svd_relative_tolerance=lqr_svd_relative_tolerance,
+                max_normalized_step=max_normalized_step,
+                weights=beam_lqr_weights,
+            )
+        elif lqr_kalman_filter_enabled:
             if lqr_design is None or lqr_kalman_state is None:
                 raise RuntimeError("LQR Kalman state was not initialized")
             raw_correction_cmd_mm = solve_lqr_state_command_correction(
@@ -526,9 +636,20 @@ def do_correction(
             after_measurement,
             weights=weights,
         )
-        after_criterion_residual = lqr_projected_residual_from_design(
-            lqr_design,
+        after_estimated_offset_mm = estimate_command_offset(
+            jacobian,
             after_measurement,
+            weights=weights,
+        )
+        after_beam_offset_mm = _beam_offset_from_estimated_offset(
+            after_estimated_offset_mm,
+            beam_geometry,
+        )
+        after_criterion_residual = _correction_criterion_residual(
+            correction_mode=correction_mode,
+            lqr_design=lqr_design,
+            measurement=after_measurement,
+            beam_offset_mm=after_beam_offset_mm,
         )
         decreased = bool(after_criterion_residual < criterion_residual)
         logger.info(
@@ -632,12 +753,16 @@ def do_correction(
 
         measurement = after_measurement
         weighted_residual = after_weighted_residual
+        estimated_offset_mm = after_estimated_offset_mm
+        beam_offset_mm = after_beam_offset_mm
         criterion_residual = after_criterion_residual
         iteration_shift_px.append(
             np.asarray(measurement["shift_px"].values, dtype=np.float64)
         )
         iteration_weighted_residuals.append(float(weighted_residual))
         iteration_criterion_residuals.append(float(criterion_residual))
+        if beam_offset_mm is not None:
+            iteration_beam_offset_mm.append(beam_offset_mm)
         warnings.extend(
             line.strip()
             for line in str(measurement.attrs.get("warnings", "")).splitlines()
@@ -1481,6 +1606,16 @@ def _correction_weights(
     return constants.CORRECTION_OBSERVATION_WEIGHTS
 
 
+def _resolve_correction_mode(value: str) -> str:
+    mode = str(value).strip().lower()
+    if mode not in CORRECTION_MODES:
+        raise ValueError(
+            "correction_mode must be one of "
+            + ", ".join(repr(item) for item in CORRECTION_MODES)
+        )
+    return mode
+
+
 def _resolve_lqr_projected_tolerance(value: Any) -> float:
     if value is _USE_DEFAULT:
         value = constants.DEFAULT_LQR_CORRECTION_PROJECTED_TOLERANCE
@@ -1488,6 +1623,93 @@ def _resolve_lqr_projected_tolerance(value: Any) -> float:
     if not np.isfinite(tolerance) or tolerance < 0.0:
         raise ValueError("lqr_projected_tolerance must be finite and non-negative")
     return tolerance
+
+
+def _positive_um_to_mm(value: float, name: str) -> float:
+    value_um = float(value)
+    if not np.isfinite(value_um) or value_um <= 0.0:
+        raise ValueError(f"{name} must be finite and positive")
+    return value_um / 1000.0
+
+
+def _beam_geometry_from_calibration(
+    calibration: xr.Dataset,
+    *,
+    beam_xz_angle_from_analyzer_deg: float,
+) -> dict[str, np.ndarray | float]:
+    if "polar" not in calibration.attrs:
+        raise ValueError("beam correction requires calibration attr 'polar'")
+    polar_deg = float(calibration.attrs["polar"])
+    beam_angle_deg = float(beam_xz_angle_from_analyzer_deg)
+    if not np.isfinite(polar_deg):
+        raise ValueError("beam correction requires finite calibration attr 'polar'")
+    if not np.isfinite(beam_angle_deg):
+        raise ValueError("beam_xz_angle_from_analyzer_deg must be finite")
+    runtime_angle_deg = beam_angle_deg - polar_deg
+    angle_rad = np.deg2rad(runtime_angle_deg)
+    beam_unit = np.asarray(
+        [np.sin(angle_rad), 0.0, np.cos(angle_rad)],
+        dtype=np.float64,
+    )
+    transverse_unit = np.asarray(
+        [np.cos(angle_rad), 0.0, -np.sin(angle_rad)],
+        dtype=np.float64,
+    )
+    projection_matrix = np.asarray(
+        [
+            transverse_unit,
+            [0.0, 1.0, 0.0],
+        ],
+        dtype=np.float64,
+    )
+    return {
+        "polar_deg": polar_deg,
+        "beam_xz_angle_deg": runtime_angle_deg,
+        "beam_unit": beam_unit,
+        "beam_transverse_unit": transverse_unit,
+        "projection_matrix": projection_matrix,
+    }
+
+
+def _beam_offset_from_estimated_offset(
+    estimated_offset_mm: np.ndarray,
+    beam_geometry: dict[str, np.ndarray | float] | None,
+) -> np.ndarray | None:
+    if beam_geometry is None:
+        return None
+    offset = np.asarray(estimated_offset_mm, dtype=np.float64)
+    if offset.shape != (len(COMMAND_AXES),):
+        raise ValueError("estimated offset must have one value for x/y/z")
+    if not np.isfinite(offset).all():
+        raise ValueError("estimated offset must contain only finite values")
+    projection_matrix = np.asarray(beam_geometry["projection_matrix"], dtype=np.float64)
+    beam_unit = np.asarray(beam_geometry["beam_unit"], dtype=np.float64)
+    transverse_vertical = projection_matrix @ offset
+    longitudinal = float(beam_unit @ offset)
+    return np.asarray(
+        [transverse_vertical[0], transverse_vertical[1], longitudinal],
+        dtype=np.float64,
+    )
+
+
+def _correction_criterion_residual(
+    *,
+    correction_mode: str,
+    lqr_design: dict[str, Any],
+    measurement: xr.Dataset,
+    beam_offset_mm: np.ndarray | None,
+) -> float:
+    if correction_mode == CORRECTION_MODE_BEAM:
+        if beam_offset_mm is None:
+            raise RuntimeError("beam correction offset was not initialized")
+        return lqr_projected_observation_residual_from_design(
+            lqr_design,
+            beam_offset_mm[:2],
+        )
+    return lqr_projected_residual_from_design(
+        lqr_design,
+        measurement,
+    )
 
 
 def _lqr_kalman_gated_measurement_warning(
@@ -1547,6 +1769,10 @@ def _reported_next_correction(
     jacobian: np.ndarray,
     measurement: xr.Dataset,
     axis_scale: np.ndarray,
+    correction_mode: str,
+    beam_observation: np.ndarray | None,
+    beam_projection_matrix: np.ndarray | None,
+    beam_lqr_weights: Sequence[float] | np.ndarray | None,
     gain: float,
     max_normalized_step: float | None,
     lqr_image_scale_px: float,
@@ -1559,7 +1785,21 @@ def _reported_next_correction(
 ) -> np.ndarray:
     if converged:
         return np.zeros(len(COMMAND_AXES), dtype=np.float64)
-    if lqr_kalman_filter_enabled:
+    if correction_mode == CORRECTION_MODE_BEAM:
+        if beam_observation is None or beam_projection_matrix is None:
+            raise RuntimeError("beam correction geometry was not initialized")
+        raw_correction = solve_lqr_observation_command_correction(
+            beam_projection_matrix,
+            beam_observation,
+            axis_scale,
+            gain=gain,
+            image_scale=1.0,
+            motor_penalty=lqr_motor_penalty,
+            svd_relative_tolerance=lqr_svd_relative_tolerance,
+            max_normalized_step=max_normalized_step,
+            weights=beam_lqr_weights,
+        )
+    elif lqr_kalman_filter_enabled:
         if lqr_design is None or lqr_kalman_state is None:
             raise RuntimeError("LQR Kalman state was not initialized")
         raw_correction = solve_lqr_state_command_correction(
@@ -1593,6 +1833,8 @@ def _build_correction_result(
     iteration_shift_px: Sequence[np.ndarray],
     iteration_weighted_residuals: Sequence[float],
     iteration_criterion_residuals: Sequence[float],
+    beam_offset_mm: np.ndarray | None,
+    iteration_beam_offset_mm: Sequence[np.ndarray],
     iteration_lqr_kalman_state: Sequence[np.ndarray],
     iteration_lqr_kalman_predicted_state: Sequence[np.ndarray],
     iteration_lqr_kalman_innovation: Sequence[np.ndarray],
@@ -1626,6 +1868,12 @@ def _build_correction_result(
     lqr_projected_tolerance: float,
     correction_tolerance: float,
     correction_criterion: str,
+    correction_mode: str,
+    beam_xz_angle_from_analyzer_deg: float,
+    beam_polar_deg: float | None,
+    beam_runtime_xz_angle_deg: float | None,
+    beam_transverse_tolerance_um: float,
+    beam_vertical_tolerance_um: float,
     gain: float,
     current_gain: float,
     max_normalized_step: float | None,
@@ -1772,6 +2020,21 @@ def _build_correction_result(
         iteration=np.arange(len(iteration_weighted_residuals), dtype=np.int64),
         move=np.arange(move_count, dtype=np.int64),
     )
+    if beam_offset_mm is not None:
+        result = result.assign(
+            {
+                "beam_offset_mm": (
+                    ("beam_axis",),
+                    np.asarray(beam_offset_mm, dtype=np.float64),
+                    {"units": "commanded-mm"},
+                ),
+                "iteration_beam_offset_mm": (
+                    ("iteration", "beam_axis"),
+                    _stack_beam_or_empty(iteration_beam_offset_mm),
+                    {"units": "commanded-mm"},
+                ),
+            }
+        ).assign_coords(beam_axis=list(BEAM_AXES))
     if lqr_kalman_filter_enabled:
         result = result.assign(
             {
@@ -1819,6 +2082,7 @@ def _build_correction_result(
         "correction_started_at_utc": correction_started_at_utc,
         "correction_converged": bool(converged),
         "correction_iterations": int(move_count),
+        "correction_mode": correction_mode,
         "correction_criterion": correction_criterion,
         "correction_tolerance": float(correction_tolerance),
         "correction_gain": float(gain),
@@ -1833,6 +2097,27 @@ def _build_correction_result(
         "correction_applied": move_count > 0,
         "warnings": "\n".join(tuple(dict.fromkeys(warnings))),
     }
+    if correction_mode == CORRECTION_MODE_BEAM:
+        attrs |= {
+            "correction_beam_xz_angle_deg": float(
+                beam_xz_angle_from_analyzer_deg
+            ),
+            "correction_beam_transverse_tolerance_um": float(
+                beam_transverse_tolerance_um
+            ),
+            "correction_beam_vertical_tolerance_um": float(
+                beam_vertical_tolerance_um
+            ),
+            "correction_lqr_kalman_disabled_reason": (
+                "beam mode uses direct LQR without the camera-space Kalman observer"
+            ),
+        }
+        if beam_polar_deg is not None:
+            attrs["correction_polar_deg"] = float(beam_polar_deg)
+        if beam_runtime_xz_angle_deg is not None:
+            attrs["correction_beam_runtime_xz_angle_deg"] = float(
+                beam_runtime_xz_angle_deg
+            )
     if (
         move_count > 0
         and correction_move_started_at is not None
@@ -1928,6 +2213,12 @@ def _stack_bool_or_empty(rows: Sequence[np.ndarray]) -> np.ndarray:
 def _stack_shift_or_empty(rows: Sequence[np.ndarray]) -> np.ndarray:
     if not rows:
         return np.empty((0, len(CAMERAS), len(PIXEL_AXES)), dtype=np.float64)
+    return np.stack(rows, axis=0).astype(np.float64, copy=False)
+
+
+def _stack_beam_or_empty(rows: Sequence[np.ndarray]) -> np.ndarray:
+    if not rows:
+        return np.empty((0, len(BEAM_AXES)), dtype=np.float64)
     return np.stack(rows, axis=0).astype(np.float64, copy=False)
 
 

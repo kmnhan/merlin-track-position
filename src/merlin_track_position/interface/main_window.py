@@ -15,6 +15,7 @@ import xarray as xr
 from qtpy import QtCore, QtGui, QtWidgets
 
 from merlin_track_position.constants import (
+    DEFAULT_CORRECTION_MODE,
     DEFAULT_VISUAL_CALIBRATION_N,
     DEFAULT_VISUAL_CALIBRATION_MIN_SHIFT_PX,
     DEFAULT_VISUAL_CALIBRATION_STEP_UM,
@@ -92,6 +93,7 @@ IMAGE_REFRESH_INTERVAL_MS = 400
 PERSISTENCE_FLUSH_INTERVAL_MS = 5000
 DEFAULT_AUTO_CORRECTION_INTERVAL_SECONDS = 180.0
 AUTO_CORRECTION_INTERVAL_SETTINGS_KEY = "auto_correction/interval_seconds"
+CORRECTION_MODE_SETTINGS_KEY = "correction/mode"
 LEGACY_AUTO_CORRECTION_INTERVAL_MS_SETTINGS_KEY = "auto_correction/interval_ms"
 LEGACY_AUTO_CORRECTION_INTERVAL_MINUTES_SETTINGS_KEY = (
     "auto_correction/interval_minutes"
@@ -547,6 +549,7 @@ class MainWindow(_MainWindowGUI):
         self.calibration_panel.auto_correction_interval_spinbox.setValue(
             self._stored_auto_correction_interval_seconds()
         )
+        self.calibration_panel.set_correction_mode(self._stored_correction_mode())
         self._calibration: xr.Dataset | None = None
         self._calibration_path: Path | None = None
         self._calibration_thread = CalibrationThread(self)
@@ -632,6 +635,9 @@ class MainWindow(_MainWindowGUI):
         )
         self.calibration_panel.auto_correction_interval_spinbox.valueChanged.connect(
             self._on_auto_correction_interval_changed
+        )
+        self.calibration_panel.correction_mode_combo.currentIndexChanged.connect(
+            self._on_correction_mode_changed
         )
         self.calibration_panel.detect_shift_button.clicked.connect(
             self._on_detect_shift_clicked
@@ -723,6 +729,17 @@ class MainWindow(_MainWindowGUI):
         except (TypeError, ValueError):
             interval_seconds = DEFAULT_AUTO_CORRECTION_INTERVAL_SECONDS
         return min(max(interval_seconds, spinbox.minimum()), spinbox.maximum())
+
+    def _stored_correction_mode(self) -> str:
+        mode = str(
+            self._settings.value(
+                CORRECTION_MODE_SETTINGS_KEY,
+                DEFAULT_CORRECTION_MODE,
+            )
+        ).strip().lower()
+        if mode not in {"camera", "beam"}:
+            return DEFAULT_CORRECTION_MODE
+        return mode
 
     def _auto_correction_interval_ms(self) -> int:
         interval_seconds = (
@@ -889,6 +906,7 @@ class MainWindow(_MainWindowGUI):
             camera_pair,
             self._calibration_path,
             motor_backend=motor_backend,
+            correction_mode=self.calibration_panel.correction_mode(),
         )
 
         ui_marked_busy = False
@@ -1044,6 +1062,14 @@ class MainWindow(_MainWindowGUI):
         self._settings.sync()
         if self._auto_correction_timer.isActive():
             self._restart_auto_correction_timer()
+
+    @QtCore.Slot(int)
+    def _on_correction_mode_changed(self, _index: int) -> None:
+        self._settings.setValue(
+            CORRECTION_MODE_SETTINGS_KEY,
+            self.calibration_panel.correction_mode(),
+        )
+        self._settings.sync()
 
     @QtCore.Slot()
     def _on_auto_correction_timeout(self) -> None:

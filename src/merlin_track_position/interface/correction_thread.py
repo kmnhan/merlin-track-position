@@ -9,6 +9,7 @@ import xarray as xr
 from qtpy import QtCore
 
 from merlin_track_position.instruments.cameras import CameraPairPlugin
+from merlin_track_position import constants
 from merlin_track_position.tracking.correct import do_correction
 
 __all__ = ("CorrectionThread",)
@@ -31,6 +32,7 @@ class CorrectionThread(QtCore.QThread):
         self._camera_pair: CameraPairPlugin | None = None
         self._calibration_path: Path | None = None
         self._motor_backend: Any | None = None
+        self._correction_mode = constants.DEFAULT_CORRECTION_MODE
 
     def configure(
         self,
@@ -38,6 +40,7 @@ class CorrectionThread(QtCore.QThread):
         camera_pair: CameraPairPlugin,
         calibration_path: str | Path,
         motor_backend: Any | None = None,
+        correction_mode: str = constants.DEFAULT_CORRECTION_MODE,
     ) -> None:
         """Set the parameters for the next correction run."""
         if self.isRunning():
@@ -46,9 +49,11 @@ class CorrectionThread(QtCore.QThread):
         self._camera_pair = camera_pair
         self._calibration_path = Path(calibration_path)
         self._motor_backend = motor_backend
+        self._correction_mode = str(correction_mode)
         logger.info(
-            "Configured correction thread: calibration_path=%s",
+            "Configured correction thread: calibration_path=%s, correction_mode=%s",
             calibration_path,
+            self._correction_mode,
         )
 
     def run(self) -> None:
@@ -75,6 +80,7 @@ class CorrectionThread(QtCore.QThread):
                     calibration_path=self._calibration_path,
                     progress_callback=self._emit_progress,
                     motor_backend=self._motor_backend,
+                    correction_mode=self._correction_mode,
                 )
             except Exception as exc:
                 logger.exception("Correction thread failed.")

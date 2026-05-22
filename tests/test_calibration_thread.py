@@ -187,6 +187,7 @@ class CorrectionThreadTests(unittest.TestCase):
             calibration_path,
             progress_callback,
             motor_backend,
+            correction_mode,
         ):
             calls.append(
                 (
@@ -194,6 +195,7 @@ class CorrectionThreadTests(unittest.TestCase):
                     passed_camera_pair,
                     Path(calibration_path),
                     motor_backend,
+                    correction_mode,
                 )
             )
             progress_callback(progress)
@@ -211,14 +213,14 @@ class CorrectionThreadTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "calibration.h5"
-            thread.configure(calibration, camera_pair, path)
+            thread.configure(calibration, camera_pair, path, correction_mode="beam")
             with patch(
                 "merlin_track_position.interface.correction_thread.do_correction",
                 side_effect=fake_do_correction,
             ):
                 thread.run()
 
-        self.assertEqual(calls, [(calibration, camera_pair, path, None)])
+        self.assertEqual(calls, [(calibration, camera_pair, path, None, "beam")])
         self.assertEqual(progress_results, [progress])
         self.assertEqual(ready, [result])
         self.assertEqual(failed, [])

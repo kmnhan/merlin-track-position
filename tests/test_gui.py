@@ -50,15 +50,15 @@ def get_qapp():
 
 class FakeSettings:
     def __init__(self):
-        self.values: dict[str, float] = {}
-        self.set_calls: list[tuple[str, float]] = []
+        self.values: dict[str, object] = {}
+        self.set_calls: list[tuple[str, object]] = []
 
     def value(self, key, fallback=None):
         return self.values.get(str(key), fallback)
 
     def setValue(self, key, value):
-        self.values[str(key)] = float(value)
-        self.set_calls.append((str(key), float(value)))
+        self.values[str(key)] = value
+        self.set_calls.append((str(key), value))
 
     def sync(self):
         pass
@@ -123,6 +123,7 @@ class FakeCorrectionThread(QtCore.QObject):
         self.camera_pair = None
         self.calibration_path = None
         self.motor_backend = None
+        self.correction_mode = None
         self.started = False
         self.running = False
 
@@ -132,11 +133,13 @@ class FakeCorrectionThread(QtCore.QObject):
         camera_pair,
         calibration_path,
         motor_backend=None,
+        correction_mode="camera",
     ):
         self.calibration = calibration
         self.camera_pair = camera_pair
         self.calibration_path = Path(calibration_path)
         self.motor_backend = motor_backend
+        self.correction_mode = correction_mode
 
     def start(self):
         self.started = True
@@ -969,6 +972,24 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
             finally:
                 window.close()
 
+    def test_correction_mode_persists(self):
+        get_qapp()
+        settings = FakeSettings()
+        settings.values["correction/mode"] = "beam"
+        with patched_main_window_runtime(settings):
+            window = MainWindow()
+            try:
+                self.assertEqual(window.calibration_panel.correction_mode(), "beam")
+
+                window.calibration_panel.set_correction_mode("camera")
+                window._on_correction_mode_changed(
+                    window.calibration_panel.correction_mode_combo.currentIndex()
+                )
+
+                self.assertEqual(settings.values["correction/mode"], "camera")
+            finally:
+                window.close()
+
     def test_auto_correction_timeout_starts_without_confirmation(self):
         get_qapp()
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -978,6 +999,7 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                 window = MainWindow()
                 try:
                     window._on_new_calibration_ready(calibration)
+                    window.calibration_panel.set_correction_mode("beam")
                     window.calibration_panel.auto_correction_checkbox.setChecked(True)
 
                     with patch(
@@ -990,6 +1012,7 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                     self.assertTrue(thread.started)
                     self.assertIs(thread.calibration, window._calibration)
                     self.assertEqual(thread.calibration_path, path)
+                    self.assertEqual(thread.correction_mode, "beam")
                     self.assertTrue(
                         window.calibration_panel.auto_correction_checkbox.isEnabled()
                     )
@@ -1213,12 +1236,14 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                         "merlin_track_position.interface.main_window.QtWidgets.QMessageBox.warning",
                         return_value=QtWidgets.QMessageBox.StandardButton.Ok,
                     ):
+                        window.calibration_panel.set_correction_mode("beam")
                         window._on_correct_sample_clicked()
 
                     thread = window._correction_thread
                     self.assertTrue(thread.started)
                     self.assertIs(thread.calibration, window._calibration)
                     self.assertEqual(thread.calibration_path, path)
+                    self.assertEqual(thread.correction_mode, "beam")
                     self.assertIsNotNone(thread.camera_pair)
                     self.assertIn(
                         "Correction in progress",
@@ -1312,6 +1337,7 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                 try:
                     window._server.motor_backend = motor_backend
                     window._on_new_calibration_ready(calibration)
+                    window.calibration_panel.set_correction_mode("beam")
 
                     window._on_move_detected(7)
 
@@ -1320,6 +1346,7 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                     self.assertIs(thread.calibration, window._calibration)
                     self.assertEqual(thread.calibration_path, path)
                     self.assertIs(thread.motor_backend, motor_backend)
+                    self.assertEqual(thread.correction_mode, "beam")
                     self.assertIsNotNone(thread.camera_pair)
                     self.assertEqual(window._server.result_calls, [])
                     self.assertTrue(window._server_correction_pending)
