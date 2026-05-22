@@ -235,7 +235,7 @@ def _correction_move_residuals(
 def _correction_status_residual(result: xr.Dataset) -> tuple[float, str, str]:
     if result.attrs.get("correction_mode") == "beam":
         name = "iteration_correction_criterion_residual"
-        label = "normalized beam residual"
+        label = "normalized beam/analyzer residual"
         suffix = ""
     else:
         name = "iteration_weighted_residual_px"
