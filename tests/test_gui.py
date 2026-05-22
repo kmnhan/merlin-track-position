@@ -5,6 +5,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
+import h5py
 import numpy as np
 import xarray as xr
 
@@ -33,6 +34,7 @@ from merlin_track_position.interface.registration_settings import (  # noqa: E40
 )
 from merlin_track_position.interface.shift_monitor_window import (  # noqa: E402
     SIDE_PANEL_MAX_WIDTH,
+    SHIFT_MONITOR_EXPORT_FORMAT,
     ShiftMonitorWindow,
 )
 from merlin_track_position.tracking.calibration_core import (  # noqa: E402
@@ -491,6 +493,19 @@ class ShiftMonitorWindowTests(unittest.TestCase):
             finally:
                 window.close()
 
+    def test_monitor_plot_x_axes_are_linked(self):
+        get_qapp()
+        with patched_shift_monitor_worker():
+            window = ShiftMonitorWindow(FakeSettings())
+            try:
+                first_plot = window.plots[("cam0", "du_px")]
+                for key, plot in window.plots.items():
+                    if key == ("cam0", "du_px"):
+                        continue
+                    self.assertIs(plot.vb.linkedView(0), first_plot.vb)
+            finally:
+                window.close()
+
     def test_first_live_frame_becomes_reference_per_camera(self):
         get_qapp()
         settings = FakeSettings()
@@ -645,8 +660,14 @@ class ShiftMonitorWindowTests(unittest.TestCase):
 
                 window.save_button.click()
 
-                self.assertEqual(settings.values[REGISTRATION_CLIP_LOW_SETTINGS_KEY], 10.0)
-                self.assertEqual(settings.values[REGISTRATION_CLIP_HIGH_SETTINGS_KEY], 90.0)
+                self.assertEqual(
+                    settings.values[REGISTRATION_CLIP_LOW_SETTINGS_KEY],
+                    10.0,
+                )
+                self.assertEqual(
+                    settings.values[REGISTRATION_CLIP_HIGH_SETTINGS_KEY],
+                    90.0,
+                )
                 self.assertEqual(
                     settings.values[REGISTRATION_NORMALIZATION_SETTINGS_KEY],
                     "none",
@@ -661,6 +682,77 @@ class ShiftMonitorWindowTests(unittest.TestCase):
                     ],
                     (10.0, 90.0),
                 )
+            finally:
+                window.close()
+
+    def test_export_writes_hdf5_plot_history(self):
+        get_qapp()
+        with tempfile.TemporaryDirectory() as tmpdir, patched_shift_monitor_worker():
+            path = Path(tmpdir) / "shift_monitor.h5"
+            window = ShiftMonitorWindow(FakeSettings())
+            try:
+                window.sample_period_spin.setValue(3.5)
+                window.upsample_spin.setValue(37)
+                window._on_shift_ready(
+                    "cam0",
+                    1.25,
+                    np.asarray([0.25, -0.5]),
+                    "warn",
+                )
+                window._on_shift_ready("cam1", 2.5, np.asarray([1.0, -1.5]), "")
+
+                window.export_history_to_hdf5(path)
+
+                with h5py.File(path, "r") as exported:
+                    self.assertEqual(
+                        exported.attrs["format"],
+                        SHIFT_MONITOR_EXPORT_FORMAT,
+                    )
+                    self.assertEqual(
+                        exported.attrs["reference_source"],
+                        "first_live_frame",
+                    )
+                    self.assertAlmostEqual(exported.attrs["sample_period_s"], 3.5)
+                    self.assertEqual(
+                        exported.attrs["registration_upsample_factor"],
+                        37,
+                    )
+                    np.testing.assert_allclose(
+                        exported["cam0/time_s"][:],
+                        [1.25],
+                    )
+                    np.testing.assert_allclose(
+                        exported["cam0/shift_px"][:],
+                        [[0.25, -0.5]],
+                    )
+                    self.assertEqual(
+                        exported["cam0/pixel_axis"].asstr()[:].tolist(),
+                        ["du_px", "dv_px"],
+                    )
+                    self.assertEqual(
+                        exported["cam0/warnings"].asstr()[:].tolist(),
+                        ["warn"],
+                    )
+                    np.testing.assert_allclose(
+                        exported["cam1/dv_px"][:],
+                        [-1.5],
+                    )
+            finally:
+                window.close()
+
+    def test_export_button_uses_save_dialog(self):
+        get_qapp()
+        with tempfile.TemporaryDirectory() as tmpdir, patched_shift_monitor_worker():
+            path = Path(tmpdir) / "shift_monitor"
+            window = ShiftMonitorWindow(FakeSettings())
+            try:
+                with patch(
+                    "merlin_track_position.interface.shift_monitor_window.QtWidgets.QFileDialog.getSaveFileName",
+                    return_value=(str(path), "HDF5 files (*.h5 *.hdf5)"),
+                ):
+                    window.export_button.click()
+
+                self.assertTrue(path.with_suffix(".h5").exists())
             finally:
                 window.close()
 

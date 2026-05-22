@@ -4,8 +4,11 @@ import logging
 import threading
 import time
 from collections.abc import Mapping
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
+import h5py
 import numpy as np
 import pyqtgraph as pg
 from qtpy import QtCore, QtWidgets
@@ -25,6 +28,7 @@ logger = logging.getLogger("merlin_track_position.interface.shift_monitor_window
 CAMERAS = ("cam0", "cam1")
 DEFAULT_MONITOR_SAMPLE_PERIOD_S = 2.0
 SIDE_PANEL_MAX_WIDTH = 360
+SHIFT_MONITOR_EXPORT_FORMAT = "merlin_track_position.shift_monitor.v1"
 PLOT_CHANNELS = (
     ("cam0", "du_px", "du"),
     ("cam0", "dv_px", "dv"),
@@ -141,9 +145,7 @@ class ShiftMonitorWindow(QtWidgets.QWidget):
         self._calibration_references: dict[str, np.ndarray] = {}
         self._live_references: dict[str, np.ndarray] = {}
         self._last_submit_at: dict[str, float] = {}
-        self._history = {
-            camera: {"t": [], "du_px": [], "dv_px": []} for camera in CAMERAS
-        }
+        self._history = _empty_history()
         self._started_at = time.monotonic()
         self._worker = _ShiftRegistrationThread(self)
         self._worker.sigShiftReady.connect(self._on_shift_ready)
@@ -219,6 +221,10 @@ class ShiftMonitorWindow(QtWidgets.QWidget):
         controls_layout.addWidget(self.save_button, 9, 0)
         controls_layout.addWidget(self.reset_button, 9, 1)
 
+        self.export_button = QtWidgets.QPushButton("Export HDF5")
+        self.export_button.setObjectName("shift_monitor_export_button")
+        controls_layout.addWidget(self.export_button, 10, 0, 1, 2)
+
         self.live_checkbox = QtWidgets.QCheckBox("Live")
         self.live_checkbox.setObjectName("shift_monitor_live_checkbox")
         self.live_checkbox.setChecked(True)
@@ -250,11 +256,16 @@ class ShiftMonitorWindow(QtWidgets.QWidget):
 
         self.plots: dict[tuple[str, str], pg.PlotItem] = {}
         self.curves: dict[tuple[str, str], pg.PlotDataItem] = {}
+        linked_x_plot: pg.PlotItem | None = None
         for row, camera in enumerate(CAMERAS):
             for col, (axis_key, axis_label) in enumerate(
                 (("du_px", "du"), ("dv_px", "dv"))
             ):
                 plot = self.graphics_layout.addPlot(row=row, col=col)
+                if linked_x_plot is None:
+                    linked_x_plot = plot
+                else:
+                    plot.setXLink(linked_x_plot)
                 plot.setTitle(f"{camera} {axis_label}")
                 plot.setLabel(
                     "bottom",
@@ -323,6 +334,7 @@ class ShiftMonitorWindow(QtWidgets.QWidget):
 
         self.save_button.clicked.connect(self._on_save_clicked)
         self.reset_button.clicked.connect(self.reset_history)
+        self.export_button.clicked.connect(self._on_export_clicked)
 
     def _set_controls_from_config(self, config: Mapping[str, Any]) -> None:
         normalized = normalized_registration_config(config)
@@ -399,9 +411,7 @@ class ShiftMonitorWindow(QtWidgets.QWidget):
         self._started_at = time.monotonic()
         self._live_references.clear()
         self._last_submit_at.clear()
-        self._history = {
-            camera: {"t": [], "du_px": [], "dv_px": []} for camera in CAMERAS
-        }
+        self._history = _empty_history()
         for camera in CAMERAS:
             for axis_key in ("du_px", "dv_px"):
                 self.curves[(camera, axis_key)].setData([], [])
@@ -477,6 +487,7 @@ class ShiftMonitorWindow(QtWidgets.QWidget):
         history["t"].append(float(elapsed_s))
         history["du_px"].append(float(shift_array[0]))
         history["dv_px"].append(float(shift_array[1]))
+        history["warnings"].append(str(warnings))
         for axis_key in ("du_px", "dv_px"):
             self.curves[(camera, axis_key)].setData(
                 history["t"],
@@ -491,6 +502,82 @@ class ShiftMonitorWindow(QtWidgets.QWidget):
     @QtCore.Slot(str, str)
     def _on_shift_failed(self, camera: str, error_message: str) -> None:
         self.warning_label.setText(f"{camera}: {error_message}")
+
+    @QtCore.Slot()
+    def _on_export_clicked(self) -> None:
+        default_name = (
+            "shift_monitor_"
+            f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.h5"
+        )
+        file_name, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Export shift monitor",
+            str(Path.home() / default_name),
+            "HDF5 files (*.h5 *.hdf5);;All files (*)",
+        )
+        if not file_name:
+            return
+
+        path = Path(file_name).expanduser()
+        if path.suffix == "":
+            path = path.with_suffix(".h5")
+        try:
+            self.export_history_to_hdf5(path)
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Could not export shift monitor",
+                str(exc),
+            )
+            return
+        self.warning_label.setText(f"Exported {path.name}.")
+
+    def export_history_to_hdf5(self, path: str | Path) -> None:
+        path = Path(path).expanduser()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        string_dtype = h5py.string_dtype(encoding="utf-8")
+        config = normalized_registration_config(self._config)
+        with h5py.File(path, "w") as file:
+            file.attrs["format"] = SHIFT_MONITOR_EXPORT_FORMAT
+            file.attrs["created_at_utc"] = datetime.now(UTC).isoformat()
+            file.attrs["reference_source"] = (
+                "calibration" if self._calibration is not None else "first_live_frame"
+            )
+            file.attrs["sample_period_s"] = float(self.sample_period_spin.value())
+            file.attrs["live_enabled"] = bool(self.live_checkbox.isChecked())
+            for key, value in config.items():
+                file.attrs[f"registration_{key}"] = value
+
+            pixel_axis = np.asarray(["du_px", "dv_px"], dtype=object)
+            for camera in CAMERAS:
+                history = self._history[camera]
+                time_s = np.asarray(history["t"], dtype=np.float64)
+                du_px = np.asarray(history["du_px"], dtype=np.float64)
+                dv_px = np.asarray(history["dv_px"], dtype=np.float64)
+                shift_px = (
+                    np.column_stack((du_px, dv_px))
+                    if time_s.size
+                    else np.empty((0, 2), dtype=np.float64)
+                )
+                group = file.create_group(camera)
+                group.attrs["reference_ready"] = (
+                    camera in self._calibration_references
+                    or camera in self._live_references
+                )
+                group.create_dataset("time_s", data=time_s)
+                group.create_dataset("du_px", data=du_px)
+                group.create_dataset("dv_px", data=dv_px)
+                group.create_dataset("shift_px", data=shift_px)
+                group.create_dataset(
+                    "pixel_axis",
+                    data=pixel_axis,
+                    dtype=string_dtype,
+                )
+                group.create_dataset(
+                    "warnings",
+                    data=np.asarray(history["warnings"], dtype=object),
+                    dtype=string_dtype,
+                )
 
     def _update_reference_label(self) -> None:
         if self._calibration is not None:
@@ -536,3 +623,10 @@ def _format_stat(value: float) -> str:
     if not np.isfinite(value):
         return "nan"
     return f"{value:.4g}"
+
+
+def _empty_history() -> dict[str, dict[str, list]]:
+    return {
+        camera: {"t": [], "du_px": [], "dv_px": [], "warnings": []}
+        for camera in CAMERAS
+    }
