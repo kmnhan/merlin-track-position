@@ -23,6 +23,7 @@ __all__ = ("ShiftMonitorWindow",)
 logger = logging.getLogger("merlin_track_position.interface.shift_monitor_window")
 
 CAMERAS = ("cam0", "cam1")
+DEFAULT_MONITOR_SAMPLE_PERIOD_S = 2.0
 PLOT_CHANNELS = (
     ("cam0", "du_px", "du"),
     ("cam0", "dv_px", "dv"),
@@ -138,6 +139,7 @@ class ShiftMonitorWindow(QtWidgets.QWidget):
         self._calibration: Any | None = None
         self._calibration_references: dict[str, np.ndarray] = {}
         self._live_references: dict[str, np.ndarray] = {}
+        self._last_submit_at: dict[str, float] = {}
         self._history = {
             camera: {"t": [], "du_px": [], "dv_px": []} for camera in CAMERAS
         }
@@ -209,6 +211,21 @@ class ShiftMonitorWindow(QtWidgets.QWidget):
         self.reset_button.setObjectName("shift_monitor_reset_button")
         controls_layout.addWidget(self.save_button, 2, 4)
         controls_layout.addWidget(self.reset_button, 2, 5)
+
+        self.live_checkbox = QtWidgets.QCheckBox("Live")
+        self.live_checkbox.setObjectName("shift_monitor_live_checkbox")
+        self.live_checkbox.setChecked(True)
+        controls_layout.addWidget(self.live_checkbox, 3, 0)
+
+        self.sample_period_spin = QtWidgets.QDoubleSpinBox()
+        self.sample_period_spin.setObjectName("shift_monitor_sample_period_spin")
+        self.sample_period_spin.setRange(0.2, 60.0)
+        self.sample_period_spin.setDecimals(2)
+        self.sample_period_spin.setSingleStep(0.5)
+        self.sample_period_spin.setSuffix(" s")
+        self.sample_period_spin.setValue(DEFAULT_MONITOR_SAMPLE_PERIOD_S)
+        controls_layout.addWidget(QtWidgets.QLabel("Monitor period"), 3, 1)
+        controls_layout.addWidget(self.sample_period_spin, 3, 2)
         controls_layout.setColumnStretch(6, 1)
         layout.addWidget(controls_group)
 
@@ -358,6 +375,7 @@ class ShiftMonitorWindow(QtWidgets.QWidget):
         self._worker.clear_pending()
         self._started_at = time.monotonic()
         self._live_references.clear()
+        self._last_submit_at.clear()
         self._history = {
             camera: {"t": [], "du_px": [], "dv_px": []} for camera in CAMERAS
         }
@@ -371,6 +389,8 @@ class ShiftMonitorWindow(QtWidgets.QWidget):
     def submit_frame(self, camera: str, image: Any) -> None:
         if camera not in CAMERAS:
             return
+        if not self.live_checkbox.isChecked():
+            return
         try:
             reference, current = self._reference_and_current_image(camera, image)
         except Exception as exc:
@@ -380,7 +400,16 @@ class ShiftMonitorWindow(QtWidgets.QWidget):
         if reference is None or current is None:
             return
 
-        elapsed_s = time.monotonic() - self._started_at
+        now = time.monotonic()
+        last_submit_at = self._last_submit_at.get(camera)
+        if (
+            last_submit_at is not None
+            and now - last_submit_at < self.sample_period_spin.value()
+        ):
+            return
+
+        elapsed_s = now - self._started_at
+        self._last_submit_at[camera] = now
         self._worker.submit(camera, reference, current, self._config, elapsed_s)
 
     def _reference_and_current_image(

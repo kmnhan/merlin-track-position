@@ -491,6 +491,54 @@ class ShiftMonitorWindowTests(unittest.TestCase):
             finally:
                 window.close()
 
+    def test_monitor_throttles_registration_submissions_by_camera(self):
+        get_qapp()
+        first = np.arange(4 * 5, dtype=float).reshape(4, 5)
+        second = first + 1.0
+        third = first + 2.0
+        fourth = first + 3.0
+
+        with (
+            patched_shift_monitor_worker(),
+            patch(
+                "merlin_track_position.interface.shift_monitor_window.time.monotonic",
+                side_effect=[100.0, 101.0, 101.5, 103.2],
+            ),
+        ):
+            window = ShiftMonitorWindow(FakeSettings())
+            try:
+                window.submit_frame("cam0", first)
+                window.submit_frame("cam0", second)
+                window.submit_frame("cam0", third)
+                window.submit_frame("cam0", fourth)
+
+                self.assertEqual(len(window._worker.submissions), 2)
+                np.testing.assert_array_equal(
+                    window._worker.submissions[0][2],
+                    second,
+                )
+                np.testing.assert_array_equal(
+                    window._worker.submissions[1][2],
+                    fourth,
+                )
+            finally:
+                window.close()
+
+    def test_monitor_live_checkbox_pauses_submissions(self):
+        get_qapp()
+        first = np.arange(4 * 5, dtype=float).reshape(4, 5)
+
+        with patched_shift_monitor_worker():
+            window = ShiftMonitorWindow(FakeSettings())
+            try:
+                window.live_checkbox.setChecked(False)
+                window.submit_frame("cam0", first)
+
+                self.assertEqual(window._worker.submissions, [])
+                self.assertEqual(window._live_references, {})
+            finally:
+                window.close()
+
     def test_calibration_reference_is_roi_matched_to_live_frame(self):
         get_qapp()
         settings = FakeSettings()
