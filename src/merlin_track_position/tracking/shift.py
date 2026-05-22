@@ -46,13 +46,16 @@ def estimate_shift(
     current: Any,
     *,
     clip_percentiles: tuple[float, float] | None = (1.0, 99.0),
-    use_window: bool = True,
+    use_window: bool = False,
     upsample_factor: int = 50,
     normalization: str | None = None,
     check_tiles: bool = True,
     high_error_threshold: float = 0.5,
 ) -> xr.Dataset:
-    """Estimate subpixel translation between two grayscale images."""
+    """Estimate subpixel translation between two grayscale images.
+
+    Pass ``use_window=True`` to apply a Hanning taper before registration.
+    """
 
     reference_image = np.asarray(reference, dtype=np.float64)
     current_image = np.asarray(current, dtype=np.float64)

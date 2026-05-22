@@ -1,4 +1,5 @@
 import unittest
+from inspect import signature
 
 import numpy as np
 from scipy import ndimage
@@ -15,6 +16,9 @@ def textured_image(seed=1, shape=(192, 224)):
 
 
 class ShiftTests(unittest.TestCase):
+    def test_hanning_window_is_disabled_by_default(self):
+        self.assertIs(signature(estimate_shift).parameters["use_window"].default, False)
+
     def test_integer_shift(self):
         reference = textured_image()
         current = ndimage.shift(reference, shift=(7, -11), order=3, mode="wrap")
