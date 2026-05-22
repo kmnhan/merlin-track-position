@@ -19,7 +19,10 @@ class ShiftTests(unittest.TestCase):
     def test_optional_registration_checks_are_disabled_by_default(self):
         parameters = signature(estimate_shift).parameters
 
+        self.assertEqual(parameters["clip_percentiles"].default, (1.0, 99.0))
         self.assertIs(parameters["use_window"].default, False)
+        self.assertEqual(parameters["upsample_factor"].default, 50)
+        self.assertEqual(parameters["normalization"].default, "phase")
         self.assertIs(parameters["check_tiles"].default, False)
 
     def test_integer_shift(self):
@@ -39,6 +42,14 @@ class ShiftTests(unittest.TestCase):
         result = estimate_shift(reference, current, check_tiles=False)
 
         np.testing.assert_allclose(result["shift_px"].values, [6.25, -4.4], atol=0.25)
+
+    def test_default_phase_registration_does_not_emit_high_error_warning(self):
+        reference = textured_image(seed=5)
+        current = ndimage.shift(reference, shift=(0.4, -0.6), order=3, mode="wrap")
+
+        result = estimate_shift(reference, current, check_tiles=False)
+
+        self.assertNotIn("high registration error", result.attrs["warnings"])
 
     def test_brightness_and_noise_robustness(self):
         reference = textured_image(seed=3)

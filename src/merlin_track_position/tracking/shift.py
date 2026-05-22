@@ -48,12 +48,14 @@ def estimate_shift(
     clip_percentiles: tuple[float, float] | None = (1.0, 99.0),
     use_window: bool = False,
     upsample_factor: int = 50,
-    normalization: str | None = None,
+    normalization: str | None = "phase",
     check_tiles: bool = False,
     high_error_threshold: float = 0.5,
 ) -> xr.Dataset:
     """Estimate subpixel translation between two grayscale images.
 
+    By default, images are percentile-clipped, normalized, and registered with
+    phase correlation at 50x subpixel upsampling.
     Pass ``use_window=True`` to apply a Hanning taper before registration.
     Pass ``check_tiles=True`` to compare local tile shifts against the full-frame
     estimate.
@@ -124,7 +126,7 @@ def estimate_shift(
         diagnostic_warnings.append(
             "registration error is not finite; shift estimate is unreliable"
         )
-    elif registration_error > high_error_threshold:
+    elif normalization != "phase" and registration_error > high_error_threshold:
         diagnostic_warnings.append(
             f"high registration error: {registration_error:.3g} > {high_error_threshold:.3g}"
         )
@@ -135,6 +137,7 @@ def estimate_shift(
             current_norm,
             shift_px,
             use_window=use_window,
+            upsample_factor=upsample_factor,
             normalization=normalization,
         )
         if tile_warning is not None:
@@ -196,6 +199,7 @@ def _tile_consistency(
     full_shift_px: np.ndarray,
     *,
     use_window: bool,
+    upsample_factor: int,
     normalization: str | None,
 ) -> str | None:
     height, width = reference_norm.shape
@@ -220,7 +224,7 @@ def _tile_consistency(
                 reference_tile,
                 current_tile,
                 use_window=use_window,
-                upsample_factor=20,
+                upsample_factor=upsample_factor,
                 normalization=normalization,
             )
             if np.isfinite(tile_shift).all() and registration_error <= 0.75:
