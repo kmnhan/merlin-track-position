@@ -104,15 +104,27 @@ class _BaslerCameraSession:
         self._latest_image: npt.NDArray | None = None
 
     def get_image(self, timeout_ms: int = 5000) -> npt.NDArray:
+        return self.get_images(1, timeout_ms=timeout_ms)[0]
+
+    def get_images(
+        self,
+        frame_count: int,
+        timeout_ms: int = 5000,
+    ) -> npt.NDArray:
+        frame_count = _validate_frame_count(frame_count)
         with self._lock:
             camera = self._ensure_camera()
             try:
-                image = self._retrieve_image(camera, timeout_ms)
+                images = [
+                    self._retrieve_image(camera, timeout_ms)
+                    for _frame_index in range(frame_count)
+                ]
             except Exception:
                 self.close()
                 raise
-            self._latest_image = image
-            return image
+            stack = np.stack(images, axis=0)
+            self._latest_image = stack[-1].copy()
+            return stack
 
     def close(self) -> None:
         with self._lock:
@@ -171,6 +183,10 @@ def _grab_single_image(timeout_ms: int = 5000):
     return _SESSION.get_image(timeout_ms)
 
 
+def _grab_image_stack(frame_count: int, timeout_ms: int = 5000):
+    return _SESSION.get_images(frame_count, timeout_ms)
+
+
 def get_basler_image() -> npt.NDArray:
     """Return the latest image from camera 1."""
     if not constants.IS_DAQ_PC:
@@ -184,6 +200,32 @@ def get_basler_image() -> npt.NDArray:
             "or the camera AOI configuration."
         )
     return np.asarray(image).copy()
+
+
+def get_basler_image_stack(frame_count: int) -> npt.NDArray:
+    """Return consecutive images from camera 1."""
+    frame_count = _validate_frame_count(frame_count)
+    if not constants.IS_DAQ_PC:
+        return np.stack(
+            [simulator.get_basler_image() for _ in range(frame_count)],
+            axis=0,
+        )
+    images = _grab_image_stack(frame_count)
+    expected_shape = (constants.IMAGE_HEIGHT_CAM1, constants.IMAGE_WIDTH_CAM1)
+    if images.shape[1:] != expected_shape:
+        raise RuntimeError(
+            f"Basler image shape {images.shape[1:]} does not match constants "
+            f"{expected_shape}; update IMAGE_HEIGHT_CAM1/IMAGE_WIDTH_CAM1 "
+            "or the camera AOI configuration."
+        )
+    return np.asarray(images).copy()
+
+
+def _validate_frame_count(frame_count: int) -> int:
+    value = int(frame_count)
+    if value < 1:
+        raise ValueError("frame_count must be >= 1")
+    return value
 
 
 atexit.register(close_basler_camera)

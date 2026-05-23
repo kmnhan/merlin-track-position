@@ -145,7 +145,6 @@ def run_calibration(
             ),
             dtype=np.float64,
         )
-        time.sleep(0.5)
         after_stacks, after_display_stacks = capture_image_and_display_stacks(
             camera_pair,
             capture_count,

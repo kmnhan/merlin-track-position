@@ -6,20 +6,75 @@ from unittest.mock import patch
 import numpy as np
 
 from merlin_track_position import constants
-from merlin_track_position.instruments import basler, simulated_hardware
-from merlin_track_position.instruments.basler import get_basler_image
+from merlin_track_position.instruments import basler, framegrab as framegrab_module
+from merlin_track_position.instruments import simulated_hardware
+from merlin_track_position.instruments.basler import (
+    get_basler_image,
+    get_basler_image_stack,
+)
 from merlin_track_position.instruments.cameras import (
+    BaslerCameraPlugin,
     CallableCameraPlugin,
     CameraPairPlugin,
+    FramegrabberCameraPlugin,
     capture_image_and_display_stacks,
     capture_image_stack,
     crop_image_to_roi,
     default_camera_pair,
 )
-from merlin_track_position.instruments.framegrab import get_framegrabber_image
+from merlin_track_position.instruments.framegrab import (
+    get_framegrabber_image,
+    get_framegrabber_image_stack,
+)
 from merlin_track_position.instruments.motors import move_motors_and_wait
 from merlin_track_position.instruments.simulated_hardware import simulator
 from merlin_track_position.tracking.shift import estimate_shift
+
+
+def framegrabber_message(raw, dt_ms):
+    topic = "framegrabber/main "
+    metadata = json.dumps(
+        {"dtype": str(raw.dtype), "shape": list(raw.shape), "dt": str(int(dt_ms))}
+    ).encode("utf-8")
+    return topic.encode("utf-8") + metadata + b"\n" + raw.tobytes()
+
+
+class FakeFramegrabberSocket:
+    def __init__(self, messages):
+        self.messages = list(messages)
+        self.recv_count = 0
+        self.receive_timeouts = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        del exc_type, exc, traceback
+
+    def setsockopt(self, option, value):
+        if option == framegrab_module.zmq.RCVTIMEO:
+            self.receive_timeouts.append(value)
+
+    def setsockopt_string(self, *args):
+        del args
+
+    def connect(self, address):
+        del address
+
+    def recv(self):
+        self.recv_count += 1
+        if self.messages:
+            return self.messages.pop(0)
+        raise framegrab_module.zmq.Again()
+
+
+class FakeFramegrabberContext:
+    def __init__(self, socket):
+        self._socket = socket
+
+    def socket(self, socket_type):
+        del socket_type
+        return self._socket
 
 
 class FakeNode:
@@ -186,49 +241,122 @@ class DevelopmentModeFramegrabTests(unittest.TestCase):
 
     def test_daq_mode_framegrabber_image_preserves_source_dtype(self):
         raw = np.arange(4 * 5, dtype=np.uint16).reshape(4, 5)
-        topic = "framegrabber/main "
-        metadata = json.dumps(
-            {"dtype": str(raw.dtype), "shape": list(raw.shape)}
-        ).encode("utf-8")
-        message = topic.encode("utf-8") + metadata + b"\n" + raw.tobytes()
-
-        class FakeSocket:
-            def __enter__(self):
-                return self
-
-            def __exit__(self, exc_type, exc, traceback):
-                del exc_type, exc, traceback
-
-            def setsockopt(self, *args):
-                del args
-
-            def setsockopt_string(self, *args):
-                del args
-
-            def connect(self, address):
-                del address
-
-            def recv(self):
-                return message
-
-        class FakeContext:
-            def socket(self, socket_type):
-                del socket_type
-                return FakeSocket()
+        message = framegrabber_message(
+            raw,
+            framegrab_module.LABVIEW_UNIX_EPOCH_OFFSET_MS + 1,
+        )
+        socket = FakeFramegrabberSocket([message])
 
         with (
             patch.object(constants, "IS_DAQ_PC", True),
             patch.object(constants, "IMAGE_HEIGHT_CAM0", 3),
             patch.object(constants, "IMAGE_WIDTH_CAM0", 4),
             patch(
+                "merlin_track_position.instruments.framegrab.time.time_ns",
+                return_value=0,
+            ),
+            patch(
                 "merlin_track_position.instruments.framegrab.zmq.Context.instance",
-                return_value=FakeContext(),
+                return_value=FakeFramegrabberContext(socket),
             ),
         ):
             image = get_framegrabber_image()
 
         np.testing.assert_array_equal(image, raw[:3, :4])
         self.assertEqual(image.dtype, np.uint16)
+        self.assertEqual(socket.recv_count, 1)
+
+    def test_daq_mode_framegrabber_discards_frames_not_later_than_request(self):
+        stale = np.zeros((3, 4), dtype=np.uint16)
+        fresh = stale + 7
+        request_start_ms = framegrab_module.LABVIEW_UNIX_EPOCH_OFFSET_MS + 1000
+        socket = FakeFramegrabberSocket(
+            [
+                framegrabber_message(stale, request_start_ms - 1),
+                framegrabber_message(stale + 1, request_start_ms),
+                framegrabber_message(fresh, request_start_ms + 1),
+            ]
+        )
+
+        with (
+            patch.object(constants, "IS_DAQ_PC", True),
+            patch.object(constants, "IMAGE_HEIGHT_CAM0", 3),
+            patch.object(constants, "IMAGE_WIDTH_CAM0", 4),
+            patch(
+                "merlin_track_position.instruments.framegrab.time.time_ns",
+                return_value=1_000_000_000,
+            ),
+            patch(
+                "merlin_track_position.instruments.framegrab.zmq.Context.instance",
+                return_value=FakeFramegrabberContext(socket),
+            ),
+        ):
+            image = get_framegrabber_image()
+
+        np.testing.assert_array_equal(image, fresh)
+        self.assertEqual(socket.recv_count, 3)
+
+    def test_daq_mode_framegrabber_stack_uses_one_request_threshold(self):
+        stale = np.zeros((3, 4), dtype=np.uint16)
+        fresh0 = stale + 7
+        duplicate_timestamp = stale + 8
+        fresh1 = stale + 9
+        request_start_ms = framegrab_module.LABVIEW_UNIX_EPOCH_OFFSET_MS + 1000
+        socket = FakeFramegrabberSocket(
+            [
+                framegrabber_message(stale, request_start_ms),
+                framegrabber_message(fresh0, request_start_ms + 1),
+                framegrabber_message(duplicate_timestamp, request_start_ms + 1),
+                framegrabber_message(fresh1, request_start_ms + 2),
+            ]
+        )
+
+        with (
+            patch.object(constants, "IS_DAQ_PC", True),
+            patch.object(constants, "IMAGE_HEIGHT_CAM0", 3),
+            patch.object(constants, "IMAGE_WIDTH_CAM0", 4),
+            patch(
+                "merlin_track_position.instruments.framegrab.time.time_ns",
+                return_value=1_000_000_000,
+            ) as time_ns,
+            patch(
+                "merlin_track_position.instruments.framegrab.zmq.Context.instance",
+                return_value=FakeFramegrabberContext(socket),
+            ),
+        ):
+            stack = get_framegrabber_image_stack(2)
+
+        time_ns.assert_called_once()
+        self.assertEqual(socket.recv_count, 4)
+        np.testing.assert_array_equal(stack, np.stack([fresh0, fresh1]))
+
+    def test_daq_mode_framegrabber_times_out_when_only_stale_frames_arrive(self):
+        raw = np.zeros((3, 4), dtype=np.uint16)
+        request_start_ms = framegrab_module.LABVIEW_UNIX_EPOCH_OFFSET_MS + 1000
+        socket = FakeFramegrabberSocket(
+            [
+                framegrabber_message(raw, request_start_ms - 1),
+                framegrabber_message(raw + 1, request_start_ms),
+            ]
+        )
+
+        with (
+            patch.object(constants, "IS_DAQ_PC", True),
+            patch.object(constants, "IMAGE_HEIGHT_CAM0", 3),
+            patch.object(constants, "IMAGE_WIDTH_CAM0", 4),
+            patch(
+                "merlin_track_position.instruments.framegrab.time.time_ns",
+                return_value=1_000_000_000,
+            ),
+            patch(
+                "merlin_track_position.instruments.framegrab.zmq.Context.instance",
+                return_value=FakeFramegrabberContext(socket),
+            ),
+        ):
+            with self.assertRaisesRegex(TimeoutError, "No fresh frame received"):
+                get_framegrabber_image()
+
+        self.assertEqual(socket.recv_count, 3)
 
     def test_basler_configuration_sets_manual_exposure_and_expected_aoi(self):
         camera = FakeBaslerCamera()
@@ -286,6 +414,29 @@ class DevelopmentModeFramegrabTests(unittest.TestCase):
         np.testing.assert_array_equal(image1, raw1)
         self.assertEqual(image0.dtype, np.uint16)
         self.assertEqual(image1.dtype, np.uint16)
+        self.assertEqual(camera.open_count, 1)
+        self.assertEqual(camera.start_grabbing_count, 1)
+        self.assertEqual(camera.retrieve_result_count, 2)
+        self.assertEqual(camera.close_count, 0)
+
+    def test_daq_mode_basler_image_stack_reuses_open_camera(self):
+        raw0 = np.arange(6, dtype=np.uint16).reshape(2, 3)
+        raw1 = raw0 + 10
+        camera = FakeBaslerCamera([raw0, raw1])
+
+        with (
+            patch.object(constants, "IS_DAQ_PC", True),
+            patch.object(constants, "IMAGE_HEIGHT_CAM1", 2),
+            patch.object(constants, "IMAGE_WIDTH_CAM1", 3),
+            patch(
+                "merlin_track_position.instruments.basler.genicam.IsWritable",
+                lambda node: node.writable,
+            ),
+            patch.object(basler, "_get_camera_by_serial_number", return_value=camera),
+        ):
+            stack = get_basler_image_stack(2)
+
+        np.testing.assert_array_equal(stack, np.stack([raw0, raw1]))
         self.assertEqual(camera.open_count, 1)
         self.assertEqual(camera.start_grabbing_count, 1)
         self.assertEqual(camera.retrieve_result_count, 2)
@@ -424,7 +575,43 @@ class DevelopmentModeFramegrabTests(unittest.TestCase):
         with self.assertRaisesRegex(TimeoutError, "cam0"):
             capture_image_stack(camera_pair, 2)
         self.assertEqual(capture_count["cam0"], 2)
-        self.assertEqual(capture_count["cam1"], 1)
+        self.assertEqual(capture_count["cam1"], 0)
+
+    def test_hardware_camera_plugins_capture_stacks_once_per_camera(self):
+        stack_cam0 = np.stack(
+            [
+                np.zeros((2, 3), dtype=np.uint16),
+                np.zeros((2, 3), dtype=np.uint16),
+            ]
+        )
+        stack_cam1 = np.stack(
+            [
+                np.ones((3, 4), dtype=np.uint16),
+                np.ones((3, 4), dtype=np.uint16) + 1,
+            ]
+        )
+        camera_pair = CameraPairPlugin(
+            FramegrabberCameraPlugin(),
+            BaslerCameraPlugin(),
+        )
+        with (
+            patch(
+                "merlin_track_position.instruments.cameras.get_framegrabber_image_stack",
+                return_value=stack_cam0,
+            ) as get_cam0_stack,
+            patch(
+                "merlin_track_position.instruments.cameras.get_basler_image_stack",
+                return_value=stack_cam1,
+            ) as get_cam1_stack,
+            patch("merlin_track_position.instruments.cameras.time.sleep") as sleep,
+        ):
+            captured_cam0, captured_cam1 = capture_image_stack(camera_pair, 2)
+
+        get_cam0_stack.assert_called_once_with(2, timeout_ms=10000)
+        get_cam1_stack.assert_called_once_with(2)
+        sleep.assert_not_called()
+        np.testing.assert_array_equal(captured_cam0, stack_cam0)
+        np.testing.assert_array_equal(captured_cam1, stack_cam1)
 
     def test_capture_image_stack_works_with_cropped_camera_callables(self):
         stale_cam0 = np.arange(4 * 5).reshape(4, 5)

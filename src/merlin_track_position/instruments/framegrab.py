@@ -1,6 +1,7 @@
 """Access images from the FrameGrabber LabVIEW panel."""
 
 import json
+import time
 
 import numpy as np
 import numpy.typing as npt
@@ -9,18 +10,40 @@ import zmq
 from merlin_track_position import constants
 from merlin_track_position.instruments.simulated_hardware import simulator
 
+LABVIEW_UNIX_EPOCH_OFFSET_MS = 2_082_844_800_000
+
 
 def get_framegrabber_image(timeout_ms: int = 5000) -> npt.NDArray:
-    """Request the latest image from the FrameGrabber LabVIEW panel.
+    """Request one fresh image from the FrameGrabber LabVIEW panel."""
+
+    return get_framegrabber_image_stack(1, timeout_ms=timeout_ms)[0]
+
+
+def get_framegrabber_image_stack(
+    frame_count: int,
+    timeout_ms: int = 5000,
+) -> npt.NDArray:
+    """Request consecutive fresh images from the FrameGrabber LabVIEW panel.
 
     Parameters
     ----------
+    frame_count
+        Number of images to capture after the shared request-start timestamp.
     timeout_ms
         Maximum time set to the zmq RCVTIMEO option, to wait for a response before
         raising TimeoutError.
     """
+    frame_count = _validate_frame_count(frame_count)
     if not constants.IS_DAQ_PC:
-        return simulator.get_framegrabber_image()
+        return np.stack(
+            [simulator.get_framegrabber_image() for _ in range(frame_count)],
+            axis=0,
+        )
+
+    request_start_labview_ms = (
+        time.time_ns() // 1_000_000 + LABVIEW_UNIX_EPOCH_OFFSET_MS
+    )
+    deadline = time.monotonic() + timeout_ms / 1000.0
 
     # This topic prefix is used by the LabVIEW panel (FrameGrabbber FSM UI2.vi) to
     # filter messages, so it must match the one used there.
@@ -29,22 +52,43 @@ def get_framegrabber_image(timeout_ms: int = 5000) -> npt.NDArray:
 
     with zmq.Context.instance().socket(zmq.SUB) as sock:
         sock.setsockopt(zmq.LINGER, 0)
-        sock.setsockopt(zmq.RCVTIMEO, timeout_ms)
         sock.setsockopt_string(zmq.SUBSCRIBE, topic)
         sock.connect(f"tcp://127.0.0.1:{constants.FRAMEGRAB_SERVER_PORT}")
-        try:
-            msg = sock.recv()
-        except zmq.Again as exc:
-            raise TimeoutError(f"No frame received within {timeout_ms} ms") from exc
+        frames: list[npt.NDArray] = []
+        last_accepted_dt = request_start_labview_ms
+        while len(frames) < frame_count:
+            remaining_s = deadline - time.monotonic()
+            if remaining_s <= 0.0:
+                raise TimeoutError(f"No fresh frame received within {timeout_ms} ms")
+            sock.setsockopt(zmq.RCVTIMEO, max(1, int(remaining_s * 1000)))
+            try:
+                msg = sock.recv()
+            except zmq.Again as exc:
+                raise TimeoutError(
+                    f"No fresh frame received within {timeout_ms} ms"
+                ) from exc
 
-    payload = msg[len(prefix) :]
-    meta_b, data = payload.split(b"\n", 1)
-    meta = json.loads(meta_b.decode("utf-8"))
+            payload = msg[len(prefix) :]
+            meta_b, data = payload.split(b"\n", 1)
+            meta = json.loads(meta_b.decode("utf-8"))
+            frame_dt = int(meta["dt"])
+            if frame_dt <= last_accepted_dt:
+                continue
 
-    return (
-        np.frombuffer(data, dtype=np.dtype(meta["dtype"]))
-        .reshape(tuple(meta["shape"]))[
-            : constants.IMAGE_HEIGHT_CAM0, : constants.IMAGE_WIDTH_CAM0
-        ]
-        .copy()
-    )
+            frames.append(
+                np.frombuffer(data, dtype=np.dtype(meta["dtype"]))
+                .reshape(tuple(meta["shape"]))[
+                    : constants.IMAGE_HEIGHT_CAM0, : constants.IMAGE_WIDTH_CAM0
+                ]
+                .copy()
+            )
+            last_accepted_dt = frame_dt
+
+    return np.stack(frames, axis=0)
+
+
+def _validate_frame_count(frame_count: int) -> int:
+    value = int(frame_count)
+    if value < 1:
+        raise ValueError("frame_count must be >= 1")
+    return value

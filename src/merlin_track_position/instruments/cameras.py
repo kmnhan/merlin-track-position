@@ -13,9 +13,14 @@ from typing import Any
 import numpy as np
 import numpy.typing as npt
 
-from merlin_track_position import constants
-from merlin_track_position.instruments.basler import get_basler_image
-from merlin_track_position.instruments.framegrab import get_framegrabber_image
+from merlin_track_position.instruments.basler import (
+    get_basler_image,
+    get_basler_image_stack,
+)
+from merlin_track_position.instruments.framegrab import (
+    get_framegrabber_image,
+    get_framegrabber_image_stack,
+)
 
 RoiGeometry = tuple[float, float, float, float]
 _NO_FRAME = object()
@@ -74,6 +79,16 @@ class CameraPlugin(ABC):
                 )
             time.sleep(self.fresh_frame_poll_interval_s)
 
+    def capture_stack(self, frame_count: int) -> tuple[npt.NDArray, npt.NDArray]:
+        """Return processing and display stacks for consecutive captures."""
+        frame_count = normalize_capture_count(frame_count)
+        images = []
+        display_images = []
+        for _frame_index in range(frame_count):
+            images.append(np.asarray(self.capture()))
+            display_images.append(np.asarray(self.display_image()))
+        return np.stack(images, axis=0), np.stack(display_images, axis=0)
+
     @abstractmethod
     def _capture_once(self) -> npt.NDArray:
         """Return one image from the underlying camera source."""
@@ -114,10 +129,16 @@ class FramegrabberCameraPlugin(CameraPlugin):
     def _capture_once(self) -> npt.NDArray:
         return get_framegrabber_image()
 
-    def _frame_key(self, image: npt.NDArray) -> Any:
-        if constants.IS_DAQ_PC:
-            return _ImageContentKey(image)
-        return super()._frame_key(image)
+    def capture_stack(self, frame_count: int) -> tuple[npt.NDArray, npt.NDArray]:
+        frame_count = normalize_capture_count(frame_count)
+        timeout_ms = max(1, int(self.fresh_frame_timeout_s * 1000.0 * frame_count))
+        stack = np.asarray(
+            get_framegrabber_image_stack(frame_count, timeout_ms=timeout_ms)
+        )
+        self._capture_serial += frame_count
+        self._last_frame_key = self._capture_serial
+        self._last_image = stack[-1].copy()
+        return stack, stack.copy()
 
 
 class BaslerCameraPlugin(CameraPlugin):
@@ -138,6 +159,14 @@ class BaslerCameraPlugin(CameraPlugin):
 
     def _capture_once(self) -> npt.NDArray:
         return get_basler_image()
+
+    def capture_stack(self, frame_count: int) -> tuple[npt.NDArray, npt.NDArray]:
+        frame_count = normalize_capture_count(frame_count)
+        stack = np.asarray(get_basler_image_stack(frame_count))
+        self._capture_serial += frame_count
+        self._last_frame_key = self._capture_serial
+        self._last_image = stack[-1].copy()
+        return stack, stack.copy()
 
 
 class CallableCameraPlugin(CameraPlugin):
@@ -187,6 +216,15 @@ class CroppedCameraPlugin(CameraPlugin):
 
     def _capture_once(self) -> npt.NDArray:
         return crop_image_to_roi(self._camera.capture(), self._roi_geometry)
+
+    def capture_stack(self, frame_count: int) -> tuple[npt.NDArray, npt.NDArray]:
+        image_stack, display_stack = self._camera.capture_stack(frame_count)
+        cropped_stack = np.stack(
+            [crop_image_to_roi(image, self._roi_geometry) for image in image_stack],
+            axis=0,
+        )
+        self._last_image = cropped_stack[-1].copy()
+        return cropped_stack, display_stack
 
     def display_image(self) -> npt.NDArray:
         return self._camera.display_image()
@@ -255,31 +293,26 @@ def capture_image_and_display_stacks(
     if not camera_plugins:
         raise ValueError("at least one camera plugin is required")
 
-    image_stacks: list[list[npt.NDArray]] = [[] for _ in camera_plugins]
-    display_stacks: list[list[npt.NDArray]] = [[] for _ in camera_plugins]
-    for capture_index in range(capture_count):
-        for camera_index, camera in enumerate(camera_plugins):
-            logger.info(
-                "Capturing camera frame: camera=%s, sample=%d/%d",
-                camera.name,
-                capture_index + 1,
-                capture_count,
-            )
-            image = np.asarray(camera.capture())
-            logger.info(
-                "Captured camera frame: camera=%s, sample=%d/%d, shape=%s",
-                camera.name,
-                capture_index + 1,
-                capture_count,
-                image.shape,
-            )
-            image_stacks[camera_index].append(image)
-            display_stacks[camera_index].append(np.asarray(camera.display_image()))
+    image_stacks: list[npt.NDArray] = []
+    display_stacks: list[npt.NDArray] = []
+    for camera in camera_plugins:
+        logger.info(
+            "Capturing camera stack: camera=%s, frame_count=%d",
+            camera.name,
+            capture_count,
+        )
+        image_stack, display_stack = camera.capture_stack(capture_count)
+        image_stack = np.asarray(image_stack)
+        display_stack = np.asarray(display_stack)
+        logger.info(
+            "Captured camera stack: camera=%s, shape=%s",
+            camera.name,
+            image_stack.shape,
+        )
+        image_stacks.append(image_stack)
+        display_stacks.append(display_stack)
 
-    return (
-        tuple(np.stack(images, axis=0) for images in image_stacks),
-        tuple(np.stack(images, axis=0) for images in display_stacks),
-    )
+    return tuple(image_stacks), tuple(display_stacks)
 
 
 def _camera_plugins_tuple(

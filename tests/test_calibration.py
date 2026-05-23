@@ -554,7 +554,7 @@ class VisualCalibrationTests(unittest.TestCase):
                     "merlin_track_position.tracking.calibrate.move_motors_and_wait",
                     side_effect=lambda _axes, goals: tuple(goals),
                 ),
-                patch("merlin_track_position.tracking.calibrate.time.sleep"),
+                patch("merlin_track_position.tracking.calibrate.time.sleep") as sleep,
                 patch(
                     "merlin_track_position.tracking.calibrate.fit_jacobian_calibration",
                     side_effect=fake_fit_jacobian_calibration,
@@ -570,12 +570,57 @@ class VisualCalibrationTests(unittest.TestCase):
                 )
 
         self.assertEqual(len(fit_calls), 1)
+        sleep.assert_not_called()
         np.testing.assert_array_equal(calibration["reference_cam0"].values, full_cam0)
         np.testing.assert_array_equal(calibration["reference_cam1"].values, full_cam1)
         self.assertEqual(calibration["reference_cam0"].shape, full_cam0.shape)
         self.assertEqual(calibration["reference_cam1"].shape, full_cam1.shape)
         self.assertEqual(calibration.attrs["roi_cam0_width"], 3.0)
         self.assertEqual(calibration.attrs["roi_cam1_height"], 3.0)
+
+    def test_run_calibration_keeps_camera_switch_sleep(self):
+        image_cam0 = np.arange(4 * 5, dtype=np.uint16).reshape(4, 5)
+        image_cam1 = np.arange(6 * 7, dtype=np.uint16).reshape(6, 7)
+        camera_pair = CameraPairPlugin(
+            CallableCameraPlugin("cam0", lambda: image_cam0),
+            CallableCameraPlugin("cam1", lambda: image_cam1),
+        )
+
+        def fake_get_positions(aliases):
+            aliases = tuple(aliases)
+            if aliases == ("x", "y", "z", "p", "t", "cam"):
+                return (0.0, 0.0, 0.0, 0.0, 0.0, 4.0)
+            return tuple(0.0 for _alias in aliases)
+
+        def fake_fit_jacobian_calibration(**kwargs):
+            return calibration_dataset().assign_attrs(kwargs["additional_context"])
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_path = Path(tmpdir) / "calibration.h5"
+            with (
+                patch(
+                    "merlin_track_position.tracking.calibrate.get_positions",
+                    side_effect=fake_get_positions,
+                ),
+                patch(
+                    "merlin_track_position.tracking.calibrate.move_motors_and_wait",
+                    side_effect=lambda _axes, goals: tuple(goals),
+                ),
+                patch("merlin_track_position.tracking.calibrate.time.sleep") as sleep,
+                patch(
+                    "merlin_track_position.tracking.calibrate.fit_jacobian_calibration",
+                    side_effect=fake_fit_jacobian_calibration,
+                ),
+            ):
+                run_calibration(
+                    camera_pair,
+                    output_path=output_path,
+                    n=2,
+                    step_um=10.0,
+                    capture_count=1,
+                )
+
+        sleep.assert_called_once_with(4.0)
 
     def test_fitted_px_per_cmd_mm_matches_synthetic_response(self):
         command_delta = probe_deltas()
@@ -2330,7 +2375,16 @@ class CorrectionTests(unittest.TestCase):
                 [shift_dataset(x_shift(10.0)), shift_dataset(np.zeros((2, 2)))],
                 positions=(10.0, 20.0, 30.0),
             )
-            raw_delta_mm = np.array([0.0002, 0.000099, -0.00005], dtype=float)
+            deadband_um = constants.DEFAULT_CORRECTION_MOVE_DELTA_DEADBAND_UM
+            active_delta_mm = (deadband_um + 0.1) / 1000.0
+            raw_delta_mm = np.array(
+                [
+                    active_delta_mm,
+                    (deadband_um / 2.0) / 1000.0,
+                    -(deadband_um / 3.0) / 1000.0,
+                ],
+                dtype=float,
+            )
             with (
                 hardware_patches[0],
                 hardware_patches[1],
@@ -2341,7 +2395,7 @@ class CorrectionTests(unittest.TestCase):
                 ),
                 patch(
                     "merlin_track_position.tracking.correct.move_motors_and_wait",
-                    return_value=(10.0002,),
+                    return_value=(10.0 + active_delta_mm,),
                 ) as move,
                 patch.object(
                     constants,
@@ -2365,17 +2419,17 @@ class CorrectionTests(unittest.TestCase):
         self.assertEqual(move.call_args.args[0], ("x",))
         np.testing.assert_allclose(
             np.asarray(move.call_args.args[1], dtype=float),
-            np.array([10.0002], dtype=float),
+            np.array([10.0 + active_delta_mm], dtype=float),
         )
         np.testing.assert_allclose(
             result["move_command_delta_mm"].values,
-            [[0.0002, 0.0, 0.0]],
+            [[active_delta_mm, 0.0, 0.0]],
         )
         self.assertEqual(
             result["move_active_axis_mask"].values.tolist(),
             [[True, False, False]],
         )
-        self.assertEqual(result.attrs["correction_move_delta_deadband_um"], 0.1)
+        self.assertEqual(result.attrs["correction_move_delta_deadband_um"], deadband_um)
 
     def test_bcs_api_correction_move_uses_motor_backlash_constant(self):
         with tempfile.TemporaryDirectory() as tmpdir:
