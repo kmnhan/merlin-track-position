@@ -205,19 +205,25 @@ class ShiftMonitorWindow(QtWidgets.QWidget):
         self.window_checkbox.setObjectName("shift_monitor_window_checkbox")
         controls_layout.addWidget(self.window_checkbox, 5, 0, 1, 2)
 
+        self.ecc_refinement_checkbox = QtWidgets.QCheckBox("ECC affine refinement")
+        self.ecc_refinement_checkbox.setObjectName(
+            "shift_monitor_ecc_refinement_checkbox"
+        )
+        controls_layout.addWidget(self.ecc_refinement_checkbox, 6, 0, 1, 2)
+
         self.high_error_spin = QtWidgets.QDoubleSpinBox()
         self.high_error_spin.setObjectName("shift_monitor_high_error_spin")
         self.high_error_spin.setRange(0.001, 1000.0)
         self.high_error_spin.setDecimals(3)
         self.high_error_spin.setSingleStep(0.05)
-        controls_layout.addWidget(QtWidgets.QLabel("Error threshold"), 6, 0)
-        controls_layout.addWidget(self.high_error_spin, 6, 1)
+        controls_layout.addWidget(QtWidgets.QLabel("Error threshold"), 7, 0)
+        controls_layout.addWidget(self.high_error_spin, 7, 1)
 
         self.capture_count_spin = QtWidgets.QSpinBox()
         self.capture_count_spin.setObjectName("shift_monitor_capture_count_spin")
         self.capture_count_spin.setRange(1, 100)
-        controls_layout.addWidget(QtWidgets.QLabel("Images"), 7, 0)
-        controls_layout.addWidget(self.capture_count_spin, 7, 1)
+        controls_layout.addWidget(QtWidgets.QLabel("Images"), 8, 0)
+        controls_layout.addWidget(self.capture_count_spin, 8, 1)
 
         self.capture_aggregation_combo = QtWidgets.QComboBox()
         self.capture_aggregation_combo.setObjectName(
@@ -225,24 +231,24 @@ class ShiftMonitorWindow(QtWidgets.QWidget):
         )
         self.capture_aggregation_combo.addItem("Median shifts", "median_shifts")
         self.capture_aggregation_combo.addItem("Mean image", "mean_image")
-        controls_layout.addWidget(QtWidgets.QLabel("Aggregation"), 8, 0)
-        controls_layout.addWidget(self.capture_aggregation_combo, 8, 1)
+        controls_layout.addWidget(QtWidgets.QLabel("Aggregation"), 9, 0)
+        controls_layout.addWidget(self.capture_aggregation_combo, 9, 1)
 
         self.save_button = QtWidgets.QPushButton("Save")
         self.save_button.setObjectName("shift_monitor_save_button")
         self.reset_button = QtWidgets.QPushButton("Reset")
         self.reset_button.setObjectName("shift_monitor_reset_button")
-        controls_layout.addWidget(self.save_button, 11, 0)
-        controls_layout.addWidget(self.reset_button, 11, 1)
+        controls_layout.addWidget(self.save_button, 12, 0)
+        controls_layout.addWidget(self.reset_button, 12, 1)
 
         self.export_button = QtWidgets.QPushButton("Export HDF5")
         self.export_button.setObjectName("shift_monitor_export_button")
-        controls_layout.addWidget(self.export_button, 12, 0, 1, 2)
+        controls_layout.addWidget(self.export_button, 13, 0, 1, 2)
 
         self.live_checkbox = QtWidgets.QCheckBox("Live")
         self.live_checkbox.setObjectName("shift_monitor_live_checkbox")
         self.live_checkbox.setChecked(True)
-        controls_layout.addWidget(self.live_checkbox, 9, 0, 1, 2)
+        controls_layout.addWidget(self.live_checkbox, 10, 0, 1, 2)
 
         self.sample_period_spin = QtWidgets.QDoubleSpinBox()
         self.sample_period_spin.setObjectName("shift_monitor_sample_period_spin")
@@ -251,8 +257,8 @@ class ShiftMonitorWindow(QtWidgets.QWidget):
         self.sample_period_spin.setSingleStep(0.5)
         self.sample_period_spin.setSuffix(" s")
         self.sample_period_spin.setValue(DEFAULT_MONITOR_SAMPLE_PERIOD_S)
-        controls_layout.addWidget(QtWidgets.QLabel("Monitor period"), 10, 0)
-        controls_layout.addWidget(self.sample_period_spin, 10, 1)
+        controls_layout.addWidget(QtWidgets.QLabel("Monitor period"), 11, 0)
+        controls_layout.addWidget(self.sample_period_spin, 11, 1)
         controls_layout.setColumnStretch(1, 1)
         side_layout.addWidget(controls_group)
 
@@ -332,6 +338,7 @@ class ShiftMonitorWindow(QtWidgets.QWidget):
             self.normalization_combo,
             self.upsample_spin,
             self.window_checkbox,
+            self.ecc_refinement_checkbox,
             self.high_error_spin,
             self.capture_count_spin,
             self.capture_aggregation_combo,
@@ -361,6 +368,7 @@ class ShiftMonitorWindow(QtWidgets.QWidget):
             self.normalization_combo,
             self.upsample_spin,
             self.window_checkbox,
+            self.ecc_refinement_checkbox,
             self.high_error_spin,
             self.capture_count_spin,
             self.capture_aggregation_combo,
@@ -374,6 +382,9 @@ class ShiftMonitorWindow(QtWidgets.QWidget):
             self.normalization_combo.setCurrentIndex(max(index, 0))
             self.upsample_spin.setValue(int(normalized["upsample_factor"]))
             self.window_checkbox.setChecked(bool(normalized["use_window"]))
+            self.ecc_refinement_checkbox.setChecked(
+                bool(normalized["use_ecc_refinement"])
+            )
             self.high_error_spin.setValue(float(normalized["high_error_threshold"]))
             self.capture_count_spin.setValue(int(normalized["capture_count"]))
             index = self.capture_aggregation_combo.findData(
@@ -401,6 +412,7 @@ class ShiftMonitorWindow(QtWidgets.QWidget):
                 "normalization": self.normalization_combo.currentData(),
                 "upsample_factor": self.upsample_spin.value(),
                 "use_window": self.window_checkbox.isChecked(),
+                "use_ecc_refinement": self.ecc_refinement_checkbox.isChecked(),
                 "high_error_threshold": self.high_error_spin.value(),
                 "capture_count": self.capture_count_spin.value(),
                 "capture_aggregation": self.capture_aggregation_combo.currentData(),

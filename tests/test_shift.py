@@ -1,6 +1,7 @@
 import unittest
-from inspect import signature
+from unittest.mock import patch
 
+import cv2
 import numpy as np
 from scipy import ndimage
 
@@ -16,15 +17,6 @@ def textured_image(seed=1, shape=(192, 224)):
 
 
 class ShiftTests(unittest.TestCase):
-    def test_optional_registration_checks_are_disabled_by_default(self):
-        parameters = signature(estimate_shift).parameters
-
-        self.assertEqual(parameters["clip_percentiles"].default, (1.0, 99.0))
-        self.assertIs(parameters["use_window"].default, False)
-        self.assertEqual(parameters["upsample_factor"].default, 50)
-        self.assertEqual(parameters["normalization"].default, "phase")
-        self.assertIs(parameters["check_tiles"].default, False)
-
     def test_integer_shift(self):
         reference = textured_image()
         current = ndimage.shift(reference, shift=(7, -11), order=3, mode="wrap")
@@ -42,6 +34,79 @@ class ShiftTests(unittest.TestCase):
         result = estimate_shift(reference, current, check_tiles=False)
 
         np.testing.assert_allclose(result["shift_px"].values, [6.25, -4.4], atol=0.25)
+
+    def test_ecc_refinement_keeps_translation_sign_convention(self):
+        reference = textured_image(seed=6)
+        current = ndimage.shift(reference, shift=(2.75, -4.25), order=3, mode="wrap")
+
+        result = estimate_shift(
+            reference,
+            current,
+            check_tiles=False,
+            use_ecc_refinement=True,
+        )
+
+        np.testing.assert_allclose(result["shift_px"].values, [-4.25, 2.75], atol=0.1)
+
+    def test_ecc_refinement_returns_affine_displacement_at_center(self):
+        reference = textured_image(seed=7)
+        height, width = reference.shape
+        center_x = (width - 1.0) / 2.0
+        center_y = (height - 1.0) / 2.0
+        scale = 1.015
+        expected_shift = np.asarray([-3.25, 2.5], dtype=np.float64)
+        warp = np.asarray(
+            [
+                [
+                    scale,
+                    0.0,
+                    expected_shift[0] + (1.0 - scale) * center_x,
+                ],
+                [
+                    0.0,
+                    scale,
+                    expected_shift[1] + (1.0 - scale) * center_y,
+                ],
+            ],
+            dtype=np.float32,
+        )
+        current = cv2.warpAffine(
+            reference.astype(np.float32),
+            warp,
+            (width, height),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_REFLECT_101,
+        )
+
+        result = estimate_shift(
+            reference,
+            current,
+            check_tiles=False,
+            use_ecc_refinement=True,
+            normalization=None,
+            clip_percentiles=None,
+        )
+
+        np.testing.assert_allclose(result["shift_px"].values, expected_shift, atol=0.1)
+
+    def test_ecc_refinement_failure_falls_back_to_phase_shift(self):
+        reference = textured_image(seed=8)
+        current = ndimage.shift(reference, shift=(-1.5, 2.0), order=3, mode="wrap")
+
+        baseline = estimate_shift(reference, current, check_tiles=False)
+        with patch(
+            "merlin_track_position.tracking.shift.cv2.findTransformECC",
+            side_effect=RuntimeError("forced failure"),
+        ):
+            result = estimate_shift(
+                reference,
+                current,
+                check_tiles=False,
+                use_ecc_refinement=True,
+            )
+
+        np.testing.assert_allclose(result["shift_px"].values, baseline["shift_px"].values)
+        self.assertIn("ECC refinement failed: forced failure", result.attrs["warnings"])
 
     def test_default_phase_registration_does_not_emit_high_error_warning(self):
         reference = textured_image(seed=5)

@@ -5,6 +5,7 @@ from __future__ import annotations
 import warnings
 from typing import Any
 
+import cv2
 import numpy as np
 import xarray as xr
 from skimage.registration import phase_cross_correlation
@@ -51,6 +52,7 @@ def estimate_shift(
     normalization: str | None = "phase",
     check_tiles: bool = False,
     high_error_threshold: float = 0.5,
+    use_ecc_refinement: bool = False,
 ) -> xr.Dataset:
     """Estimate subpixel translation between two grayscale images.
 
@@ -59,6 +61,8 @@ def estimate_shift(
     Pass ``use_window=True`` to apply a Hanning taper before registration.
     Pass ``check_tiles=True`` to compare local tile shifts against the full-frame
     estimate.
+    Pass ``use_ecc_refinement=True`` to refine the phase-correlation result with
+    an affine OpenCV ECC registration and return the center-point displacement.
     """
 
     reference_image = np.asarray(reference, dtype=np.float64)
@@ -131,6 +135,17 @@ def estimate_shift(
             f"high registration error: {registration_error:.3g} > {high_error_threshold:.3g}"
         )
 
+    if use_ecc_refinement and np.isfinite(shift_px).all():
+        try:
+            shift_px = _estimate_ecc_affine_shift(
+                reference_norm,
+                current_norm,
+                shift_px,
+                use_window=use_window,
+            )
+        except Exception as exc:
+            diagnostic_warnings.append(f"ECC refinement failed: {exc}")
+
     if check_tiles and np.isfinite(shift_px).all():
         tile_warning = _tile_consistency(
             reference_norm,
@@ -167,15 +182,11 @@ def _estimate_translation(
     if upsample_factor < 1:
         raise ValueError("upsample_factor must be >= 1")
 
-    reference_work = reference_norm
-    current_work = current_norm
-    if use_window:
-        window = np.outer(
-            np.hanning(reference_norm.shape[0]),
-            np.hanning(reference_norm.shape[1]),
-        )
-        reference_work = reference_work * window
-        current_work = current_work * window
+    reference_work, current_work = _registration_work_images(
+        reference_norm,
+        current_norm,
+        use_window=use_window,
+    )
 
     with warnings.catch_warnings(record=True) as caught_warnings:
         warnings.simplefilter("always", UserWarning)
@@ -191,6 +202,74 @@ def _estimate_translation(
         float(phase_difference),
         tuple(str(item.message) for item in caught_warnings),
     )
+
+
+def _estimate_ecc_affine_shift(
+    reference_norm: np.ndarray,
+    current_norm: np.ndarray,
+    initial_shift_px: np.ndarray,
+    *,
+    use_window: bool,
+) -> np.ndarray:
+    reference_work, current_work = _registration_work_images(
+        reference_norm,
+        current_norm,
+        use_window=use_window,
+    )
+    initial_shift = np.asarray(initial_shift_px, dtype=np.float64)
+    if initial_shift.shape != (2,) or not np.isfinite(initial_shift).all():
+        raise ValueError("initial ECC shift must be a finite 2-vector")
+
+    warp = np.asarray(
+        [
+            [1.0, 0.0, initial_shift[0]],
+            [0.0, 1.0, initial_shift[1]],
+        ],
+        dtype=np.float32,
+    )
+    criteria = (
+        cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT,
+        50,
+        1e-5,
+    )
+    _correlation, refined_warp = cv2.findTransformECC(
+        np.ascontiguousarray(reference_work, dtype=np.float32),
+        np.ascontiguousarray(current_work, dtype=np.float32),
+        warp,
+        cv2.MOTION_AFFINE,
+        criteria,
+        None,
+        5,
+    )
+    refined = np.asarray(refined_warp, dtype=np.float64)
+    if refined.shape != (2, 3) or not np.isfinite(refined).all():
+        raise ValueError("ECC returned a non-finite affine warp")
+
+    height, width = reference_norm.shape
+    center = np.asarray([(width - 1.0) / 2.0, (height - 1.0) / 2.0], dtype=np.float64)
+    mapped_center = refined @ np.asarray([center[0], center[1], 1.0], dtype=np.float64)
+    shift = mapped_center - center
+    if not np.isfinite(shift).all():
+        raise ValueError("ECC returned a non-finite center displacement")
+    return np.asarray(shift, dtype=np.float64)
+
+
+def _registration_work_images(
+    reference_norm: np.ndarray,
+    current_norm: np.ndarray,
+    *,
+    use_window: bool,
+) -> tuple[np.ndarray, np.ndarray]:
+    reference_work = reference_norm
+    current_work = current_norm
+    if use_window:
+        window = np.outer(
+            np.hanning(reference_norm.shape[0]),
+            np.hanning(reference_norm.shape[1]),
+        )
+        reference_work = reference_work * window
+        current_work = current_work * window
+    return reference_work, current_work
 
 
 def _tile_consistency(

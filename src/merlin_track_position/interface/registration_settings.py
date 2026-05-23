@@ -18,6 +18,7 @@ __all__ = (
     "REGISTRATION_NORMALIZATION_SETTINGS_KEY",
     "REGISTRATION_UPSAMPLE_FACTOR_SETTINGS_KEY",
     "REGISTRATION_USE_WINDOW_SETTINGS_KEY",
+    "REGISTRATION_USE_ECC_REFINEMENT_SETTINGS_KEY",
     "REGISTRATION_HIGH_ERROR_THRESHOLD_SETTINGS_KEY",
     "normalized_registration_config",
     "registration_config_from_settings",
@@ -42,6 +43,7 @@ REGISTRATION_CLIP_HIGH_SETTINGS_KEY = "registration/clip_high"
 REGISTRATION_NORMALIZATION_SETTINGS_KEY = "registration/normalization"
 REGISTRATION_UPSAMPLE_FACTOR_SETTINGS_KEY = "registration/upsample_factor"
 REGISTRATION_USE_WINDOW_SETTINGS_KEY = "registration/use_window"
+REGISTRATION_USE_ECC_REFINEMENT_SETTINGS_KEY = "registration/use_ecc_refinement"
 REGISTRATION_HIGH_ERROR_THRESHOLD_SETTINGS_KEY = (
     "registration/high_error_threshold"
 )
@@ -55,6 +57,7 @@ DEFAULT_REGISTRATION_CONFIG: dict[str, object] = {
     "normalization": "phase",
     "upsample_factor": 50,
     "use_window": False,
+    "use_ecc_refinement": False,
     "high_error_threshold": 0.5,
     "capture_count": constants.DEFAULT_CORRECTION_CAPTURE_COUNT,
     "capture_aggregation": CAPTURE_AGGREGATION_MEDIAN_SHIFTS,
@@ -115,6 +118,10 @@ def normalized_registration_config(
             values["use_window"],
             bool(DEFAULT_REGISTRATION_CONFIG["use_window"]),
         ),
+        "use_ecc_refinement": _as_bool(
+            values["use_ecc_refinement"],
+            bool(DEFAULT_REGISTRATION_CONFIG["use_ecc_refinement"]),
+        ),
         "high_error_threshold": float(high_error_threshold),
         "capture_count": int(capture_count),
         "capture_aggregation": _capture_aggregation_value(
@@ -149,6 +156,10 @@ def registration_config_from_settings(settings: Any) -> dict[str, object]:
             "use_window": settings.value(
                 REGISTRATION_USE_WINDOW_SETTINGS_KEY,
                 DEFAULT_REGISTRATION_CONFIG["use_window"],
+            ),
+            "use_ecc_refinement": settings.value(
+                REGISTRATION_USE_ECC_REFINEMENT_SETTINGS_KEY,
+                DEFAULT_REGISTRATION_CONFIG["use_ecc_refinement"],
             ),
             "high_error_threshold": settings.value(
                 REGISTRATION_HIGH_ERROR_THRESHOLD_SETTINGS_KEY,
@@ -186,6 +197,10 @@ def save_registration_config(
         normalized["upsample_factor"],
     )
     settings.setValue(REGISTRATION_USE_WINDOW_SETTINGS_KEY, normalized["use_window"])
+    settings.setValue(
+        REGISTRATION_USE_ECC_REFINEMENT_SETTINGS_KEY,
+        normalized["use_ecc_refinement"],
+    )
     settings.setValue(
         REGISTRATION_HIGH_ERROR_THRESHOLD_SETTINGS_KEY,
         normalized["high_error_threshold"],
@@ -231,6 +246,7 @@ def registration_config_to_shift_kwargs(
         "upsample_factor": normalized["upsample_factor"],
         "normalization": normalization,
         "high_error_threshold": normalized["high_error_threshold"],
+        "use_ecc_refinement": normalized["use_ecc_refinement"],
     }
 
 
