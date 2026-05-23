@@ -7,6 +7,7 @@ import math
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from numbers import Integral
 from typing import Any
 
@@ -293,9 +294,9 @@ def capture_image_and_display_stacks(
     if not camera_plugins:
         raise ValueError("at least one camera plugin is required")
 
-    image_stacks: list[npt.NDArray] = []
-    display_stacks: list[npt.NDArray] = []
-    for camera in camera_plugins:
+    def capture_camera_stack(
+        camera: CameraPlugin,
+    ) -> tuple[npt.NDArray, npt.NDArray]:
         logger.info(
             "Capturing camera stack: camera=%s, frame_count=%d",
             camera.name,
@@ -309,10 +310,17 @@ def capture_image_and_display_stacks(
             camera.name,
             image_stack.shape,
         )
-        image_stacks.append(image_stack)
-        display_stacks.append(display_stack)
+        return image_stack, display_stack
 
-    return tuple(image_stacks), tuple(display_stacks)
+    with ThreadPoolExecutor(max_workers=len(camera_plugins)) as executor:
+        captured_stacks = tuple(
+            executor.map(capture_camera_stack, camera_plugins),
+        )
+
+    return (
+        tuple(image_stack for image_stack, _display_stack in captured_stacks),
+        tuple(display_stack for _image_stack, display_stack in captured_stacks),
+    )
 
 
 def _camera_plugins_tuple(

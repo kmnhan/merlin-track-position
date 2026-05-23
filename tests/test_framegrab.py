@@ -1,4 +1,5 @@
 import json
+import threading
 import unittest
 from importlib import resources
 from unittest.mock import patch
@@ -546,6 +547,29 @@ class DevelopmentModeFramegrabTests(unittest.TestCase):
         np.testing.assert_array_equal(stack_cam0, np.stack([stale_cam0, fresh_cam0]))
         np.testing.assert_array_equal(stack_cam1, np.stack([cam1, cam1 + 2]))
 
+    def test_capture_image_stack_runs_camera_stacks_in_parallel(self):
+        image_cam0 = np.zeros((2, 3), dtype=np.uint16)
+        image_cam1 = np.ones((3, 4), dtype=np.uint16)
+        barrier = threading.Barrier(2, timeout=1.0)
+
+        def capture_cam0():
+            barrier.wait()
+            return image_cam0
+
+        def capture_cam1():
+            barrier.wait()
+            return image_cam1
+
+        camera_pair = CameraPairPlugin(
+            CallableCameraPlugin("cam0", capture_cam0),
+            CallableCameraPlugin("cam1", capture_cam1),
+        )
+
+        stack_cam0, stack_cam1 = capture_image_stack(camera_pair, 1)
+
+        np.testing.assert_array_equal(stack_cam0, image_cam0[np.newaxis, :, :])
+        np.testing.assert_array_equal(stack_cam1, image_cam1[np.newaxis, :, :])
+
     def test_capture_image_stack_rejects_empty_camera_list(self):
         with self.assertRaisesRegex(ValueError, "at least one camera plugin"):
             capture_image_stack((), 1)
@@ -575,7 +599,7 @@ class DevelopmentModeFramegrabTests(unittest.TestCase):
         with self.assertRaisesRegex(TimeoutError, "cam0"):
             capture_image_stack(camera_pair, 2)
         self.assertEqual(capture_count["cam0"], 2)
-        self.assertEqual(capture_count["cam1"], 0)
+        self.assertLessEqual(capture_count["cam1"], 2)
 
     def test_hardware_camera_plugins_capture_stacks_once_per_camera(self):
         stack_cam0 = np.stack(
