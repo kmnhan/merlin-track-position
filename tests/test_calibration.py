@@ -188,7 +188,7 @@ def calibration_dataset(jacobian=None):
             "y_cam1": np.arange(6),
             "x_cam1": np.arange(7),
         },
-        attrs={"warnings": ""},
+        attrs={"warnings": "", "polar": 0.0},
     )
     validate_visual_calibration_dataset(dataset)
     return dataset
@@ -212,10 +212,16 @@ class ShiftDetectionTests(unittest.TestCase):
             calibration = calibration.assign_attrs({"calibration_path": str(path)})
             attrs_before |= {"calibration_path": str(path)}
 
-            with patch(
-                "merlin_track_position.tracking.detect._capture_measurement",
-                return_value=measurement,
-            ) as capture:
+            with (
+                patch(
+                    "merlin_track_position.tracking.detect.get_positions",
+                    return_value=(0.0,),
+                ),
+                patch(
+                    "merlin_track_position.tracking.detect._capture_measurement",
+                    return_value=measurement,
+                ) as capture,
+            ):
                 result = detect_shift(calibration, object(), capture_count=1)
 
             capture.assert_called_once()
@@ -235,8 +241,49 @@ class ShiftDetectionTests(unittest.TestCase):
                 weighted_pixel_residual(measurement),
             )
             self.assertEqual(result.attrs["warnings"], "registration warning")
+            self.assertFalse(result.attrs["detection_polar_rotation_applied"])
             self.assertEqual(dict(calibration.attrs), attrs_before)
             self.assertFalse(correction_history_path(path).exists())
+
+    def test_detect_shift_rotates_estimated_offset_for_current_polar(self):
+        calibration = calibration_dataset()
+        runtime_jacobian = correct_module._rotate_px_per_cmd_mm_for_polar_delta(
+            calibration["px_per_cmd_mm"].values,
+            90.0,
+        )
+        offset_mm = np.asarray([0.0, 0.0, 0.020], dtype=float)
+        shift = measured_from_jacobian(
+            offset_mm.reshape(1, len(COMMAND_AXES)),
+            runtime_jacobian,
+        )[0]
+        measurement = shift_dataset(shift)
+
+        with (
+            patch(
+                "merlin_track_position.tracking.detect.get_positions",
+                return_value=(90.0,),
+            ),
+            patch(
+                "merlin_track_position.tracking.detect._capture_measurement",
+                return_value=measurement,
+            ),
+        ):
+            result = detect_shift(calibration, object(), capture_count=1)
+
+        np.testing.assert_allclose(
+            result["estimated_command_offset_mm"].values,
+            offset_mm,
+            atol=1e-12,
+        )
+        np.testing.assert_allclose(
+            result["detected_shift_um"].values,
+            1000.0 * offset_mm,
+            atol=1e-9,
+        )
+        self.assertTrue(result.attrs["detection_polar_rotation_applied"])
+        self.assertEqual(result.attrs["detection_calibration_polar_deg"], 0.0)
+        self.assertEqual(result.attrs["detection_current_polar_deg"], 90.0)
+        self.assertEqual(result.attrs["detection_polar_applied_delta_deg"], 90.0)
 
     def test_detect_shift_uses_calibration_beam_targets_as_roi_local_ecc_points(self):
         calibration = calibration_dataset().assign_attrs(
@@ -254,9 +301,13 @@ class ShiftDetectionTests(unittest.TestCase):
                 "beam_target_cam1_u": 4.0,
                 "beam_target_cam1_v": 2.0,
             }
-        )
+            )
 
         with (
+            patch(
+                "merlin_track_position.tracking.detect.get_positions",
+                return_value=(0.0,),
+            ),
             patch(
                 "merlin_track_position.tracking.correct.capture_image_stack",
                 return_value=(
@@ -1298,10 +1349,24 @@ class CorrectionTests(unittest.TestCase):
 
     def patch_hardware(self, measurements, *, positions=(10.0, 20.0, 30.0)):
         measurement_iter = iter(measurements)
+
+        if isinstance(positions, dict):
+            position_map = {str(axis): float(value) for axis, value in positions.items()}
+        else:
+            position_values = tuple(float(value) for value in positions)
+            if len(position_values) == len(COMMAND_AXES):
+                position_values = (*position_values, 0.0)
+            if len(position_values) != len(COMMAND_AXES) + 1:
+                raise ValueError("positions must provide x/y/z and optionally p")
+            position_map = dict(zip((*COMMAND_AXES, "p"), position_values, strict=True))
+
+        def fake_get_positions(aliases):
+            return tuple(position_map[str(alias)] for alias in aliases)
+
         return (
             patch(
                 "merlin_track_position.tracking.correct.get_positions",
-                return_value=positions,
+                side_effect=fake_get_positions,
             ),
             patch(
                 "merlin_track_position.tracking.correct.capture_image_stack",
@@ -1314,6 +1379,40 @@ class CorrectionTests(unittest.TestCase):
                 "merlin_track_position.tracking.correct.measure_image_error",
                 side_effect=lambda *args, **kwargs: next(measurement_iter),
             ),
+        )
+
+    def test_polar_rotation_maps_runtime_axes_into_calibration_basis(self):
+        calibration_jacobian = px_per_cmd_mm()
+        rotated = correct_module._rotate_px_per_cmd_mm_for_polar_delta(
+            calibration_jacobian,
+            90.0,
+        )
+        calibration_observation = calibration_jacobian.reshape(
+            len(CAMERAS) * len(PIXEL_AXES),
+            len(COMMAND_AXES),
+        )
+        runtime_observation = rotated.reshape(
+            len(CAMERAS) * len(PIXEL_AXES),
+            len(COMMAND_AXES),
+        )
+        x_index = COMMAND_AXES.index("x")
+        y_index = COMMAND_AXES.index("y")
+        z_index = COMMAND_AXES.index("z")
+
+        np.testing.assert_allclose(
+            runtime_observation[:, z_index],
+            calibration_observation[:, x_index],
+            atol=1e-12,
+        )
+        np.testing.assert_allclose(
+            runtime_observation[:, x_index],
+            -calibration_observation[:, z_index],
+            atol=1e-12,
+        )
+        np.testing.assert_allclose(
+            runtime_observation[:, y_index],
+            calibration_observation[:, y_index],
+            atol=1e-12,
         )
 
     def test_capture_measurement_crops_full_references_and_current_images(self):
@@ -1451,16 +1550,20 @@ class CorrectionTests(unittest.TestCase):
             65.0,
         )
 
-    def test_beam_mode_requires_polar_but_camera_mode_accepts_old_calibration(self):
+    def test_correction_requires_calibration_polar(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            path = self.save_calibration(tmpdir)
+            path = Path(tmpdir) / "calibration.h5"
+            calibration = calibration_dataset()
+            calibration.attrs.pop("polar")
+            save_calibration_dataset(calibration, path)
             hardware_patches = self.patch_hardware([shift_dataset(np.zeros((2, 2)))])
             with (
                 hardware_patches[0],
                 hardware_patches[1],
                 hardware_patches[2],
+                self.assertRaisesRegex(ValueError, "polar"),
             ):
-                result = do_correction(
+                do_correction(
                     path,
                     capture_count=1,
                     correction_mode="camera",
@@ -1468,9 +1571,6 @@ class CorrectionTests(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "polar"):
                 do_correction(path, object(), capture_count=1, correction_mode="beam")
-
-        self.assertTrue(result.attrs["correction_converged"])
-        self.assertEqual(result.attrs["correction_mode"], "camera")
 
     def test_beam_mode_corrects_longitudinal_offset_from_analyzer_view(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1559,6 +1659,39 @@ class CorrectionTests(unittest.TestCase):
             "beam_transverse analyzer_transverse vertical",
         )
         self.assertEqual(result.attrs["correction_analyzer_runtime_xz_angle_deg"], 0.0)
+
+    def test_beam_mode_uses_current_polar_for_runtime_geometry(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "calibration.h5"
+            calibration = calibration_dataset().assign_attrs(polar=0.0)
+            save_calibration_dataset(calibration, path)
+            hardware_patches = self.patch_hardware(
+                [shift_dataset(np.zeros((2, 2)))],
+                positions={"x": 10.0, "y": 20.0, "z": 30.0, "p": 10.0},
+            )
+            with (
+                hardware_patches[0],
+                hardware_patches[1],
+                hardware_patches[2],
+                patch(
+                    "merlin_track_position.tracking.correct.move_motors_and_wait",
+                    Mock(),
+                ) as move,
+            ):
+                result = do_correction(
+                    path,
+                    capture_count=1,
+                    correction_mode="beam",
+                )
+
+        move.assert_not_called()
+        self.assertTrue(result.attrs["correction_converged"])
+        self.assertTrue(result.attrs["correction_polar_rotation_applied"])
+        self.assertEqual(result.attrs["correction_calibration_polar_deg"], 0.0)
+        self.assertEqual(result.attrs["correction_current_polar_deg"], 10.0)
+        self.assertEqual(result.attrs["correction_polar_deg"], 10.0)
+        self.assertEqual(result.attrs["correction_beam_runtime_xz_angle_deg"], 55.0)
+        self.assertEqual(result.attrs["correction_analyzer_runtime_xz_angle_deg"], -10.0)
 
     def test_beam_mode_does_not_move_when_dual_view_residual_is_within_tolerance(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1738,6 +1871,11 @@ class CorrectionTests(unittest.TestCase):
                 events.append(("measure", None))
                 return next(measurements)
 
+            def fake_direct_get_positions(aliases):
+                if tuple(aliases) == ("p",):
+                    return (0.0,)
+                raise AssertionError("direct BCS xyz get should not be used")
+
             with (
                 patch(
                     "merlin_track_position.tracking.correct._local_timestamp_iso",
@@ -1749,7 +1887,7 @@ class CorrectionTests(unittest.TestCase):
                 ),
                 patch(
                     "merlin_track_position.tracking.correct.get_positions",
-                    side_effect=AssertionError("direct BCS get should not be used"),
+                    side_effect=fake_direct_get_positions,
                 ),
                 patch(
                     "merlin_track_position.tracking.correct.move_motors_and_wait",
@@ -1792,11 +1930,101 @@ class CorrectionTests(unittest.TestCase):
             result.attrs["correction_move_finished_at"],
             "2026-01-01T00:00:03-08:00",
         )
-        self.assertEqual(events[0], ("get", tuple(COMMAND_AXES)))
+        self.assertEqual(events[0], ("get", (*COMMAND_AXES, "p")))
+        self.assertEqual(events[1], ("get", tuple(COMMAND_AXES)))
         self.assertEqual(
             [event[0] for event in events],
-            ["get", "measure", "move", "get", "measure", "move", "get", "measure"],
+            [
+                "get",
+                "get",
+                "measure",
+                "move",
+                "get",
+                "measure",
+                "move",
+                "get",
+                "measure",
+            ],
         )
+
+    def test_delegated_correction_falls_back_to_direct_bcs_polar_read(self):
+        class NoPolarMotorBackend:
+            def __init__(self):
+                self.positions = np.array([10.0, 20.0, 30.0], dtype=float)
+                self.moves = []
+
+            def get_positions(self, motor_aliases):
+                aliases = tuple(motor_aliases)
+                if "p" in aliases:
+                    raise ValueError("delegated backend has no polar readback")
+                return tuple(
+                    self.positions[COMMAND_AXES.index(axis)] for axis in aliases
+                )
+
+            def move_motors_and_wait(
+                self,
+                motor_aliases,
+                goals,
+                *,
+                max_retries=4,
+                backlash_correction=None,
+                move_timeout_s=60.0,
+            ):
+                del max_retries, backlash_correction, move_timeout_s
+                self.moves.append((tuple(motor_aliases), tuple(goals)))
+                for axis, goal in zip(motor_aliases, goals, strict=True):
+                    self.positions[COMMAND_AXES.index(axis)] = float(goal)
+                return tuple(goals)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self.save_calibration(tmpdir)
+            calibration = calibration_dataset()
+            runtime_jacobian = correct_module._rotate_px_per_cmd_mm_for_polar_delta(
+                calibration["px_per_cmd_mm"].values,
+                90.0,
+            )
+            offset_mm = np.asarray([0.0, 0.0, 0.020], dtype=float)
+            shift = measured_from_jacobian(
+                offset_mm.reshape(1, len(COMMAND_AXES)),
+                runtime_jacobian,
+            )[0]
+            measurements = iter([shift_dataset(shift), shift_dataset(np.zeros((2, 2)))])
+            backend = NoPolarMotorBackend()
+
+            def fake_direct_get_positions(aliases):
+                if tuple(aliases) == ("p",):
+                    return (90.0,)
+                raise AssertionError("direct BCS xyz get should not be used")
+
+            with (
+                patch(
+                    "merlin_track_position.tracking.correct.get_positions",
+                    side_effect=fake_direct_get_positions,
+                ),
+                patch(
+                    "merlin_track_position.tracking.correct.capture_image_stack",
+                    return_value=(
+                        np.zeros((1, 4, 5), dtype=float),
+                        np.zeros((1, 6, 7), dtype=float),
+                    ),
+                ),
+                patch(
+                    "merlin_track_position.tracking.correct.measure_image_error",
+                    side_effect=lambda *args, **kwargs: next(measurements),
+                ),
+            ):
+                result = do_correction(
+                    path,
+                    capture_count=1,
+                    correction_mode="camera",
+                    max_moves=1,
+                    motor_backend=backend,
+                )
+
+        self.assertEqual(len(backend.moves), 1)
+        self.assertTrue(result.attrs["correction_polar_rotation_applied"])
+        self.assertEqual(result.attrs["correction_current_polar_deg"], 90.0)
+        np.testing.assert_allclose(result["px_per_cmd_mm"].values, runtime_jacobian)
 
     def test_lqr_correction_moves_commanded_mm_through_existing_loop(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1851,6 +2079,112 @@ class CorrectionTests(unittest.TestCase):
             expected_model_residual,
         )
         self.assertIn("correction_lqr_motor_penalty", result.attrs)
+
+    def test_lqr_correction_rotates_jacobian_for_current_polar(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self.save_calibration(tmpdir)
+            calibration = calibration_dataset()
+            runtime_jacobian = correct_module._rotate_px_per_cmd_mm_for_polar_delta(
+                calibration["px_per_cmd_mm"].values,
+                90.0,
+            )
+            runtime_axis_scale, *_ = derive_axis_scale_from_jacobian(
+                runtime_jacobian,
+                calibration["probe_command_delta_mm"].values,
+            )
+            offset_mm = np.asarray([0.0, 0.0, 0.020], dtype=float)
+            shift = measured_from_jacobian(
+                offset_mm.reshape(1, len(COMMAND_AXES)),
+                runtime_jacobian,
+            )[0]
+            expected_delta = solve_lqr_command_correction(
+                runtime_jacobian,
+                shift_dataset(shift),
+                runtime_axis_scale,
+                gain=TEST_CORRECTION_GAIN,
+                image_scale_px=TEST_LQR_IMAGE_SCALE_PX,
+                motor_penalty=TEST_LQR_MOTOR_PENALTY,
+                svd_relative_tolerance=TEST_LQR_SVD_RELATIVE_TOLERANCE,
+                max_normalized_step=TEST_CORRECTION_MAX_NORMALIZED_STEP,
+                weights=TEST_CORRECTION_WEIGHTS,
+            )
+            expected_delta = correct_module._validate_command_correction(expected_delta)
+            hardware_patches = self.patch_hardware(
+                [shift_dataset(shift), shift_dataset(np.zeros((2, 2)))],
+                positions={"x": 10.0, "y": 20.0, "z": 30.0, "p": 90.0},
+            )
+            with (
+                hardware_patches[0],
+                hardware_patches[1],
+                hardware_patches[2],
+                patch(
+                    "merlin_track_position.tracking.correct.move_motors_and_wait",
+                    return_value=(10.0, 20.0, 30.0),
+                ) as move,
+            ):
+                result = do_correction(
+                    path,
+                    capture_count=1,
+                    correction_mode="camera",
+                    max_moves=1,
+                    gain=TEST_CORRECTION_GAIN,
+                    max_normalized_step=TEST_CORRECTION_MAX_NORMALIZED_STEP,
+                    lqr_image_scale_px=TEST_LQR_IMAGE_SCALE_PX,
+                    lqr_motor_penalty=TEST_LQR_MOTOR_PENALTY,
+                    lqr_svd_relative_tolerance=TEST_LQR_SVD_RELATIVE_TOLERANCE,
+                    weights=TEST_CORRECTION_WEIGHTS,
+                )
+
+        active_axes = tuple(move.call_args.args[0])
+        requested = tuple(float(value) for value in move.call_args.args[1])
+        actual_delta = np.zeros(len(COMMAND_AXES), dtype=float)
+        for axis, goal in zip(active_axes, requested, strict=True):
+            index = COMMAND_AXES.index(axis)
+            actual_delta[index] = goal - np.array([10.0, 20.0, 30.0])[index]
+        np.testing.assert_allclose(actual_delta, expected_delta, atol=1e-12)
+        np.testing.assert_allclose(result["px_per_cmd_mm"].values, runtime_jacobian)
+        np.testing.assert_allclose(result["axis_scale_cmd_mm"].values, runtime_axis_scale)
+        self.assertTrue(result.attrs["correction_polar_rotation_applied"])
+        self.assertEqual(result.attrs["correction_calibration_polar_deg"], 0.0)
+        self.assertEqual(result.attrs["correction_current_polar_deg"], 90.0)
+        self.assertEqual(result.attrs["correction_polar_applied_delta_deg"], 90.0)
+
+    def test_lqr_correction_keeps_saved_jacobian_within_polar_deadband(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self.save_calibration(tmpdir)
+            calibration = calibration_dataset()
+            deadband = constants.MOTOR_STALE_READBACK_DEADBAND["p"]
+            hardware_patches = self.patch_hardware(
+                [shift_dataset(np.zeros((2, 2)))],
+                positions={"x": 10.0, "y": 20.0, "z": 30.0, "p": deadband / 2.0},
+            )
+            with (
+                hardware_patches[0],
+                hardware_patches[1],
+                hardware_patches[2],
+                patch(
+                    "merlin_track_position.tracking.correct.move_motors_and_wait",
+                    Mock(),
+                ) as move,
+            ):
+                result = do_correction(
+                    path,
+                    capture_count=1,
+                    correction_mode="camera",
+                )
+
+        move.assert_not_called()
+        np.testing.assert_allclose(
+            result["px_per_cmd_mm"].values,
+            calibration["px_per_cmd_mm"].values,
+        )
+        np.testing.assert_allclose(
+            result["axis_scale_cmd_mm"].values,
+            calibration["axis_scale_cmd_mm"].values,
+        )
+        self.assertFalse(result.attrs["correction_polar_rotation_applied"])
+        self.assertEqual(result.attrs["correction_polar_applied_delta_deg"], 0.0)
+        self.assertEqual(result.attrs["correction_polar_deadband_deg"], deadband)
 
     def test_lqr_convergence_uses_projected_normalized_error(self):
         with tempfile.TemporaryDirectory() as tmpdir:

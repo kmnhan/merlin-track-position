@@ -13,6 +13,7 @@ from merlin_track_position.instruments.cameras import (
     default_camera_pair,
     normalize_capture_count,
 )
+from merlin_track_position.instruments.motors import get_positions
 from merlin_track_position.tracking.calibration_core import (
     CAPTURE_AGGREGATION_MEDIAN_SHIFTS,
     COMMAND_AXES,
@@ -20,7 +21,12 @@ from merlin_track_position.tracking.calibration_core import (
     validate_visual_calibration_dataset,
     weighted_pixel_residual,
 )
-from merlin_track_position.tracking.correct import _capture_measurement
+from merlin_track_position.tracking.correct import (
+    _capture_measurement,
+    _prefixed_polar_attrs,
+    _runtime_px_per_cmd_mm_for_polar,
+    _single_position_value,
+)
 
 __all__ = ("detect_shift",)
 
@@ -45,9 +51,13 @@ def detect_shift(
 
     reference_cam0 = np.asarray(calibration["reference_cam0"].values)
     reference_cam1 = np.asarray(calibration["reference_cam1"].values)
-    jacobian = np.asarray(
-        calibration["px_per_cmd_mm"].values,
-        dtype=np.float64,
+    current_polar_deg = _single_position_value(
+        get_positions(("p",)),
+        "current polar readback",
+    )
+    jacobian, polar_attrs = _runtime_px_per_cmd_mm_for_polar(
+        calibration,
+        current_polar_deg,
     )
     logger.info("Detecting shift without motor correction.")
     measurement = _capture_measurement(
@@ -70,22 +80,26 @@ def detect_shift(
         estimated_offset_mm.tolist(),
         weighted_residual_px,
     )
-    return measurement.assign(
-        {
-            "estimated_command_offset_mm": (
-                ("command_axis",),
-                estimated_offset_mm,
-                {"units": "commanded-mm"},
-            ),
-            "detected_shift_um": (
-                ("command_axis",),
-                1000.0 * estimated_offset_mm,
-                {"units": "um"},
-            ),
-            "weighted_residual_px": (
-                (),
-                float(weighted_residual_px),
-                {"units": "px"},
-            ),
-        }
-    ).assign_coords(command_axis=list(COMMAND_AXES))
+    return (
+        measurement.assign(
+            {
+                "estimated_command_offset_mm": (
+                    ("command_axis",),
+                    estimated_offset_mm,
+                    {"units": "commanded-mm"},
+                ),
+                "detected_shift_um": (
+                    ("command_axis",),
+                    1000.0 * estimated_offset_mm,
+                    {"units": "um"},
+                ),
+                "weighted_residual_px": (
+                    (),
+                    float(weighted_residual_px),
+                    {"units": "px"},
+                ),
+            }
+        )
+        .assign_coords(command_axis=list(COMMAND_AXES))
+        .assign_attrs(_prefixed_polar_attrs("detection", polar_attrs))
+    )

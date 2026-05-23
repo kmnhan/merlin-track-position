@@ -24,6 +24,7 @@ from merlin_track_position.tracking.calibration_core import (
     COMMAND_AXES,
     PIXEL_AXES,
     compute_lqr_correction_design,
+    derive_axis_scale_from_jacobian,
     estimate_command_offset,
     initialize_lqr_kalman_state,
     load_calibration_dataset,
@@ -199,6 +200,24 @@ def do_correction(
         raise ValueError("min_command_norm_mm must be finite and non-negative")
     if max_moves < 0:
         raise ValueError("max_moves must be >= 0")
+    logger.info("Reading initial commanded x/y/z and polar positions.")
+    commanded_position_mm, current_polar_deg = (
+        _read_initial_commanded_position_and_polar_deg(motor_backend)
+    )
+    logger.info("Initial commanded positions: %s", commanded_position_mm.tolist())
+    jacobian, polar_attrs = _runtime_px_per_cmd_mm_for_polar(
+        calibration,
+        current_polar_deg,
+    )
+    logger.info(
+        "Correction polar geometry: calibration=%g deg, current=%g deg, "
+        "delta=%g deg, deadband=%g deg, rotation_applied=%s",
+        polar_attrs["calibration_polar_deg"],
+        polar_attrs["current_polar_deg"],
+        polar_attrs["polar_delta_deg"],
+        polar_attrs["polar_deadband_deg"],
+        polar_attrs["polar_rotation_applied"],
+    )
     beam_transverse_tolerance_mm = _positive_um_to_mm(
         beam_transverse_tolerance_um,
         "beam_transverse_tolerance_um",
@@ -229,10 +248,11 @@ def do_correction(
     reference_cam0 = np.asarray(calibration["reference_cam0"].values)
     reference_cam1 = np.asarray(calibration["reference_cam1"].values)
     axis_scale = np.asarray(calibration["axis_scale_cmd_mm"].values, dtype=np.float64)
-    jacobian = np.asarray(
-        calibration["px_per_cmd_mm"].values,
-        dtype=np.float64,
-    )
+    if polar_attrs["polar_rotation_applied"]:
+        axis_scale, *_ = derive_axis_scale_from_jacobian(
+            jacobian,
+            np.asarray(calibration["probe_command_delta_mm"].values, dtype=np.float64),
+        )
     beam_geometry: dict[str, np.ndarray | float] | None = None
     beam_lqr_weights: np.ndarray | None = None
     lqr_image_scale: float | np.ndarray = lqr_image_scale_px
@@ -241,6 +261,7 @@ def do_correction(
         beam_geometry = _beam_geometry_from_calibration(
             calibration,
             beam_xz_angle_from_analyzer_deg=beam_xz_angle_from_analyzer_deg,
+            polar_deg=float(polar_attrs["current_polar_deg"]),
         )
         beam_lqr_weights = np.asarray(
             [
@@ -279,14 +300,6 @@ def do_correction(
         current_gain,
         max_moves,
     )
-    logger.info("Reading initial commanded x/y/z positions.")
-    commanded_position_mm = np.asarray(
-        motor_backend.get_positions(COMMAND_AXES),
-        dtype=np.float64,
-    )
-    if commanded_position_mm.shape != (len(COMMAND_AXES),):
-        raise ValueError("initial command position readback must have x/y/z values")
-    logger.info("Initial commanded positions: %s", commanded_position_mm.tolist())
     initial_commanded_position_mm = commanded_position_mm.copy()
     correction_log_path = correction_history_path(resolved_path)
     correction_run_id = _next_correction_history_run_id(correction_log_path)
@@ -472,6 +485,7 @@ def do_correction(
             correction_criterion=correction_criterion,
             correction_mode=correction_mode,
             beam_xz_angle_from_analyzer_deg=beam_xz_angle_from_analyzer_deg,
+            polar_attrs=polar_attrs,
             beam_polar_deg=(
                 None
                 if beam_geometry is None
@@ -1695,17 +1709,155 @@ def _positive_um_to_mm(value: float, name: str) -> float:
     return value_um / 1000.0
 
 
+def _calibration_polar_deg(calibration: xr.Dataset) -> float:
+    if "polar" not in calibration.attrs:
+        raise ValueError("correction requires calibration attr 'polar'")
+    polar_deg = float(calibration.attrs["polar"])
+    if not np.isfinite(polar_deg):
+        raise ValueError("correction requires finite calibration attr 'polar'")
+    return polar_deg
+
+
+def _read_initial_commanded_position_and_polar_deg(
+    motor_backend: CorrectionMotorBackend,
+) -> tuple[np.ndarray, float]:
+    aliases = (*COMMAND_AXES, "p")
+    try:
+        values = _position_values(
+            motor_backend.get_positions(aliases),
+            len(COMMAND_AXES) + 1,
+            "initial x/y/z/p readback",
+        )
+        return values[: len(COMMAND_AXES)].copy(), float(values[-1])
+    except Exception as exc:
+        if isinstance(motor_backend, DirectBCSMotorBackend):
+            raise
+        logger.info(
+            "Motor backend did not provide combined x/y/z/p readback (%s); "
+            "falling back to delegated x/y/z plus direct BCS polar read.",
+            exc,
+        )
+    commanded_position_mm = _position_values(
+        motor_backend.get_positions(COMMAND_AXES),
+        len(COMMAND_AXES),
+        "initial command position readback",
+    )
+    current_polar_deg = _single_position_value(
+        get_positions(("p",)),
+        "current polar readback",
+    )
+    return commanded_position_mm, current_polar_deg
+
+
+def _position_values(values: Sequence[float], count: int, name: str) -> np.ndarray:
+    array = np.asarray(values, dtype=np.float64)
+    if array.shape != (count,):
+        raise ValueError(f"{name} must contain exactly {count} value(s)")
+    if not np.isfinite(array).all():
+        raise ValueError(f"{name} must contain only finite values")
+    return array
+
+
+def _single_position_value(values: Sequence[float], name: str) -> float:
+    return float(_position_values(values, 1, name)[0])
+
+
+def _polar_deadband_deg() -> float:
+    deadband = float(constants.MOTOR_STALE_READBACK_DEADBAND["p"])
+    if not np.isfinite(deadband) or deadband < 0.0:
+        raise ValueError("polar deadband must be finite and non-negative")
+    return deadband
+
+
+def _runtime_px_per_cmd_mm_for_polar(
+    calibration: xr.Dataset,
+    current_polar_deg: float,
+) -> tuple[np.ndarray, dict[str, float | bool]]:
+    polar_attrs = _runtime_polar_attrs(calibration, current_polar_deg)
+    jacobian = np.asarray(calibration["px_per_cmd_mm"].values, dtype=np.float64)
+    if polar_attrs["polar_rotation_applied"]:
+        jacobian = _rotate_px_per_cmd_mm_for_polar_delta(
+            jacobian,
+            float(polar_attrs["polar_applied_delta_deg"]),
+        )
+    return jacobian, polar_attrs
+
+
+def _runtime_polar_attrs(
+    calibration: xr.Dataset,
+    current_polar_deg: float,
+) -> dict[str, float | bool]:
+    calibration_polar_deg = _calibration_polar_deg(calibration)
+    current_polar_deg = float(current_polar_deg)
+    if not np.isfinite(current_polar_deg):
+        raise ValueError("current polar readback must be finite")
+    polar_deadband_deg = _polar_deadband_deg()
+    polar_delta_deg = current_polar_deg - calibration_polar_deg
+    polar_rotation_applied = bool(abs(polar_delta_deg) > polar_deadband_deg)
+    return {
+        "calibration_polar_deg": float(calibration_polar_deg),
+        "current_polar_deg": float(current_polar_deg),
+        "polar_delta_deg": float(polar_delta_deg),
+        "polar_applied_delta_deg": float(
+            polar_delta_deg if polar_rotation_applied else 0.0
+        ),
+        "polar_deadband_deg": float(polar_deadband_deg),
+        "polar_rotation_applied": polar_rotation_applied,
+    }
+
+
+def _prefixed_polar_attrs(
+    prefix: str,
+    polar_attrs: Mapping[str, float | bool],
+) -> dict[str, float | bool]:
+    return {f"{prefix}_{key}": value for key, value in polar_attrs.items()}
+
+
+def _rotate_px_per_cmd_mm_for_polar_delta(
+    px_per_cmd_mm: np.ndarray,
+    polar_delta_deg: float,
+) -> np.ndarray:
+    jacobian = np.asarray(px_per_cmd_mm, dtype=np.float64)
+    if jacobian.shape != (len(CAMERAS), len(PIXEL_AXES), len(COMMAND_AXES)):
+        raise ValueError(
+            "px_per_cmd_mm must have shape (camera, pixel_axis, command_axis)"
+        )
+    if not np.isfinite(jacobian).all():
+        raise ValueError("px_per_cmd_mm must contain only finite values")
+    delta_deg = float(polar_delta_deg)
+    if not np.isfinite(delta_deg):
+        raise ValueError("polar_delta_deg must be finite")
+
+    delta_rad = np.deg2rad(delta_deg)
+    cosine = float(np.cos(delta_rad))
+    sine = float(np.sin(delta_rad))
+    rotation = np.asarray(
+        [
+            [cosine, 0.0, sine],
+            [0.0, 1.0, 0.0],
+            [-sine, 0.0, cosine],
+        ],
+        dtype=np.float64,
+    )
+    return (
+        jacobian.reshape(len(CAMERAS) * len(PIXEL_AXES), len(COMMAND_AXES))
+        @ rotation
+    ).reshape(len(CAMERAS), len(PIXEL_AXES), len(COMMAND_AXES))
+
+
 def _beam_geometry_from_calibration(
     calibration: xr.Dataset,
     *,
     beam_xz_angle_from_analyzer_deg: float,
+    polar_deg: float | None = None,
 ) -> dict[str, np.ndarray | float]:
-    if "polar" not in calibration.attrs:
-        raise ValueError("beam correction requires calibration attr 'polar'")
-    polar_deg = float(calibration.attrs["polar"])
+    if polar_deg is None:
+        polar_deg = _calibration_polar_deg(calibration)
+    else:
+        polar_deg = float(polar_deg)
     beam_angle_deg = float(beam_xz_angle_from_analyzer_deg)
     if not np.isfinite(polar_deg):
-        raise ValueError("beam correction requires finite calibration attr 'polar'")
+        raise ValueError("beam correction requires finite polar angle")
     if not np.isfinite(beam_angle_deg):
         raise ValueError("beam_xz_angle_from_analyzer_deg must be finite")
     beam_runtime_angle_deg = beam_angle_deg - polar_deg
@@ -2002,6 +2154,7 @@ def _build_correction_result(
     correction_criterion: str,
     correction_mode: str,
     beam_xz_angle_from_analyzer_deg: float,
+    polar_attrs: Mapping[str, float | bool],
     beam_polar_deg: float | None,
     beam_runtime_xz_angle_deg: float | None,
     analyzer_runtime_xz_angle_deg: float | None,
@@ -2234,6 +2387,7 @@ def _build_correction_result(
         "correction_mode": correction_mode,
         "correction_criterion": correction_criterion,
         "correction_tolerance": float(correction_tolerance),
+        **_prefixed_polar_attrs("correction", polar_attrs),
         "correction_gain": float(gain),
         "correction_final_gain": float(current_gain),
         "correction_max_normalized_step": max_normalized_attr,
