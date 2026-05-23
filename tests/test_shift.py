@@ -48,7 +48,7 @@ class ShiftTests(unittest.TestCase):
 
         np.testing.assert_allclose(result["shift_px"].values, [-4.25, 2.75], atol=0.1)
 
-    def test_ecc_refinement_returns_affine_displacement_at_center(self):
+    def test_ecc_refinement_returns_homography_displacement_at_center(self):
         reference = textured_image(seed=7)
         height, width = reference.shape
         center_x = (width - 1.0) / 2.0
@@ -89,7 +89,7 @@ class ShiftTests(unittest.TestCase):
 
         np.testing.assert_allclose(result["shift_px"].values, expected_shift, atol=0.1)
 
-    def test_ecc_refinement_returns_affine_displacement_at_reference_point(self):
+    def test_ecc_refinement_returns_homography_displacement_at_reference_point(self):
         reference = textured_image(seed=9)
         height, width = reference.shape
         center_x = (width - 1.0) / 2.0
@@ -132,6 +132,65 @@ class ShiftTests(unittest.TestCase):
         )
 
         np.testing.assert_allclose(result["shift_px"].values, expected_shift, atol=0.1)
+
+    def test_ecc_refinement_uses_homography_motion_model(self):
+        reference = textured_image(seed=10)
+        point = np.asarray([76.25, 88.5], dtype=np.float64)
+        homography = np.asarray(
+            [
+                [1.01, 0.015, -2.0],
+                [-0.01, 0.995, 3.0],
+                [1.0e-4, -2.0e-4, 1.0],
+            ],
+            dtype=np.float32,
+        )
+        mapped_homogeneous = homography.astype(np.float64) @ np.r_[point, 1.0]
+        expected_shift = mapped_homogeneous[:2] / mapped_homogeneous[2] - point
+
+        with patch(
+            "merlin_track_position.tracking.shift.cv2.findTransformECC",
+            return_value=(1.0, homography),
+        ) as find_ecc:
+            result = estimate_shift(
+                reference,
+                reference.copy(),
+                check_tiles=False,
+                use_ecc_refinement=True,
+                ecc_reference_point_px=point,
+            )
+
+        self.assertEqual(find_ecc.call_args.args[3], cv2.MOTION_HOMOGRAPHY)
+        self.assertEqual(find_ecc.call_args.args[2].shape, (3, 3))
+        np.testing.assert_allclose(result["shift_px"].values, expected_shift)
+
+    def test_ecc_refinement_uses_affine_motion_model(self):
+        reference = textured_image(seed=11)
+        point = np.asarray([71.5, 83.25], dtype=np.float64)
+        affine = np.asarray(
+            [
+                [1.01, 0.015, -2.0],
+                [-0.01, 0.995, 3.0],
+            ],
+            dtype=np.float32,
+        )
+        expected_shift = affine.astype(np.float64) @ np.r_[point, 1.0] - point
+
+        with patch(
+            "merlin_track_position.tracking.shift.cv2.findTransformECC",
+            return_value=(1.0, affine),
+        ) as find_ecc:
+            result = estimate_shift(
+                reference,
+                reference.copy(),
+                check_tiles=False,
+                use_ecc_refinement=True,
+                ecc_motion_model="affine",
+                ecc_reference_point_px=point,
+            )
+
+        self.assertEqual(find_ecc.call_args.args[3], cv2.MOTION_AFFINE)
+        self.assertEqual(find_ecc.call_args.args[2].shape, (2, 3))
+        np.testing.assert_allclose(result["shift_px"].values, expected_shift)
 
     def test_ecc_refinement_failure_falls_back_to_phase_shift(self):
         reference = textured_image(seed=8)

@@ -10,6 +10,8 @@ __all__ = (
     "CAPTURE_AGGREGATION_MEAN_IMAGE",
     "CAPTURE_AGGREGATION_MEDIAN_SHIFTS",
     "DEFAULT_REGISTRATION_CONFIG",
+    "ECC_MOTION_MODEL_AFFINE",
+    "ECC_MOTION_MODEL_HOMOGRAPHY",
     "REGISTRATION_CAPTURE_AGGREGATION_SETTINGS_KEY",
     "REGISTRATION_CAPTURE_COUNT_SETTINGS_KEY",
     "REGISTRATION_CLIP_ENABLED_SETTINGS_KEY",
@@ -19,6 +21,7 @@ __all__ = (
     "REGISTRATION_UPSAMPLE_FACTOR_SETTINGS_KEY",
     "REGISTRATION_USE_WINDOW_SETTINGS_KEY",
     "REGISTRATION_USE_ECC_REFINEMENT_SETTINGS_KEY",
+    "REGISTRATION_ECC_MOTION_MODEL_SETTINGS_KEY",
     "REGISTRATION_HIGH_ERROR_THRESHOLD_SETTINGS_KEY",
     "normalized_registration_config",
     "registration_config_from_settings",
@@ -34,6 +37,9 @@ CAPTURE_AGGREGATIONS = (
     CAPTURE_AGGREGATION_MEDIAN_SHIFTS,
     CAPTURE_AGGREGATION_MEAN_IMAGE,
 )
+ECC_MOTION_MODEL_AFFINE = "affine"
+ECC_MOTION_MODEL_HOMOGRAPHY = "homography"
+ECC_MOTION_MODELS = (ECC_MOTION_MODEL_AFFINE, ECC_MOTION_MODEL_HOMOGRAPHY)
 REGISTRATION_CAPTURE_COUNT_MIN = 1
 REGISTRATION_CAPTURE_COUNT_MAX = 100
 
@@ -44,6 +50,7 @@ REGISTRATION_NORMALIZATION_SETTINGS_KEY = "registration/normalization"
 REGISTRATION_UPSAMPLE_FACTOR_SETTINGS_KEY = "registration/upsample_factor"
 REGISTRATION_USE_WINDOW_SETTINGS_KEY = "registration/use_window"
 REGISTRATION_USE_ECC_REFINEMENT_SETTINGS_KEY = "registration/use_ecc_refinement"
+REGISTRATION_ECC_MOTION_MODEL_SETTINGS_KEY = "registration/ecc_motion_model"
 REGISTRATION_HIGH_ERROR_THRESHOLD_SETTINGS_KEY = (
     "registration/high_error_threshold"
 )
@@ -58,6 +65,7 @@ DEFAULT_REGISTRATION_CONFIG: dict[str, object] = {
     "upsample_factor": 50,
     "use_window": False,
     "use_ecc_refinement": False,
+    "ecc_motion_model": ECC_MOTION_MODEL_HOMOGRAPHY,
     "high_error_threshold": 0.5,
     "capture_count": constants.DEFAULT_CORRECTION_CAPTURE_COUNT,
     "capture_aggregation": CAPTURE_AGGREGATION_MEDIAN_SHIFTS,
@@ -122,6 +130,7 @@ def normalized_registration_config(
             values["use_ecc_refinement"],
             bool(DEFAULT_REGISTRATION_CONFIG["use_ecc_refinement"]),
         ),
+        "ecc_motion_model": _ecc_motion_model_value(values["ecc_motion_model"]),
         "high_error_threshold": float(high_error_threshold),
         "capture_count": int(capture_count),
         "capture_aggregation": _capture_aggregation_value(
@@ -160,6 +169,10 @@ def registration_config_from_settings(settings: Any) -> dict[str, object]:
             "use_ecc_refinement": settings.value(
                 REGISTRATION_USE_ECC_REFINEMENT_SETTINGS_KEY,
                 DEFAULT_REGISTRATION_CONFIG["use_ecc_refinement"],
+            ),
+            "ecc_motion_model": settings.value(
+                REGISTRATION_ECC_MOTION_MODEL_SETTINGS_KEY,
+                DEFAULT_REGISTRATION_CONFIG["ecc_motion_model"],
             ),
             "high_error_threshold": settings.value(
                 REGISTRATION_HIGH_ERROR_THRESHOLD_SETTINGS_KEY,
@@ -200,6 +213,10 @@ def save_registration_config(
     settings.setValue(
         REGISTRATION_USE_ECC_REFINEMENT_SETTINGS_KEY,
         normalized["use_ecc_refinement"],
+    )
+    settings.setValue(
+        REGISTRATION_ECC_MOTION_MODEL_SETTINGS_KEY,
+        normalized["ecc_motion_model"],
     )
     settings.setValue(
         REGISTRATION_HIGH_ERROR_THRESHOLD_SETTINGS_KEY,
@@ -247,6 +264,7 @@ def registration_config_to_shift_kwargs(
         "normalization": normalization,
         "high_error_threshold": normalized["high_error_threshold"],
         "use_ecc_refinement": normalized["use_ecc_refinement"],
+        "ecc_motion_model": normalized["ecc_motion_model"],
     }
     if config is not None and "ecc_reference_point_px" in config:
         shift_kwargs["ecc_reference_point_px"] = config["ecc_reference_point_px"]
@@ -300,3 +318,10 @@ def _capture_aggregation_value(value: Any) -> str:
     if lowered in CAPTURE_AGGREGATIONS:
         return lowered
     return CAPTURE_AGGREGATION_MEDIAN_SHIFTS
+
+
+def _ecc_motion_model_value(value: Any) -> str:
+    lowered = str(value).strip().lower()
+    if lowered in ECC_MOTION_MODELS:
+        return lowered
+    return ECC_MOTION_MODEL_HOMOGRAPHY

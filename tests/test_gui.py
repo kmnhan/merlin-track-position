@@ -30,6 +30,7 @@ from merlin_track_position.interface.registration_settings import (  # noqa: E40
     REGISTRATION_CAPTURE_COUNT_SETTINGS_KEY,
     REGISTRATION_CLIP_HIGH_SETTINGS_KEY,
     REGISTRATION_CLIP_LOW_SETTINGS_KEY,
+    REGISTRATION_ECC_MOTION_MODEL_SETTINGS_KEY,
     REGISTRATION_NORMALIZATION_SETTINGS_KEY,
     REGISTRATION_UPSAMPLE_FACTOR_SETTINGS_KEY,
     REGISTRATION_USE_ECC_REFINEMENT_SETTINGS_KEY,
@@ -722,6 +723,9 @@ class ShiftMonitorWindowTests(unittest.TestCase):
                 )
                 window.upsample_spin.setValue(51)
                 window.ecc_refinement_checkbox.setChecked(True)
+                window.ecc_motion_model_combo.setCurrentIndex(
+                    window.ecc_motion_model_combo.findData("affine")
+                )
                 window.capture_count_spin.setValue(7)
                 window.capture_aggregation_combo.setCurrentIndex(
                     window.capture_aggregation_combo.findData("mean_image")
@@ -750,6 +754,10 @@ class ShiftMonitorWindowTests(unittest.TestCase):
                     True,
                 )
                 self.assertEqual(
+                    settings.values[REGISTRATION_ECC_MOTION_MODEL_SETTINGS_KEY],
+                    "affine",
+                )
+                self.assertEqual(
                     settings.values[REGISTRATION_CAPTURE_COUNT_SETTINGS_KEY],
                     7,
                 )
@@ -770,6 +778,12 @@ class ShiftMonitorWindowTests(unittest.TestCase):
                     True,
                 )
                 self.assertEqual(
+                    registration_config_to_shift_kwargs(saved_configs[-1])[
+                        "ecc_motion_model"
+                    ],
+                    "affine",
+                )
+                self.assertEqual(
                     registration_config_to_measurement_kwargs(saved_configs[-1])[
                         "capture_count"
                     ],
@@ -787,6 +801,9 @@ class ShiftMonitorWindowTests(unittest.TestCase):
                 window.sample_period_spin.setValue(3.5)
                 window.upsample_spin.setValue(37)
                 window.ecc_refinement_checkbox.setChecked(True)
+                window.ecc_motion_model_combo.setCurrentIndex(
+                    window.ecc_motion_model_combo.findData("affine")
+                )
                 window.capture_count_spin.setValue(5)
                 window.capture_aggregation_combo.setCurrentIndex(
                     window.capture_aggregation_combo.findData("mean_image")
@@ -818,6 +835,10 @@ class ShiftMonitorWindowTests(unittest.TestCase):
                     self.assertEqual(
                         exported.attrs["registration_use_ecc_refinement"],
                         True,
+                    )
+                    self.assertEqual(
+                        exported.attrs["registration_ecc_motion_model"],
+                        "affine",
                     )
                     self.assertEqual(exported.attrs["registration_capture_count"], 5)
                     self.assertEqual(
@@ -2081,6 +2102,7 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                             "normalization": None,
                             "high_error_threshold": 0.25,
                             "use_ecc_refinement": True,
+                            "ecc_motion_model": "homography",
                             "capture_count": 7,
                             "capture_aggregation": "mean_image",
                         },

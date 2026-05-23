@@ -54,6 +54,7 @@ def estimate_shift(
     check_tiles: bool = False,
     high_error_threshold: float = 0.5,
     use_ecc_refinement: bool = False,
+    ecc_motion_model: str = "homography",
     ecc_reference_point_px: npt.ArrayLike | None = None,
 ) -> xr.Dataset:
     """Estimate subpixel translation between two grayscale images.
@@ -64,8 +65,9 @@ def estimate_shift(
     Pass ``check_tiles=True`` to compare local tile shifts against the full-frame
     estimate.
     Pass ``use_ecc_refinement=True`` to refine the phase-correlation result with
-    an affine OpenCV ECC registration and return the displacement at
-    ``ecc_reference_point_px``. If no point is supplied, the image center is used.
+    an OpenCV ECC affine or homography registration and return the displacement
+    at ``ecc_reference_point_px``. If no point is supplied, the image center is
+    used.
     """
 
     reference_image = np.asarray(reference, dtype=np.float64)
@@ -140,11 +142,12 @@ def estimate_shift(
 
     if use_ecc_refinement and np.isfinite(shift_px).all():
         try:
-            shift_px = _estimate_ecc_affine_shift(
+            shift_px = _estimate_ecc_shift(
                 reference_norm,
                 current_norm,
                 shift_px,
                 use_window=use_window,
+                motion_model=ecc_motion_model,
                 reference_point_px=ecc_reference_point_px,
             )
         except Exception as exc:
@@ -208,12 +211,13 @@ def _estimate_translation(
     )
 
 
-def _estimate_ecc_affine_shift(
+def _estimate_ecc_shift(
     reference_norm: np.ndarray,
     current_norm: np.ndarray,
     initial_shift_px: np.ndarray,
     *,
     use_window: bool,
+    motion_model: str,
     reference_point_px: npt.ArrayLike | None,
 ) -> np.ndarray:
     reference_work, current_work = _registration_work_images(
@@ -225,13 +229,7 @@ def _estimate_ecc_affine_shift(
     if initial_shift.shape != (2,) or not np.isfinite(initial_shift).all():
         raise ValueError("initial ECC shift must be a finite 2-vector")
 
-    warp = np.asarray(
-        [
-            [1.0, 0.0, initial_shift[0]],
-            [0.0, 1.0, initial_shift[1]],
-        ],
-        dtype=np.float32,
-    )
+    motion_code, warp = _initial_ecc_warp(motion_model, initial_shift)
     criteria = (
         cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT,
         50,
@@ -241,21 +239,66 @@ def _estimate_ecc_affine_shift(
         np.ascontiguousarray(reference_work, dtype=np.float32),
         np.ascontiguousarray(current_work, dtype=np.float32),
         warp,
-        cv2.MOTION_AFFINE,
+        motion_code,
         criteria,
         None,
         5,
     )
     refined = np.asarray(refined_warp, dtype=np.float64)
-    if refined.shape != (2, 3) or not np.isfinite(refined).all():
-        raise ValueError("ECC returned a non-finite affine warp")
+    if refined.shape != warp.shape or not np.isfinite(refined).all():
+        raise ValueError(f"ECC returned a non-finite {motion_model} warp")
 
     point = _ecc_reference_point(reference_norm.shape, reference_point_px)
-    mapped = refined @ np.asarray([point[0], point[1], 1.0], dtype=np.float64)
+    if motion_code == cv2.MOTION_AFFINE:
+        mapped = refined @ np.asarray([point[0], point[1], 1.0], dtype=np.float64)
+        shift = mapped - point
+        if not np.isfinite(shift).all():
+            raise ValueError("ECC returned a non-finite point displacement")
+        return np.asarray(shift, dtype=np.float64)
+
+    mapped_homogeneous = refined @ np.asarray(
+        [point[0], point[1], 1.0],
+        dtype=np.float64,
+    )
+    denominator = float(mapped_homogeneous[2])
+    if abs(denominator) <= 1e-12:
+        raise ValueError("ECC homography maps reference point to infinity")
+    mapped = mapped_homogeneous[:2] / denominator
     shift = mapped - point
     if not np.isfinite(shift).all():
         raise ValueError("ECC returned a non-finite point displacement")
     return np.asarray(shift, dtype=np.float64)
+
+
+def _initial_ecc_warp(
+    motion_model: str,
+    initial_shift: np.ndarray,
+) -> tuple[int, np.ndarray]:
+    normalized_model = str(motion_model).strip().lower()
+    if normalized_model == "affine":
+        return (
+            cv2.MOTION_AFFINE,
+            np.asarray(
+                [
+                    [1.0, 0.0, initial_shift[0]],
+                    [0.0, 1.0, initial_shift[1]],
+                ],
+                dtype=np.float32,
+            ),
+        )
+    if normalized_model == "homography":
+        return (
+            cv2.MOTION_HOMOGRAPHY,
+            np.asarray(
+                [
+                    [1.0, 0.0, initial_shift[0]],
+                    [0.0, 1.0, initial_shift[1]],
+                    [0.0, 0.0, 1.0],
+                ],
+                dtype=np.float32,
+            ),
+        )
+    raise ValueError(f"unsupported ECC motion model: {motion_model!r}")
 
 
 def _ecc_reference_point(
