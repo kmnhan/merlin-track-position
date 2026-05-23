@@ -44,6 +44,7 @@ from merlin_track_position.interface.shift_monitor_window import (  # noqa: E402
 from merlin_track_position.tracking.calibration_core import (  # noqa: E402
     COMMAND_AXES,
     derive_axis_scale_from_jacobian,
+    load_calibration_dataset,
     save_calibration_dataset,
 )
 from merlin_track_position.instruments import parse_config  # noqa: E402
@@ -257,7 +258,18 @@ def roi_child_item_count(window):
 
 
 def roi_editing_enabled(window):
-    return all(roi.translatable for roi in window.image_rois.values())
+    return all(
+        roi.resizable and all(handle.isEnabled() for handle in roi.getHandles())
+        for roi in window.image_rois.values()
+    )
+
+
+def roi_body_translation_enabled(window):
+    return any(roi.translatable for roi in window.image_rois.values())
+
+
+def beam_target_dragging_enabled(window):
+    return all(target.movable for target in window.image_targets.values())
 
 
 def full_camera_image(camera, value):
@@ -1099,8 +1111,18 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                     window.calibration_panel.detect_shift_button.isEnabled()
                 )
                 self.assertFalse(window.show_reference_images_button.isEnabled())
+                self.assertFalse(window.reset_beam_target_button.isEnabled())
+                self.assertIs(
+                    window.image_controls_layout.itemAt(1).widget(),
+                    window.show_reference_images_button,
+                )
+                self.assertIs(
+                    window.image_controls_layout.itemAt(2).widget(),
+                    window.reset_beam_target_button,
+                )
                 self.assertTrue(roi_handles_visible(window))
                 self.assertTrue(roi_editing_enabled(window))
+                self.assertFalse(roi_body_translation_enabled(window))
                 self.assertEqual(
                     window.image_plots["cam0"].getAxis("bottom").labelText,
                     "u",
@@ -1347,6 +1369,7 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
 
                 window._on_new_calibration_ready(calibration)
 
+                self.assertFalse(window.reset_beam_target_button.isEnabled())
                 np.testing.assert_allclose(
                     beam_target_point(window, "cam0"),
                     [cam0_point[0] + 3.0, cam0_point[1] - 2.0],
@@ -1355,8 +1378,84 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                     beam_target_point(window, "cam1"),
                     [cam1_point[0] - 4.0, cam1_point[1] + 5.0],
                 )
+
+                dragged_cam0 = (cam0_point[0] + 8.0, cam0_point[1] + 6.0)
+                window.image_targets["cam0"].setPos(
+                    *main_window._display_point("cam0", dragged_cam0)
+                )
+                window._on_beam_target_position_changed("cam0")
+
+                self.assertTrue(window.reset_beam_target_button.isEnabled())
+
+                window.reset_beam_target_button.click()
+
+                self.assertFalse(window.reset_beam_target_button.isEnabled())
+                self.assertNotIn("cam0", window._beam_target_user_overrides)
+                np.testing.assert_allclose(
+                    beam_target_point(window, "cam0"),
+                    [cam0_point[0] + 3.0, cam0_point[1] - 2.0],
+                )
             finally:
                 window.close()
+
+    def test_dragged_beam_target_does_not_overwrite_saved_calibration_metadata(self):
+        get_qapp()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "calibration.h5"
+            cam0_target = main_window._roi_center_point(
+                "cam0",
+                main_window._default_roi_geometry(
+                    *main_window.CAMERA_IMAGE_SIZES["cam0"]
+                ),
+            )
+            cam1_target = main_window._roi_center_point(
+                "cam1",
+                main_window._default_roi_geometry(
+                    *main_window.CAMERA_IMAGE_SIZES["cam1"]
+                ),
+            )
+            calibration = build_sample_calibration_dataset(
+                image_shape_cam0=(4, 5),
+                image_shape_cam1=(6, 7),
+            ).assign_attrs(
+                {
+                    "calibration_path": str(path),
+                    "beam_target_cam0_u": cam0_target[0],
+                    "beam_target_cam0_v": cam0_target[1],
+                    "beam_target_cam1_u": cam1_target[0],
+                    "beam_target_cam1_v": cam1_target[1],
+                }
+            )
+            save_calibration_dataset(calibration, path)
+
+            with patched_main_window_runtime():
+                window = MainWindow()
+                try:
+                    window._on_new_calibration_ready(calibration)
+                    dragged_cam0 = (cam0_target[0] + 10.0, cam0_target[1] - 10.0)
+                    window.image_targets["cam0"].setPos(
+                        *main_window._display_point("cam0", dragged_cam0)
+                    )
+                    window._on_beam_target_position_changed("cam0")
+
+                    with patch(
+                        "merlin_track_position.interface.main_window."
+                        "QtWidgets.QFileDialog.getSaveFileName",
+                        return_value=(str(path), ""),
+                    ):
+                        window._on_save_calibration_clicked()
+
+                    saved = load_calibration_dataset(path)
+                    self.assertEqual(saved.attrs["beam_target_cam0_u"], cam0_target[0])
+                    self.assertEqual(saved.attrs["beam_target_cam0_v"], cam0_target[1])
+                    self.assertEqual(saved.attrs["beam_target_cam1_u"], cam1_target[0])
+                    self.assertEqual(saved.attrs["beam_target_cam1_v"], cam1_target[1])
+                    np.testing.assert_allclose(
+                        beam_target_point(window, "cam0"),
+                        dragged_cam0,
+                    )
+                finally:
+                    window.close()
 
     def test_loaded_calibration_locks_roi_and_button_clears_without_dialog(self):
         get_qapp()
@@ -1385,6 +1484,7 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                 self.assertTrue(window.show_reference_images_button.isEnabled())
                 self.assertFalse(roi_handles_visible(window))
                 self.assertFalse(roi_editing_enabled(window))
+                self.assertTrue(beam_target_dragging_enabled(window))
 
                 with patch.object(
                     CalibrationStartDialog,
@@ -1413,6 +1513,7 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                 self.assertFalse(window.show_reference_images_button.isEnabled())
                 self.assertTrue(roi_handles_visible(window))
                 self.assertTrue(roi_editing_enabled(window))
+                self.assertTrue(beam_target_dragging_enabled(window))
             finally:
                 window.close()
 
@@ -1497,6 +1598,72 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                     self,
                     image_parent_rect(window, "cam1"),
                     (0.0, 0.0, float(image_height), float(image_width)),
+                )
+            finally:
+                window.close()
+
+    def test_beam_target_drag_previews_reference_image_until_release(self):
+        get_qapp()
+        metadata = _roi_metadata_from_geometries(
+            {
+                "cam0": (10.2, 12.4, 5.0, 4.0),
+                "cam1": (14.7, 16.1, 7.0, 6.0),
+            }
+        )
+        calibration = build_sample_calibration_dataset(
+            image_shape_cam0=(5, 6),
+            image_shape_cam1=(7, 8),
+        ).assign_attrs({"calibration_path": "/tmp/calibration.h5"} | metadata)
+        current_cam0 = full_camera_image("cam0", 3.0)
+        current_cam1 = full_camera_image("cam1", 4.0)
+        refreshed_cam0 = full_camera_image("cam0", 5.0)
+
+        with patched_main_window_runtime():
+            window = MainWindow()
+            try:
+                window._on_image_capture_ready("cam0", current_cam0)
+                window._on_image_capture_ready("cam1", current_cam1)
+                window._on_new_calibration_ready(calibration)
+
+                window._on_beam_target_drag_started("cam0")
+
+                self.assertTrue(window._reference_preview_active)
+                self.assertTrue(window._beam_target_reference_preview_active)
+                np.testing.assert_array_equal(
+                    window.image_items["cam0"].image,
+                    calibration["reference_cam0"].values,
+                )
+                np.testing.assert_array_equal(
+                    window.image_items["cam1"].image,
+                    calibration["reference_cam1"].values,
+                )
+
+                window._on_image_capture_ready("cam0", refreshed_cam0)
+                np.testing.assert_array_equal(
+                    window.image_items["cam0"].image,
+                    calibration["reference_cam0"].values,
+                )
+
+                initial_point = beam_target_point(window, "cam0")
+                dragged_cam0 = (initial_point[0] + 1.0, initial_point[1] - 1.0)
+                window.image_targets["cam0"].setPos(
+                    *main_window._display_point("cam0", dragged_cam0)
+                )
+                window._on_beam_target_position_change_finished("cam0")
+
+                self.assertFalse(window._reference_preview_active)
+                self.assertFalse(window._beam_target_reference_preview_active)
+                np.testing.assert_array_equal(
+                    window.image_items["cam0"].image,
+                    refreshed_cam0,
+                )
+                np.testing.assert_array_equal(
+                    window.image_items["cam1"].image,
+                    current_cam1,
+                )
+                np.testing.assert_allclose(
+                    beam_target_point(window, "cam0"),
+                    dragged_cam0,
                 )
             finally:
                 window.close()
@@ -1807,6 +1974,7 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                 self.assertEqual(roi_child_item_count(window), 0)
                 self.assertFalse(roi_handles_visible(window))
                 self.assertFalse(roi_editing_enabled(window))
+                self.assertTrue(beam_target_dragging_enabled(window))
 
                 window._set_roi_editing_enabled(True)
 
@@ -1814,6 +1982,8 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                 self.assertEqual(roi_child_item_count(window), 16)
                 self.assertTrue(roi_handles_visible(window))
                 self.assertTrue(roi_editing_enabled(window))
+                self.assertFalse(roi_body_translation_enabled(window))
+                self.assertTrue(beam_target_dragging_enabled(window))
             finally:
                 window.close()
 

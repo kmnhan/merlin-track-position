@@ -8,6 +8,7 @@ import threading
 import time
 from collections.abc import Callable, Mapping
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pyqtgraph as pg
@@ -474,6 +475,19 @@ class _ImageCaptureThread(QtCore.QThread):
         self._wake.set()
 
 
+class _BeamTargetItem(pg.TargetItem):
+    sigDragStarted = QtCore.Signal(object)
+
+    def mouseDragEvent(self, ev: Any) -> None:  # noqa: N802
+        if (
+            self.movable
+            and ev.button() == QtCore.Qt.MouseButton.LeftButton
+            and ev.isStart()
+        ):
+            self.sigDragStarted.emit(self)
+        super().mouseDragEvent(ev)
+
+
 class _MainWindowGUI(QtWidgets.QMainWindow):
     def __init__(self, parent: QtCore.QObject | None = None):
         super().__init__(parent)
@@ -495,17 +509,21 @@ class _MainWindowGUI(QtWidgets.QMainWindow):
         image_layout = QtWidgets.QVBoxLayout(image_widget)
         image_layout.setContentsMargins(0, 0, 0, 0)
 
-        image_controls_layout = QtWidgets.QHBoxLayout()
+        self.image_controls_layout = QtWidgets.QHBoxLayout()
         self.image_auto_refresh_checkbox = QtWidgets.QCheckBox("Update images")
         self.image_auto_refresh_checkbox.setObjectName("image_auto_refresh_checkbox")
         self.image_auto_refresh_checkbox.setChecked(True)
-        image_controls_layout.addWidget(self.image_auto_refresh_checkbox)
+        self.image_controls_layout.addWidget(self.image_auto_refresh_checkbox)
         self.show_reference_images_button = QtWidgets.QPushButton("Reference")
         self.show_reference_images_button.setObjectName("show_reference_images_button")
         self.show_reference_images_button.setEnabled(False)
-        image_controls_layout.addWidget(self.show_reference_images_button)
-        image_controls_layout.addStretch(1)
-        image_layout.addLayout(image_controls_layout)
+        self.image_controls_layout.addWidget(self.show_reference_images_button)
+        self.reset_beam_target_button = QtWidgets.QPushButton("Reset target")
+        self.reset_beam_target_button.setObjectName("reset_beam_target_button")
+        self.reset_beam_target_button.setEnabled(False)
+        self.image_controls_layout.addWidget(self.reset_beam_target_button)
+        self.image_controls_layout.addStretch(1)
+        image_layout.addLayout(self.image_controls_layout)
 
         self.image_graphics_layout = pg.GraphicsLayoutWidget()
         image_layout.addWidget(self.image_graphics_layout)
@@ -575,14 +593,15 @@ class _MainWindowGUI(QtWidgets.QMainWindow):
                 pen=pg.mkPen("#008c99", width=2),
                 hoverPen=pg.mkPen("#00c2d1", width=2),
             )
+            image_roi.translatable = False
             _add_roi_scale_handles(image_roi)
             image_roi.setZValue(10)
             image_plot.addItem(image_roi)
 
             target_point = _roi_center_point(camera, roi_geometry)
-            image_target = pg.TargetItem(
+            image_target = _BeamTargetItem(
                 pos=_display_point(camera, target_point),
-                size=14,
+                size=10,
                 symbol="crosshair",
                 pen=pg.mkPen("#d55e00", width=2),
                 hoverPen=pg.mkPen("#ff8c33", width=2),
@@ -637,6 +656,7 @@ class MainWindow(_MainWindowGUI):
         self._latest_images: tuple[np.ndarray, np.ndarray] | None = None
         self._latest_images_by_camera: dict[str, np.ndarray] = {}
         self._reference_preview_active = False
+        self._beam_target_reference_preview_active = False
         self._reference_preview_restore_state: dict[
             str,
             tuple[np.ndarray, QtCore.QRectF],
@@ -695,8 +715,13 @@ class MainWindow(_MainWindowGUI):
                     camera
                 )
             )
+            self.image_targets[camera].sigDragStarted.connect(
+                lambda *args, camera=camera: self._on_beam_target_drag_started(
+                    camera
+                )
+            )
             self.image_targets[camera].sigPositionChangeFinished.connect(
-                lambda *args, camera=camera: self._on_beam_target_position_changed(
+                lambda *args, camera=camera: self._on_beam_target_position_change_finished(
                     camera
                 )
             )
@@ -759,8 +784,12 @@ class MainWindow(_MainWindowGUI):
         self.show_reference_images_button.released.connect(
             self._on_show_reference_images_released
         )
+        self.reset_beam_target_button.clicked.connect(
+            self._on_reset_beam_targets_clicked
+        )
         self.calibration_panel.reset()
         self._set_reference_preview_button_enabled(False)
+        self._update_reset_beam_target_button()
         self._set_roi_editing_enabled(True)
 
         self._server = MotorServer(self)
@@ -1087,7 +1116,7 @@ class MainWindow(_MainWindowGUI):
             was_blocked = roi.blockSignals(True)
             try:
                 roi.setSelected(False)
-                roi.translatable = enabled
+                roi.translatable = False
                 roi.rotatable = enabled
                 roi.resizable = enabled
                 if enabled:
@@ -1102,7 +1131,7 @@ class MainWindow(_MainWindowGUI):
             roi.update()
         for target in self.image_targets.values():
             if hasattr(target, "movable"):
-                target.movable = enabled
+                target.movable = True
 
     def _on_roi_region_change_finished(self, camera: str) -> None:
         if self._calibration is not None or not self._roi_editing_enabled:
@@ -1135,6 +1164,15 @@ class MainWindow(_MainWindowGUI):
         point = self._beam_target_point(camera)
         self._set_beam_target_point(camera, point, user_override=True)
         self._set_shift_monitor_beam_targets()
+
+    def _on_beam_target_drag_started(self, camera: str) -> None:
+        if camera not in self.image_targets:
+            return
+        self._begin_beam_target_reference_preview()
+
+    def _on_beam_target_position_change_finished(self, camera: str) -> None:
+        self._on_beam_target_position_changed(camera)
+        self._end_beam_target_reference_preview()
 
     def _beam_target_point(self, camera: str) -> tuple[float, float]:
         target = self.image_targets[camera]
@@ -1171,6 +1209,7 @@ class MainWindow(_MainWindowGUI):
             self._beam_target_user_overrides.add(camera)
         else:
             self._beam_target_user_overrides.discard(camera)
+        self._update_reset_beam_target_button()
 
     def _sync_beam_target_after_roi_change(self, camera: str) -> None:
         if not hasattr(self, "image_targets") or camera not in self.image_targets:
@@ -1243,6 +1282,7 @@ class MainWindow(_MainWindowGUI):
                 user_override=False,
             )
         self._set_shift_monitor_beam_targets()
+        self._update_reset_beam_target_button()
 
     def _calibration_beam_target_point(
         self,
@@ -1256,6 +1296,58 @@ class MainWindow(_MainWindowGUI):
             _roi_center_point(camera, self._get_roi_geometry(camera)),
             dtype=np.float64,
         )
+
+    def _loaded_calibration_beam_target_point(
+        self,
+        camera: str,
+    ) -> np.ndarray | None:
+        if self._calibration is None:
+            return None
+        attrs = self._calibration.attrs
+        if not all(key in attrs for key in BEAM_TARGET_ATTR_KEYS[camera]):
+            return None
+        point = self._calibration_beam_target_point(self._calibration, camera)
+        return np.asarray(
+            _clamp_point_to_roi(
+                camera,
+                (float(point[0]), float(point[1])),
+                self._get_roi_geometry(camera),
+            ),
+            dtype=np.float64,
+        )
+
+    def _beam_target_differs_from_loaded_calibration(self) -> bool:
+        if self._calibration is None:
+            return False
+        for camera in CAMERA_IMAGE_SIZES:
+            loaded_point = self._loaded_calibration_beam_target_point(camera)
+            if loaded_point is None:
+                return False
+            current_point = np.asarray(self._beam_target_point(camera), dtype=np.float64)
+            if not np.allclose(current_point, loaded_point, rtol=0.0, atol=1e-6):
+                return True
+        return False
+
+    def _update_reset_beam_target_button(self) -> None:
+        if not hasattr(self, "reset_beam_target_button"):
+            return
+        self.reset_beam_target_button.setEnabled(
+            self._beam_target_differs_from_loaded_calibration()
+        )
+
+    @QtCore.Slot()
+    def _on_reset_beam_targets_clicked(self) -> None:
+        if self._calibration is None:
+            self._update_reset_beam_target_button()
+            return
+        for camera in CAMERA_IMAGE_SIZES:
+            point = self._loaded_calibration_beam_target_point(camera)
+            if point is None:
+                self._update_reset_beam_target_button()
+                return
+            self._set_beam_target_point(camera, point, user_override=False)
+        self._set_shift_monitor_beam_targets()
+        self._update_reset_beam_target_button()
 
     def _capture_cam0_image(self) -> np.ndarray:
         with self._image_capture_locks["cam0"]:
@@ -1294,6 +1386,7 @@ class MainWindow(_MainWindowGUI):
     def _on_show_reference_images_pressed(self) -> None:
         if self._calibration is None:
             return
+        self._beam_target_reference_preview_active = False
         self._reference_preview_active = True
         self._reference_preview_restore_state = self._current_image_item_state()
         for camera in CAMERA_IMAGE_SIZES:
@@ -1303,6 +1396,7 @@ class MainWindow(_MainWindowGUI):
     def _on_show_reference_images_released(self) -> None:
         if not self._reference_preview_active:
             return
+        self._beam_target_reference_preview_active = False
         self._reference_preview_active = False
         self._restore_latest_current_images()
         self._reference_preview_restore_state = {}
@@ -1363,9 +1457,29 @@ class MainWindow(_MainWindowGUI):
         enabled = bool(enabled)
         self.show_reference_images_button.setEnabled(enabled)
         if not enabled and self._reference_preview_active:
+            self._beam_target_reference_preview_active = False
             self._reference_preview_active = False
             self._restore_latest_current_images()
             self._reference_preview_restore_state = {}
+
+    def _begin_beam_target_reference_preview(self) -> None:
+        if self._calibration is None or self._reference_preview_active:
+            return
+        self._beam_target_reference_preview_active = True
+        self._reference_preview_active = True
+        self._reference_preview_restore_state = self._current_image_item_state()
+        for camera in CAMERA_IMAGE_SIZES:
+            self._show_reference_image(camera)
+
+    def _end_beam_target_reference_preview(self) -> None:
+        if not self._beam_target_reference_preview_active:
+            return
+        self._beam_target_reference_preview_active = False
+        if not self._reference_preview_active:
+            return
+        self._reference_preview_active = False
+        self._restore_latest_current_images()
+        self._reference_preview_restore_state = {}
 
     def _show_current_image(self, camera: str, image: object) -> None:
         self._set_camera_image(camera, image, self._full_image_rect(camera))
@@ -1522,6 +1636,7 @@ class MainWindow(_MainWindowGUI):
         self._restore_latest_correction_result(path)
         self._set_reference_preview_button_enabled(True)
         self._set_shift_monitor_calibration()
+        self._update_reset_beam_target_button()
         self._schedule_persistence_flush_if_needed()
 
     @QtCore.Slot()
@@ -1554,14 +1669,11 @@ class MainWindow(_MainWindowGUI):
 
         path = Path(file_name)
         try:
-            calibration_to_save = self._calibration.assign_attrs(
-                self._current_beam_target_metadata()
-            )
-            persistence = save_calibration_dataset_deferred(calibration_to_save, path)
+            persistence = save_calibration_dataset_deferred(self._calibration, path)
             if persistence.flushed:
                 self._calibration = load_calibration_dataset(path)
             else:
-                self._calibration = calibration_to_save.load().copy(deep=True)
+                self._calibration = self._calibration.load().copy(deep=True)
                 self._calibration.attrs["calibration_path"] = str(path)
                 self._calibration = self._calibration.assign_attrs(
                     persistence_result_attrs("calibration", persistence)
@@ -1577,6 +1689,7 @@ class MainWindow(_MainWindowGUI):
         self._calibration_path = path
         self._set_roi_editing_enabled(False)
         self._set_shift_monitor_calibration()
+        self._update_reset_beam_target_button()
         if persistence.pending:
             self.calibration_panel.show_loaded_calibration(self._calibration, path.name)
             self.calibration_panel.calibration_status_label.setText(
@@ -1820,6 +1933,7 @@ class MainWindow(_MainWindowGUI):
         self.calibration_panel.show_loaded_calibration(calibration, display_name)
         self._set_reference_preview_button_enabled(True)
         self._set_shift_monitor_calibration()
+        self._update_reset_beam_target_button()
         self._schedule_persistence_flush_if_needed()
 
     @QtCore.Slot(str)
@@ -1863,6 +1977,7 @@ class MainWindow(_MainWindowGUI):
             self.calibration_panel.show_correction_result(result)
             self._set_reference_preview_button_enabled(True)
             self._set_shift_monitor_calibration()
+            self._update_reset_beam_target_button()
             self._flush_pending_persistence()
         except Exception as exc:
             self._restore_calibration_idle_state()
@@ -1992,6 +2107,7 @@ class MainWindow(_MainWindowGUI):
         self._set_reference_preview_button_enabled(False)
         self._restore_calibration_idle_state()
         self._set_shift_monitor_calibration()
+        self._update_reset_beam_target_button()
 
     def _get_roi_geometry(self, camera: str) -> RoiGeometry:
         image_width, image_height = CAMERA_IMAGE_SIZES[camera]
