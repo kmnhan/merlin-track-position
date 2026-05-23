@@ -62,6 +62,13 @@ from merlin_track_position.tracking.persistence import (
     pending_entry_count,
     persistence_result_attrs,
 )
+from merlin_track_position.tracking.roi import (
+    BEAM_TARGET_ATTR_KEYS,
+    beam_target_attrs_from_points,
+    beam_target_point_from_attrs_or_default,
+    roi_crop_bounds,
+    roi_local_point_from_full_frame,
+)
 
 __all__ = ("CalibrationStartDialog", "MainWindow")
 
@@ -179,6 +186,20 @@ def _display_geometry(
     return (x, y, width, height)
 
 
+def _display_point(camera: str, point: tuple[float, float]) -> tuple[float, float]:
+    u, v = point
+    if camera in TRANSPOSED_IMAGE_DISPLAY_CAMERAS:
+        return (v, u)
+    return (u, v)
+
+
+def _raw_point_from_display(
+    camera: str,
+    point: tuple[float, float],
+) -> tuple[float, float]:
+    return _display_point(camera, point)
+
+
 def _raw_geometry_from_display(
     camera: str,
     geometry: tuple[float, float, float, float],
@@ -196,6 +217,29 @@ def _display_image_size(
         (0.0, 0.0, image_width, image_height),
     )
     return display_width, display_height
+
+
+def _roi_center_point(camera: str, geometry: RoiGeometry) -> tuple[float, float]:
+    image_width, image_height = CAMERA_IMAGE_SIZES[camera]
+    x0, y0, x1, y1 = roi_crop_bounds(geometry, (image_height, image_width))
+    return (
+        x0 + (x1 - x0 - 1.0) / 2.0,
+        y0 + (y1 - y0 - 1.0) / 2.0,
+    )
+
+
+def _clamp_point_to_roi(
+    camera: str,
+    point: tuple[float, float],
+    geometry: RoiGeometry,
+) -> tuple[float, float]:
+    image_width, image_height = CAMERA_IMAGE_SIZES[camera]
+    x0, y0, x1, y1 = roi_crop_bounds(geometry, (image_height, image_width))
+    u, v = point
+    return (
+        min(max(float(u), float(x0)), float(x1 - 1)),
+        min(max(float(v), float(y0)), float(y1 - 1)),
+    )
 
 
 def _raw_rect_from_display_rect(camera: str, rect: QtCore.QRectF) -> QtCore.QRectF:
@@ -468,6 +512,7 @@ class _MainWindowGUI(QtWidgets.QMainWindow):
         self.image_plots: dict[str, pg.PlotItem] = {}
         self.image_items: dict[str, pg.ImageItem] = {}
         self.image_rois: dict[str, pg.ROI] = {}
+        self.image_targets: dict[str, pg.TargetItem] = {}
         self._image_raw_rects: dict[str, QtCore.QRectF] = {}
         for row, (camera, (image_width, image_height)) in enumerate(
             CAMERA_IMAGE_SIZES.items()
@@ -534,9 +579,23 @@ class _MainWindowGUI(QtWidgets.QMainWindow):
             image_roi.setZValue(10)
             image_plot.addItem(image_roi)
 
+            target_point = _roi_center_point(camera, roi_geometry)
+            image_target = pg.TargetItem(
+                pos=_display_point(camera, target_point),
+                size=14,
+                symbol="crosshair",
+                pen=pg.mkPen("#d55e00", width=2),
+                hoverPen=pg.mkPen("#ff8c33", width=2),
+                movable=True,
+            )
+            image_target.setVisible(False)
+            image_target.setZValue(20)
+            image_plot.addItem(image_target)
+
             self.image_plots[camera] = image_plot
             self.image_items[camera] = image_item
             self.image_rois[camera] = image_roi
+            self.image_targets[camera] = image_target
             self._image_raw_rects[camera] = QtCore.QRectF(raw_rect)
 
         splitter.addWidget(image_widget)
@@ -571,6 +630,7 @@ class MainWindow(_MainWindowGUI):
         self._calibration_started_at: float | None = None
         self._calibration_processing_started_at: float | None = None
         self._roi_editing_enabled = True
+        self._beam_target_user_overrides: set[str] = set()
         self._last_correction_result: xr.Dataset | None = None
         self._server_correction_pending = False
         self._server_correction_target: int | None = None
@@ -630,6 +690,17 @@ class MainWindow(_MainWindowGUI):
                     camera
                 )
             )
+            self.image_targets[camera].sigPositionChanged.connect(
+                lambda *args, camera=camera: self._on_beam_target_position_changed(
+                    camera
+                )
+            )
+            self.image_targets[camera].sigPositionChangeFinished.connect(
+                lambda *args, camera=camera: self._on_beam_target_position_changed(
+                    camera
+                )
+            )
+        self._update_beam_target_visibility()
         self.calibration_panel.load_calibration_button.clicked.connect(
             self._on_load_calibration_clicked
         )
@@ -773,7 +844,10 @@ class MainWindow(_MainWindowGUI):
         logger.info("Automatic timed correction enabled every %d ms.", interval_ms)
 
     def _registration_measurement_kwargs(self) -> dict[str, object]:
-        return registration_config_to_measurement_kwargs(self._registration_config)
+        kwargs = registration_config_to_measurement_kwargs(self._registration_config)
+        if kwargs.get("use_ecc_refinement"):
+            kwargs["ecc_reference_point_px"] = self._current_ecc_reference_points_px()
+        return kwargs
 
     @QtCore.Slot()
     def _on_shift_monitor_triggered(self) -> None:
@@ -802,6 +876,8 @@ class MainWindow(_MainWindowGUI):
             self._registration_config = registration_config_from_settings(
                 self._settings
             )
+        self._update_beam_target_visibility()
+        self._set_shift_monitor_beam_targets()
 
     def _on_shift_monitor_destroyed(self, _object: object | None = None) -> None:
         self._shift_monitor_window = None
@@ -809,6 +885,13 @@ class MainWindow(_MainWindowGUI):
     def _set_shift_monitor_calibration(self) -> None:
         if self._shift_monitor_window is not None:
             self._shift_monitor_window.set_calibration(self._calibration)
+            self._set_shift_monitor_beam_targets()
+
+    def _set_shift_monitor_beam_targets(self) -> None:
+        if self._shift_monitor_window is not None:
+            self._shift_monitor_window.set_beam_target_points(
+                self._current_beam_target_points()
+            )
 
     def _stop_auto_correction(self, *, uncheck: bool) -> None:
         if hasattr(self, "_auto_correction_timer"):
@@ -1017,6 +1100,9 @@ class MainWindow(_MainWindowGUI):
             finally:
                 roi.blockSignals(was_blocked)
             roi.update()
+        for target in self.image_targets.values():
+            if hasattr(target, "movable"):
+                target.movable = enabled
 
     def _on_roi_region_change_finished(self, camera: str) -> None:
         if self._calibration is not None or not self._roi_editing_enabled:
@@ -1042,6 +1128,134 @@ class MainWindow(_MainWindowGUI):
         )
         self._set_roi_geometry(camera, geometry)
         self._persist_roi_geometry(camera, geometry)
+
+    def _on_beam_target_position_changed(self, camera: str) -> None:
+        if camera not in self.image_targets:
+            return
+        point = self._beam_target_point(camera)
+        self._set_beam_target_point(camera, point, user_override=True)
+        self._set_shift_monitor_beam_targets()
+
+    def _beam_target_point(self, camera: str) -> tuple[float, float]:
+        target = self.image_targets[camera]
+        position = target.pos()
+        return _raw_point_from_display(
+            camera,
+            (float(position.x()), float(position.y())),
+        )
+
+    def _set_beam_target_point(
+        self,
+        camera: str,
+        point: object,
+        *,
+        user_override: bool,
+    ) -> None:
+        point_array = np.asarray(point, dtype=np.float64)
+        if point_array.shape != (2,) or not np.isfinite(point_array).all():
+            point_array = np.asarray(
+                _roi_center_point(camera, self._get_roi_geometry(camera))
+            )
+        clamped = _clamp_point_to_roi(
+            camera,
+            (float(point_array[0]), float(point_array[1])),
+            self._get_roi_geometry(camera),
+        )
+        target = self.image_targets[camera]
+        was_blocked = target.blockSignals(True)
+        try:
+            target.setPos(*_display_point(camera, clamped))
+        finally:
+            target.blockSignals(was_blocked)
+        if user_override:
+            self._beam_target_user_overrides.add(camera)
+        else:
+            self._beam_target_user_overrides.discard(camera)
+
+    def _sync_beam_target_after_roi_change(self, camera: str) -> None:
+        if not hasattr(self, "image_targets") or camera not in self.image_targets:
+            return
+        if not hasattr(self, "_beam_target_user_overrides"):
+            return
+        if camera in self._beam_target_user_overrides:
+            self._set_beam_target_point(
+                camera,
+                self._beam_target_point(camera),
+                user_override=True,
+            )
+            return
+        self._set_beam_target_point(
+            camera,
+            _roi_center_point(camera, self._get_roi_geometry(camera)),
+            user_override=False,
+        )
+
+    def _current_beam_target_points(self) -> dict[str, np.ndarray]:
+        return {
+            camera: np.asarray(self._beam_target_point(camera), dtype=np.float64)
+            for camera in CAMERA_IMAGE_SIZES
+        }
+
+    def _current_beam_target_metadata(self) -> dict[str, float]:
+        return beam_target_attrs_from_points(self._current_beam_target_points())
+
+    def _current_ecc_reference_points_px(self) -> dict[str, np.ndarray]:
+        attrs = self._registration_roi_metadata()
+        return {
+            camera: roi_local_point_from_full_frame(
+                attrs,
+                camera,
+                self._beam_target_point(camera),
+            )
+            for camera in CAMERA_IMAGE_SIZES
+        }
+
+    def _update_beam_target_visibility(self) -> None:
+        visible = bool(self._registration_config.get("use_ecc_refinement"))
+        for target in self.image_targets.values():
+            target.setVisible(visible)
+
+    def _registration_roi_metadata(self) -> Mapping[str, object]:
+        if self._calibration is None:
+            return _roi_metadata_from_geometries(self._current_roi_geometries())
+        roi_geometries = _roi_geometries_from_calibration_metadata(self._calibration)
+        if roi_geometries is None:
+            return {}
+        return _roi_metadata_from_geometries(roi_geometries)
+
+    def _apply_calibration_beam_target_metadata(
+        self,
+        calibration: xr.Dataset,
+        *,
+        preserve_user_overrides: bool = False,
+    ) -> None:
+        for camera in CAMERA_IMAGE_SIZES:
+            if preserve_user_overrides and camera in self._beam_target_user_overrides:
+                self._set_beam_target_point(
+                    camera,
+                    self._beam_target_point(camera),
+                    user_override=True,
+                )
+                continue
+            self._set_beam_target_point(
+                camera,
+                self._calibration_beam_target_point(calibration, camera),
+                user_override=False,
+            )
+        self._set_shift_monitor_beam_targets()
+
+    def _calibration_beam_target_point(
+        self,
+        calibration: xr.Dataset,
+        camera: str,
+    ) -> np.ndarray:
+        keys = BEAM_TARGET_ATTR_KEYS[camera]
+        if any(key in calibration.attrs for key in keys):
+            return beam_target_point_from_attrs_or_default(calibration.attrs, camera)
+        return np.asarray(
+            _roi_center_point(camera, self._get_roi_geometry(camera)),
+            dtype=np.float64,
+        )
 
     def _capture_cam0_image(self) -> np.ndarray:
         with self._image_capture_locks["cam0"]:
@@ -1300,6 +1514,7 @@ class MainWindow(_MainWindowGUI):
             return
 
         self._apply_calibration_roi_metadata(calibration)
+        self._apply_calibration_beam_target_metadata(calibration)
         self._calibration = calibration
         self._calibration_path = path
         self._set_roi_editing_enabled(False)
@@ -1339,11 +1554,14 @@ class MainWindow(_MainWindowGUI):
 
         path = Path(file_name)
         try:
-            persistence = save_calibration_dataset_deferred(self._calibration, path)
+            calibration_to_save = self._calibration.assign_attrs(
+                self._current_beam_target_metadata()
+            )
+            persistence = save_calibration_dataset_deferred(calibration_to_save, path)
             if persistence.flushed:
                 self._calibration = load_calibration_dataset(path)
             else:
-                self._calibration = self._calibration.load().copy(deep=True)
+                self._calibration = calibration_to_save.load().copy(deep=True)
                 self._calibration.attrs["calibration_path"] = str(path)
                 self._calibration = self._calibration.assign_attrs(
                     persistence_result_attrs("calibration", persistence)
@@ -1398,6 +1616,7 @@ class MainWindow(_MainWindowGUI):
         output_path = dialog.output_path()
         roi_geometries = self._current_roi_geometries()
         roi_metadata = _roi_metadata_from_geometries(roi_geometries)
+        roi_metadata |= self._current_beam_target_metadata()
         camera_pair = self._camera_pair_for_current_images()
         try:
             self._calibration_total_steps = visual_calibration_probe_count(n)
@@ -1585,6 +1804,10 @@ class MainWindow(_MainWindowGUI):
         self._calibration_processing_started_at = None
         self._calibration_total_steps = 0
         self._apply_calibration_roi_metadata(calibration, persist=False)
+        self._apply_calibration_beam_target_metadata(
+            calibration,
+            preserve_user_overrides=True,
+        )
         self._calibration = calibration
         self._calibration_path = calibration_path
         self._last_correction_result = None
@@ -1624,6 +1847,10 @@ class MainWindow(_MainWindowGUI):
                 raise RuntimeError("correction finished without a calibration path")
             calibration = self._calibration_after_correction_result(result)
             self._apply_calibration_roi_metadata(calibration, persist=False)
+            self._apply_calibration_beam_target_metadata(
+                calibration,
+                preserve_user_overrides=True,
+            )
 
             self._calibration = calibration
             self._set_roi_editing_enabled(False)
@@ -1759,6 +1986,9 @@ class MainWindow(_MainWindowGUI):
         self._calibration = None
         self._calibration_path = None
         self._last_correction_result = None
+        self._beam_target_user_overrides.clear()
+        for camera in CAMERA_IMAGE_SIZES:
+            self._sync_beam_target_after_roi_change(camera)
         self._set_reference_preview_button_enabled(False)
         self._restore_calibration_idle_state()
         self._set_shift_monitor_calibration()
@@ -1809,6 +2039,7 @@ class MainWindow(_MainWindowGUI):
         image_roi = self.image_rois[camera]
         image_roi.setPos(display_geometry[:2], update=False, finish=False)
         image_roi.setSize(display_geometry[2:], update=True, finish=False)
+        self._sync_beam_target_after_roi_change(camera)
 
     def _persist_roi_geometry(
         self,

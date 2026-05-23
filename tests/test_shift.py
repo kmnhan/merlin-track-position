@@ -89,6 +89,50 @@ class ShiftTests(unittest.TestCase):
 
         np.testing.assert_allclose(result["shift_px"].values, expected_shift, atol=0.1)
 
+    def test_ecc_refinement_returns_affine_displacement_at_reference_point(self):
+        reference = textured_image(seed=9)
+        height, width = reference.shape
+        center_x = (width - 1.0) / 2.0
+        center_y = (height - 1.0) / 2.0
+        scale = 1.012
+        center_shift = np.asarray([-2.0, 3.0], dtype=np.float64)
+        warp = np.asarray(
+            [
+                [
+                    scale,
+                    0.0,
+                    center_shift[0] + (1.0 - scale) * center_x,
+                ],
+                [
+                    0.0,
+                    scale,
+                    center_shift[1] + (1.0 - scale) * center_y,
+                ],
+            ],
+            dtype=np.float32,
+        )
+        current = cv2.warpAffine(
+            reference.astype(np.float32),
+            warp,
+            (width, height),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_REFLECT_101,
+        )
+        point = np.asarray([center_x + 24.0, center_y - 16.0], dtype=np.float64)
+        expected_shift = warp.astype(np.float64) @ np.r_[point, 1.0] - point
+
+        result = estimate_shift(
+            reference,
+            current,
+            check_tiles=False,
+            use_ecc_refinement=True,
+            ecc_reference_point_px=(float(point[0]), float(point[1])),
+            normalization=None,
+            clip_percentiles=None,
+        )
+
+        np.testing.assert_allclose(result["shift_px"].values, expected_shift, atol=0.1)
+
     def test_ecc_refinement_failure_falls_back_to_phase_shift(self):
         reference = textured_image(seed=8)
         current = ndimage.shift(reference, shift=(-1.5, 2.0), order=3, mode="wrap")

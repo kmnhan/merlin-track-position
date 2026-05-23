@@ -240,7 +240,7 @@ def registration_config_to_shift_kwargs(
     normalization = (
         "phase" if normalized["normalization"] == "phase" else None
     )
-    return {
+    shift_kwargs = {
         "clip_percentiles": clip_percentiles,
         "use_window": normalized["use_window"],
         "upsample_factor": normalized["upsample_factor"],
@@ -248,6 +248,9 @@ def registration_config_to_shift_kwargs(
         "high_error_threshold": normalized["high_error_threshold"],
         "use_ecc_refinement": normalized["use_ecc_refinement"],
     }
+    if config is not None and "ecc_reference_point_px" in config:
+        shift_kwargs["ecc_reference_point_px"] = config["ecc_reference_point_px"]
+    return shift_kwargs
 
 
 def _as_bool(value: Any, fallback: bool) -> bool:

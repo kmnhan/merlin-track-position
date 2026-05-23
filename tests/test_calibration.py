@@ -238,6 +238,55 @@ class ShiftDetectionTests(unittest.TestCase):
             self.assertEqual(dict(calibration.attrs), attrs_before)
             self.assertFalse(correction_history_path(path).exists())
 
+    def test_detect_shift_uses_calibration_beam_targets_as_roi_local_ecc_points(self):
+        calibration = calibration_dataset().assign_attrs(
+            {
+                "roi_cam0_x": 1.0,
+                "roi_cam0_y": 1.0,
+                "roi_cam0_width": 2.0,
+                "roi_cam0_height": 2.0,
+                "roi_cam1_x": 2.0,
+                "roi_cam1_y": 1.0,
+                "roi_cam1_width": 3.0,
+                "roi_cam1_height": 2.0,
+                "beam_target_cam0_u": 2.0,
+                "beam_target_cam0_v": 2.0,
+                "beam_target_cam1_u": 4.0,
+                "beam_target_cam1_v": 2.0,
+            }
+        )
+
+        with (
+            patch(
+                "merlin_track_position.tracking.correct.capture_image_stack",
+                return_value=(
+                    np.zeros((1, 4, 5), dtype=float),
+                    np.zeros((1, 6, 7), dtype=float),
+                ),
+            ),
+            patch(
+                "merlin_track_position.tracking.correct.measure_image_error",
+                return_value=shift_dataset(np.zeros((2, 2), dtype=float)),
+            ) as measure,
+        ):
+            detect_shift(
+                calibration,
+                object(),
+                capture_count=1,
+                use_ecc_refinement=True,
+            )
+
+        kwargs = measure.call_args.kwargs
+        self.assertTrue(kwargs["use_ecc_refinement"])
+        np.testing.assert_allclose(
+            kwargs["ecc_reference_point_px"]["cam0"],
+            [1.0, 1.0],
+        )
+        np.testing.assert_allclose(
+            kwargs["ecc_reference_point_px"]["cam1"],
+            [2.0, 1.0],
+        )
+
 
 class VisualCalibrationTests(unittest.TestCase):
     def test_capture_count_defaults_are_split_by_workflow(self):

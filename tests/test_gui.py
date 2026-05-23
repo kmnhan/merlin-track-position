@@ -277,6 +277,10 @@ def roi_display_geometry(window, camera):
     return (position.x(), position.y(), size.x(), size.y())
 
 
+def beam_target_point(window, camera):
+    return np.asarray(window._beam_target_point(camera), dtype=float)
+
+
 def assert_rect_close(testcase, rect, expected):
     actual = (rect.x(), rect.y(), rect.width(), rect.height())
     for actual_value, expected_value in zip(actual, expected, strict=True):
@@ -1127,6 +1131,22 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
             finally:
                 window.close()
 
+    def test_beam_targets_initialize_at_roi_centers(self):
+        get_qapp()
+        with patched_main_window_runtime():
+            window = MainWindow()
+            try:
+                for camera in main_window.CAMERA_IMAGE_SIZES:
+                    np.testing.assert_allclose(
+                        beam_target_point(window, camera),
+                        main_window._roi_center_point(
+                            camera,
+                            window._get_roi_geometry(camera),
+                        ),
+                    )
+            finally:
+                window.close()
+
     def test_shift_monitor_menu_opens_singleton_and_receives_frames(self):
         get_qapp()
         created = []
@@ -1139,12 +1159,16 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                 self.settings = settings
                 self.registration_config = dict(registration_config)
                 self.calibration_calls = []
+                self.beam_target_calls = []
                 self.frames = []
                 self.show_count = 0
                 created.append(self)
 
             def set_calibration(self, calibration):
                 self.calibration_calls.append(calibration)
+
+            def set_beam_target_points(self, points):
+                self.beam_target_calls.append(dict(points))
 
             def submit_frame(self, camera, image):
                 self.frames.append((camera, image))
@@ -1276,7 +1300,61 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                 )
                 self.assertEqual(roi_metadata["roi_cam0_x"], 1.0)
                 self.assertEqual(roi_metadata["roi_cam1_y"], 4.0)
+                np.testing.assert_allclose(
+                    [
+                        roi_metadata["beam_target_cam0_u"],
+                        roi_metadata["beam_target_cam0_v"],
+                    ],
+                    beam_target_point(window, "cam0"),
+                )
+                np.testing.assert_allclose(
+                    [
+                        roi_metadata["beam_target_cam1_u"],
+                        roi_metadata["beam_target_cam1_v"],
+                    ],
+                    beam_target_point(window, "cam1"),
+                )
                 self.assertIsNotNone(camera_pair)
+            finally:
+                window.close()
+
+    def test_loaded_calibration_initializes_beam_targets_from_metadata(self):
+        get_qapp()
+        calibration = build_sample_calibration_dataset(
+            image_shape_cam0=(4, 5),
+            image_shape_cam1=(6, 7),
+        ).assign_attrs({"calibration_path": "/tmp/calibration.h5"})
+
+        with patched_main_window_runtime():
+            window = MainWindow()
+            try:
+                cam0_point = main_window._roi_center_point(
+                    "cam0",
+                    window._get_roi_geometry("cam0"),
+                )
+                cam1_point = main_window._roi_center_point(
+                    "cam1",
+                    window._get_roi_geometry("cam1"),
+                )
+                calibration = calibration.assign_attrs(
+                    {
+                        "beam_target_cam0_u": cam0_point[0] + 3.0,
+                        "beam_target_cam0_v": cam0_point[1] - 2.0,
+                        "beam_target_cam1_u": cam1_point[0] - 4.0,
+                        "beam_target_cam1_v": cam1_point[1] + 5.0,
+                    }
+                )
+
+                window._on_new_calibration_ready(calibration)
+
+                np.testing.assert_allclose(
+                    beam_target_point(window, "cam0"),
+                    [cam0_point[0] + 3.0, cam0_point[1] - 2.0],
+                )
+                np.testing.assert_allclose(
+                    beam_target_point(window, "cam1"),
+                    [cam1_point[0] - 4.0, cam1_point[1] + 5.0],
+                )
             finally:
                 window.close()
 
@@ -1822,8 +1900,10 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
 
                     window._start_correction()
 
+                    shift_kwargs = dict(window._correction_thread.shift_kwargs)
+                    reference_points = shift_kwargs.pop("ecc_reference_point_px")
                     self.assertEqual(
-                        window._correction_thread.shift_kwargs,
+                        shift_kwargs,
                         {
                             "clip_percentiles": (20.0, 80.0),
                             "use_window": True,
@@ -1835,6 +1915,101 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                             "capture_aggregation": "mean_image",
                         },
                     )
+                    for camera in main_window.CAMERA_IMAGE_SIZES:
+                        np.testing.assert_allclose(
+                            reference_points[camera],
+                            beam_target_point(window, camera),
+                        )
+                finally:
+                    window.close()
+
+    def test_ecc_beam_target_drag_overrides_metadata_for_detect_and_correction(self):
+        get_qapp()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "calibration.h5"
+            roi_metadata = _roi_metadata_from_geometries(
+                {
+                    "cam0": (10.0, 20.0, 100.0, 80.0),
+                    "cam1": (30.0, 40.0, 120.0, 90.0),
+                }
+            )
+            calibration = write_sample_calibration(path).assign_attrs(
+                roi_metadata
+                | {
+                    "beam_target_cam0_u": 35.0,
+                    "beam_target_cam0_v": 45.0,
+                    "beam_target_cam1_u": 70.0,
+                    "beam_target_cam1_v": 85.0,
+                }
+            )
+            with patched_main_window_runtime():
+                window = MainWindow()
+                try:
+                    config = dict(window._registration_config)
+                    config["use_ecc_refinement"] = True
+                    window._on_registration_config_saved(config)
+                    window._on_new_calibration_ready(calibration)
+
+                    np.testing.assert_allclose(
+                        beam_target_point(window, "cam0"),
+                        [35.0, 45.0],
+                    )
+                    dragged_cam0 = (50.0, 60.0)
+                    window.image_targets["cam0"].setPos(
+                        *main_window._display_point("cam0", dragged_cam0)
+                    )
+                    window._on_beam_target_position_changed("cam0")
+
+                    updated_calibration = calibration.assign_attrs(
+                        {
+                            "beam_target_cam0_u": 90.0,
+                            "beam_target_cam0_v": 95.0,
+                            "beam_target_cam1_u": 75.0,
+                            "beam_target_cam1_v": 90.0,
+                        }
+                    )
+                    window._apply_calibration_beam_target_metadata(
+                        updated_calibration,
+                        preserve_user_overrides=True,
+                    )
+
+                    np.testing.assert_allclose(
+                        beam_target_point(window, "cam0"),
+                        dragged_cam0,
+                    )
+                    np.testing.assert_allclose(
+                        beam_target_point(window, "cam1"),
+                        [75.0, 90.0],
+                    )
+                    expected_points = {
+                        "cam0": np.asarray([40.0, 40.0], dtype=float),
+                        "cam1": np.asarray([45.0, 50.0], dtype=float),
+                    }
+                    registration_kwargs = window._registration_measurement_kwargs()
+                    for camera, point in expected_points.items():
+                        np.testing.assert_allclose(
+                            registration_kwargs["ecc_reference_point_px"][camera],
+                            point,
+                        )
+
+                    window._on_detect_shift_clicked()
+                    for camera, point in expected_points.items():
+                        np.testing.assert_allclose(
+                            window._detect_shift_thread.shift_kwargs[
+                                "ecc_reference_point_px"
+                            ][camera],
+                            point,
+                        )
+
+                    window._detect_shift_thread.running = False
+                    window._start_correction()
+                    for camera, point in expected_points.items():
+                        np.testing.assert_allclose(
+                            window._correction_thread.shift_kwargs[
+                                "ecc_reference_point_px"
+                            ][camera],
+                            point,
+                        )
                 finally:
                     window.close()
 

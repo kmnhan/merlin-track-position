@@ -721,13 +721,13 @@ def measure_image_error(
         reference_image_cam0,
         current_stack_cam0,
         capture_aggregation=capture_aggregation,
-        **shift_kwargs,
+        **_shift_kwargs_for_camera(shift_kwargs, "cam0"),
     )
     shift_cam1, mad_cam1, warnings_cam1 = estimate_capture_stack_shift(
         reference_image_cam1,
         current_stack_cam1,
         capture_aggregation=capture_aggregation,
-        **shift_kwargs,
+        **_shift_kwargs_for_camera(shift_kwargs, "cam1"),
     )
     current_image_cam0 = _representative_capture_image(
         current_stack_cam0,
@@ -1592,7 +1592,7 @@ def _estimate_probe_mean_image_shifts(
             shift_px, capture_warnings = _estimate_capture_shift(
                 reference,
                 current,
-                **shift_kwargs,
+                **_shift_kwargs_for_camera(shift_kwargs, CAMERAS[camera_index]),
             )
             pixels[probe_index, camera_index, :] = shift_px
             probe_warnings.append(capture_warnings)
@@ -1655,7 +1655,7 @@ def _estimate_indexed_capture_shift(
     shift_px, capture_warnings = _estimate_capture_shift(
         reference,
         current,
-        **shift_kwargs,
+        **_shift_kwargs_for_camera(shift_kwargs, CAMERAS[camera_index]),
     )
     warnings = tuple(
         _format_capture_warning(line, capture_index, capture_count)
@@ -1663,6 +1663,31 @@ def _estimate_indexed_capture_shift(
         if line
     )
     return sample_index, camera_index, capture_index, shift_px, warnings
+
+
+def _shift_kwargs_for_camera(
+    shift_kwargs: Mapping[str, Any],
+    camera: str,
+) -> dict[str, Any]:
+    kwargs = dict(shift_kwargs)
+    if "ecc_reference_point_px" not in kwargs:
+        return kwargs
+
+    point = kwargs["ecc_reference_point_px"]
+    if point is None:
+        return kwargs
+    if isinstance(point, Mapping):
+        camera_point = point.get(camera)
+        if camera_point is None:
+            kwargs.pop("ecc_reference_point_px")
+        else:
+            kwargs["ecc_reference_point_px"] = camera_point
+        return kwargs
+
+    point_array = np.asarray(point, dtype=np.float64)
+    if point_array.shape == (len(CAMERAS), len(PIXEL_AXES)):
+        kwargs["ecc_reference_point_px"] = point_array[CAMERAS.index(camera)]
+    return kwargs
 
 
 def _estimate_capture_shift(

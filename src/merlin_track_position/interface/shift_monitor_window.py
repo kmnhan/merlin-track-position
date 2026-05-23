@@ -19,7 +19,11 @@ from merlin_track_position.interface.registration_settings import (
     save_registration_config,
 )
 from merlin_track_position.tracking.calibration_core import estimate_capture_stack_shift
-from merlin_track_position.tracking.roi import matching_reference_and_stack
+from merlin_track_position.tracking.roi import (
+    beam_target_point_from_attrs_or_default,
+    matching_reference_and_stack,
+    roi_local_point_from_full_frame,
+)
 
 __all__ = ("ShiftMonitorWindow",)
 
@@ -62,6 +66,10 @@ class _ShiftRegistrationThread(QtCore.QThread):
         reference_array = np.asarray(reference, dtype=np.float64).copy()
         current_array = np.asarray(current_stack, dtype=np.float64).copy()
         normalized_config = normalized_registration_config(config)
+        if "ecc_reference_point_px" in config:
+            normalized_config["ecc_reference_point_px"] = config[
+                "ecc_reference_point_px"
+            ]
         with self._lock:
             self._pending[str(camera)] = (
                 reference_array,
@@ -141,6 +149,7 @@ class ShiftMonitorWindow(QtWidgets.QWidget):
         self._config = normalized_registration_config(registration_config)
         self._calibration: Any | None = None
         self._calibration_references: dict[str, np.ndarray] = {}
+        self._beam_target_points: dict[str, np.ndarray] = {}
         self._live_references: dict[str, np.ndarray] = {}
         self._frame_buffers: dict[str, list[np.ndarray]] = {}
         self._last_submit_at: dict[str, float] = {}
@@ -443,6 +452,15 @@ class ShiftMonitorWindow(QtWidgets.QWidget):
                     ).copy()
         self.reset_history()
 
+    def set_beam_target_points(
+        self,
+        points: Mapping[str, Any],
+    ) -> None:
+        self._beam_target_points = {
+            str(camera): np.asarray(point, dtype=np.float64).copy()
+            for camera, point in points.items()
+        }
+
     @QtCore.Slot()
     def reset_history(self) -> None:
         self._worker.clear_pending()
@@ -482,7 +500,31 @@ class ShiftMonitorWindow(QtWidgets.QWidget):
 
         elapsed_s = now - self._started_at
         self._last_submit_at[camera] = now
-        self._worker.submit(camera, reference, current, self._config, elapsed_s)
+        config = dict(self._config)
+        reference_point = self._ecc_reference_point_for_camera(camera)
+        if reference_point is not None:
+            config["ecc_reference_point_px"] = reference_point
+        self._worker.submit(camera, reference, current, config, elapsed_s)
+
+    def _ecc_reference_point_for_camera(self, camera: str) -> np.ndarray | None:
+        if not bool(self._config.get("use_ecc_refinement")):
+            return None
+
+        point = self._beam_target_points.get(camera)
+        if point is None and self._calibration is not None:
+            point = beam_target_point_from_attrs_or_default(
+                self._calibration.attrs,
+                camera,
+            )
+        if point is None:
+            return None
+        if self._calibration is None:
+            return np.asarray(point, dtype=np.float64)
+        return roi_local_point_from_full_frame(
+            self._calibration.attrs,
+            camera,
+            point,
+        )
 
     def _reference_and_current_stack(
         self,

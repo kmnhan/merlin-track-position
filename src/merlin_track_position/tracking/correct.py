@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, NamedTuple, Protocol
@@ -49,7 +49,11 @@ from merlin_track_position.tracking.persistence import (
     persistence_result_attrs,
     stage_dataset,
 )
-from merlin_track_position.tracking.roi import matching_reference_and_stack
+from merlin_track_position.tracking.roi import (
+    beam_target_point_from_attrs_or_default,
+    matching_reference_and_stack,
+    roi_local_point_from_full_frame,
+)
 
 logger = logging.getLogger("merlin_track_position.tracking.correct")
 
@@ -2348,6 +2352,10 @@ def _capture_measurement(
         reference_cam1,
         current_cam1,
     )
+    shift_kwargs = _shift_kwargs_with_calibration_ecc_points(
+        calibration,
+        shift_kwargs,
+    )
     logger.info("Measuring image error against calibration references.")
     measurement = measure_image_error(
         reference_cam0,
@@ -2362,6 +2370,28 @@ def _capture_measurement(
         np.asarray(measurement["shift_px"].values, dtype=np.float64).tolist(),
     )
     return measurement
+
+
+def _shift_kwargs_with_calibration_ecc_points(
+    calibration: xr.Dataset,
+    shift_kwargs: Mapping[str, Any],
+) -> dict[str, Any]:
+    kwargs = dict(shift_kwargs)
+    if not kwargs.get("use_ecc_refinement"):
+        return kwargs
+    if "ecc_reference_point_px" in kwargs:
+        return kwargs
+
+    attrs = calibration.attrs
+    kwargs["ecc_reference_point_px"] = {
+        camera: roi_local_point_from_full_frame(
+            attrs,
+            camera,
+            beam_target_point_from_attrs_or_default(attrs, camera),
+        )
+        for camera in CAMERAS
+    }
+    return kwargs
 
 
 def _stack_or_empty(rows: Sequence[np.ndarray]) -> np.ndarray:

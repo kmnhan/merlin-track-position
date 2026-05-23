@@ -7,6 +7,7 @@ from typing import Any
 
 import cv2
 import numpy as np
+import numpy.typing as npt
 import xarray as xr
 from skimage.registration import phase_cross_correlation
 
@@ -53,6 +54,7 @@ def estimate_shift(
     check_tiles: bool = False,
     high_error_threshold: float = 0.5,
     use_ecc_refinement: bool = False,
+    ecc_reference_point_px: npt.ArrayLike | None = None,
 ) -> xr.Dataset:
     """Estimate subpixel translation between two grayscale images.
 
@@ -62,7 +64,8 @@ def estimate_shift(
     Pass ``check_tiles=True`` to compare local tile shifts against the full-frame
     estimate.
     Pass ``use_ecc_refinement=True`` to refine the phase-correlation result with
-    an affine OpenCV ECC registration and return the center-point displacement.
+    an affine OpenCV ECC registration and return the displacement at
+    ``ecc_reference_point_px``. If no point is supplied, the image center is used.
     """
 
     reference_image = np.asarray(reference, dtype=np.float64)
@@ -142,6 +145,7 @@ def estimate_shift(
                 current_norm,
                 shift_px,
                 use_window=use_window,
+                reference_point_px=ecc_reference_point_px,
             )
         except Exception as exc:
             diagnostic_warnings.append(f"ECC refinement failed: {exc}")
@@ -210,6 +214,7 @@ def _estimate_ecc_affine_shift(
     initial_shift_px: np.ndarray,
     *,
     use_window: bool,
+    reference_point_px: npt.ArrayLike | None,
 ) -> np.ndarray:
     reference_work, current_work = _registration_work_images(
         reference_norm,
@@ -245,13 +250,29 @@ def _estimate_ecc_affine_shift(
     if refined.shape != (2, 3) or not np.isfinite(refined).all():
         raise ValueError("ECC returned a non-finite affine warp")
 
-    height, width = reference_norm.shape
-    center = np.asarray([(width - 1.0) / 2.0, (height - 1.0) / 2.0], dtype=np.float64)
-    mapped_center = refined @ np.asarray([center[0], center[1], 1.0], dtype=np.float64)
-    shift = mapped_center - center
+    point = _ecc_reference_point(reference_norm.shape, reference_point_px)
+    mapped = refined @ np.asarray([point[0], point[1], 1.0], dtype=np.float64)
+    shift = mapped - point
     if not np.isfinite(shift).all():
-        raise ValueError("ECC returned a non-finite center displacement")
+        raise ValueError("ECC returned a non-finite point displacement")
     return np.asarray(shift, dtype=np.float64)
+
+
+def _ecc_reference_point(
+    shape: tuple[int, int],
+    reference_point_px: npt.ArrayLike | None,
+) -> np.ndarray:
+    if reference_point_px is None:
+        height, width = shape
+        return np.asarray(
+            [(width - 1.0) / 2.0, (height - 1.0) / 2.0],
+            dtype=np.float64,
+        )
+
+    point = np.asarray(reference_point_px, dtype=np.float64)
+    if point.shape != (2,) or not np.isfinite(point).all():
+        raise ValueError("ECC reference point must be a finite 2-vector")
+    return point
 
 
 def _registration_work_images(
