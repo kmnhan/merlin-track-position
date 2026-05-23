@@ -20,6 +20,7 @@ from merlin_track_position.instruments.cameras import (
 from merlin_track_position.instruments.motors import get_positions, move_motors_and_wait
 from merlin_track_position.tracking.calibration_core import (
     CAMERAS,
+    CAPTURE_AGGREGATION_MEDIAN_SHIFTS,
     COMMAND_AXES,
     PIXEL_AXES,
     compute_lqr_correction_design,
@@ -121,6 +122,7 @@ def do_correction(
     calibration_path: str | Path | None = None,
     max_retries: int = 4,
     capture_count: int = constants.DEFAULT_CORRECTION_CAPTURE_COUNT,
+    capture_aggregation: str = CAPTURE_AGGREGATION_MEDIAN_SHIFTS,
     lqr_projected_tolerance: Any = _USE_DEFAULT,
     gain: Any = _USE_DEFAULT,
     max_normalized_step: Any = _USE_DEFAULT,
@@ -295,6 +297,7 @@ def do_correction(
         reference_cam0,
         reference_cam1,
         capture_count,
+        capture_aggregation=capture_aggregation,
         **shift_kwargs,
     )
     weighted_residual = weighted_pixel_residual(measurement, weights=weights)
@@ -673,6 +676,7 @@ def do_correction(
             reference_cam0,
             reference_cam1,
             capture_count,
+            capture_aggregation=capture_aggregation,
             **shift_kwargs,
         )
         after_weighted_residual = weighted_pixel_residual(
@@ -2234,6 +2238,13 @@ def _build_correction_result(
             constants.DEFAULT_CORRECTION_MOVE_DELTA_DEADBAND_UM
         ),
         "correction_backlash_enabled": bool(correction_backlash_enabled),
+        "capture_count": int(measurement.attrs.get("capture_count", 1)),
+        "capture_aggregation": str(
+            measurement.attrs.get(
+                "capture_aggregation",
+                CAPTURE_AGGREGATION_MEDIAN_SHIFTS,
+            )
+        ),
         "max_correction_moves": int(max_moves),
         "correction_applied": move_count > 0,
         "warnings": "\n".join(tuple(dict.fromkeys(warnings))),
@@ -2311,9 +2322,14 @@ def _capture_measurement(
     reference_cam0: np.ndarray,
     reference_cam1: np.ndarray,
     capture_count: int,
+    capture_aggregation: str = CAPTURE_AGGREGATION_MEDIAN_SHIFTS,
     **shift_kwargs: Any,
 ) -> xr.Dataset:
-    logger.info("Capturing image stack: capture_count=%d", capture_count)
+    logger.info(
+        "Capturing image stack: capture_count=%d, capture_aggregation=%s",
+        capture_count,
+        capture_aggregation,
+    )
     current_cam0, current_cam1 = capture_image_stack(camera_pair, capture_count)
     logger.info(
         "Captured image stacks: cam0_shape=%s, cam1_shape=%s",
@@ -2338,6 +2354,7 @@ def _capture_measurement(
         current_cam0,
         reference_cam1,
         current_cam1,
+        capture_aggregation=capture_aggregation,
         **shift_kwargs,
     )
     logger.info(

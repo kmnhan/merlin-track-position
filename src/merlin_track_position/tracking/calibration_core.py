@@ -33,6 +33,12 @@ from merlin_track_position.tracking.shift import estimate_shift
 CAMERAS = ("cam0", "cam1")
 COMMAND_AXES = ("x", "y", "z")
 PIXEL_AXES = ("du_px", "dv_px")
+CAPTURE_AGGREGATION_MEDIAN_SHIFTS = "median_shifts"
+CAPTURE_AGGREGATION_MEAN_IMAGE = "mean_image"
+CAPTURE_AGGREGATIONS = (
+    CAPTURE_AGGREGATION_MEDIAN_SHIFTS,
+    CAPTURE_AGGREGATION_MEAN_IMAGE,
+)
 OBSERVATION_AXES = tuple(
     f"{camera}_{pixel_axis}" for camera in CAMERAS for pixel_axis in PIXEL_AXES
 )
@@ -96,6 +102,7 @@ def fit_jacobian_calibration(
     condition_warning_threshold: float = (
         constants.DEFAULT_JACOBIAN_CONDITION_WARNING
     ),
+    capture_aggregation: str = CAPTURE_AGGREGATION_MEDIAN_SHIFTS,
     additional_context: dict[str, Any] | None = None,
     progress_callback: ProgressCallback | None = None,
     n_jobs: int | None = None,
@@ -118,6 +125,7 @@ def fit_jacobian_calibration(
             "argument 'reference_index'"
         )
     n_jobs = _resolve_n_jobs(n_jobs)
+    capture_aggregation = _normalize_capture_aggregation(capture_aggregation)
 
     reference_image_cam0 = _as_reference_image("reference_cam0", reference_cam0)
     reference_image_cam1 = _as_reference_image("reference_cam1", reference_cam1)
@@ -188,6 +196,7 @@ def fit_jacobian_calibration(
     measured_delta_px, capture_shift_mad_px, measurement_warnings = (
         _estimate_probe_capture_shifts(
             ((before_cam0, after_cam0), (before_cam1, after_cam1)),
+            capture_aggregation=capture_aggregation,
             progress_callback=progress_callback,
             n_jobs=n_jobs,
             **shift_kwargs,
@@ -262,6 +271,7 @@ def fit_jacobian_calibration(
     )
     attrs: dict[str, Any] = {
         "capture_count": capture_count,
+        "capture_aggregation": capture_aggregation,
         "min_shift_px": min_shift_px,
         "condition_warning_threshold": condition_warning_threshold,
         "warnings": "\n".join(tuple(warnings)),
@@ -686,10 +696,13 @@ def measure_image_error(
     current_cam0: Any,
     reference_cam1: Any,
     current_cam1: Any,
+    *,
+    capture_aggregation: str = CAPTURE_AGGREGATION_MEDIAN_SHIFTS,
     **shift_kwargs: Any,
 ) -> xr.Dataset:
     """Measure the current two-camera image error against the references."""
 
+    capture_aggregation = _normalize_capture_aggregation(capture_aggregation)
     reference_image_cam0 = _as_reference_image("reference_cam0", reference_cam0)
     reference_image_cam1 = _as_reference_image("reference_cam1", reference_cam1)
     current_captures_cam0, current_dtypes_cam0 = _as_capture_arrays(
@@ -704,14 +717,16 @@ def measure_image_error(
     current_stack_cam0 = current_captures_cam0[0]
     current_stack_cam1 = current_captures_cam1[0]
 
-    shift_cam0, mad_cam0, warnings_cam0 = _estimate_median_capture_shift(
+    shift_cam0, mad_cam0, warnings_cam0 = estimate_capture_stack_shift(
         reference_image_cam0,
         current_stack_cam0,
+        capture_aggregation=capture_aggregation,
         **shift_kwargs,
     )
-    shift_cam1, mad_cam1, warnings_cam1 = _estimate_median_capture_shift(
+    shift_cam1, mad_cam1, warnings_cam1 = estimate_capture_stack_shift(
         reference_image_cam1,
         current_stack_cam1,
+        capture_aggregation=capture_aggregation,
         **shift_kwargs,
     )
     current_image_cam0 = _representative_capture_image(
@@ -760,6 +775,7 @@ def measure_image_error(
         },
         attrs={
             "capture_count": capture_count,
+            "capture_aggregation": capture_aggregation,
             "warnings": "\n".join(shift_warnings),
         },
     )
@@ -1438,6 +1454,7 @@ def _estimate_probe_capture_shifts(
         tuple[Sequence[np.ndarray], Sequence[np.ndarray]],
     ],
     *,
+    capture_aggregation: str,
     progress_callback: ProgressCallback | None,
     n_jobs: int,
     **shift_kwargs: Any,
@@ -1446,9 +1463,17 @@ def _estimate_probe_capture_shifts(
     np.ndarray,
     list[tuple[tuple[str, ...], tuple[str, ...]]],
 ]:
+    capture_aggregation = _normalize_capture_aggregation(capture_aggregation)
     probe_count = len(capture_arrays_by_camera[0][0])
     capture_count = int(capture_arrays_by_camera[0][0][0].shape[0])
     camera_count = len(CAMERAS)
+    if capture_aggregation == CAPTURE_AGGREGATION_MEAN_IMAGE:
+        return _estimate_probe_mean_image_shifts(
+            capture_arrays_by_camera,
+            progress_callback=progress_callback,
+            **shift_kwargs,
+        )
+
     total = probe_count * camera_count * capture_count
     if progress_callback is not None:
         progress_callback(0, total)
@@ -1526,6 +1551,54 @@ def _estimate_probe_capture_shifts(
             pixels[probe_index, camera_index, :] = median_shift
             capture_shift_mad_px[probe_index, camera_index, :] = shift_mad
             probe_warnings.append(camera_warnings)
+        measurement_warnings.append((probe_warnings[0], probe_warnings[1]))
+
+    return pixels, capture_shift_mad_px, measurement_warnings
+
+
+def _estimate_probe_mean_image_shifts(
+    capture_arrays_by_camera: tuple[
+        tuple[Sequence[np.ndarray], Sequence[np.ndarray]],
+        tuple[Sequence[np.ndarray], Sequence[np.ndarray]],
+    ],
+    *,
+    progress_callback: ProgressCallback | None,
+    **shift_kwargs: Any,
+) -> tuple[
+    np.ndarray,
+    np.ndarray,
+    list[tuple[tuple[str, ...], tuple[str, ...]]],
+]:
+    probe_count = len(capture_arrays_by_camera[0][0])
+    camera_count = len(CAMERAS)
+    total = probe_count * camera_count
+    if progress_callback is not None:
+        progress_callback(0, total)
+
+    pixels = np.empty(
+        (probe_count, camera_count, len(PIXEL_AXES)),
+        dtype=np.float64,
+    )
+    capture_shift_mad_px = np.zeros_like(pixels)
+    measurement_warnings: list[tuple[tuple[str, ...], tuple[str, ...]]] = []
+    completed = 0
+    for probe_index in range(probe_count):
+        probe_warnings: list[tuple[str, ...]] = []
+        for camera_index, (before_arrays, after_arrays) in enumerate(
+            capture_arrays_by_camera
+        ):
+            reference = _mean_capture_image(before_arrays[probe_index])
+            current = _mean_capture_image(after_arrays[probe_index])
+            shift_px, capture_warnings = _estimate_capture_shift(
+                reference,
+                current,
+                **shift_kwargs,
+            )
+            pixels[probe_index, camera_index, :] = shift_px
+            probe_warnings.append(capture_warnings)
+            completed += 1
+            if progress_callback is not None:
+                progress_callback(completed, total)
         measurement_warnings.append((probe_warnings[0], probe_warnings[1]))
 
     return pixels, capture_shift_mad_px, measurement_warnings
@@ -1785,6 +1858,28 @@ def _cast_representative_image(image: np.ndarray, dtype: np.dtype) -> np.ndarray
     return np.asarray(image, dtype=dtype)
 
 
+def estimate_capture_stack_shift(
+    reference: np.ndarray,
+    captures: np.ndarray,
+    *,
+    capture_aggregation: str = CAPTURE_AGGREGATION_MEDIAN_SHIFTS,
+    **shift_kwargs: Any,
+) -> tuple[np.ndarray, np.ndarray, tuple[str, ...]]:
+    capture_aggregation = _normalize_capture_aggregation(capture_aggregation)
+    if capture_aggregation == CAPTURE_AGGREGATION_MEAN_IMAGE:
+        shift_px, capture_warnings = _estimate_capture_shift(
+            reference,
+            _mean_capture_image(captures),
+            **shift_kwargs,
+        )
+        return (
+            shift_px,
+            np.zeros(len(PIXEL_AXES), dtype=np.float64),
+            capture_warnings,
+        )
+    return _estimate_median_capture_shift(reference, captures, **shift_kwargs)
+
+
 def _estimate_median_capture_shift(
     reference: np.ndarray,
     captures: np.ndarray,
@@ -1828,6 +1923,16 @@ def _summarize_capture_shifts(
     median_shift = np.median(finite_shifts, axis=0)
     shift_mad = np.median(np.abs(finite_shifts - median_shift), axis=0)
     return median_shift, shift_mad, tuple(warnings)
+
+
+def _normalize_capture_aggregation(value: Any) -> str:
+    lowered = str(value).strip().lower()
+    if lowered in CAPTURE_AGGREGATIONS:
+        return lowered
+    raise ValueError(
+        "capture_aggregation must be one of: "
+        + ", ".join(repr(item) for item in CAPTURE_AGGREGATIONS)
+    )
 
 
 def _format_capture_warning(

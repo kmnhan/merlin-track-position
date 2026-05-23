@@ -18,8 +18,8 @@ from merlin_track_position.interface.registration_settings import (
     registration_config_to_shift_kwargs,
     save_registration_config,
 )
+from merlin_track_position.tracking.calibration_core import estimate_capture_stack_shift
 from merlin_track_position.tracking.roi import matching_reference_and_stack
-from merlin_track_position.tracking.shift import estimate_shift
 
 __all__ = ("ShiftMonitorWindow",)
 
@@ -55,12 +55,12 @@ class _ShiftRegistrationThread(QtCore.QThread):
         self,
         camera: str,
         reference: Any,
-        current: Any,
+        current_stack: Any,
         config: Mapping[str, Any],
         elapsed_s: float,
     ) -> None:
         reference_array = np.asarray(reference, dtype=np.float64).copy()
-        current_array = np.asarray(current, dtype=np.float64).copy()
+        current_array = np.asarray(current_stack, dtype=np.float64).copy()
         normalized_config = normalized_registration_config(config)
         with self._lock:
             self._pending[str(camera)] = (
@@ -91,16 +91,14 @@ class _ShiftRegistrationThread(QtCore.QThread):
                     if not self._running.is_set() or self.isInterruptionRequested():
                         break
                     try:
-                        result = estimate_shift(
+                        shift_px, _shift_mad_px, warnings = estimate_capture_stack_shift(
                             reference,
                             current,
+                            capture_aggregation=str(config["capture_aggregation"]),
                             **registration_config_to_shift_kwargs(config),
                         )
-                        shift_px = np.asarray(
-                            result["shift_px"].values,
-                            dtype=np.float64,
-                        )
-                        warnings = str(result.attrs.get("warnings", ""))
+                        shift_px = np.asarray(shift_px, dtype=np.float64)
+                        warning_text = "\n".join(warnings)
                     except Exception as exc:
                         logger.exception("Shift monitor failed for %s.", camera)
                         if (
@@ -114,7 +112,7 @@ class _ShiftRegistrationThread(QtCore.QThread):
                             camera,
                             elapsed_s,
                             shift_px,
-                            warnings,
+                            warning_text,
                         )
         finally:
             self._running.clear()
@@ -144,6 +142,7 @@ class ShiftMonitorWindow(QtWidgets.QWidget):
         self._calibration: Any | None = None
         self._calibration_references: dict[str, np.ndarray] = {}
         self._live_references: dict[str, np.ndarray] = {}
+        self._frame_buffers: dict[str, list[np.ndarray]] = {}
         self._last_submit_at: dict[str, float] = {}
         self._history = _empty_history()
         self._started_at = time.monotonic()
@@ -214,21 +213,36 @@ class ShiftMonitorWindow(QtWidgets.QWidget):
         controls_layout.addWidget(QtWidgets.QLabel("Error threshold"), 6, 0)
         controls_layout.addWidget(self.high_error_spin, 6, 1)
 
+        self.capture_count_spin = QtWidgets.QSpinBox()
+        self.capture_count_spin.setObjectName("shift_monitor_capture_count_spin")
+        self.capture_count_spin.setRange(1, 100)
+        controls_layout.addWidget(QtWidgets.QLabel("Images"), 7, 0)
+        controls_layout.addWidget(self.capture_count_spin, 7, 1)
+
+        self.capture_aggregation_combo = QtWidgets.QComboBox()
+        self.capture_aggregation_combo.setObjectName(
+            "shift_monitor_capture_aggregation_combo"
+        )
+        self.capture_aggregation_combo.addItem("Median shifts", "median_shifts")
+        self.capture_aggregation_combo.addItem("Mean image", "mean_image")
+        controls_layout.addWidget(QtWidgets.QLabel("Aggregation"), 8, 0)
+        controls_layout.addWidget(self.capture_aggregation_combo, 8, 1)
+
         self.save_button = QtWidgets.QPushButton("Save")
         self.save_button.setObjectName("shift_monitor_save_button")
         self.reset_button = QtWidgets.QPushButton("Reset")
         self.reset_button.setObjectName("shift_monitor_reset_button")
-        controls_layout.addWidget(self.save_button, 9, 0)
-        controls_layout.addWidget(self.reset_button, 9, 1)
+        controls_layout.addWidget(self.save_button, 11, 0)
+        controls_layout.addWidget(self.reset_button, 11, 1)
 
         self.export_button = QtWidgets.QPushButton("Export HDF5")
         self.export_button.setObjectName("shift_monitor_export_button")
-        controls_layout.addWidget(self.export_button, 10, 0, 1, 2)
+        controls_layout.addWidget(self.export_button, 12, 0, 1, 2)
 
         self.live_checkbox = QtWidgets.QCheckBox("Live")
         self.live_checkbox.setObjectName("shift_monitor_live_checkbox")
         self.live_checkbox.setChecked(True)
-        controls_layout.addWidget(self.live_checkbox, 7, 0, 1, 2)
+        controls_layout.addWidget(self.live_checkbox, 9, 0, 1, 2)
 
         self.sample_period_spin = QtWidgets.QDoubleSpinBox()
         self.sample_period_spin.setObjectName("shift_monitor_sample_period_spin")
@@ -237,8 +251,8 @@ class ShiftMonitorWindow(QtWidgets.QWidget):
         self.sample_period_spin.setSingleStep(0.5)
         self.sample_period_spin.setSuffix(" s")
         self.sample_period_spin.setValue(DEFAULT_MONITOR_SAMPLE_PERIOD_S)
-        controls_layout.addWidget(QtWidgets.QLabel("Monitor period"), 8, 0)
-        controls_layout.addWidget(self.sample_period_spin, 8, 1)
+        controls_layout.addWidget(QtWidgets.QLabel("Monitor period"), 10, 0)
+        controls_layout.addWidget(self.sample_period_spin, 10, 1)
         controls_layout.setColumnStretch(1, 1)
         side_layout.addWidget(controls_group)
 
@@ -319,6 +333,8 @@ class ShiftMonitorWindow(QtWidgets.QWidget):
             self.upsample_spin,
             self.window_checkbox,
             self.high_error_spin,
+            self.capture_count_spin,
+            self.capture_aggregation_combo,
         ):
             signal = (
                 widget.currentIndexChanged
@@ -346,6 +362,8 @@ class ShiftMonitorWindow(QtWidgets.QWidget):
             self.upsample_spin,
             self.window_checkbox,
             self.high_error_spin,
+            self.capture_count_spin,
+            self.capture_aggregation_combo,
         )
         blockers = [widget.blockSignals(True) for widget in widgets]
         try:
@@ -357,6 +375,11 @@ class ShiftMonitorWindow(QtWidgets.QWidget):
             self.upsample_spin.setValue(int(normalized["upsample_factor"]))
             self.window_checkbox.setChecked(bool(normalized["use_window"]))
             self.high_error_spin.setValue(float(normalized["high_error_threshold"]))
+            self.capture_count_spin.setValue(int(normalized["capture_count"]))
+            index = self.capture_aggregation_combo.findData(
+                normalized["capture_aggregation"]
+            )
+            self.capture_aggregation_combo.setCurrentIndex(max(index, 0))
         finally:
             for widget, blocked in zip(widgets, blockers, strict=True):
                 widget.blockSignals(blocked)
@@ -379,12 +402,15 @@ class ShiftMonitorWindow(QtWidgets.QWidget):
                 "upsample_factor": self.upsample_spin.value(),
                 "use_window": self.window_checkbox.isChecked(),
                 "high_error_threshold": self.high_error_spin.value(),
+                "capture_count": self.capture_count_spin.value(),
+                "capture_aggregation": self.capture_aggregation_combo.currentData(),
             }
         )
 
     @QtCore.Slot()
     def _on_control_changed(self) -> None:
         self._config = self._current_config_from_controls()
+        self._frame_buffers.clear()
 
     @QtCore.Slot()
     def _on_save_clicked(self) -> None:
@@ -410,6 +436,7 @@ class ShiftMonitorWindow(QtWidgets.QWidget):
         self._worker.clear_pending()
         self._started_at = time.monotonic()
         self._live_references.clear()
+        self._frame_buffers.clear()
         self._last_submit_at.clear()
         self._history = _empty_history()
         for camera in CAMERAS:
@@ -424,15 +451,6 @@ class ShiftMonitorWindow(QtWidgets.QWidget):
             return
         if not self.live_checkbox.isChecked():
             return
-        try:
-            reference, current = self._reference_and_current_image(camera, image)
-        except Exception as exc:
-            logger.exception("Could not prepare shift monitor image for %s.", camera)
-            self.warning_label.setText(f"{camera}: {exc}")
-            return
-        if reference is None or current is None:
-            return
-
         now = time.monotonic()
         last_submit_at = self._last_submit_at.get(camera)
         if (
@@ -441,22 +459,41 @@ class ShiftMonitorWindow(QtWidgets.QWidget):
         ):
             return
 
+        try:
+            reference, current = self._reference_and_current_stack(camera, image)
+        except Exception as exc:
+            logger.exception("Could not prepare shift monitor image for %s.", camera)
+            self.warning_label.setText(f"{camera}: {exc}")
+            return
+        if reference is None or current is None:
+            return
+
         elapsed_s = now - self._started_at
         self._last_submit_at[camera] = now
         self._worker.submit(camera, reference, current, self._config, elapsed_s)
 
-    def _reference_and_current_image(
+    def _reference_and_current_stack(
         self,
         camera: str,
         image: Any,
     ) -> tuple[np.ndarray | None, np.ndarray | None]:
         current = np.asarray(image)
+        capture_count = int(self._config["capture_count"])
+        buffer = self._frame_buffers.setdefault(camera, [])
+        buffer.append(current.copy())
+        if len(buffer) < capture_count:
+            return None, None
+        stack = np.stack(buffer[-capture_count:], axis=0)
+        buffer.clear()
         if self._calibration is None:
             if camera not in self._live_references:
-                self._live_references[camera] = current.copy()
+                self._live_references[camera] = np.mean(
+                    np.asarray(stack, dtype=np.float64),
+                    axis=0,
+                )
                 self._update_reference_label()
                 return None, None
-            return self._live_references[camera], current
+            return self._live_references[camera], stack
 
         if camera not in self._calibration_references:
             raise RuntimeError(f"calibration is missing reference_{camera}")
@@ -464,9 +501,9 @@ class ShiftMonitorWindow(QtWidgets.QWidget):
             self._calibration.attrs,
             camera,
             self._calibration_references[camera],
-            current[np.newaxis, ...],
+            stack,
         )
-        return reference, stack[0]
+        return reference, stack
 
     @QtCore.Slot(str, float, object, str)
     def _on_shift_ready(

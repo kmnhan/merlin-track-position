@@ -43,7 +43,7 @@ from merlin_track_position.interface.detection_thread import DetectShiftThread
 from merlin_track_position.interface.registration_settings import (
     normalized_registration_config,
     registration_config_from_settings,
-    registration_config_to_shift_kwargs,
+    registration_config_to_measurement_kwargs,
 )
 from merlin_track_position.interface.shift_monitor_window import ShiftMonitorWindow
 from merlin_track_position.server import MotorServer
@@ -772,8 +772,8 @@ class MainWindow(_MainWindowGUI):
         self._auto_correction_timer.start()
         logger.info("Automatic timed correction enabled every %d ms.", interval_ms)
 
-    def _registration_shift_kwargs(self) -> dict[str, object]:
-        return registration_config_to_shift_kwargs(self._registration_config)
+    def _registration_measurement_kwargs(self) -> dict[str, object]:
+        return registration_config_to_measurement_kwargs(self._registration_config)
 
     @QtCore.Slot()
     def _on_shift_monitor_triggered(self) -> None:
@@ -958,7 +958,7 @@ class MainWindow(_MainWindowGUI):
             self._calibration_path,
             motor_backend=motor_backend,
             correction_mode=self.calibration_panel.correction_mode(),
-            shift_kwargs=self._registration_shift_kwargs(),
+            shift_kwargs=self._registration_measurement_kwargs(),
         )
 
         ui_marked_busy = False
@@ -1407,7 +1407,7 @@ class MainWindow(_MainWindowGUI):
                 output_path,
                 n=n,
                 step_um=step_um,
-                shift_kwargs=self._registration_shift_kwargs(),
+                shift_kwargs=self._registration_measurement_kwargs(),
             )
         except Exception as exc:
             QtWidgets.QMessageBox.critical(
@@ -1492,7 +1492,7 @@ class MainWindow(_MainWindowGUI):
             self._detect_shift_thread.configure(
                 self._calibration,
                 camera_pair,
-                shift_kwargs=self._registration_shift_kwargs(),
+                shift_kwargs=self._registration_measurement_kwargs(),
             )
         except Exception as exc:
             QtWidgets.QMessageBox.critical(

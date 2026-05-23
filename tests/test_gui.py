@@ -26,10 +26,13 @@ from merlin_track_position.interface.main_window import (  # noqa: E402
     _roi_metadata_from_geometries,
 )
 from merlin_track_position.interface.registration_settings import (  # noqa: E402
+    REGISTRATION_CAPTURE_AGGREGATION_SETTINGS_KEY,
+    REGISTRATION_CAPTURE_COUNT_SETTINGS_KEY,
     REGISTRATION_CLIP_HIGH_SETTINGS_KEY,
     REGISTRATION_CLIP_LOW_SETTINGS_KEY,
     REGISTRATION_NORMALIZATION_SETTINGS_KEY,
     REGISTRATION_UPSAMPLE_FACTOR_SETTINGS_KEY,
+    registration_config_to_measurement_kwargs,
     registration_config_to_shift_kwargs,
 )
 from merlin_track_position.interface.shift_monitor_window import (  # noqa: E402
@@ -515,6 +518,7 @@ class ShiftMonitorWindowTests(unittest.TestCase):
         with patched_shift_monitor_worker():
             window = ShiftMonitorWindow(settings)
             try:
+                window.capture_count_spin.setValue(1)
                 window.submit_frame("cam0", first)
                 self.assertEqual(window._worker.submissions, [])
                 self.assertIn("cam0", window.reference_label.text())
@@ -527,11 +531,49 @@ class ShiftMonitorWindowTests(unittest.TestCase):
                 )
                 self.assertEqual(camera, "cam0")
                 np.testing.assert_array_equal(reference, first)
-                np.testing.assert_array_equal(current, second)
+                np.testing.assert_array_equal(current, second[np.newaxis, :, :])
 
                 window.submit_frame("cam1", np.ones((3, 4)))
 
                 self.assertEqual(len(window._worker.submissions), 1)
+            finally:
+                window.close()
+
+    def test_monitor_buffers_capture_count_frames_per_submission(self):
+        get_qapp()
+        settings = FakeSettings()
+        frames = [
+            np.full((2, 2), value, dtype=float)
+            for value in (1.0, 2.0, 3.0, 4.0)
+        ]
+
+        with patched_shift_monitor_worker():
+            window = ShiftMonitorWindow(settings)
+            try:
+                window.capture_count_spin.setValue(2)
+                window.submit_frame("cam0", frames[0])
+                window.submit_frame("cam0", frames[1])
+                self.assertEqual(window._worker.submissions, [])
+                np.testing.assert_array_equal(
+                    window._live_references["cam0"],
+                    np.full((2, 2), 1.5),
+                )
+
+                window.submit_frame("cam0", frames[2])
+                self.assertEqual(window._worker.submissions, [])
+                window.submit_frame("cam0", frames[3])
+
+                self.assertEqual(len(window._worker.submissions), 1)
+                camera, reference, current, config, _elapsed_s = (
+                    window._worker.submissions[0]
+                )
+                self.assertEqual(camera, "cam0")
+                np.testing.assert_array_equal(reference, np.full((2, 2), 1.5))
+                np.testing.assert_array_equal(
+                    current,
+                    np.stack(frames[2:4], axis=0),
+                )
+                self.assertEqual(config["capture_count"], 2)
             finally:
                 window.close()
 
@@ -546,11 +588,12 @@ class ShiftMonitorWindowTests(unittest.TestCase):
             patched_shift_monitor_worker(),
             patch(
                 "merlin_track_position.interface.shift_monitor_window.time.monotonic",
-                side_effect=[100.0, 101.0, 101.5, 103.2],
+                side_effect=[100.0, 100.0, 101.0, 101.5, 103.2],
             ),
         ):
             window = ShiftMonitorWindow(FakeSettings())
             try:
+                window.capture_count_spin.setValue(1)
                 window.submit_frame("cam0", first)
                 window.submit_frame("cam0", second)
                 window.submit_frame("cam0", third)
@@ -559,11 +602,11 @@ class ShiftMonitorWindowTests(unittest.TestCase):
                 self.assertEqual(len(window._worker.submissions), 2)
                 np.testing.assert_array_equal(
                     window._worker.submissions[0][2],
-                    second,
+                    second[np.newaxis, :, :],
                 )
                 np.testing.assert_array_equal(
                     window._worker.submissions[1][2],
-                    fourth,
+                    fourth[np.newaxis, :, :],
                 )
             finally:
                 window.close()
@@ -614,6 +657,7 @@ class ShiftMonitorWindowTests(unittest.TestCase):
         with patched_shift_monitor_worker():
             window = ShiftMonitorWindow(settings)
             try:
+                window.capture_count_spin.setValue(1)
                 window.set_calibration(calibration)
                 window.submit_frame("cam0", current_cam0)
 
@@ -623,7 +667,10 @@ class ShiftMonitorWindowTests(unittest.TestCase):
                 )
                 self.assertEqual(camera, "cam0")
                 np.testing.assert_array_equal(reference, reference_cam0[3:8, 2:6])
-                np.testing.assert_array_equal(current, current_cam0[3:8, 2:6])
+                np.testing.assert_array_equal(
+                    current,
+                    current_cam0[np.newaxis, 3:8, 2:6],
+                )
             finally:
                 window.close()
 
@@ -657,6 +704,10 @@ class ShiftMonitorWindowTests(unittest.TestCase):
                     window.normalization_combo.findData("none")
                 )
                 window.upsample_spin.setValue(51)
+                window.capture_count_spin.setValue(7)
+                window.capture_aggregation_combo.setCurrentIndex(
+                    window.capture_aggregation_combo.findData("mean_image")
+                )
 
                 window.save_button.click()
 
@@ -677,10 +728,24 @@ class ShiftMonitorWindowTests(unittest.TestCase):
                     51,
                 )
                 self.assertEqual(
+                    settings.values[REGISTRATION_CAPTURE_COUNT_SETTINGS_KEY],
+                    7,
+                )
+                self.assertEqual(
+                    settings.values[REGISTRATION_CAPTURE_AGGREGATION_SETTINGS_KEY],
+                    "mean_image",
+                )
+                self.assertEqual(
                     registration_config_to_shift_kwargs(saved_configs[-1])[
                         "clip_percentiles"
                     ],
                     (10.0, 90.0),
+                )
+                self.assertEqual(
+                    registration_config_to_measurement_kwargs(saved_configs[-1])[
+                        "capture_count"
+                    ],
+                    7,
                 )
             finally:
                 window.close()
@@ -693,6 +758,10 @@ class ShiftMonitorWindowTests(unittest.TestCase):
             try:
                 window.sample_period_spin.setValue(3.5)
                 window.upsample_spin.setValue(37)
+                window.capture_count_spin.setValue(5)
+                window.capture_aggregation_combo.setCurrentIndex(
+                    window.capture_aggregation_combo.findData("mean_image")
+                )
                 window._on_shift_ready(
                     "cam0",
                     1.25,
@@ -716,6 +785,11 @@ class ShiftMonitorWindowTests(unittest.TestCase):
                     self.assertEqual(
                         exported.attrs["registration_upsample_factor"],
                         37,
+                    )
+                    self.assertEqual(exported.attrs["registration_capture_count"], 5)
+                    self.assertEqual(
+                        exported.attrs["registration_capture_aggregation"],
+                        "mean_image",
                     )
                     np.testing.assert_allclose(
                         exported["cam0/time_s"][:],
@@ -1181,7 +1255,7 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                 self.assertEqual(step_um, 10.0)
                 self.assertEqual(
                     shift_kwargs,
-                    registration_config_to_shift_kwargs(window._registration_config),
+                    registration_config_to_measurement_kwargs(window._registration_config),
                 )
                 self.assertEqual(roi_metadata["roi_cam0_x"], 1.0)
                 self.assertEqual(roi_metadata["roi_cam1_y"], 4.0)
@@ -1454,7 +1528,7 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                     self.assertEqual(thread.correction_mode, "beam")
                     self.assertEqual(
                         thread.shift_kwargs,
-                        registration_config_to_shift_kwargs(window._registration_config),
+                        registration_config_to_measurement_kwargs(window._registration_config),
                     )
                     self.assertTrue(
                         window.calibration_panel.auto_correction_checkbox.isEnabled()
@@ -1689,7 +1763,7 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                     self.assertEqual(thread.correction_mode, "beam")
                     self.assertEqual(
                         thread.shift_kwargs,
-                        registration_config_to_shift_kwargs(window._registration_config),
+                        registration_config_to_measurement_kwargs(window._registration_config),
                     )
                     self.assertIsNotNone(thread.camera_pair)
                     self.assertIn(
@@ -1722,6 +1796,8 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                             "upsample_factor": 51,
                             "use_window": True,
                             "high_error_threshold": 0.25,
+                            "capture_count": 7,
+                            "capture_aggregation": "mean_image",
                         }
                     )
                     window._on_new_calibration_ready(calibration)
@@ -1736,6 +1812,8 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                             "upsample_factor": 51,
                             "normalization": None,
                             "high_error_threshold": 0.25,
+                            "capture_count": 7,
+                            "capture_aggregation": "mean_image",
                         },
                     )
                 finally:
@@ -1758,7 +1836,7 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                     self.assertIs(thread.calibration, window._calibration)
                     self.assertEqual(
                         thread.shift_kwargs,
-                        registration_config_to_shift_kwargs(window._registration_config),
+                        registration_config_to_measurement_kwargs(window._registration_config),
                     )
                     self.assertIsNotNone(thread.camera_pair)
                     self.assertIsNone(window._last_correction_result)
@@ -1836,7 +1914,7 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                     self.assertEqual(thread.correction_mode, "beam")
                     self.assertEqual(
                         thread.shift_kwargs,
-                        registration_config_to_shift_kwargs(window._registration_config),
+                        registration_config_to_measurement_kwargs(window._registration_config),
                     )
                     self.assertIsNotNone(thread.camera_pair)
                     self.assertEqual(window._server.result_calls, [])

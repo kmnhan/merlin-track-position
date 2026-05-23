@@ -98,8 +98,11 @@ def absolute_command_positions(command_delta, center=(1.0, 2.0, 3.0)):
     return np.asarray(pre_rows, dtype=float), np.asarray(post_rows, dtype=float)
 
 
-def empty_capture_stacks(probe_count, shape=(8, 9)):
-    return [np.zeros((1, *shape), dtype=np.float32) for _ in range(probe_count)]
+def empty_capture_stacks(probe_count, shape=(8, 9), capture_count=1):
+    return [
+        np.zeros((capture_count, *shape), dtype=np.float32)
+        for _ in range(probe_count)
+    ]
 
 
 def shift_dataset(values):
@@ -250,6 +253,176 @@ class VisualCalibrationTests(unittest.TestCase):
             detect_shift.__kwdefaults__["capture_count"],
             constants.DEFAULT_CORRECTION_CAPTURE_COUNT,
         )
+
+    def test_measure_image_error_median_registers_each_capture(self):
+        shifts = iter(
+            (
+                np.asarray([1.0, 2.0]),
+                np.asarray([3.0, 4.0]),
+                np.asarray([5.0, 6.0]),
+                np.asarray([7.0, 8.0]),
+            )
+        )
+        calls = []
+
+        def fake_estimate_shift(reference, current, **kwargs):
+            calls.append((np.asarray(reference).copy(), np.asarray(current).copy()))
+            del kwargs
+            return xr.Dataset(
+                {"shift_px": (("pixel_axis",), next(shifts))},
+                coords={"pixel_axis": list(PIXEL_AXES)},
+                attrs={"warnings": ""},
+            )
+
+        with patch(
+            "merlin_track_position.tracking.calibration_core.estimate_shift",
+            side_effect=fake_estimate_shift,
+        ):
+            result = calibration_core.measure_image_error(
+                np.zeros((2, 2)),
+                np.stack(
+                    (
+                        np.full((2, 2), 10.0),
+                        np.full((2, 2), 20.0),
+                    ),
+                    axis=0,
+                ),
+                np.zeros((3, 3)),
+                np.stack(
+                    (
+                        np.full((3, 3), 30.0),
+                        np.full((3, 3), 40.0),
+                    ),
+                    axis=0,
+                ),
+            )
+
+        self.assertEqual(len(calls), 4)
+        np.testing.assert_allclose(
+            result["shift_px"].values,
+            [[2.0, 3.0], [6.0, 7.0]],
+        )
+        np.testing.assert_allclose(result["capture_shift_mad_px"].values, 1.0)
+        self.assertEqual(result.attrs["capture_count"], 2)
+        self.assertEqual(result.attrs["capture_aggregation"], "median_shifts")
+
+    def test_measure_image_error_mean_image_registers_averaged_image_once(self):
+        shifts = iter((np.asarray([1.0, 2.0]), np.asarray([3.0, 4.0])))
+        calls = []
+
+        def fake_estimate_shift(reference, current, **kwargs):
+            calls.append((np.asarray(reference).copy(), np.asarray(current).copy()))
+            del kwargs
+            return xr.Dataset(
+                {"shift_px": (("pixel_axis",), next(shifts))},
+                coords={"pixel_axis": list(PIXEL_AXES)},
+                attrs={"warnings": "warning"},
+            )
+
+        with patch(
+            "merlin_track_position.tracking.calibration_core.estimate_shift",
+            side_effect=fake_estimate_shift,
+        ):
+            result = calibration_core.measure_image_error(
+                np.zeros((2, 2)),
+                np.stack(
+                    (
+                        np.full((2, 2), 10.0),
+                        np.full((2, 2), 20.0),
+                    ),
+                    axis=0,
+                ),
+                np.zeros((3, 3)),
+                np.stack(
+                    (
+                        np.full((3, 3), 30.0),
+                        np.full((3, 3), 40.0),
+                    ),
+                    axis=0,
+                ),
+                capture_aggregation="mean_image",
+            )
+
+        self.assertEqual(len(calls), 2)
+        np.testing.assert_array_equal(calls[0][1], np.full((2, 2), 15.0))
+        np.testing.assert_array_equal(calls[1][1], np.full((3, 3), 35.0))
+        np.testing.assert_allclose(
+            result["shift_px"].values,
+            [[1.0, 2.0], [3.0, 4.0]],
+        )
+        np.testing.assert_allclose(result["capture_shift_mad_px"].values, 0.0)
+        self.assertTrue(np.isfinite(result["capture_shift_mad_px"].values).all())
+        self.assertEqual(result.attrs["capture_count"], 2)
+        self.assertEqual(result.attrs["capture_aggregation"], "mean_image")
+        self.assertIn("cam0 warning", result.attrs["warnings"])
+        self.assertIn("cam1 warning", result.attrs["warnings"])
+
+    def test_fit_calibration_mean_image_records_aggregation(self):
+        command_delta = probe_deltas()
+        expected = px_per_cmd_mm()
+        measured = measured_from_jacobian(command_delta, expected)
+        shift_values = iter(
+            measured[probe_index, camera_index]
+            for probe_index in range(command_delta.shape[0])
+            for camera_index in range(len(CAMERAS))
+        )
+        calls = []
+        progress = []
+
+        def fake_estimate_shift(reference, current, **kwargs):
+            calls.append((np.asarray(reference).copy(), np.asarray(current).copy()))
+            del kwargs
+            return xr.Dataset(
+                {"shift_px": (("pixel_axis",), next(shift_values))},
+                coords={"pixel_axis": list(PIXEL_AXES)},
+                attrs={"warnings": ""},
+            )
+
+        with patch(
+            "merlin_track_position.tracking.calibration_core.estimate_shift",
+            side_effect=fake_estimate_shift,
+        ):
+            result = fit_jacobian_calibration(
+                reference_cam0=np.zeros((3, 3)),
+                reference_cam1=np.zeros((3, 3)),
+                before_images_cam0=empty_capture_stacks(
+                    command_delta.shape[0],
+                    shape=(3, 3),
+                    capture_count=2,
+                ),
+                after_images_cam0=empty_capture_stacks(
+                    command_delta.shape[0],
+                    shape=(3, 3),
+                    capture_count=2,
+                ),
+                before_images_cam1=empty_capture_stacks(
+                    command_delta.shape[0],
+                    shape=(3, 3),
+                    capture_count=2,
+                ),
+                after_images_cam1=empty_capture_stacks(
+                    command_delta.shape[0],
+                    shape=(3, 3),
+                    capture_count=2,
+                ),
+                command_delta_mm=command_delta,
+                pre_commanded_position_mm=np.zeros((command_delta.shape[0], 3)),
+                post_commanded_position_mm=command_delta,
+                pre_readback_position_mm=np.zeros((command_delta.shape[0], 3)),
+                post_readback_position_mm=command_delta,
+                min_shift_px=0.0,
+                capture_aggregation="mean_image",
+                progress_callback=lambda completed, total: progress.append(
+                    (completed, total)
+                ),
+                n_jobs=1,
+            )
+
+        self.assertEqual(len(calls), command_delta.shape[0] * len(CAMERAS))
+        self.assertEqual(progress[0], (0, command_delta.shape[0] * len(CAMERAS)))
+        self.assertEqual(progress[-1], (command_delta.shape[0] * len(CAMERAS),) * 2)
+        self.assertEqual(result.attrs["capture_count"], 2)
+        self.assertEqual(result.attrs["capture_aggregation"], "mean_image")
 
     def test_visual_calibration_probe_count_uses_default_n(self):
         self.assertEqual(visual_calibration_probe_count(), 21)
@@ -1110,7 +1283,11 @@ class CorrectionTests(unittest.TestCase):
                     Mock(),
                 ) as move,
             ):
-                result = do_correction(path, capture_count=1)
+                result = do_correction(
+                    path,
+                    capture_count=1,
+                    correction_mode="camera",
+                )
 
             history_path = correction_history_path(path)
             with xr.open_dataset(
@@ -1189,7 +1366,11 @@ class CorrectionTests(unittest.TestCase):
                 hardware_patches[1],
                 hardware_patches[2],
             ):
-                result = do_correction(path, capture_count=1)
+                result = do_correction(
+                    path,
+                    capture_count=1,
+                    correction_mode="camera",
+                )
 
             with self.assertRaisesRegex(ValueError, "polar"):
                 do_correction(path, object(), capture_count=1, correction_mode="beam")
@@ -1398,6 +1579,7 @@ class CorrectionTests(unittest.TestCase):
                 result = do_correction(
                     path,
                     capture_count=1,
+                    correction_mode="camera",
                     max_moves=1,
                     gain=TEST_CORRECTION_GAIN,
                     max_normalized_step=TEST_CORRECTION_MAX_NORMALIZED_STEP,
@@ -1499,6 +1681,7 @@ class CorrectionTests(unittest.TestCase):
                 result = do_correction(
                     path,
                     capture_count=1,
+                    correction_mode="camera",
                     max_moves=2,
                     motor_backend=backend,
                 )
@@ -1553,6 +1736,7 @@ class CorrectionTests(unittest.TestCase):
                 result = do_correction(
                     path,
                     capture_count=1,
+                    correction_mode="camera",
                     max_moves=1,
                     gain=TEST_CORRECTION_GAIN,
                     max_normalized_step=TEST_CORRECTION_MAX_NORMALIZED_STEP,
@@ -1626,6 +1810,7 @@ class CorrectionTests(unittest.TestCase):
                 result = do_correction(
                     path,
                     capture_count=1,
+                    correction_mode="camera",
                     max_moves=1,
                     lqr_image_scale_px=TEST_LQR_IMAGE_SCALE_PX,
                     lqr_motor_penalty=TEST_LQR_MOTOR_PENALTY,
@@ -1683,6 +1868,7 @@ class CorrectionTests(unittest.TestCase):
                 result = do_correction(
                     path,
                     capture_count=1,
+                    correction_mode="camera",
                     max_moves=1,
                     gain=TEST_CORRECTION_GAIN,
                     max_normalized_step=TEST_CORRECTION_MAX_NORMALIZED_STEP,
@@ -1735,6 +1921,7 @@ class CorrectionTests(unittest.TestCase):
                 result = do_correction(
                     path,
                     capture_count=1,
+                    correction_mode="camera",
                     max_moves=1,
                     gain=TEST_CORRECTION_GAIN,
                     max_normalized_step=TEST_CORRECTION_MAX_NORMALIZED_STEP,
@@ -1787,6 +1974,7 @@ class CorrectionTests(unittest.TestCase):
                 result = do_correction(
                     path,
                     capture_count=1,
+                    correction_mode="camera",
                     max_moves=3,
                     gain=TEST_CORRECTION_GAIN,
                     max_normalized_step=TEST_CORRECTION_MAX_NORMALIZED_STEP,
@@ -1842,6 +2030,7 @@ class CorrectionTests(unittest.TestCase):
                 do_correction(
                     path,
                     capture_count=1,
+                    correction_mode="camera",
                     max_moves=1,
                     lqr_image_scale_px=TEST_LQR_IMAGE_SCALE_PX,
                     lqr_motor_penalty=TEST_LQR_MOTOR_PENALTY,
@@ -1906,6 +2095,7 @@ class CorrectionTests(unittest.TestCase):
                 result = do_correction(
                     path,
                     capture_count=1,
+                    correction_mode="camera",
                     max_moves=1,
                     gain=TEST_CORRECTION_GAIN,
                     max_normalized_step=TEST_CORRECTION_MAX_NORMALIZED_STEP,
@@ -2118,6 +2308,7 @@ class CorrectionTests(unittest.TestCase):
                 result = do_correction(
                     path,
                     capture_count=1,
+                    correction_mode="camera",
                     max_moves=1,
                     gain=TEST_CORRECTION_GAIN,
                     lqr_image_scale_px=TEST_LQR_IMAGE_SCALE_PX,
@@ -2161,6 +2352,7 @@ class CorrectionTests(unittest.TestCase):
                 result = do_correction(
                     path,
                     capture_count=1,
+                    correction_mode="camera",
                     max_moves=1,
                     gain=TEST_CORRECTION_GAIN,
                     max_normalized_step=TEST_CORRECTION_MAX_NORMALIZED_STEP,
@@ -2236,6 +2428,7 @@ class CorrectionTests(unittest.TestCase):
                 result = do_correction(
                     path,
                     capture_count=1,
+                    correction_mode="camera",
                     max_moves=1,
                     gain=TEST_CORRECTION_GAIN,
                     max_normalized_step=TEST_CORRECTION_MAX_NORMALIZED_STEP,
@@ -2285,6 +2478,7 @@ class CorrectionTests(unittest.TestCase):
                 result = do_correction(
                     path,
                     capture_count=1,
+                    correction_mode="camera",
                     max_moves=1,
                     gain=TEST_CORRECTION_GAIN,
                     max_normalized_step=TEST_CORRECTION_MAX_NORMALIZED_STEP,
@@ -2314,7 +2508,12 @@ class CorrectionTests(unittest.TestCase):
                     return_value=(10.0, 20.0, 30.0),
                 ),
             ):
-                result = do_correction(path, capture_count=1, max_moves=1)
+                result = do_correction(
+                    path,
+                    capture_count=1,
+                    correction_mode="camera",
+                    max_moves=1,
+                )
 
             history_path = correction_history_path(path)
             with xr.open_dataset(
@@ -2778,7 +2977,12 @@ class CorrectionTests(unittest.TestCase):
                         return_value=(10.0, 20.0, 30.0),
                     ),
                 ):
-                    result = do_correction(path, capture_count=1, max_moves=1)
+                    result = do_correction(
+                        path,
+                        capture_count=1,
+                        correction_mode="camera",
+                        max_moves=1,
+                    )
                     pending = load_latest_correction_history_dataset(path)
 
                     self.assertEqual(
@@ -2841,6 +3045,7 @@ class CorrectionTests(unittest.TestCase):
                 result = do_correction(
                     path,
                     capture_count=1,
+                    correction_mode="camera",
                     max_moves=1,
                     progress_callback=progress_results.append,
                 )
@@ -2870,7 +3075,12 @@ class CorrectionTests(unittest.TestCase):
                     return_value=(10.0, 20.0, 30.0),
                 ),
             ):
-                do_correction(path, capture_count=1, max_moves=1)
+                do_correction(
+                    path,
+                    capture_count=1,
+                    correction_mode="camera",
+                    max_moves=1,
+                )
 
             loaded = load_latest_correction_history_dataset(path)
 
@@ -2898,7 +3108,12 @@ class CorrectionTests(unittest.TestCase):
                     return_value=(10.0, 20.0, 30.0),
                 ),
             ):
-                result = do_correction(path, capture_count=1, max_moves=1)
+                result = do_correction(
+                    path,
+                    capture_count=1,
+                    correction_mode="camera",
+                    max_moves=1,
+                )
 
         self.assertFalse(result.attrs["correction_converged"])
         self.assertIn("did not converge", result.attrs["warnings"])

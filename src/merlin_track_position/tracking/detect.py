@@ -14,6 +14,7 @@ from merlin_track_position.instruments.cameras import (
     normalize_capture_count,
 )
 from merlin_track_position.tracking.calibration_core import (
+    CAPTURE_AGGREGATION_MEDIAN_SHIFTS,
     COMMAND_AXES,
     estimate_command_offset,
     validate_visual_calibration_dataset,
@@ -31,6 +32,7 @@ def detect_shift(
     camera_pair: CameraPairPlugin | None = None,
     *,
     capture_count: int = constants.DEFAULT_CORRECTION_CAPTURE_COUNT,
+    capture_aggregation: str = CAPTURE_AGGREGATION_MEDIAN_SHIFTS,
     weights: Sequence[float] | np.ndarray | None = None,
     **shift_kwargs: Any,
 ) -> xr.Dataset:
@@ -54,6 +56,7 @@ def detect_shift(
         reference_cam0,
         reference_cam1,
         capture_count,
+        capture_aggregation=capture_aggregation,
         **shift_kwargs,
     )
     estimated_offset_mm = estimate_command_offset(

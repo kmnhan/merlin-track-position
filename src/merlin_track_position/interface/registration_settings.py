@@ -4,8 +4,14 @@ import math
 from collections.abc import Mapping
 from typing import Any
 
+from merlin_track_position import constants
+
 __all__ = (
+    "CAPTURE_AGGREGATION_MEAN_IMAGE",
+    "CAPTURE_AGGREGATION_MEDIAN_SHIFTS",
     "DEFAULT_REGISTRATION_CONFIG",
+    "REGISTRATION_CAPTURE_AGGREGATION_SETTINGS_KEY",
+    "REGISTRATION_CAPTURE_COUNT_SETTINGS_KEY",
     "REGISTRATION_CLIP_ENABLED_SETTINGS_KEY",
     "REGISTRATION_CLIP_LOW_SETTINGS_KEY",
     "REGISTRATION_CLIP_HIGH_SETTINGS_KEY",
@@ -15,10 +21,20 @@ __all__ = (
     "REGISTRATION_HIGH_ERROR_THRESHOLD_SETTINGS_KEY",
     "normalized_registration_config",
     "registration_config_from_settings",
+    "registration_config_to_measurement_kwargs",
     "registration_config_to_shift_kwargs",
     "save_registration_config",
 )
 
+
+CAPTURE_AGGREGATION_MEDIAN_SHIFTS = "median_shifts"
+CAPTURE_AGGREGATION_MEAN_IMAGE = "mean_image"
+CAPTURE_AGGREGATIONS = (
+    CAPTURE_AGGREGATION_MEDIAN_SHIFTS,
+    CAPTURE_AGGREGATION_MEAN_IMAGE,
+)
+REGISTRATION_CAPTURE_COUNT_MIN = 1
+REGISTRATION_CAPTURE_COUNT_MAX = 100
 
 REGISTRATION_CLIP_ENABLED_SETTINGS_KEY = "registration/clip_enabled"
 REGISTRATION_CLIP_LOW_SETTINGS_KEY = "registration/clip_low"
@@ -29,6 +45,8 @@ REGISTRATION_USE_WINDOW_SETTINGS_KEY = "registration/use_window"
 REGISTRATION_HIGH_ERROR_THRESHOLD_SETTINGS_KEY = (
     "registration/high_error_threshold"
 )
+REGISTRATION_CAPTURE_COUNT_SETTINGS_KEY = "registration/capture_count"
+REGISTRATION_CAPTURE_AGGREGATION_SETTINGS_KEY = "registration/capture_aggregation"
 
 DEFAULT_REGISTRATION_CONFIG: dict[str, object] = {
     "clip_enabled": True,
@@ -38,6 +56,8 @@ DEFAULT_REGISTRATION_CONFIG: dict[str, object] = {
     "upsample_factor": 50,
     "use_window": False,
     "high_error_threshold": 0.5,
+    "capture_count": constants.DEFAULT_CORRECTION_CAPTURE_COUNT,
+    "capture_aggregation": CAPTURE_AGGREGATION_MEDIAN_SHIFTS,
 }
 
 
@@ -77,6 +97,14 @@ def normalized_registration_config(
             DEFAULT_REGISTRATION_CONFIG["high_error_threshold"]
         )
 
+    capture_count = _as_int(
+        values["capture_count"],
+        DEFAULT_REGISTRATION_CONFIG["capture_count"],
+    )
+    if capture_count < REGISTRATION_CAPTURE_COUNT_MIN:
+        capture_count = int(DEFAULT_REGISTRATION_CONFIG["capture_count"])
+    capture_count = min(capture_count, REGISTRATION_CAPTURE_COUNT_MAX)
+
     return {
         "clip_enabled": clip_enabled,
         "clip_low": float(clip_low),
@@ -88,6 +116,10 @@ def normalized_registration_config(
             bool(DEFAULT_REGISTRATION_CONFIG["use_window"]),
         ),
         "high_error_threshold": float(high_error_threshold),
+        "capture_count": int(capture_count),
+        "capture_aggregation": _capture_aggregation_value(
+            values["capture_aggregation"]
+        ),
     }
 
 
@@ -122,6 +154,14 @@ def registration_config_from_settings(settings: Any) -> dict[str, object]:
                 REGISTRATION_HIGH_ERROR_THRESHOLD_SETTINGS_KEY,
                 DEFAULT_REGISTRATION_CONFIG["high_error_threshold"],
             ),
+            "capture_count": settings.value(
+                REGISTRATION_CAPTURE_COUNT_SETTINGS_KEY,
+                DEFAULT_REGISTRATION_CONFIG["capture_count"],
+            ),
+            "capture_aggregation": settings.value(
+                REGISTRATION_CAPTURE_AGGREGATION_SETTINGS_KEY,
+                DEFAULT_REGISTRATION_CONFIG["capture_aggregation"],
+            ),
         }
     )
 
@@ -150,8 +190,27 @@ def save_registration_config(
         REGISTRATION_HIGH_ERROR_THRESHOLD_SETTINGS_KEY,
         normalized["high_error_threshold"],
     )
+    settings.setValue(
+        REGISTRATION_CAPTURE_COUNT_SETTINGS_KEY,
+        normalized["capture_count"],
+    )
+    settings.setValue(
+        REGISTRATION_CAPTURE_AGGREGATION_SETTINGS_KEY,
+        normalized["capture_aggregation"],
+    )
     settings.sync()
     return normalized
+
+
+def registration_config_to_measurement_kwargs(
+    config: Mapping[str, Any],
+) -> dict[str, object]:
+    normalized = normalized_registration_config(config)
+    return {
+        "capture_count": normalized["capture_count"],
+        "capture_aggregation": normalized["capture_aggregation"],
+        **registration_config_to_shift_kwargs(normalized),
+    }
 
 
 def registration_config_to_shift_kwargs(
@@ -215,3 +274,10 @@ def _normalization_value(value: Any) -> str:
     if lowered == "none":
         return "none"
     return "phase"
+
+
+def _capture_aggregation_value(value: Any) -> str:
+    lowered = str(value).strip().lower()
+    if lowered in CAPTURE_AGGREGATIONS:
+        return lowered
+    return CAPTURE_AGGREGATION_MEDIAN_SHIFTS

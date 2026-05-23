@@ -19,6 +19,7 @@ from merlin_track_position.instruments.cameras import (
 from merlin_track_position.instruments.motors import get_positions, move_motors_and_wait
 from merlin_track_position.tracking.calibration_core import (
     CAMERAS,
+    CAPTURE_AGGREGATION_MEDIAN_SHIFTS,
     COMMAND_AXES,
     PROBE_COMMAND_DELTA_MODE_ABSOLUTE_CENTER,
     PROBE_COMMAND_DELTA_MODE_ATTR,
@@ -57,6 +58,7 @@ def run_calibration(
     step_um: float = constants.DEFAULT_VISUAL_CALIBRATION_STEP_UM,
     min_shift_px: float = constants.DEFAULT_VISUAL_CALIBRATION_MIN_SHIFT_PX,
     capture_count: int = constants.DEFAULT_CALIBRATION_CAPTURE_COUNT,
+    capture_aggregation: str = CAPTURE_AGGREGATION_MEDIAN_SHIFTS,
     additional_context: Mapping[str, Any] | None = None,
     processing_callback: Callable[[int, int], None] | None = None,
     step_callback: Callable[
@@ -201,6 +203,7 @@ def run_calibration(
         pre_readback_position_mm=pre_readback_position_mm,
         post_readback_position_mm=post_readback_position_mm,
         min_shift_px=min_shift_px,
+        capture_aggregation=capture_aggregation,
         progress_callback=processing_callback,
         additional_context=context,
         **shift_options,
