@@ -62,9 +62,9 @@ def _configure_camera(camera: pylon.InstantCamera) -> None:
         camera.ExposureTimeAbs.Value = constants.BASLER_EXPOSURE
 
         if genicam.IsWritable(camera.GammaEnable):
-            logger.debug("Disabling gamma correction.")
-            camera.GammaEnable.Value = False
-            # camera.GammaEnable.Value = True
+            logger.debug("Enabling gamma correction.")
+            # camera.GammaEnable.Value = False
+            camera.GammaEnable.Value = True
 
         for node, value, name in (
             (camera.OffsetX, int(camera.OffsetX.Min), "OffsetX"),
