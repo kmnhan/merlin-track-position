@@ -106,9 +106,13 @@ For each camera, compute the sub-pixel shift against the reference image:
 
 ```math
 (\Delta u_{i,k}, \Delta v_{i,k})
-= \text{CrossCorrShift}(I_{i,k}, I_i^\star),
+= \text{IPC}(I_{i,k}, I_i^\star),
 \quad i \in \{0,1\}.
 ```
+
+The implementation uses Iterative Phase Correlation (IPC) for registration, but any
+sub-pixel image-registration method that produces a shift in the same sign convention
+can be used.
 
 The implemented sign convention must satisfy
 
@@ -762,7 +766,7 @@ noise.
 
 The correction loop should stop or abort when:
 
-- cross-correlation confidence is too low;
+- image registration reports low contrast, low texture, or inconsistent tile shifts;
 - the current image is outside the field of view;
 - the image error is outside the local linear region of the Jacobian;
 - the proposed motor command would violate position bounds;

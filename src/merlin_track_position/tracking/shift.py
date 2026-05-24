@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-import warnings
+import operator
 from typing import Any
 
 import cv2
 import numpy as np
 import numpy.typing as npt
 import xarray as xr
-from skimage.registration import phase_cross_correlation
 
 PIXEL_AXES = ("du_px", "dv_px")
 
@@ -49,10 +48,9 @@ def estimate_shift(
     *,
     clip_percentiles: tuple[float, float] | None = (1.0, 99.0),
     use_window: bool = False,
-    upsample_factor: int = 50,
-    normalization: str | None = "phase",
+    phase_l2_size: int = 7,
+    phase_max_iters: int = 50,
     check_tiles: bool = False,
-    high_error_threshold: float = 0.5,
     use_ecc_refinement: bool = False,
     ecc_motion_model: str = "homography",
     ecc_reference_point_px: npt.ArrayLike | None = None,
@@ -62,7 +60,7 @@ def estimate_shift(
     """Estimate subpixel translation between two grayscale images.
 
     By default, images are percentile-clipped, normalized, and registered with
-    phase correlation at 50x subpixel upsampling.
+    OpenCV iterative phase correlation.
     Pass ``use_window=True`` to apply a Hanning taper before registration.
     Pass ``check_tiles=True`` to compare local tile shifts against the full-frame
     estimate.
@@ -91,6 +89,8 @@ def estimate_shift(
             "reference and current images must have identical shapes; "
             f"got {reference_image.shape!r} and {current_image.shape!r}"
         )
+    phase_l2_size = _positive_int(phase_l2_size, "phase_l2_size")
+    phase_max_iters = _positive_int(phase_max_iters, "phase_max_iters")
 
     dynamic_range = float(np.max(reference_image) - np.min(reference_image))
     standard_deviation = float(np.std(reference_image))
@@ -107,41 +107,33 @@ def estimate_shift(
             "reference image has low texture; shift may be unreliable"
         )
 
+    reference_norm = normalize_intensity(
+        reference_image,
+        clip_percentiles=clip_percentiles,
+    )
+    current_norm = normalize_intensity(
+        current_image,
+        clip_percentiles=clip_percentiles,
+    )
+
     if dynamic_range <= 1e-12 or standard_deviation <= 1e-12:
-        reference_norm = normalize_intensity(
-            reference_image, clip_percentiles=clip_percentiles
-        )
-        current_norm = normalize_intensity(
-            current_image, clip_percentiles=clip_percentiles
-        )
         shift_px = np.array([np.nan, np.nan], dtype=np.float64)
-        registration_error = np.inf
+        diagnostic_warnings.append(
+            "registration skipped because reference image has little or no intensity contrast"
+        )
     else:
-        reference_norm = normalize_intensity(
-            reference_image, clip_percentiles=clip_percentiles
-        )
-        current_norm = normalize_intensity(
-            current_image, clip_percentiles=clip_percentiles
-        )
-        shift_px, registration_error, _, skimage_warnings = _estimate_translation(
+        shift_px = _estimate_translation(
             reference_norm,
             current_norm,
             use_window=use_window,
-            upsample_factor=upsample_factor,
-            normalization=normalization,
-        )
-        diagnostic_warnings.extend(
-            f"skimage registration warning: {message}" for message in skimage_warnings
+            phase_l2_size=phase_l2_size,
+            phase_max_iters=phase_max_iters,
         )
 
-    if not np.isfinite(registration_error):
+    if not np.isfinite(shift_px).all():
         shift_px = np.array([np.nan, np.nan], dtype=np.float64)
         diagnostic_warnings.append(
-            "registration error is not finite; shift estimate is unreliable"
-        )
-    elif normalization != "phase" and registration_error > high_error_threshold:
-        diagnostic_warnings.append(
-            f"high registration error: {registration_error:.3g} > {high_error_threshold:.3g}"
+            "registration shift is not finite; shift estimate is unreliable"
         )
 
     explicit_ecc_initial_shift = None
@@ -179,8 +171,8 @@ def estimate_shift(
             current_norm,
             shift_px,
             use_window=use_window,
-            upsample_factor=upsample_factor,
-            normalization=normalization,
+            phase_l2_size=phase_l2_size,
+            phase_max_iters=phase_max_iters,
         )
         if tile_warning is not None:
             diagnostic_warnings.append(tile_warning)
@@ -199,15 +191,15 @@ def _estimate_translation(
     current_norm: np.ndarray,
     *,
     use_window: bool,
-    upsample_factor: int,
-    normalization: str | None,
-) -> tuple[np.ndarray, float, float, tuple[str, ...]]:
+    phase_l2_size: int,
+    phase_max_iters: int,
+) -> np.ndarray:
     if reference_norm.shape != current_norm.shape:
         raise ValueError("images must have identical shapes")
     if min(reference_norm.shape) < 3:
         raise ValueError("images must be at least 3x3 pixels")
-    if upsample_factor < 1:
-        raise ValueError("upsample_factor must be >= 1")
+    l2_size = _positive_int(phase_l2_size, "phase_l2_size")
+    max_iters = _positive_int(phase_max_iters, "phase_max_iters")
 
     reference_work, current_work = _registration_work_images(
         reference_norm,
@@ -215,20 +207,28 @@ def _estimate_translation(
         use_window=use_window,
     )
 
-    with warnings.catch_warnings(record=True) as caught_warnings:
-        warnings.simplefilter("always", UserWarning)
-        shift_yx, registration_error, phase_difference = phase_cross_correlation(
-            reference_work,
-            current_work,
-            upsample_factor=upsample_factor,
-            normalization=normalization,
-        )
-    return (
-        np.array([-shift_yx[1], -shift_yx[0]], dtype=np.float64),
-        float(registration_error),
-        float(phase_difference),
-        tuple(str(item.message) for item in caught_warnings),
+    shift_xy = cv2.phaseCorrelateIterative(
+        np.ascontiguousarray(reference_work, dtype=np.float32),
+        np.ascontiguousarray(current_work, dtype=np.float32),
+        l2_size,
+        max_iters,
     )
+    shift_px = np.asarray(shift_xy, dtype=np.float64)
+    if shift_px.shape != (2,):
+        raise ValueError("phaseCorrelateIterative returned an unexpected shift shape")
+    return shift_px
+
+
+def _positive_int(value: Any, name: str) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a positive integer")
+    try:
+        numeric = operator.index(value)
+    except TypeError as exc:
+        raise ValueError(f"{name} must be a positive integer") from exc
+    if numeric < 1:
+        raise ValueError(f"{name} must be a positive integer")
+    return int(numeric)
 
 
 def _estimate_ecc_shift(
@@ -362,8 +362,8 @@ def _tile_consistency(
     full_shift_px: np.ndarray,
     *,
     use_window: bool,
-    upsample_factor: int,
-    normalization: str | None,
+    phase_l2_size: int,
+    phase_max_iters: int,
 ) -> str | None:
     height, width = reference_norm.shape
     grid = 3 if min(height, width) >= 192 else 2
@@ -383,14 +383,14 @@ def _tile_consistency(
             current_tile = current_norm[y0:y1, x0:x1]
             if float(np.std(reference_tile)) < 1e-6:
                 continue
-            tile_shift, registration_error, _, _ = _estimate_translation(
+            tile_shift = _estimate_translation(
                 reference_tile,
                 current_tile,
                 use_window=use_window,
-                upsample_factor=upsample_factor,
-                normalization=normalization,
+                phase_l2_size=phase_l2_size,
+                phase_max_iters=phase_max_iters,
             )
-            if np.isfinite(tile_shift).all() and registration_error <= 0.75:
+            if np.isfinite(tile_shift).all():
                 shifts.append(tile_shift)
 
     if len(shifts) < max(3, grid):

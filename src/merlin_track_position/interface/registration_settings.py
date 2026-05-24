@@ -17,12 +17,11 @@ __all__ = (
     "REGISTRATION_CLIP_ENABLED_SETTINGS_KEY",
     "REGISTRATION_CLIP_LOW_SETTINGS_KEY",
     "REGISTRATION_CLIP_HIGH_SETTINGS_KEY",
-    "REGISTRATION_NORMALIZATION_SETTINGS_KEY",
-    "REGISTRATION_UPSAMPLE_FACTOR_SETTINGS_KEY",
+    "REGISTRATION_PHASE_L2_SIZE_SETTINGS_KEY",
+    "REGISTRATION_PHASE_MAX_ITERS_SETTINGS_KEY",
     "REGISTRATION_USE_WINDOW_SETTINGS_KEY",
     "REGISTRATION_USE_ECC_REFINEMENT_SETTINGS_KEY",
     "REGISTRATION_ECC_MOTION_MODEL_SETTINGS_KEY",
-    "REGISTRATION_HIGH_ERROR_THRESHOLD_SETTINGS_KEY",
     "normalized_registration_config",
     "registration_config_from_settings",
     "registration_config_to_measurement_kwargs",
@@ -46,14 +45,11 @@ REGISTRATION_CAPTURE_COUNT_MAX = 100
 REGISTRATION_CLIP_ENABLED_SETTINGS_KEY = "registration/clip_enabled"
 REGISTRATION_CLIP_LOW_SETTINGS_KEY = "registration/clip_low"
 REGISTRATION_CLIP_HIGH_SETTINGS_KEY = "registration/clip_high"
-REGISTRATION_NORMALIZATION_SETTINGS_KEY = "registration/normalization"
-REGISTRATION_UPSAMPLE_FACTOR_SETTINGS_KEY = "registration/upsample_factor"
+REGISTRATION_PHASE_L2_SIZE_SETTINGS_KEY = "registration/phase_l2_size"
+REGISTRATION_PHASE_MAX_ITERS_SETTINGS_KEY = "registration/phase_max_iters"
 REGISTRATION_USE_WINDOW_SETTINGS_KEY = "registration/use_window"
 REGISTRATION_USE_ECC_REFINEMENT_SETTINGS_KEY = "registration/use_ecc_refinement"
 REGISTRATION_ECC_MOTION_MODEL_SETTINGS_KEY = "registration/ecc_motion_model"
-REGISTRATION_HIGH_ERROR_THRESHOLD_SETTINGS_KEY = (
-    "registration/high_error_threshold"
-)
 REGISTRATION_CAPTURE_COUNT_SETTINGS_KEY = "registration/capture_count"
 REGISTRATION_CAPTURE_AGGREGATION_SETTINGS_KEY = "registration/capture_aggregation"
 
@@ -61,12 +57,11 @@ DEFAULT_REGISTRATION_CONFIG: dict[str, object] = {
     "clip_enabled": True,
     "clip_low": 1.0,
     "clip_high": 99.0,
-    "normalization": "phase",
-    "upsample_factor": 50,
+    "phase_l2_size": 7,
+    "phase_max_iters": 50,
     "use_window": False,
     "use_ecc_refinement": False,
     "ecc_motion_model": ECC_MOTION_MODEL_HOMOGRAPHY,
-    "high_error_threshold": 0.5,
     "capture_count": constants.DEFAULT_CORRECTION_CAPTURE_COUNT,
     "capture_aggregation": CAPTURE_AGGREGATION_MEDIAN_SHIFTS,
 }
@@ -92,21 +87,19 @@ def normalized_registration_config(
         clip_low = float(DEFAULT_REGISTRATION_CONFIG["clip_low"])
         clip_high = float(DEFAULT_REGISTRATION_CONFIG["clip_high"])
 
-    upsample_factor = _as_int(
-        values["upsample_factor"],
-        DEFAULT_REGISTRATION_CONFIG["upsample_factor"],
+    phase_l2_size = _as_int(
+        values["phase_l2_size"],
+        DEFAULT_REGISTRATION_CONFIG["phase_l2_size"],
     )
-    if upsample_factor < 1:
-        upsample_factor = int(DEFAULT_REGISTRATION_CONFIG["upsample_factor"])
+    if phase_l2_size < 1:
+        phase_l2_size = int(DEFAULT_REGISTRATION_CONFIG["phase_l2_size"])
 
-    high_error_threshold = _as_float(
-        values["high_error_threshold"],
-        DEFAULT_REGISTRATION_CONFIG["high_error_threshold"],
+    phase_max_iters = _as_int(
+        values["phase_max_iters"],
+        DEFAULT_REGISTRATION_CONFIG["phase_max_iters"],
     )
-    if high_error_threshold <= 0.0:
-        high_error_threshold = float(
-            DEFAULT_REGISTRATION_CONFIG["high_error_threshold"]
-        )
+    if phase_max_iters < 1:
+        phase_max_iters = int(DEFAULT_REGISTRATION_CONFIG["phase_max_iters"])
 
     capture_count = _as_int(
         values["capture_count"],
@@ -120,8 +113,8 @@ def normalized_registration_config(
         "clip_enabled": clip_enabled,
         "clip_low": float(clip_low),
         "clip_high": float(clip_high),
-        "normalization": _normalization_value(values["normalization"]),
-        "upsample_factor": int(upsample_factor),
+        "phase_l2_size": int(phase_l2_size),
+        "phase_max_iters": int(phase_max_iters),
         "use_window": _as_bool(
             values["use_window"],
             bool(DEFAULT_REGISTRATION_CONFIG["use_window"]),
@@ -131,7 +124,6 @@ def normalized_registration_config(
             bool(DEFAULT_REGISTRATION_CONFIG["use_ecc_refinement"]),
         ),
         "ecc_motion_model": _ecc_motion_model_value(values["ecc_motion_model"]),
-        "high_error_threshold": float(high_error_threshold),
         "capture_count": int(capture_count),
         "capture_aggregation": _capture_aggregation_value(
             values["capture_aggregation"]
@@ -154,13 +146,13 @@ def registration_config_from_settings(settings: Any) -> dict[str, object]:
                 REGISTRATION_CLIP_HIGH_SETTINGS_KEY,
                 DEFAULT_REGISTRATION_CONFIG["clip_high"],
             ),
-            "normalization": settings.value(
-                REGISTRATION_NORMALIZATION_SETTINGS_KEY,
-                DEFAULT_REGISTRATION_CONFIG["normalization"],
+            "phase_l2_size": settings.value(
+                REGISTRATION_PHASE_L2_SIZE_SETTINGS_KEY,
+                DEFAULT_REGISTRATION_CONFIG["phase_l2_size"],
             ),
-            "upsample_factor": settings.value(
-                REGISTRATION_UPSAMPLE_FACTOR_SETTINGS_KEY,
-                DEFAULT_REGISTRATION_CONFIG["upsample_factor"],
+            "phase_max_iters": settings.value(
+                REGISTRATION_PHASE_MAX_ITERS_SETTINGS_KEY,
+                DEFAULT_REGISTRATION_CONFIG["phase_max_iters"],
             ),
             "use_window": settings.value(
                 REGISTRATION_USE_WINDOW_SETTINGS_KEY,
@@ -173,10 +165,6 @@ def registration_config_from_settings(settings: Any) -> dict[str, object]:
             "ecc_motion_model": settings.value(
                 REGISTRATION_ECC_MOTION_MODEL_SETTINGS_KEY,
                 DEFAULT_REGISTRATION_CONFIG["ecc_motion_model"],
-            ),
-            "high_error_threshold": settings.value(
-                REGISTRATION_HIGH_ERROR_THRESHOLD_SETTINGS_KEY,
-                DEFAULT_REGISTRATION_CONFIG["high_error_threshold"],
             ),
             "capture_count": settings.value(
                 REGISTRATION_CAPTURE_COUNT_SETTINGS_KEY,
@@ -202,12 +190,12 @@ def save_registration_config(
     settings.setValue(REGISTRATION_CLIP_LOW_SETTINGS_KEY, normalized["clip_low"])
     settings.setValue(REGISTRATION_CLIP_HIGH_SETTINGS_KEY, normalized["clip_high"])
     settings.setValue(
-        REGISTRATION_NORMALIZATION_SETTINGS_KEY,
-        normalized["normalization"],
+        REGISTRATION_PHASE_L2_SIZE_SETTINGS_KEY,
+        normalized["phase_l2_size"],
     )
     settings.setValue(
-        REGISTRATION_UPSAMPLE_FACTOR_SETTINGS_KEY,
-        normalized["upsample_factor"],
+        REGISTRATION_PHASE_MAX_ITERS_SETTINGS_KEY,
+        normalized["phase_max_iters"],
     )
     settings.setValue(REGISTRATION_USE_WINDOW_SETTINGS_KEY, normalized["use_window"])
     settings.setValue(
@@ -217,10 +205,6 @@ def save_registration_config(
     settings.setValue(
         REGISTRATION_ECC_MOTION_MODEL_SETTINGS_KEY,
         normalized["ecc_motion_model"],
-    )
-    settings.setValue(
-        REGISTRATION_HIGH_ERROR_THRESHOLD_SETTINGS_KEY,
-        normalized["high_error_threshold"],
     )
     settings.setValue(
         REGISTRATION_CAPTURE_COUNT_SETTINGS_KEY,
@@ -254,15 +238,11 @@ def registration_config_to_shift_kwargs(
         if normalized["clip_enabled"]
         else None
     )
-    normalization = (
-        "phase" if normalized["normalization"] == "phase" else None
-    )
     shift_kwargs = {
         "clip_percentiles": clip_percentiles,
         "use_window": normalized["use_window"],
-        "upsample_factor": normalized["upsample_factor"],
-        "normalization": normalization,
-        "high_error_threshold": normalized["high_error_threshold"],
+        "phase_l2_size": normalized["phase_l2_size"],
+        "phase_max_iters": normalized["phase_max_iters"],
         "use_ecc_refinement": normalized["use_ecc_refinement"],
         "ecc_motion_model": normalized["ecc_motion_model"],
     }
@@ -302,15 +282,6 @@ def _as_int(value: Any, fallback: object) -> int:
     except (TypeError, ValueError):
         return int(fallback)
     return numeric
-
-
-def _normalization_value(value: Any) -> str:
-    if value is None:
-        return "none"
-    lowered = str(value).strip().lower()
-    if lowered == "none":
-        return "none"
-    return "phase"
 
 
 def _capture_aggregation_value(value: Any) -> str:

@@ -35,6 +35,50 @@ class ShiftTests(unittest.TestCase):
 
         np.testing.assert_allclose(result["shift_px"].values, [6.25, -4.4], atol=0.25)
 
+    def test_opencv_iterative_phase_parameters_and_sign_convention(self):
+        reference = textured_image(seed=4)
+
+        with patch(
+            "merlin_track_position.tracking.shift.cv2.phaseCorrelateIterative",
+            return_value=(1.25, -2.5),
+        ) as phase_correlate:
+            result = estimate_shift(
+                reference,
+                reference.copy(),
+                check_tiles=False,
+                phase_l2_size=11,
+                phase_max_iters=23,
+            )
+
+        self.assertEqual(phase_correlate.call_args.args[2:], (11, 23))
+        np.testing.assert_allclose(result["shift_px"].values, [1.25, -2.5])
+
+    def test_phase_registration_parameters_must_be_positive_integers(self):
+        reference = textured_image(seed=15)
+        current = reference.copy()
+
+        for kwargs in (
+            {"phase_l2_size": 0},
+            {"phase_l2_size": 1.5},
+            {"phase_l2_size": True},
+            {"phase_max_iters": 0},
+            {"phase_max_iters": 1.5},
+            {"phase_max_iters": False},
+        ):
+            with self.subTest(kwargs=kwargs):
+                name = next(iter(kwargs))
+                with self.assertRaisesRegex(ValueError, name):
+                    estimate_shift(reference, current, check_tiles=False, **kwargs)
+
+    def test_tile_consistency_uses_opencv_iterative_phase_registration(self):
+        reference = textured_image(seed=16)
+        current = ndimage.shift(reference, shift=(1.25, -1.75), order=3, mode="wrap")
+
+        result = estimate_shift(reference, current, check_tiles=True)
+
+        np.testing.assert_allclose(result["shift_px"].values, [-1.75, 1.25], atol=0.25)
+        self.assertNotIn("tile shift estimates are inconsistent", result.attrs["warnings"])
+
     def test_ecc_refinement_keeps_translation_sign_convention(self):
         reference = textured_image(seed=6)
         current = ndimage.shift(reference, shift=(2.75, -4.25), order=3, mode="wrap")
@@ -83,7 +127,6 @@ class ShiftTests(unittest.TestCase):
             current,
             check_tiles=False,
             use_ecc_refinement=True,
-            normalization=None,
             clip_percentiles=None,
         )
 
@@ -127,7 +170,6 @@ class ShiftTests(unittest.TestCase):
             check_tiles=False,
             use_ecc_refinement=True,
             ecc_reference_point_px=(float(point[0]), float(point[1])),
-            normalization=None,
             clip_percentiles=None,
         )
 
@@ -280,7 +322,7 @@ class ShiftTests(unittest.TestCase):
         self.assertTrue(np.isnan(result["shift_px"].values).all())
         self.assertIn("ECC refinement failed: forced failure", result.attrs["warnings"])
 
-    def test_default_phase_registration_does_not_emit_high_error_warning(self):
+    def test_opencv_phase_registration_does_not_emit_high_error_warning(self):
         reference = textured_image(seed=5)
         current = ndimage.shift(reference, shift=(0.4, -0.6), order=3, mode="wrap")
 
@@ -308,7 +350,7 @@ class ShiftTests(unittest.TestCase):
         self.assertTrue(np.isnan(result["shift_px"].values).all())
         self.assertIn("little or no intensity contrast", warnings)
         self.assertIn("low texture", warnings)
-        self.assertIn("registration error is not finite", warnings)
+        self.assertIn("registration skipped", warnings)
 
 
 if __name__ == "__main__":

@@ -289,7 +289,7 @@ class CorrectionSimulationTests(unittest.TestCase):
             max_moves=1,
             motor_error_model=ZERO_MOTOR_ERROR_MODEL_UM,
             weights=(1.0, 1.0, 1.0, 1.0),
-            shift_kwargs={"check_tiles": False, "upsample_factor": 20},
+            shift_kwargs={"check_tiles": False, "phase_max_iters": 20},
         )
 
         residual = result["weighted_residual_px"].values[0, 0]
