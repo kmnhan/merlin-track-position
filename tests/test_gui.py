@@ -2897,6 +2897,87 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                 finally:
                     window.close()
 
+    def test_load_calibration_dialog_starts_at_scan_default_path(self):
+        get_qapp()
+        default_path = Path("/tmp/current_scan/calibration.h5")
+        with patched_main_window_runtime():
+            window = MainWindow()
+            try:
+                with (
+                    patch.object(
+                        main_window,
+                        "_default_calibration_path",
+                        return_value=default_path,
+                    ),
+                    patch(
+                        "merlin_track_position.interface.main_window."
+                        "QtWidgets.QFileDialog.getOpenFileName",
+                        return_value=("", ""),
+                    ) as get_open_file_name,
+                ):
+                    window._on_load_calibration_clicked()
+
+                get_open_file_name.assert_called_once_with(
+                    window,
+                    "Load calibration",
+                    str(default_path),
+                    "Calibration files (*.h5 *.hdf5 *.nc);;All files (*)",
+                )
+            finally:
+                window.close()
+
+    def test_load_calibration_dialog_starts_at_current_calibration_path(self):
+        get_qapp()
+        current_path = Path("/tmp/current_scan/current_calibration.h5")
+        with patched_main_window_runtime():
+            window = MainWindow()
+            try:
+                window._calibration_path = current_path
+                with patch(
+                    "merlin_track_position.interface.main_window."
+                    "QtWidgets.QFileDialog.getOpenFileName",
+                    return_value=("", ""),
+                ) as get_open_file_name:
+                    window._on_load_calibration_clicked()
+
+                get_open_file_name.assert_called_once_with(
+                    window,
+                    "Load calibration",
+                    str(current_path),
+                    "Calibration files (*.h5 *.hdf5 *.nc);;All files (*)",
+                )
+            finally:
+                window.close()
+
+    def test_load_calibration_dialog_falls_back_to_home_when_scan_path_fails(self):
+        get_qapp()
+        fallback_path = Path.home() / main_window.DEFAULT_CALIBRATION_FILE_NAME
+        with patched_main_window_runtime():
+            window = MainWindow()
+            try:
+                with (
+                    patch.object(
+                        main_window,
+                        "_default_calibration_path",
+                        side_effect=FileNotFoundError("missing setup"),
+                    ),
+                    patch(
+                        "merlin_track_position.interface.main_window."
+                        "QtWidgets.QFileDialog.getOpenFileName",
+                        return_value=("", ""),
+                    ) as get_open_file_name,
+                ):
+                    window._on_load_calibration_clicked()
+
+                get_open_file_name.assert_called_once_with(
+                    window,
+                    "Load calibration",
+                    str(fallback_path),
+                    "Calibration files (*.h5 *.hdf5 *.nc);;All files (*)",
+                )
+            finally:
+                window.close()
+
     def test_loading_calibration_restores_latest_correction_result(self):
         get_qapp()
         with tempfile.TemporaryDirectory() as tmpdir:

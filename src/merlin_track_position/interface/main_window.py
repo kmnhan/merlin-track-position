@@ -113,6 +113,20 @@ def _default_calibration_path() -> Path:
     return _default_calibration_directory() / DEFAULT_CALIBRATION_FILE_NAME
 
 
+def _load_calibration_dialog_path(current_path: Path | None) -> Path:
+    if current_path is not None:
+        return current_path
+    try:
+        return _default_calibration_path()
+    except Exception:
+        logger.info(
+            "Could not read scan base file directory for load dialog; "
+            "using home directory.",
+            exc_info=True,
+        )
+        return Path.home() / DEFAULT_CALIBRATION_FILE_NAME
+
+
 class _CorrectionUnavailable(RuntimeError):
     """Expected state that prevents a correction run from starting."""
 
@@ -2104,10 +2118,11 @@ class MainWindow(_MainWindowGUI):
             return
 
         self._flush_pending_persistence()
+        default_path = _load_calibration_dialog_path(self._calibration_path)
         file_name, _ = QtWidgets.QFileDialog.getOpenFileName(
             self,
             "Load calibration",
-            "",
+            str(default_path),
             "Calibration files (*.h5 *.hdf5 *.nc);;All files (*)",
         )
         if not file_name:
