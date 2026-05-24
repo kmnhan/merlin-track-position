@@ -192,6 +192,55 @@ class ShiftTests(unittest.TestCase):
         self.assertEqual(find_ecc.call_args.args[2].shape, (2, 3))
         np.testing.assert_allclose(result["shift_px"].values, expected_shift)
 
+    def test_ecc_refinement_uses_explicit_initial_shift_for_homography(self):
+        reference = textured_image(seed=12)
+        initial_shift = np.asarray([8.25, -5.5], dtype=np.float64)
+
+        def echo_initial_warp(*args):
+            return 1.0, args[2].copy()
+
+        with patch(
+            "merlin_track_position.tracking.shift.cv2.findTransformECC",
+            side_effect=echo_initial_warp,
+        ) as find_ecc:
+            result = estimate_shift(
+                reference,
+                reference.copy(),
+                check_tiles=False,
+                use_ecc_refinement=True,
+                ecc_initial_shift_px=initial_shift,
+            )
+
+        initial_warp = find_ecc.call_args.args[2]
+        self.assertEqual(find_ecc.call_args.args[3], cv2.MOTION_HOMOGRAPHY)
+        np.testing.assert_allclose(initial_warp[:2, 2], initial_shift)
+        np.testing.assert_allclose(result["shift_px"].values, initial_shift)
+
+    def test_ecc_refinement_uses_explicit_initial_shift_for_affine(self):
+        reference = textured_image(seed=13)
+        initial_shift = np.asarray([-6.5, 3.75], dtype=np.float64)
+
+        def echo_initial_warp(*args):
+            return 1.0, args[2].copy()
+
+        with patch(
+            "merlin_track_position.tracking.shift.cv2.findTransformECC",
+            side_effect=echo_initial_warp,
+        ) as find_ecc:
+            result = estimate_shift(
+                reference,
+                reference.copy(),
+                check_tiles=False,
+                use_ecc_refinement=True,
+                ecc_motion_model="affine",
+                ecc_initial_shift_px=initial_shift,
+            )
+
+        initial_warp = find_ecc.call_args.args[2]
+        self.assertEqual(find_ecc.call_args.args[3], cv2.MOTION_AFFINE)
+        np.testing.assert_allclose(initial_warp[:, 2], initial_shift)
+        np.testing.assert_allclose(result["shift_px"].values, initial_shift)
+
     def test_ecc_refinement_failure_falls_back_to_phase_shift(self):
         reference = textured_image(seed=8)
         current = ndimage.shift(reference, shift=(-1.5, 2.0), order=3, mode="wrap")
@@ -209,6 +258,26 @@ class ShiftTests(unittest.TestCase):
             )
 
         np.testing.assert_allclose(result["shift_px"].values, baseline["shift_px"].values)
+        self.assertIn("ECC refinement failed: forced failure", result.attrs["warnings"])
+
+    def test_ecc_refinement_failure_can_disable_phase_fallback(self):
+        reference = textured_image(seed=14)
+        current = ndimage.shift(reference, shift=(-1.5, 2.0), order=3, mode="wrap")
+
+        with patch(
+            "merlin_track_position.tracking.shift.cv2.findTransformECC",
+            side_effect=RuntimeError("forced failure"),
+        ):
+            result = estimate_shift(
+                reference,
+                current,
+                check_tiles=False,
+                use_ecc_refinement=True,
+                ecc_initial_shift_px=(0.0, 0.0),
+                ecc_fallback_to_phase_shift=False,
+            )
+
+        self.assertTrue(np.isnan(result["shift_px"].values).all())
         self.assertIn("ECC refinement failed: forced failure", result.attrs["warnings"])
 
     def test_default_phase_registration_does_not_emit_high_error_warning(self):

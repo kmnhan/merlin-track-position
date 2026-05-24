@@ -23,9 +23,10 @@ from merlin_track_position.tracking.calibration_core import (
 )
 from merlin_track_position.tracking.correct import (
     _capture_measurement,
+    _polar_ecc_seed_shift_kwargs,
+    _position_values,
     _prefixed_polar_attrs,
     _runtime_px_per_cmd_mm_for_polar,
-    _single_position_value,
 )
 
 __all__ = ("detect_shift",)
@@ -51,15 +52,25 @@ def detect_shift(
 
     reference_cam0 = np.asarray(calibration["reference_cam0"].values)
     reference_cam1 = np.asarray(calibration["reference_cam1"].values)
-    current_polar_deg = _single_position_value(
-        get_positions(("p",)),
-        "current polar readback",
+    current_position = _position_values(
+        get_positions((*COMMAND_AXES, "p")),
+        len(COMMAND_AXES) + 1,
+        "current x/y/z/p readback",
     )
+    current_commanded_position_mm = current_position[: len(COMMAND_AXES)].copy()
+    current_polar_deg = float(current_position[-1])
     jacobian, polar_attrs = _runtime_px_per_cmd_mm_for_polar(
         calibration,
         current_polar_deg,
     )
     logger.info("Detecting shift without motor correction.")
+    measurement_shift_kwargs = _polar_ecc_seed_shift_kwargs(
+        shift_kwargs,
+        calibration=calibration,
+        jacobian=jacobian,
+        polar_attrs=polar_attrs,
+        commanded_position_mm=current_commanded_position_mm,
+    )
     measurement = _capture_measurement(
         calibration,
         camera_pair,
@@ -67,7 +78,7 @@ def detect_shift(
         reference_cam1,
         capture_count,
         capture_aggregation=capture_aggregation,
-        **shift_kwargs,
+        **measurement_shift_kwargs,
     )
     estimated_offset_mm = estimate_command_offset(
         jacobian,

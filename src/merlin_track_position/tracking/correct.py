@@ -38,6 +38,7 @@ from merlin_track_position.tracking.calibration_core import (
     update_lqr_kalman_state,
     validate_visual_calibration_dataset,
     weighted_pixel_residual,
+    _initial_commanded_position_from_attrs,
 )
 from merlin_track_position.tracking.persistence import (
     PendingEntry,
@@ -308,6 +309,13 @@ def do_correction(
     correction_move_finished_at: str | None = None
 
     logger.info("Capturing initial correction measurement.")
+    initial_shift_kwargs = _polar_ecc_seed_shift_kwargs(
+        shift_kwargs,
+        calibration=calibration,
+        jacobian=jacobian,
+        polar_attrs=polar_attrs,
+        commanded_position_mm=commanded_position_mm,
+    )
     measurement = _capture_measurement(
         calibration,
         camera_pair,
@@ -315,7 +323,7 @@ def do_correction(
         reference_cam1,
         capture_count,
         capture_aggregation=capture_aggregation,
-        **shift_kwargs,
+        **initial_shift_kwargs,
     )
     weighted_residual = weighted_pixel_residual(measurement, weights=weights)
     estimated_offset_mm = estimate_command_offset(
@@ -688,6 +696,14 @@ def do_correction(
         commanded_position_mm = requested_position_mm
 
         logger.info("Capturing post-move correction measurement.")
+        after_shift_kwargs = _polar_ecc_seed_shift_kwargs(
+            shift_kwargs,
+            polar_attrs=polar_attrs,
+            seed_shift_px=(
+                np.asarray(measurement["shift_px"].values, dtype=np.float64)
+                + predicted_delta_px
+            ),
+        )
         after_measurement = _capture_measurement(
             calibration,
             camera_pair,
@@ -695,7 +711,7 @@ def do_correction(
             reference_cam1,
             capture_count,
             capture_aggregation=capture_aggregation,
-            **shift_kwargs,
+            **after_shift_kwargs,
         )
         after_weighted_residual = weighted_pixel_residual(
             after_measurement,
@@ -1811,6 +1827,71 @@ def _prefixed_polar_attrs(
     polar_attrs: Mapping[str, float | bool],
 ) -> dict[str, float | bool]:
     return {f"{prefix}_{key}": value for key, value in polar_attrs.items()}
+
+
+def _polar_ecc_seed_shift_kwargs(
+    shift_kwargs: Mapping[str, Any],
+    *,
+    polar_attrs: Mapping[str, float | bool],
+    calibration: xr.Dataset | None = None,
+    jacobian: np.ndarray | None = None,
+    commanded_position_mm: np.ndarray | None = None,
+    seed_shift_px: np.ndarray | None = None,
+) -> dict[str, Any]:
+    kwargs = dict(shift_kwargs)
+    if not kwargs.get("use_ecc_refinement") or not bool(
+        polar_attrs["polar_rotation_applied"]
+    ):
+        return kwargs
+
+    if seed_shift_px is None:
+        if calibration is None or jacobian is None or commanded_position_mm is None:
+            raise ValueError(
+                "calibration, jacobian, and commanded_position_mm are required"
+            )
+        calibration_position = _initial_commanded_position_from_attrs(calibration.attrs)
+        if calibration_position is None:
+            seed_shift = np.zeros((len(CAMERAS), len(PIXEL_AXES)), dtype=np.float64)
+        else:
+            command_delta = np.asarray(commanded_position_mm, dtype=np.float64)
+            if command_delta.shape != (len(COMMAND_AXES),) or not np.isfinite(
+                command_delta
+            ).all():
+                raise ValueError(
+                    "commanded_position_mm must be a finite command-axis vector"
+                )
+            jacobian_array = np.asarray(jacobian, dtype=np.float64)
+            if jacobian_array.shape != (
+                len(CAMERAS),
+                len(PIXEL_AXES),
+                len(COMMAND_AXES),
+            ):
+                raise ValueError(
+                    "jacobian must have shape (camera, pixel_axis, command_axis)"
+                )
+            if not np.isfinite(jacobian_array).all():
+                raise ValueError("jacobian must contain only finite values")
+            command_delta = command_delta - calibration_position
+            seed_shift = (
+                jacobian_array.reshape(
+                    len(CAMERAS) * len(PIXEL_AXES),
+                    len(COMMAND_AXES),
+                )
+                @ command_delta
+            ).reshape(len(CAMERAS), len(PIXEL_AXES))
+    else:
+        seed_shift = np.asarray(seed_shift_px, dtype=np.float64)
+
+    if seed_shift.shape != (len(CAMERAS), len(PIXEL_AXES)) or not np.isfinite(
+        seed_shift
+    ).all():
+        raise ValueError("seed_shift_px must have shape (camera, pixel_axis)")
+
+    kwargs["ecc_initial_shift_px"] = {
+        camera: seed_shift[index].copy() for index, camera in enumerate(CAMERAS)
+    }
+    kwargs["ecc_fallback_to_phase_shift"] = False
+    return kwargs
 
 
 def _rotate_px_per_cmd_mm_for_polar_delta(

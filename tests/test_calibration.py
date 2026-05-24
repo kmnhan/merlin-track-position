@@ -215,7 +215,7 @@ class ShiftDetectionTests(unittest.TestCase):
             with (
                 patch(
                     "merlin_track_position.tracking.detect.get_positions",
-                    return_value=(0.0,),
+                    return_value=(1.0, 2.0, 3.0, 0.0),
                 ),
                 patch(
                     "merlin_track_position.tracking.detect._capture_measurement",
@@ -261,7 +261,7 @@ class ShiftDetectionTests(unittest.TestCase):
         with (
             patch(
                 "merlin_track_position.tracking.detect.get_positions",
-                return_value=(90.0,),
+                return_value=(1.0, 2.0, 3.0, 90.0),
             ),
             patch(
                 "merlin_track_position.tracking.detect._capture_measurement",
@@ -285,6 +285,57 @@ class ShiftDetectionTests(unittest.TestCase):
         self.assertEqual(result.attrs["detection_current_polar_deg"], 90.0)
         self.assertEqual(result.attrs["detection_polar_applied_delta_deg"], 90.0)
 
+    def test_detect_shift_seeds_ecc_from_runtime_polar_geometry(self):
+        calibration = calibration_dataset().assign_attrs(
+            initial_x_mm=1.0,
+            initial_y_mm=2.0,
+            initial_z_mm=3.0,
+        )
+        runtime_jacobian = correct_module._rotate_px_per_cmd_mm_for_polar_delta(
+            calibration["px_per_cmd_mm"].values,
+            90.0,
+        )
+        current_position = np.asarray([1.0, 2.0, 3.020], dtype=float)
+        expected_seed = measured_from_jacobian(
+            (current_position - np.asarray([1.0, 2.0, 3.0])).reshape(
+                1,
+                len(COMMAND_AXES),
+            ),
+            runtime_jacobian,
+        )[0]
+
+        with (
+            patch(
+                "merlin_track_position.tracking.detect.get_positions",
+                return_value=(*current_position, 90.0),
+            ),
+            patch(
+                "merlin_track_position.tracking.correct.capture_image_stack",
+                return_value=(
+                    np.zeros((1, 4, 5), dtype=float),
+                    np.zeros((1, 6, 7), dtype=float),
+                ),
+            ),
+            patch(
+                "merlin_track_position.tracking.correct.measure_image_error",
+                return_value=shift_dataset(np.zeros((2, 2), dtype=float)),
+            ) as measure,
+        ):
+            detect_shift(
+                calibration,
+                object(),
+                capture_count=1,
+                use_ecc_refinement=True,
+            )
+
+        kwargs = measure.call_args.kwargs
+        self.assertFalse(kwargs["ecc_fallback_to_phase_shift"])
+        for index, camera in enumerate(CAMERAS):
+            np.testing.assert_allclose(
+                kwargs["ecc_initial_shift_px"][camera],
+                expected_seed[index],
+            )
+
     def test_detect_shift_uses_calibration_beam_targets_as_roi_local_ecc_points(self):
         calibration = calibration_dataset().assign_attrs(
             {
@@ -306,7 +357,7 @@ class ShiftDetectionTests(unittest.TestCase):
         with (
             patch(
                 "merlin_track_position.tracking.detect.get_positions",
-                return_value=(0.0,),
+                return_value=(1.0, 2.0, 3.0, 0.0),
             ),
             patch(
                 "merlin_track_position.tracking.correct.capture_image_stack",
@@ -2025,6 +2076,137 @@ class CorrectionTests(unittest.TestCase):
         self.assertTrue(result.attrs["correction_polar_rotation_applied"])
         self.assertEqual(result.attrs["correction_current_polar_deg"], 90.0)
         np.testing.assert_allclose(result["px_per_cmd_mm"].values, runtime_jacobian)
+
+    def test_correction_initial_measurement_seeds_ecc_from_runtime_geometry(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "calibration.h5"
+            calibration = calibration_dataset().assign_attrs(
+                initial_x_mm=10.0,
+                initial_y_mm=20.0,
+                initial_z_mm=30.0,
+            )
+            save_calibration_dataset(calibration, path)
+            runtime_jacobian = correct_module._rotate_px_per_cmd_mm_for_polar_delta(
+                calibration["px_per_cmd_mm"].values,
+                90.0,
+            )
+            current_position = np.asarray([10.0, 20.0, 30.020], dtype=float)
+            expected_seed = measured_from_jacobian(
+                (current_position - np.asarray([10.0, 20.0, 30.0])).reshape(
+                    1,
+                    len(COMMAND_AXES),
+                ),
+                runtime_jacobian,
+            )[0]
+
+            def fake_get_positions(aliases):
+                position_map = dict(
+                    zip(
+                        (*COMMAND_AXES, "p"),
+                        (*current_position, 90.0),
+                        strict=True,
+                    )
+                )
+                return tuple(position_map[str(alias)] for alias in aliases)
+
+            with (
+                patch(
+                    "merlin_track_position.tracking.correct.get_positions",
+                    side_effect=fake_get_positions,
+                ),
+                patch(
+                    "merlin_track_position.tracking.correct.capture_image_stack",
+                    return_value=(
+                        np.zeros((1, 4, 5), dtype=float),
+                        np.zeros((1, 6, 7), dtype=float),
+                    ),
+                ),
+                patch(
+                    "merlin_track_position.tracking.correct.measure_image_error",
+                    return_value=shift_dataset(np.zeros((2, 2), dtype=float)),
+                ) as measure,
+            ):
+                do_correction(
+                    path,
+                    capture_count=1,
+                    correction_mode="camera",
+                    use_ecc_refinement=True,
+                )
+
+        kwargs = measure.call_args.kwargs
+        self.assertFalse(kwargs["ecc_fallback_to_phase_shift"])
+        for index, camera in enumerate(CAMERAS):
+            np.testing.assert_allclose(
+                kwargs["ecc_initial_shift_px"][camera],
+                expected_seed[index],
+            )
+
+    def test_correction_post_move_measurement_seeds_ecc_from_prediction(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "calibration.h5"
+            calibration = calibration_dataset().assign_attrs(
+                initial_x_mm=10.0,
+                initial_y_mm=20.0,
+                initial_z_mm=30.0,
+            )
+            save_calibration_dataset(calibration, path)
+            p0 = np.array([[60.0, -40.0], [20.0, 10.0]], dtype=float)
+            p1 = np.zeros((len(CAMERAS), len(PIXEL_AXES)), dtype=float)
+            measurements = iter([shift_dataset(p0), shift_dataset(p1)])
+            measure_kwargs = []
+
+            def fake_get_positions(aliases):
+                position_map = dict(
+                    zip(
+                        (*COMMAND_AXES, "p"),
+                        (10.0, 20.0, 30.0, 90.0),
+                        strict=True,
+                    )
+                )
+                return tuple(position_map[str(alias)] for alias in aliases)
+
+            def fake_measure_image_error(*args, **kwargs):
+                del args
+                measure_kwargs.append(dict(kwargs))
+                return next(measurements)
+
+            with (
+                patch(
+                    "merlin_track_position.tracking.correct.get_positions",
+                    side_effect=fake_get_positions,
+                ),
+                patch(
+                    "merlin_track_position.tracking.correct.capture_image_stack",
+                    return_value=(
+                        np.zeros((1, 4, 5), dtype=float),
+                        np.zeros((1, 6, 7), dtype=float),
+                    ),
+                ),
+                patch(
+                    "merlin_track_position.tracking.correct.measure_image_error",
+                    side_effect=fake_measure_image_error,
+                ),
+                patch(
+                    "merlin_track_position.tracking.correct.move_motors_and_wait",
+                    return_value=(10.0, 20.0, 30.0),
+                ),
+            ):
+                result = do_correction(
+                    path,
+                    capture_count=1,
+                    correction_mode="camera",
+                    max_moves=1,
+                    use_ecc_refinement=True,
+                )
+
+        self.assertEqual(len(measure_kwargs), 2)
+        expected_seed = p0 + result["move_predicted_delta_px"].values[0]
+        self.assertFalse(measure_kwargs[1]["ecc_fallback_to_phase_shift"])
+        for index, camera in enumerate(CAMERAS):
+            np.testing.assert_allclose(
+                measure_kwargs[1]["ecc_initial_shift_px"][camera],
+                expected_seed[index],
+            )
 
     def test_lqr_correction_moves_commanded_mm_through_existing_loop(self):
         with tempfile.TemporaryDirectory() as tmpdir:

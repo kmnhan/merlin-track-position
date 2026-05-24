@@ -56,6 +56,8 @@ def estimate_shift(
     use_ecc_refinement: bool = False,
     ecc_motion_model: str = "homography",
     ecc_reference_point_px: npt.ArrayLike | None = None,
+    ecc_initial_shift_px: npt.ArrayLike | None = None,
+    ecc_fallback_to_phase_shift: bool = True,
 ) -> xr.Dataset:
     """Estimate subpixel translation between two grayscale images.
 
@@ -67,7 +69,9 @@ def estimate_shift(
     Pass ``use_ecc_refinement=True`` to refine the phase-correlation result with
     an OpenCV ECC affine or homography registration and return the displacement
     at ``ecc_reference_point_px``. If no point is supplied, the image center is
-    used.
+    used. ``ecc_initial_shift_px`` overrides the phase-correlation shift used to
+    initialize ECC. Pass ``ecc_fallback_to_phase_shift=False`` when the supplied
+    ECC seed is trusted and a failed refinement should invalidate the estimate.
     """
 
     reference_image = np.asarray(reference, dtype=np.float64)
@@ -140,18 +144,34 @@ def estimate_shift(
             f"high registration error: {registration_error:.3g} > {high_error_threshold:.3g}"
         )
 
-    if use_ecc_refinement and np.isfinite(shift_px).all():
+    explicit_ecc_initial_shift = None
+    if use_ecc_refinement and ecc_initial_shift_px is not None:
+        explicit_ecc_initial_shift = np.asarray(ecc_initial_shift_px, dtype=np.float64)
+        if explicit_ecc_initial_shift.shape != (2,) or not np.isfinite(
+            explicit_ecc_initial_shift
+        ).all():
+            raise ValueError("ecc_initial_shift_px must be a finite 2-vector")
+    if use_ecc_refinement and (
+        explicit_ecc_initial_shift is not None or np.isfinite(shift_px).all()
+    ):
+        ecc_initial_shift = (
+            explicit_ecc_initial_shift
+            if explicit_ecc_initial_shift is not None
+            else shift_px
+        )
         try:
             shift_px = _estimate_ecc_shift(
                 reference_norm,
                 current_norm,
-                shift_px,
+                ecc_initial_shift,
                 use_window=use_window,
                 motion_model=ecc_motion_model,
                 reference_point_px=ecc_reference_point_px,
             )
         except Exception as exc:
             diagnostic_warnings.append(f"ECC refinement failed: {exc}")
+            if not ecc_fallback_to_phase_shift:
+                shift_px = np.array([np.nan, np.nan], dtype=np.float64)
 
     if check_tiles and np.isfinite(shift_px).all():
         tile_warning = _tile_consistency(

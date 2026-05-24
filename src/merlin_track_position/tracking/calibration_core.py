@@ -1670,23 +1670,21 @@ def _shift_kwargs_for_camera(
     camera: str,
 ) -> dict[str, Any]:
     kwargs = dict(shift_kwargs)
-    if "ecc_reference_point_px" not in kwargs:
-        return kwargs
+    for name in ("ecc_reference_point_px", "ecc_initial_shift_px"):
+        if name not in kwargs or kwargs[name] is None:
+            continue
+        value = kwargs[name]
+        if isinstance(value, Mapping):
+            camera_value = value.get(camera)
+            if camera_value is None:
+                kwargs.pop(name)
+            else:
+                kwargs[name] = camera_value
+            continue
 
-    point = kwargs["ecc_reference_point_px"]
-    if point is None:
-        return kwargs
-    if isinstance(point, Mapping):
-        camera_point = point.get(camera)
-        if camera_point is None:
-            kwargs.pop("ecc_reference_point_px")
-        else:
-            kwargs["ecc_reference_point_px"] = camera_point
-        return kwargs
-
-    point_array = np.asarray(point, dtype=np.float64)
-    if point_array.shape == (len(CAMERAS), len(PIXEL_AXES)):
-        kwargs["ecc_reference_point_px"] = point_array[CAMERAS.index(camera)]
+        value_array = np.asarray(value, dtype=np.float64)
+        if value_array.shape == (len(CAMERAS), len(PIXEL_AXES)):
+            kwargs[name] = value_array[CAMERAS.index(camera)]
     return kwargs
 
 
