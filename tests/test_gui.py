@@ -1418,6 +1418,71 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
             finally:
                 window.close()
 
+    def test_beam_targets_initialize_from_settings(self):
+        get_qapp()
+        settings = FakeSettings()
+        stored_points = {}
+        for camera, image_size in main_window.CAMERA_IMAGE_SIZES.items():
+            point = np.asarray(
+                main_window._roi_center_point(
+                    camera,
+                    main_window._default_roi_geometry(*image_size),
+                ),
+                dtype=float,
+            ) + np.asarray([3.0, -2.0], dtype=float)
+            stored_points[camera] = point
+            for key, value in zip(
+                main_window.BEAM_TARGET_SETTINGS_KEYS[camera],
+                point,
+                strict=True,
+            ):
+                settings.values[key] = float(value)
+
+        with patched_main_window_runtime(settings):
+            window = MainWindow()
+            try:
+                for camera, point in stored_points.items():
+                    np.testing.assert_allclose(beam_target_point(window, camera), point)
+                    self.assertIn(camera, window._beam_target_user_overrides)
+            finally:
+                window.close()
+
+    def test_beam_target_drag_finished_persists_raw_coordinates(self):
+        get_qapp()
+        with patched_main_window_runtime() as settings:
+            window = MainWindow()
+            try:
+                camera = "cam1"
+                dragged_point = np.asarray(
+                    main_window._roi_center_point(
+                        camera,
+                        window._get_roi_geometry(camera),
+                    ),
+                    dtype=float,
+                ) + np.asarray([4.0, -3.0], dtype=float)
+
+                window.image_targets[camera].setPos(
+                    *main_window._display_point(camera, dragged_point)
+                )
+                settings.set_calls.clear()
+                window._on_beam_target_position_change_finished(camera)
+
+                self.assertEqual(
+                    settings.set_calls,
+                    [
+                        (
+                            main_window.BEAM_TARGET_SETTINGS_KEYS[camera][0],
+                            float(dragged_point[0]),
+                        ),
+                        (
+                            main_window.BEAM_TARGET_SETTINGS_KEYS[camera][1],
+                            float(dragged_point[1]),
+                        ),
+                    ],
+                )
+            finally:
+                window.close()
+
     def test_shift_monitor_menu_opens_singleton_and_receives_frames(self):
         get_qapp()
         created = []
@@ -1765,6 +1830,64 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                 self.assertTrue(roi_handles_visible(window))
                 self.assertTrue(roi_editing_enabled(window))
                 self.assertTrue(beam_target_dragging_enabled(window))
+            finally:
+                window.close()
+
+    def test_clearing_calibration_preserves_current_beam_targets(self):
+        get_qapp()
+        with patched_main_window_runtime() as settings:
+            window = MainWindow()
+            try:
+                target_points = {
+                    camera: np.asarray(
+                        main_window._roi_center_point(
+                            camera,
+                            window._get_roi_geometry(camera),
+                        ),
+                        dtype=float,
+                    )
+                    + np.asarray([6.0, -5.0], dtype=float)
+                    for camera in main_window.CAMERA_IMAGE_SIZES
+                }
+                target_attrs = {
+                    key: float(value)
+                    for camera, point in target_points.items()
+                    for key, value in zip(
+                        main_window.BEAM_TARGET_ATTR_KEYS[camera],
+                        point,
+                        strict=True,
+                    )
+                }
+                calibration = build_sample_calibration_dataset(
+                    image_shape_cam0=(4, 5),
+                    image_shape_cam1=(6, 7),
+                ).assign_attrs(
+                    {"calibration_path": "/tmp/calibration.h5"} | target_attrs
+                )
+
+                window._on_new_calibration_ready(calibration)
+                settings.set_calls.clear()
+
+                with patch.object(
+                    CalibrationStartDialog,
+                    "exec",
+                    side_effect=AssertionError("dialog should not open"),
+                ):
+                    window._on_new_calibration_clicked()
+
+                self.assertIsNone(window._calibration)
+                for camera, point in target_points.items():
+                    np.testing.assert_allclose(beam_target_point(window, camera), point)
+                    self.assertIn(camera, window._beam_target_user_overrides)
+                self.assertEqual(
+                    settings.set_calls,
+                    [
+                        ("beam_target/cam0/u", float(target_points["cam0"][0])),
+                        ("beam_target/cam0/v", float(target_points["cam0"][1])),
+                        ("beam_target/cam1/u", float(target_points["cam1"][0])),
+                        ("beam_target/cam1/v", float(target_points["cam1"][1])),
+                    ],
+                )
             finally:
                 window.close()
 

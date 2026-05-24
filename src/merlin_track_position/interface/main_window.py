@@ -138,6 +138,10 @@ ROI_SETTINGS_KEYS: dict[str, tuple[str, str, str, str]] = {
     )
     for camera in CAMERA_IMAGE_SIZES
 }
+BEAM_TARGET_SETTINGS_KEYS: dict[str, tuple[str, str]] = {
+    camera: (f"beam_target/{camera}/u", f"beam_target/{camera}/v")
+    for camera in CAMERA_IMAGE_SIZES
+}
 ROI_METADATA_KEYS: dict[str, tuple[str, str, str, str]] = {
     camera: (
         f"roi_{camera}_x",
@@ -1006,6 +1010,13 @@ class MainWindow(_MainWindowGUI):
                 camera,
                 _clamp_roi_geometry(tuple(roi_values), image_width, image_height),
             )
+            stored_target_point = self._stored_beam_target_point(camera)
+            if stored_target_point is not None:
+                self._set_beam_target_point(
+                    camera,
+                    stored_target_point,
+                    user_override=True,
+                )
             self.image_rois[camera].sigRegionChangeFinished.connect(
                 lambda _roi=None, camera=camera: self._on_roi_region_change_finished(
                     camera
@@ -1522,6 +1533,7 @@ class MainWindow(_MainWindowGUI):
 
     def _on_beam_target_position_change_finished(self, camera: str) -> None:
         self._on_beam_target_position_changed(camera)
+        self._persist_beam_target_point(camera)
         self._end_beam_target_reference_preview()
 
     def _beam_target_point(self, camera: str) -> tuple[float, float]:
@@ -1622,6 +1634,7 @@ class MainWindow(_MainWindowGUI):
         calibration: xr.Dataset,
         *,
         preserve_user_overrides: bool = False,
+        persist: bool = True,
     ) -> None:
         for camera in CAMERA_IMAGE_SIZES:
             if preserve_user_overrides and camera in self._beam_target_user_overrides:
@@ -1636,6 +1649,8 @@ class MainWindow(_MainWindowGUI):
                 self._calibration_beam_target_point(calibration, camera),
                 user_override=False,
             )
+            if persist:
+                self._persist_beam_target_point(camera)
         self._set_shift_monitor_beam_targets()
         self._update_reset_beam_target_button()
 
@@ -1703,6 +1718,7 @@ class MainWindow(_MainWindowGUI):
                 self._update_reset_beam_target_button()
                 return
             self._set_beam_target_point(camera, point, user_override=False)
+            self._persist_beam_target_point(camera)
         self._set_shift_monitor_beam_targets()
         self._update_reset_beam_target_button()
 
@@ -2100,6 +2116,7 @@ class MainWindow(_MainWindowGUI):
         roi_geometries = self._current_roi_geometries()
         roi_metadata = _roi_metadata_from_geometries(roi_geometries)
         roi_metadata |= self._current_beam_target_metadata()
+        self._persist_current_beam_target_points()
         camera_pair = self._camera_pair_for_current_images()
         try:
             self._calibration_total_steps = visual_calibration_probe_count(n)
@@ -2290,6 +2307,7 @@ class MainWindow(_MainWindowGUI):
         self._apply_calibration_beam_target_metadata(
             calibration,
             preserve_user_overrides=True,
+            persist=False,
         )
         self._calibration = calibration
         self._calibration_path = calibration_path
@@ -2334,6 +2352,7 @@ class MainWindow(_MainWindowGUI):
             self._apply_calibration_beam_target_metadata(
                 calibration,
                 preserve_user_overrides=True,
+                persist=False,
             )
 
             self._calibration = calibration
@@ -2469,13 +2488,15 @@ class MainWindow(_MainWindowGUI):
             self.calibration_panel.show_correction_result(result)
 
     def _clear_loaded_calibration(self) -> None:
+        beam_target_points = self._current_beam_target_points()
         self._stop_auto_correction(uncheck=True)
         self._calibration = None
         self._calibration_path = None
         self._last_correction_result = None
         self._beam_target_user_overrides.clear()
-        for camera in CAMERA_IMAGE_SIZES:
-            self._sync_beam_target_after_roi_change(camera)
+        for camera, point in beam_target_points.items():
+            self._set_beam_target_point(camera, point, user_override=True)
+        self._persist_current_beam_target_points()
         self._set_reference_preview_button_enabled(False)
         self._restore_calibration_idle_state()
         self._set_shift_monitor_calibration()
@@ -2532,6 +2553,34 @@ class MainWindow(_MainWindowGUI):
         for key, value in zip(ROI_SETTINGS_KEYS[camera], geometry, strict=True):
             self._settings.setValue(key, float(value))
         self._settings.sync()
+
+    def _stored_beam_target_point(self, camera: str) -> tuple[float, float] | None:
+        keys = BEAM_TARGET_SETTINGS_KEYS[camera]
+        values = [self._settings.value(key, None) for key in keys]
+        if any(value is None for value in values):
+            return None
+        try:
+            u_value, v_value = values
+            point = (float(u_value), float(v_value))
+        except (TypeError, ValueError):
+            return None
+        if not all(math.isfinite(value) for value in point):
+            return None
+        return _clamp_point_to_roi(camera, point, self._get_roi_geometry(camera))
+
+    def _persist_beam_target_point(self, camera: str) -> None:
+        point = _clamp_point_to_roi(
+            camera,
+            self._beam_target_point(camera),
+            self._get_roi_geometry(camera),
+        )
+        for key, value in zip(BEAM_TARGET_SETTINGS_KEYS[camera], point, strict=True):
+            self._settings.setValue(key, float(value))
+        self._settings.sync()
+
+    def _persist_current_beam_target_points(self) -> None:
+        for camera in CAMERA_IMAGE_SIZES:
+            self._persist_beam_target_point(camera)
 
     def _apply_calibration_roi_metadata(
         self,
