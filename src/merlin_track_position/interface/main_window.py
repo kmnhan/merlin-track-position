@@ -8,7 +8,7 @@ import threading
 import time
 from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import pyqtgraph as pg
@@ -46,8 +46,12 @@ from merlin_track_position.instruments.camera_config import (
     save_camera_config,
 )
 from merlin_track_position.instruments.basler import (
+    BaslerCameraCapabilities,
     close_basler_camera,
     get_basler_image,
+    list_basler_devices,
+    read_basler_capabilities,
+    validate_basler_config,
 )
 from merlin_track_position.instruments.framegrab import get_framegrabber_image
 from merlin_track_position.instruments.simulated_hardware import simulator
@@ -450,6 +454,10 @@ class CameraSettingsDialog(QtWidgets.QDialog):
         super().__init__(parent)
         self.setWindowTitle("Camera Settings")
         self._rows: dict[str, dict[str, QtWidgets.QWidget]] = {}
+        self._basler_devices = {
+            device.serial_number: device for device in list_basler_devices()
+        }
+        self._basler_capabilities: dict[str, BaslerCameraCapabilities] = {}
 
         layout = QtWidgets.QVBoxLayout(self)
         tabs = QtWidgets.QTabWidget()
@@ -470,9 +478,21 @@ class CameraSettingsDialog(QtWidgets.QDialog):
             form.addRow("Source", source_combo)
             rows["source_type"] = source_combo
 
-            serial_edit = QtWidgets.QLineEdit(config.serial_number)
-            form.addRow("Serial", serial_edit)
-            rows["serial_number"] = serial_edit
+            serial_combo = QtWidgets.QComboBox()
+            serial_combo.addItem("Select connected camera", "")
+            for device in self._basler_devices.values():
+                label = f"{device.model_name or 'Basler'} ({device.serial_number})"
+                serial_combo.addItem(label, device.serial_number)
+            if config.serial_number:
+                index = serial_combo.findData(config.serial_number)
+                if index >= 0:
+                    serial_combo.setCurrentIndex(index)
+            form.addRow("Serial", serial_combo)
+            rows["serial_number"] = serial_combo
+
+            model_label = QtWidgets.QLabel()
+            form.addRow("Model", model_label)
+            rows["model_name"] = model_label
 
             for name, label, value, minimum, maximum in (
                 ("width", "Width", config.width, 1, 10000),
@@ -494,9 +514,9 @@ class CameraSettingsDialog(QtWidgets.QDialog):
             form.addRow("Exposure us", exposure_spin)
             rows["exposure_us"] = exposure_spin
 
-            pixel_format_edit = QtWidgets.QLineEdit(config.pixel_format)
-            form.addRow("Pixel format", pixel_format_edit)
-            rows["pixel_format"] = pixel_format_edit
+            pixel_format_combo = QtWidgets.QComboBox()
+            form.addRow("Pixel format", pixel_format_combo)
+            rows["pixel_format"] = pixel_format_combo
 
             output_combo = QtWidgets.QComboBox()
             for output_mode in BASLER_OUTPUT_MODES:
@@ -519,6 +539,13 @@ class CameraSettingsDialog(QtWidgets.QDialog):
 
             self._rows[slot] = rows
             tabs.addTab(page, slot)
+            source_combo.currentIndexChanged.connect(
+                lambda _index, slot=slot: self._sync_basler_controls(slot)
+            )
+            serial_combo.currentIndexChanged.connect(
+                lambda _index, slot=slot: self._sync_basler_controls(slot)
+            )
+            self._sync_basler_controls(slot, preferred_pixel_format=config.pixel_format)
 
         buttons = QtWidgets.QDialogButtonBox(
             QtWidgets.QDialogButtonBox.StandardButton.Ok
@@ -528,28 +555,140 @@ class CameraSettingsDialog(QtWidgets.QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
+    def _sync_basler_controls(
+        self,
+        slot: str,
+        *,
+        preferred_pixel_format: str | None = None,
+    ) -> None:
+        rows = self._rows[slot]
+        source_combo = cast(QtWidgets.QComboBox, rows["source_type"])
+        serial_combo = cast(QtWidgets.QComboBox, rows["serial_number"])
+        pixel_format_combo = cast(QtWidgets.QComboBox, rows["pixel_format"])
+        model_label = cast(QtWidgets.QLabel, rows["model_name"])
+
+        source_type = str(source_combo.currentData())
+        is_basler = source_type == "basler"
+        serial_combo.setEnabled(is_basler)
+        pixel_format_combo.setEnabled(is_basler)
+        rows["exposure_us"].setEnabled(is_basler)
+        rows["offset_x"].setEnabled(is_basler)
+        rows["offset_y"].setEnabled(is_basler)
+        rows["max_num_buffer"].setEnabled(is_basler)
+
+        if not is_basler:
+            model_label.setText("")
+            return
+
+        serial = str(serial_combo.currentData() or "")
+        device = self._basler_devices.get(serial)
+        model_label.setText(device.model_name if device is not None else "")
+        capabilities = self._capabilities_for_serial(serial)
+        if capabilities is None:
+            pixel_format_combo.clear()
+            return
+
+        for name in ("width", "height", "offset_x", "offset_y"):
+            spin = cast(QtWidgets.QSpinBox, rows[name])
+            value_range = getattr(capabilities, name)
+            spin.setRange(int(value_range.minimum), int(value_range.maximum))
+            spin.setSingleStep(max(1, int(value_range.increment)))
+        exposure_range = capabilities.exposure_us
+        exposure_spin = cast(QtWidgets.QDoubleSpinBox, rows["exposure_us"])
+        exposure_spin.setRange(exposure_range.minimum, exposure_range.maximum)
+        exposure_spin.setSingleStep(max(exposure_range.increment, 0.001))
+
+        current = (
+            preferred_pixel_format
+            if preferred_pixel_format is not None
+            else str(pixel_format_combo.currentData() or "")
+        )
+        pixel_format_combo.clear()
+        for pixel_format in capabilities.pixel_formats:
+            pixel_format_combo.addItem(pixel_format, pixel_format)
+        pixel_format_combo.setCurrentIndex(
+            max(pixel_format_combo.findData(current), 0)
+        )
+
+    def _capabilities_for_serial(
+        self,
+        serial: str,
+    ) -> BaslerCameraCapabilities | None:
+        if not serial:
+            return None
+        if serial in self._basler_capabilities:
+            return self._basler_capabilities[serial]
+        try:
+            capabilities = read_basler_capabilities(serial)
+        except Exception:
+            return None
+        self._basler_capabilities[serial] = capabilities
+        return capabilities
+
+    def accept(self) -> None:
+        try:
+            configs = self.configs()
+            for config in configs.values():
+                if config.source_type != "basler":
+                    continue
+                if not config.serial_number:
+                    raise ValueError(
+                        f"{config.slot} Basler source requires a connected camera"
+                    )
+                validate_basler_config(config)
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Invalid camera settings",
+                str(exc),
+            )
+            return
+        super().accept()
+
     def configs(self) -> dict[str, CameraConfig]:
         configs: dict[str, CameraConfig] = {}
         defaults = default_camera_configs()
         for slot, rows in self._rows.items():
             default = defaults[slot]
+            source_combo = cast(QtWidgets.QComboBox, rows["source_type"])
+            serial_combo = cast(QtWidgets.QComboBox, rows["serial_number"])
+            pixel_format_combo = cast(QtWidgets.QComboBox, rows["pixel_format"])
+            output_combo = cast(QtWidgets.QComboBox, rows["output_mode"])
+            width_spin = cast(QtWidgets.QSpinBox, rows["width"])
+            height_spin = cast(QtWidgets.QSpinBox, rows["height"])
+            offset_x_spin = cast(QtWidgets.QSpinBox, rows["offset_x"])
+            offset_y_spin = cast(QtWidgets.QSpinBox, rows["offset_y"])
+            exposure_spin = cast(QtWidgets.QDoubleSpinBox, rows["exposure_us"])
+            buffer_spin = cast(QtWidgets.QSpinBox, rows["max_num_buffer"])
+            display_transpose = cast(QtWidgets.QCheckBox, rows["display_transpose"])
+            display_invert_x = cast(QtWidgets.QCheckBox, rows["display_invert_x"])
+            display_invert_y = cast(QtWidgets.QCheckBox, rows["display_invert_y"])
+
+            source_type = str(source_combo.currentData())
+            serial_number = (
+                str(serial_combo.currentData() or "")
+                if source_type == "basler"
+                else ""
+            )
+            device = self._basler_devices.get(serial_number)
             configs[slot] = CameraConfig(
                 slot=slot,
-                source_type=str(rows["source_type"].currentData()),  # type: ignore[attr-defined]
-                serial_number=rows["serial_number"].text().strip(),  # type: ignore[attr-defined]
-                width=int(rows["width"].value()),  # type: ignore[attr-defined]
-                height=int(rows["height"].value()),  # type: ignore[attr-defined]
-                offset_x=int(rows["offset_x"].value()),  # type: ignore[attr-defined]
-                offset_y=int(rows["offset_y"].value()),  # type: ignore[attr-defined]
-                exposure_us=float(rows["exposure_us"].value()),  # type: ignore[attr-defined]
-                pixel_format=rows["pixel_format"].text().strip()
-                or default.pixel_format,  # type: ignore[attr-defined]
-                output_mode=str(rows["output_mode"].currentData()),  # type: ignore[attr-defined]
-                max_num_buffer=int(rows["max_num_buffer"].value()),  # type: ignore[attr-defined]
+                source_type=source_type,
+                serial_number=serial_number,
+                model_name=device.model_name if device is not None else "",
+                width=int(width_spin.value()),
+                height=int(height_spin.value()),
+                offset_x=int(offset_x_spin.value()),
+                offset_y=int(offset_y_spin.value()),
+                exposure_us=float(exposure_spin.value()),
+                pixel_format=str(pixel_format_combo.currentData() or "")
+                or default.pixel_format,
+                output_mode=str(output_combo.currentData()),
+                max_num_buffer=int(buffer_spin.value()),
                 display=DisplayTransform(
-                    transpose=bool(rows["display_transpose"].isChecked()),  # type: ignore[attr-defined]
-                    invert_x=bool(rows["display_invert_x"].isChecked()),  # type: ignore[attr-defined]
-                    invert_y=bool(rows["display_invert_y"].isChecked()),  # type: ignore[attr-defined]
+                    transpose=bool(display_transpose.isChecked()),
+                    invert_x=bool(display_invert_x.isChecked()),
+                    invert_y=bool(display_invert_y.isChecked()),
                 ),
             )
         return configs
@@ -1045,19 +1184,27 @@ class MainWindow(_MainWindowGUI):
 
     @QtCore.Slot()
     def _on_camera_settings_triggered(self) -> None:
-        dialog = CameraSettingsDialog(self._camera_configs, self)
-        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
-            return
-        configs = dialog.configs()
-        for config in configs.values():
-            save_camera_config(self._settings, config)
-        self._settings.sync()
+        refresh_checked = self.image_auto_refresh_checkbox.isChecked()
+        self._set_image_refresh_enabled(False)
+        self.image_auto_refresh_checkbox.setEnabled(False)
         close_basler_camera()
-        QtWidgets.QMessageBox.information(
-            self,
-            "Camera settings saved",
-            "Camera settings were saved. Reopen this window before using changed hardware settings.",
-        )
+        try:
+            dialog = CameraSettingsDialog(self._camera_configs, self)
+            if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+                return
+            configs = dialog.configs()
+            for config in configs.values():
+                save_camera_config(self._settings, config)
+            self._settings.sync()
+            close_basler_camera()
+            QtWidgets.QMessageBox.information(
+                self,
+                "Camera settings saved",
+                "Camera settings were saved. Reopen this window before using changed hardware settings.",
+            )
+        finally:
+            self.image_auto_refresh_checkbox.setEnabled(True)
+            self._set_image_refresh_enabled(refresh_checked)
 
     @QtCore.Slot(object)
     def _on_registration_config_saved(self, config: object) -> None:

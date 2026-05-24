@@ -32,6 +32,11 @@ from merlin_track_position.instruments.camera_config import (  # noqa: E402
     CameraConfig,
     DisplayTransform,
 )
+from merlin_track_position.instruments.basler import (  # noqa: E402
+    BaslerCameraCapabilities,
+    BaslerDevice,
+    BaslerValueRange,
+)
 from merlin_track_position.interface.registration_settings import (  # noqa: E402
     DEFAULT_REGISTRATION_CONFIG,
     REGISTRATION_CAPTURE_AGGREGATION_SETTINGS_KEY,
@@ -1171,6 +1176,28 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
 
     def test_camera_settings_dialog_returns_updated_configs(self):
         get_qapp()
+        device_old = BaslerDevice("old", "old-model", "old-full-name")
+        device_new = BaslerDevice("new-serial", "new-model", "new-full-name")
+        capabilities = {
+            "old": BaslerCameraCapabilities(
+                device_old,
+                width=BaslerValueRange(1, 10, 1),
+                height=BaslerValueRange(1, 10, 1),
+                offset_x=BaslerValueRange(0, 10, 1),
+                offset_y=BaslerValueRange(0, 10, 1),
+                exposure_us=BaslerValueRange(1.0, 1000000.0, 1.0),
+                pixel_formats=("Mono12",),
+            ),
+            "new-serial": BaslerCameraCapabilities(
+                device_new,
+                width=BaslerValueRange(2, 12, 2),
+                height=BaslerValueRange(1, 10, 1),
+                offset_x=BaslerValueRange(0, 10, 1),
+                offset_y=BaslerValueRange(0, 10, 1),
+                exposure_us=BaslerValueRange(1.0, 1000000.0, 1.0),
+                pixel_formats=("Mono12", "BayerRG12"),
+            ),
+        }
         configs = {
             "cam0": CameraConfig(
                 slot="cam0",
@@ -1187,20 +1214,70 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                 display=DisplayTransform(transpose=True, invert_x=True, invert_y=True),
             ),
         }
-        dialog = CameraSettingsDialog(configs)
-        try:
-            rows = dialog._rows["cam1"]
-            rows["serial_number"].setText("new-serial")
-            rows["width"].setValue(9)
-            rows["display_transpose"].setChecked(False)
+        with (
+            patch(
+                "merlin_track_position.interface.main_window.list_basler_devices",
+                return_value=(device_old, device_new),
+            ),
+            patch(
+                "merlin_track_position.interface.main_window.read_basler_capabilities",
+                side_effect=lambda serial: capabilities[serial],
+            ),
+        ):
+            dialog = CameraSettingsDialog(configs)
+            try:
+                rows = dialog._rows["cam1"]
+                rows["serial_number"].setCurrentIndex(
+                    rows["serial_number"].findData("new-serial")
+                )
+                rows["width"].setValue(10)
+                rows["pixel_format"].setCurrentIndex(
+                    rows["pixel_format"].findData("BayerRG12")
+                )
+                rows["display_transpose"].setChecked(False)
 
-            updated = dialog.configs()["cam1"]
-        finally:
-            dialog.close()
+                updated = dialog.configs()["cam1"]
+            finally:
+                dialog.close()
 
         self.assertEqual(updated.serial_number, "new-serial")
-        self.assertEqual(updated.width, 9)
+        self.assertEqual(updated.model_name, "new-model")
+        self.assertEqual(updated.width, 10)
+        self.assertEqual(updated.pixel_format, "BayerRG12")
         self.assertFalse(updated.display.transpose)
+
+    def test_camera_settings_dialog_blocks_basler_without_connected_device(self):
+        get_qapp()
+        configs = {
+            "cam0": CameraConfig(
+                slot="cam0",
+                source_type=SOURCE_FRAMEGRABBER,
+                width=4,
+                height=3,
+            ),
+            "cam1": CameraConfig(
+                slot="cam1",
+                source_type=SOURCE_BASLER,
+                serial_number="missing",
+                width=6,
+                height=5,
+            ),
+        }
+        with (
+            patch(
+                "merlin_track_position.interface.main_window.list_basler_devices",
+                return_value=(),
+            ),
+            patch.object(QtWidgets.QMessageBox, "warning") as warning,
+        ):
+            dialog = CameraSettingsDialog(configs)
+            try:
+                dialog.accept()
+            finally:
+                dialog.close()
+
+        self.assertTrue(warning.called)
+        self.assertIn("requires a connected camera", warning.call_args.args[2])
 
     def test_fresh_window_has_editable_roi_and_new_calibration_button(self):
         get_qapp()

@@ -97,12 +97,14 @@ class FakeNode:
         minimum=0,
         maximum=10_000,
         increment=1,
+        symbolics=None,
         writable=True,
     ):
         self.Value = value
         self.Min = minimum
         self.Max = maximum
         self.Inc = increment
+        self.Symbolics = list(symbolics or [])
         self.writable = writable
 
 
@@ -125,12 +127,14 @@ class FakeBaslerCamera:
         self.ExposureAuto = FakeNode("Continuous")
         self.ExposureTimeAbs = FakeNode()
         self.GammaEnable = FakeNode(False)
+        self.CenterX = FakeNode(True)
+        self.CenterY = FakeNode(True)
         self.OffsetX = FakeNode(100, minimum=0)
         self.OffsetY = FakeNode(50, minimum=0)
         self.Width = FakeNode(maximum=constants.IMAGE_WIDTH_CAM1)
         self.Height = FakeNode(maximum=constants.IMAGE_HEIGHT_CAM1)
         self.PixelFormat = FakeNode()
-        self.MaxNumBuffer = None
+        self.MaxNumBuffer = FakeNode(10)
         self.arrays = list(arrays or [])
         self.grab_succeeded = grab_succeeded
         self.open_count = 0
@@ -173,6 +177,37 @@ class FakeBaslerCamera:
                 dtype=np.uint16,
             )
         return FakeGrabResult(array, succeeded=self.grab_succeeded)
+
+
+class FakeBaslerDevice:
+    def __init__(self, serial_number, model_name, full_name, camera):
+        self.serial_number = serial_number
+        self.model_name = model_name
+        self.full_name = full_name
+        self.camera = camera
+
+    def GetSerialNumber(self):
+        return self.serial_number
+
+    def GetModelName(self):
+        return self.model_name
+
+    def GetFullName(self):
+        return self.full_name
+
+
+class FakeBaslerFactory:
+    def __init__(self, devices):
+        self.devices = list(devices)
+
+    def EnumerateDevices(self):
+        return list(self.devices)
+
+    def CreateDevice(self, device_info):
+        for device in self.devices:
+            if device is device_info:
+                return device.camera
+        raise ValueError("unknown fake device")
 
 
 class FakeGrabResult:
@@ -430,11 +465,105 @@ class DevelopmentModeFramegrabTests(unittest.TestCase):
         self.assertEqual(camera.Height.Value, config.height)
         self.assertEqual(camera.PixelFormat.Value, config.pixel_format)
 
+    def test_basler_discovery_lists_connected_devices(self):
+        camera = FakeBaslerCamera()
+        device = FakeBaslerDevice("1234", "a2A2590-22gcBAS", "dev-1234", camera)
+
+        with patch.object(
+            basler.pylon.TlFactory,
+            "GetInstance",
+            return_value=FakeBaslerFactory([device]),
+        ):
+            devices = basler.list_basler_devices()
+
+        self.assertEqual(
+            devices,
+            (
+                basler.BaslerDevice(
+                    serial_number="1234",
+                    model_name="a2A2590-22gcBAS",
+                    full_name="dev-1234",
+                ),
+            ),
+        )
+
+    def test_basler_capabilities_read_live_node_ranges_and_pixel_formats(self):
+        camera = FakeBaslerCamera()
+        camera.Width = FakeNode(10, minimum=4, maximum=2592, increment=4)
+        camera.Height = FakeNode(12, minimum=2, maximum=1944, increment=2)
+        camera.OffsetX = FakeNode(0, minimum=0, maximum=64, increment=4)
+        camera.OffsetY = FakeNode(0, minimum=0, maximum=32, increment=2)
+        camera.ExposureTimeAbs = FakeNode(1000.0, minimum=10.0, maximum=300000.0)
+        camera.PixelFormat = FakeNode("Mono12", symbolics=("Mono12", "BayerRG12"))
+        device = FakeBaslerDevice("1234", "a2A2590-22gcBAS", "dev-1234", camera)
+
+        with (
+            patch.object(
+                basler.pylon.TlFactory,
+                "GetInstance",
+                return_value=FakeBaslerFactory([device]),
+            ),
+            patch.object(basler.pylon, "InstantCamera", side_effect=lambda camera: camera),
+            patch(
+                "merlin_track_position.instruments.basler.genicam.IsWritable",
+                lambda node: node.writable,
+            ),
+        ):
+            capabilities = basler.read_basler_capabilities("1234")
+
+        self.assertEqual(capabilities.device.serial_number, "1234")
+        self.assertEqual(capabilities.device.model_name, "a2A2590-22gcBAS")
+        self.assertEqual(capabilities.width.minimum, 4.0)
+        self.assertEqual(capabilities.width.maximum, 2592.0)
+        self.assertEqual(capabilities.width.increment, 4.0)
+        self.assertEqual(capabilities.pixel_formats, ("Mono12", "BayerRG12"))
+        self.assertEqual(camera.open_count, 1)
+        self.assertEqual(camera.close_count, 1)
+
+    def test_basler_validation_rejects_values_outside_live_capabilities(self):
+        camera = FakeBaslerCamera()
+        camera.Width = FakeNode(10, minimum=4, maximum=2592, increment=4)
+        camera.Height = FakeNode(12, minimum=2, maximum=1944, increment=2)
+        camera.OffsetX = FakeNode(0, minimum=0, maximum=64, increment=4)
+        camera.OffsetY = FakeNode(0, minimum=0, maximum=32, increment=2)
+        camera.ExposureTimeAbs = FakeNode(1000.0, minimum=10.0, maximum=300000.0)
+        camera.PixelFormat = FakeNode("Mono12", symbolics=("Mono12", "BayerRG12"))
+        device = FakeBaslerDevice("1234", "a2A2590-22gcBAS", "dev-1234", camera)
+        config = CameraConfig(
+            slot="cam1",
+            source_type=SOURCE_BASLER,
+            serial_number="1234",
+            model_name="a2A2590-22gcBAS",
+            width=7,
+            height=12,
+            exposure_us=1.0,
+            pixel_format="RGB8",
+        )
+
+        with (
+            patch.object(
+                basler.pylon.TlFactory,
+                "GetInstance",
+                return_value=FakeBaslerFactory([device]),
+            ),
+            patch.object(basler.pylon, "InstantCamera", side_effect=lambda camera: camera),
+            patch(
+                "merlin_track_position.instruments.basler.genicam.IsWritable",
+                lambda node: node.writable,
+            ),
+        ):
+            with self.assertRaisesRegex(
+                ValueError,
+                "width=7.*exposure_us=1.*pixel_format",
+            ):
+                basler.validate_basler_config(config)
+
     def test_camera_config_from_settings_normalizes_slot_values(self):
         settings = FakeSettings(
             {
                 "camera/cam0/source_type": SOURCE_BASLER,
                 "camera/cam0/serial_number": "1234",
+                "camera/cam0/model_name": "a2A2590-22gcBAS",
                 "camera/cam0/width": "2592",
                 "camera/cam0/height": "1944",
                 "camera/cam0/output_mode": BASLER_OUTPUT_RGB8,
@@ -448,6 +577,7 @@ class DevelopmentModeFramegrabTests(unittest.TestCase):
 
         self.assertEqual(config.source_type, SOURCE_BASLER)
         self.assertEqual(config.serial_number, "1234")
+        self.assertEqual(config.model_name, "a2A2590-22gcBAS")
         self.assertEqual(config.width, 2592)
         self.assertEqual(config.height, 1944)
         self.assertEqual(config.output_mode, BASLER_OUTPUT_RGB8)
@@ -492,6 +622,7 @@ class DevelopmentModeFramegrabTests(unittest.TestCase):
                 slot="cam1",
                 source_type=SOURCE_BASLER,
                 serial_number="serial-a",
+                model_name="a2A2590-22gcBAS",
                 width=6,
                 height=5,
                 exposure_us=125000.0,
@@ -499,6 +630,7 @@ class DevelopmentModeFramegrabTests(unittest.TestCase):
         }
         metadata = camera_metadata(configs)
         self.assertEqual(metadata["camera_cam1_exposure_us"], 125000.0)
+        self.assertEqual(metadata["camera_cam1_model_name"], "a2A2590-22gcBAS")
         metadata["camera_cam1_serial_number"] = "serial-b"
 
         self.assertEqual(
@@ -570,6 +702,7 @@ class DevelopmentModeFramegrabTests(unittest.TestCase):
             height=2,
             output_mode=BASLER_OUTPUT_RGB8,
             pixel_format="BayerRG12",
+            max_num_buffer=7,
         )
 
         with (
@@ -589,6 +722,7 @@ class DevelopmentModeFramegrabTests(unittest.TestCase):
 
         np.testing.assert_array_equal(image, converted)
         self.assertEqual(len(converter.convert_calls), 1)
+        self.assertEqual(camera.MaxNumBuffer.Value, 7)
 
     def test_daq_mode_basler_image_accepts_expected_shape(self):
         raw = np.arange(6, dtype=np.uint16).reshape(2, 3)

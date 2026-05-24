@@ -32,6 +32,7 @@ class CameraConfig:
     slot: str
     source_type: str
     serial_number: str = ""
+    model_name: str = ""
     width: int = 1
     height: int = 1
     offset_x: int = 0
@@ -47,6 +48,7 @@ class CameraConfig:
         return (
             self.source_type,
             self.serial_number,
+            self.model_name,
             self.width,
             self.height,
             self.offset_x,
@@ -72,6 +74,7 @@ def default_camera_config(slot: str) -> CameraConfig:
         slot=slot,
         source_type=SOURCE_BASLER,
         serial_number=str(constants.BASLER_CAMERA_SERIAL),
+        model_name="",
         width=int(constants.IMAGE_WIDTH_CAM1),
         height=int(constants.IMAGE_HEIGHT_CAM1),
         exposure_us=float(constants.BASLER_EXPOSURE),
@@ -105,6 +108,7 @@ def camera_config_from_settings(settings: Any, slot: str) -> CameraConfig:
         serial_number=str(
             settings.value(f"{prefix}/serial_number", default.serial_number)
         ),
+        model_name=str(settings.value(f"{prefix}/model_name", default.model_name)),
         width=_positive_int(
             settings.value(f"{prefix}/width", default.width), default.width
         ),
@@ -158,6 +162,7 @@ def save_camera_config(settings: Any, config: CameraConfig) -> None:
     prefix = f"camera/{_slot_value(config.slot)}"
     settings.setValue(f"{prefix}/source_type", config.source_type)
     settings.setValue(f"{prefix}/serial_number", config.serial_number)
+    settings.setValue(f"{prefix}/model_name", config.model_name)
     settings.setValue(f"{prefix}/width", int(config.width))
     settings.setValue(f"{prefix}/height", int(config.height))
     settings.setValue(f"{prefix}/offset_x", int(config.offset_x))
@@ -178,6 +183,8 @@ def camera_metadata(configs: Mapping[str, CameraConfig]) -> dict[str, object]:
         prefix = f"camera_{slot}"
         metadata[f"{prefix}_source_type"] = config.source_type
         metadata[f"{prefix}_serial_number"] = config.serial_number
+        if config.model_name:
+            metadata[f"{prefix}_model_name"] = config.model_name
         metadata[f"{prefix}_width"] = int(config.width)
         metadata[f"{prefix}_height"] = int(config.height)
         metadata[f"{prefix}_offset_x"] = int(config.offset_x)
@@ -199,6 +206,7 @@ def camera_config_mismatches(
         comparisons = (
             ("source_type", config.source_type, str),
             ("serial_number", config.serial_number, str),
+            ("model_name", config.model_name, str),
             ("width", config.width, int),
             ("height", config.height, int),
             ("offset_x", config.offset_x, int),
