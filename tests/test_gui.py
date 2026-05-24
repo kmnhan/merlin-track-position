@@ -29,6 +29,7 @@ from merlin_track_position.interface.main_window import (  # noqa: E402
 from merlin_track_position.instruments.camera_config import (  # noqa: E402
     SOURCE_BASLER,
     SOURCE_FRAMEGRABBER,
+    SOURCE_SIMULATED,
     CameraConfig,
     DisplayTransform,
 )
@@ -1296,7 +1297,8 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
 
                 updated = dialog.configs()["cam0"]
                 self.assertTrue(rows["offset_x"].isEnabled())
-                self.assertFalse(rows["pixel_format"].isEnabled())
+                self.assertNotIn("serial_number", rows)
+                self.assertNotIn("pixel_format", rows)
             finally:
                 dialog.close()
 
@@ -1305,6 +1307,82 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
         self.assertEqual(updated.height, 8000)
         self.assertEqual(updated.offset_x, 123)
         self.assertEqual(updated.offset_y, 456)
+
+    def test_camera_settings_dialog_preserves_source_drafts_when_switching(self):
+        get_qapp()
+        device = BaslerDevice("basler-1", "model-1", "full-name-1")
+        capabilities = BaslerCameraCapabilities(
+            device,
+            width=BaslerValueRange(2, 12, 2),
+            height=BaslerValueRange(2, 12, 2),
+            offset_x=BaslerValueRange(0, 12, 2),
+            offset_y=BaslerValueRange(0, 12, 2),
+            exposure_us=BaslerValueRange(1.0, 1000000.0, 1.0),
+            pixel_formats=("Mono12", "BayerRG12"),
+        )
+        configs = {
+            "cam0": CameraConfig(
+                slot="cam0",
+                source_type=SOURCE_FRAMEGRABBER,
+                width=4,
+                height=3,
+            ),
+            "cam1": CameraConfig(
+                slot="cam1",
+                source_type=SOURCE_SIMULATED,
+                width=6,
+                height=5,
+            ),
+        }
+        with (
+            patch(
+                "merlin_track_position.interface.main_window.list_basler_devices",
+                return_value=(device,),
+            ),
+            patch(
+                "merlin_track_position.interface.main_window.read_basler_capabilities",
+                return_value=capabilities,
+            ),
+        ):
+            dialog = CameraSettingsDialog(configs)
+            try:
+                rows = dialog._rows["cam0"]
+                rows["width"].setValue(9000)
+                rows["display_transpose"].setChecked(True)
+
+                rows["source_type"].setCurrentIndex(
+                    rows["source_type"].findData(SOURCE_BASLER)
+                )
+                rows["serial_number"].setCurrentIndex(
+                    rows["serial_number"].findData("basler-1")
+                )
+                rows["width"].setValue(10)
+                rows["pixel_format"].setCurrentIndex(
+                    rows["pixel_format"].findData("BayerRG12")
+                )
+
+                rows["source_type"].setCurrentIndex(
+                    rows["source_type"].findData(SOURCE_FRAMEGRABBER)
+                )
+                framegrabber_config = dialog.configs()["cam0"]
+                self.assertEqual(rows["width"].value(), 9000)
+                self.assertTrue(rows["display_transpose"].isChecked())
+                self.assertNotIn("pixel_format", rows)
+
+                rows["source_type"].setCurrentIndex(
+                    rows["source_type"].findData(SOURCE_BASLER)
+                )
+                basler_config = dialog.configs()["cam0"]
+            finally:
+                dialog.close()
+
+        self.assertEqual(framegrabber_config.source_type, SOURCE_FRAMEGRABBER)
+        self.assertEqual(framegrabber_config.width, 9000)
+        self.assertTrue(framegrabber_config.display.transpose)
+        self.assertEqual(basler_config.source_type, SOURCE_BASLER)
+        self.assertEqual(basler_config.serial_number, "basler-1")
+        self.assertEqual(basler_config.width, 10)
+        self.assertEqual(basler_config.pixel_format, "BayerRG12")
 
     def test_camera_settings_dialog_blocks_basler_without_connected_device(self):
         get_qapp()
@@ -1332,6 +1410,11 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
         ):
             dialog = CameraSettingsDialog(configs)
             try:
+                rows = dialog._rows["cam1"]
+                self.assertIn("serial_number", rows)
+                self.assertIn("source_message", rows)
+                self.assertNotIn("width", rows)
+                self.assertNotIn("pixel_format", rows)
                 dialog.accept()
             finally:
                 dialog.close()
