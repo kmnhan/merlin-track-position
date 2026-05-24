@@ -14,11 +14,6 @@ SOURCE_BASLER = "basler"
 SOURCE_SIMULATED = "simulated"
 SOURCE_TYPES = (SOURCE_FRAMEGRABBER, SOURCE_BASLER, SOURCE_SIMULATED)
 
-BASLER_OUTPUT_NATIVE = "native"
-BASLER_OUTPUT_RGB8 = "rgb8"
-BASLER_OUTPUT_BGR8 = "bgr8"
-BASLER_OUTPUT_MODES = (BASLER_OUTPUT_NATIVE, BASLER_OUTPUT_RGB8, BASLER_OUTPUT_BGR8)
-
 
 @dataclass(frozen=True)
 class DisplayTransform:
@@ -39,7 +34,6 @@ class CameraConfig:
     offset_y: int = 0
     exposure_us: float = 0.0
     pixel_format: str = "Mono12"
-    output_mode: str = BASLER_OUTPUT_NATIVE
     max_num_buffer: int = 10
     display: DisplayTransform = DisplayTransform()
 
@@ -55,7 +49,6 @@ class CameraConfig:
             self.offset_y,
             self.exposure_us,
             self.pixel_format,
-            self.output_mode,
             self.max_num_buffer,
         )
 
@@ -79,7 +72,6 @@ def default_camera_config(slot: str) -> CameraConfig:
         height=int(constants.IMAGE_HEIGHT_CAM1),
         exposure_us=float(constants.BASLER_EXPOSURE),
         pixel_format="Mono12",
-        output_mode=BASLER_OUTPUT_NATIVE,
         max_num_buffer=10,
         display=DisplayTransform(transpose=True, invert_x=True, invert_y=True),
     )
@@ -96,11 +88,6 @@ def camera_config_from_settings(settings: Any, slot: str) -> CameraConfig:
         settings.value(f"{prefix}/source_type", default.source_type),
         SOURCE_TYPES,
         default.source_type,
-    )
-    output_mode = _choice(
-        settings.value(f"{prefix}/output_mode", default.output_mode),
-        BASLER_OUTPUT_MODES,
-        default.output_mode,
     )
     return CameraConfig(
         slot=default.slot,
@@ -130,7 +117,6 @@ def camera_config_from_settings(settings: Any, slot: str) -> CameraConfig:
         pixel_format=str(
             settings.value(f"{prefix}/pixel_format", default.pixel_format)
         ),
-        output_mode=output_mode,
         max_num_buffer=_positive_int(
             settings.value(f"{prefix}/max_num_buffer", default.max_num_buffer),
             default.max_num_buffer,
@@ -169,7 +155,6 @@ def save_camera_config(settings: Any, config: CameraConfig) -> None:
     settings.setValue(f"{prefix}/offset_y", int(config.offset_y))
     settings.setValue(f"{prefix}/exposure_us", float(config.exposure_us))
     settings.setValue(f"{prefix}/pixel_format", config.pixel_format)
-    settings.setValue(f"{prefix}/output_mode", config.output_mode)
     settings.setValue(f"{prefix}/max_num_buffer", int(config.max_num_buffer))
     settings.setValue(f"{prefix}/display_transpose", bool(config.display.transpose))
     settings.setValue(f"{prefix}/display_invert_x", bool(config.display.invert_x))
@@ -191,7 +176,6 @@ def camera_metadata(configs: Mapping[str, CameraConfig]) -> dict[str, object]:
         metadata[f"{prefix}_offset_y"] = int(config.offset_y)
         metadata[f"{prefix}_exposure_us"] = float(config.exposure_us)
         metadata[f"{prefix}_pixel_format"] = config.pixel_format
-        metadata[f"{prefix}_output_mode"] = config.output_mode
     return metadata
 
 
@@ -213,7 +197,6 @@ def camera_config_mismatches(
             ("offset_y", config.offset_y, int),
             ("exposure_us", config.exposure_us, float),
             ("pixel_format", config.pixel_format, str),
-            ("output_mode", config.output_mode, str),
         )
         for name, expected, converter in comparisons:
             key = f"{prefix}_{name}"

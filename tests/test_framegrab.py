@@ -14,7 +14,6 @@ from merlin_track_position.instruments.basler import (
     get_basler_image_stack,
 )
 from merlin_track_position.instruments.camera_config import (
-    BASLER_OUTPUT_RGB8,
     SOURCE_BASLER,
     SOURCE_FRAMEGRABBER,
     CameraConfig,
@@ -231,26 +230,6 @@ class FakeGrabResult:
 
     def GetErrorDescription(self):
         return "fake failure"
-
-
-class FakeConvertedImage:
-    def __init__(self, array):
-        self.array = np.asarray(array)
-
-    def GetArray(self):
-        return self.array
-
-
-class FakeImageFormatConverter:
-    def __init__(self, converted):
-        self.converted = np.asarray(converted)
-        self.OutputPixelFormat = None
-        self.OutputBitAlignment = None
-        self.convert_calls = []
-
-    def Convert(self, grab_result):
-        self.convert_calls.append(grab_result)
-        return FakeConvertedImage(self.converted)
 
 
 class FakeSettings:
@@ -655,6 +634,24 @@ class DevelopmentModeFramegrabTests(unittest.TestCase):
             ):
                 basler.validate_basler_config(config)
 
+    def test_preferred_basler_pixel_format_uses_highest_bit_native_format(self):
+        self.assertEqual(
+            basler.preferred_basler_pixel_format(
+                ("Mono8", "Mono12", "BayerRG8", "BayerRG12")
+            ),
+            "BayerRG12",
+        )
+        self.assertEqual(
+            basler.preferred_basler_pixel_format(("Mono8", "Mono12", "Mono16")),
+            "Mono16",
+        )
+        self.assertEqual(
+            basler.preferred_basler_pixel_format(
+                ("RGB8", "RGB12Packed", "RGB16Planar")
+            ),
+            "RGB16Planar",
+        )
+
     def test_camera_config_from_settings_normalizes_slot_values(self):
         settings = FakeSettings(
             {
@@ -663,7 +660,6 @@ class DevelopmentModeFramegrabTests(unittest.TestCase):
                 "camera/cam0/model_name": "a2A2590-22gcBAS",
                 "camera/cam0/width": "2592",
                 "camera/cam0/height": "1944",
-                "camera/cam0/output_mode": BASLER_OUTPUT_RGB8,
                 "camera/cam0/display_transpose": "true",
                 "camera/cam0/display_invert_x": "1",
                 "camera/cam0/display_invert_y": "false",
@@ -677,7 +673,6 @@ class DevelopmentModeFramegrabTests(unittest.TestCase):
         self.assertEqual(config.model_name, "a2A2590-22gcBAS")
         self.assertEqual(config.width, 2592)
         self.assertEqual(config.height, 1944)
-        self.assertEqual(config.output_mode, BASLER_OUTPUT_RGB8)
         self.assertEqual(
             config.display,
             DisplayTransform(transpose=True, invert_x=True, invert_y=False),
@@ -785,20 +780,16 @@ class DevelopmentModeFramegrabTests(unittest.TestCase):
         self.assertEqual(camera0.open_count, 1)
         self.assertEqual(camera1.open_count, 1)
 
-    def test_basler_rgb_output_uses_pylon_converter(self):
-        raw = np.arange(6, dtype=np.uint16).reshape(2, 3)
-        converted = np.zeros((2, 3, 3), dtype=np.uint8)
-        converted[..., 0] = 10
+    def test_basler_capture_uses_native_grab_array_without_converter(self):
+        raw = np.arange(18, dtype=np.uint16).reshape(2, 3, 3)
         camera = FakeBaslerCamera([raw])
-        converter = FakeImageFormatConverter(converted)
         config = CameraConfig(
             slot="cam1",
             source_type=SOURCE_BASLER,
             serial_number="rgb",
             width=3,
             height=2,
-            output_mode=BASLER_OUTPUT_RGB8,
-            pixel_format="BayerRG12",
+            pixel_format="RGB12Packed",
             max_num_buffer=7,
         )
 
@@ -809,16 +800,10 @@ class DevelopmentModeFramegrabTests(unittest.TestCase):
                 lambda node: node.writable,
             ),
             patch.object(basler, "_get_camera_by_serial_number", return_value=camera),
-            patch.object(
-                basler.pylon,
-                "ImageFormatConverter",
-                return_value=converter,
-            ),
         ):
             image = get_basler_image(config)
 
-        np.testing.assert_array_equal(image, converted)
-        self.assertEqual(len(converter.convert_calls), 1)
+        np.testing.assert_array_equal(image, raw)
         self.assertEqual(camera.MaxNumBuffer.Value, 7)
 
     def test_daq_mode_basler_image_accepts_expected_shape(self):

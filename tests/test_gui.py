@@ -1231,6 +1231,7 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                 rows["serial_number"].setCurrentIndex(
                     rows["serial_number"].findData("new-serial")
                 )
+                self.assertEqual(rows["pixel_format"].currentData(), "BayerRG12")
                 rows["width"].setValue(10)
                 rows["pixel_format"].setCurrentIndex(
                     rows["pixel_format"].findData("BayerRG12")

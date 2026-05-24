@@ -14,9 +14,6 @@ from pypylon import genicam, pylon
 
 from merlin_track_position import constants
 from merlin_track_position.instruments.camera_config import (
-    BASLER_OUTPUT_BGR8,
-    BASLER_OUTPUT_NATIVE,
-    BASLER_OUTPUT_RGB8,
     CameraConfig,
     default_camera_config,
 )
@@ -48,6 +45,51 @@ class BaslerCameraCapabilities:
     offset_y: BaslerValueRange
     exposure_us: BaslerValueRange
     pixel_formats: tuple[str, ...]
+
+
+def preferred_basler_pixel_format(
+    pixel_formats: tuple[str, ...],
+    *,
+    fallback: str = "Mono12",
+) -> str:
+    """Choose the highest-bit native pixel format from live Basler capabilities."""
+
+    formats = tuple(str(pixel_format) for pixel_format in pixel_formats if pixel_format)
+    if not formats:
+        return fallback
+
+    color_prefixes = (
+        "bayer",
+        "rgb",
+        "bgr",
+        "rgba",
+        "bgra",
+        "bicolor",
+        "yuv",
+        "ycbcr",
+    )
+    candidates = tuple(
+        pixel_format
+        for pixel_format in formats
+        if pixel_format.strip().lower().startswith(color_prefixes)
+    ) or tuple(
+        pixel_format
+        for pixel_format in formats
+        if pixel_format.strip().lower().startswith("mono")
+    ) or formats
+
+    preferred = candidates[0]
+    preferred_depth = -1
+    for pixel_format in candidates:
+        normalized = pixel_format.strip().lower()
+        depth = next(
+            (int(bits) for bits in ("32", "16", "14", "12", "10", "8") if bits in normalized),
+            0,
+        )
+        if depth > preferred_depth:
+            preferred = pixel_format
+            preferred_depth = depth
+    return preferred
 
 
 def _close_camera(camera: pylon.InstantCamera) -> None:
@@ -353,7 +395,6 @@ class _BaslerCameraSession:
         self._config = config
         self._lock = threading.RLock()
         self._camera: pylon.InstantCamera | None = None
-        self._converter: pylon.ImageFormatConverter | None = None
         self._latest_image: npt.NDArray | None = None
 
     def get_image(self, timeout_ms: int = 5000) -> npt.NDArray:
@@ -369,7 +410,7 @@ class _BaslerCameraSession:
             camera = self._ensure_camera()
             try:
                 images = [
-                    self._retrieve_image(camera, timeout_ms, self._converter)
+                    self._retrieve_image(camera, timeout_ms)
                     for _frame_index in range(frame_count)
                 ]
             except Exception:
@@ -383,7 +424,6 @@ class _BaslerCameraSession:
         with self._lock:
             camera = self._camera
             self._camera = None
-            self._converter = None
             self._latest_image = None
             if camera is not None:
                 _close_camera(camera)
@@ -397,11 +437,9 @@ class _BaslerCameraSession:
         try:
             _configure_camera(camera, self._config)
             camera.MaxNumBuffer.Value = int(self._config.max_num_buffer)
-            self._converter = _image_converter(self._config)
             camera.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
         except Exception:
             _close_camera(camera)
-            self._converter = None
             raise
 
         self._camera = camera
@@ -411,7 +449,6 @@ class _BaslerCameraSession:
     def _retrieve_image(
         camera: pylon.InstantCamera,
         timeout_ms: int,
-        converter: pylon.ImageFormatConverter | None,
     ) -> npt.NDArray:
         grab_result = camera.RetrieveResult(
             int(timeout_ms),
@@ -423,29 +460,12 @@ class _BaslerCameraSession:
                     "Image grab failed: "
                     f"{grab_result.GetErrorCode()} {grab_result.GetErrorDescription()}"
                 )
-            if converter is not None:
-                converted = converter.Convert(grab_result)
-                return converted.GetArray().copy()
             return grab_result.GetArray(raw=False).copy()
         finally:
             grab_result.Release()
 
 
 _SESSIONS: dict[tuple[object, ...], _BaslerCameraSession] = {}
-
-
-def _image_converter(config: CameraConfig) -> pylon.ImageFormatConverter | None:
-    if config.output_mode == BASLER_OUTPUT_NATIVE:
-        return None
-    converter = pylon.ImageFormatConverter()
-    if config.output_mode == BASLER_OUTPUT_RGB8:
-        converter.OutputPixelFormat = pylon.PixelType_RGB8packed
-    elif config.output_mode == BASLER_OUTPUT_BGR8:
-        converter.OutputPixelFormat = pylon.PixelType_BGR8packed
-    else:
-        raise ValueError(f"unsupported Basler output mode: {config.output_mode!r}")
-    converter.OutputBitAlignment = pylon.OutputBitAlignment_MsbAligned
-    return converter
 
 
 def _session_for_config(config: CameraConfig) -> _BaslerCameraSession:
@@ -527,11 +547,6 @@ def _validate_image_shape(image: npt.NDArray, config: CameraConfig) -> None:
             f"Basler image shape {image_shape} does not match configured "
             f"height/width {expected_shape}; update the camera configuration "
             "or AOI settings."
-        )
-    if config.output_mode != BASLER_OUTPUT_NATIVE and image_shape[2:] != (3,):
-        raise RuntimeError(
-            f"Basler converted color image must have shape "
-            f"({config.height}, {config.width}, 3), got {image_shape!r}"
         )
 
 

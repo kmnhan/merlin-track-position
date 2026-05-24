@@ -31,7 +31,6 @@ from merlin_track_position.instruments.cameras import (
     crop_image_to_roi,
 )
 from merlin_track_position.instruments.camera_config import (
-    BASLER_OUTPUT_MODES,
     CAMERA_SLOTS,
     SOURCE_BASLER,
     SOURCE_FRAMEGRABBER,
@@ -51,6 +50,7 @@ from merlin_track_position.instruments.basler import (
     close_basler_camera,
     get_basler_image,
     list_basler_devices,
+    preferred_basler_pixel_format,
     read_basler_capabilities,
     validate_basler_config,
 )
@@ -545,7 +545,6 @@ class CameraSettingsDialog(QtWidgets.QDialog):
                 model_name="",
                 exposure_us=basler_default.exposure_us,
                 pixel_format=basler_default.pixel_format,
-                output_mode=basler_default.output_mode,
                 max_num_buffer=basler_default.max_num_buffer,
             )
         if source_type in (SOURCE_FRAMEGRABBER, SOURCE_SIMULATED):
@@ -584,10 +583,11 @@ class CameraSettingsDialog(QtWidgets.QDialog):
     def _on_basler_serial_changed(self, slot: str) -> None:
         if self._selected_sources[slot] != SOURCE_BASLER:
             return
-        self._draft_configs[slot][SOURCE_BASLER] = self._config_from_rows(
+        config = self._config_from_rows(
             slot,
             SOURCE_BASLER,
         )
+        self._draft_configs[slot][SOURCE_BASLER] = replace(config, pixel_format="")
         self._rebuild_source_rows(slot, self._draft_configs[slot][SOURCE_BASLER])
 
     def _rebuild_source_rows(self, slot: str, config: CameraConfig) -> None:
@@ -671,20 +671,22 @@ class CameraSettingsDialog(QtWidgets.QDialog):
         pixel_format_combo = QtWidgets.QComboBox()
         for pixel_format in capabilities.pixel_formats:
             pixel_format_combo.addItem(pixel_format, pixel_format)
+        selected_pixel_format = config.pixel_format
+        fallback_pixel_format = default_camera_config("cam1").pixel_format
+        preferred_pixel_format = preferred_basler_pixel_format(
+            capabilities.pixel_formats,
+            fallback=selected_pixel_format or fallback_pixel_format,
+        )
+        if (
+            selected_pixel_format not in capabilities.pixel_formats
+            or selected_pixel_format == fallback_pixel_format
+        ):
+            selected_pixel_format = preferred_pixel_format
         pixel_format_combo.setCurrentIndex(
-            max(pixel_format_combo.findData(config.pixel_format), 0)
+            max(pixel_format_combo.findData(selected_pixel_format), 0)
         )
         form.addRow("Pixel format", pixel_format_combo)
         rows["pixel_format"] = pixel_format_combo
-
-        output_combo = QtWidgets.QComboBox()
-        for output_mode in BASLER_OUTPUT_MODES:
-            output_combo.addItem(output_mode, output_mode)
-        output_combo.setCurrentIndex(
-            max(output_combo.findData(config.output_mode), 0)
-        )
-        form.addRow("Output mode", output_combo)
-        rows["output_mode"] = output_combo
 
         buffer_spin = QtWidgets.QSpinBox()
         buffer_spin.setRange(1, 1000)
@@ -801,7 +803,6 @@ class CameraSettingsDialog(QtWidgets.QDialog):
             offset_y=spin_value("offset_y", default.offset_y),
             exposure_us=double_spin_value("exposure_us", default.exposure_us),
             pixel_format=combo_value("pixel_format", default.pixel_format),
-            output_mode=combo_value("output_mode", default.output_mode),
             max_num_buffer=spin_value("max_num_buffer", default.max_num_buffer),
             display=DisplayTransform(
                 transpose=checkbox_value(
