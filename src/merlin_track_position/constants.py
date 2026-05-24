@@ -52,7 +52,6 @@ DEFAULT_CORRECTION_CAPTURE_COUNT: int = 3
 # Default number of worker threads for calibration fitting. 1 works best on the DAQ PC.
 CALIBRATION_FIT_N_JOBS: int = 1
 
-
 # Default backlash-aware calibration trajectory controls.
 DEFAULT_VISUAL_CALIBRATION_N: int = 5
 DEFAULT_VISUAL_CALIBRATION_STEP_UM: float = 50.0
@@ -89,9 +88,9 @@ DEFAULT_CORRECTION_MODE: str = "beam"
 # toward +x in the sample xz plane. Beam-frame tolerances are correction
 # residual scales, in microns, for transverse-in-xz and vertical-y offsets.
 DEFAULT_BEAM_XZ_ANGLE_FROM_ANALYZER_DEG: float = 65.0
-DEFAULT_BEAM_TRANSVERSE_TOLERANCE_UM: float = 3.0
-DEFAULT_BEAM_ANALYZER_TRANSVERSE_TOLERANCE_UM: float = 3.0
-DEFAULT_BEAM_VERTICAL_TOLERANCE_UM: float = 3.0
+DEFAULT_BEAM_TRANSVERSE_TOLERANCE_UM: float = 2.75
+DEFAULT_BEAM_ANALYZER_TRANSVERSE_TOLERANCE_UM: float = 2.75
+DEFAULT_BEAM_VERTICAL_TOLERANCE_UM: float = 2.0
 
 # LQR solver weights and numerical tolerance.
 DEFAULT_LQR_CORRECTION_GAIN: float = 0.50
