@@ -12,6 +12,12 @@ import xarray as xr
 
 PIXEL_AXES = ("du_px", "dv_px")
 BASLER_RGB_TO_MONO_WEIGHTS = np.asarray((0.25, 0.625, 0.125), dtype=np.float32)
+ECC_NATIVE_DTYPES = (
+    np.dtype(np.uint8),
+    np.dtype(np.uint16),
+    np.dtype(np.float32),
+    np.dtype(np.float64),
+)
 
 
 def normalize_intensity(
@@ -287,9 +293,10 @@ def _estimate_ecc_shift(
         50,
         1e-5,
     )
+    reference_ecc, current_ecc = _ecc_input_images(reference_work, current_work)
     _correlation, refined_warp = cv2.findTransformECC(
-        np.ascontiguousarray(reference_work),
-        np.ascontiguousarray(current_work),
+        reference_ecc,
+        current_ecc,
         warp,
         motion_code,
         criteria,
@@ -351,6 +358,26 @@ def _initial_ecc_warp(
             ),
         )
     raise ValueError(f"unsupported ECC motion model: {motion_model!r}")
+
+
+def _ecc_input_images(
+    reference_image: np.ndarray,
+    current_image: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    reference_array = np.asarray(reference_image)
+    current_array = np.asarray(current_image)
+    if (
+        reference_array.dtype == current_array.dtype
+        and reference_array.dtype in ECC_NATIVE_DTYPES
+    ):
+        return (
+            np.ascontiguousarray(reference_array),
+            np.ascontiguousarray(current_array),
+        )
+    return (
+        np.ascontiguousarray(reference_array, dtype=np.float32),
+        np.ascontiguousarray(current_array, dtype=np.float32),
+    )
 
 
 def _ecc_reference_point(

@@ -296,6 +296,33 @@ class ShiftTests(unittest.TestCase):
         self.assertEqual(find_ecc.call_args.args[1].dtype, np.dtype(np.uint16))
         np.testing.assert_allclose(result["shift_px"].values, initial_shift)
 
+    def test_int32_grayscale_ecc_refinement_converts_to_float32(self):
+        reference = textured_uint16(seed=18).astype(np.int32)
+        initial_shift = np.asarray([3.0, -4.0], dtype=np.float64)
+
+        def echo_initial_warp(*args):
+            return 1.0, args[2].copy()
+
+        with patch(
+            "merlin_track_position.tracking.shift.cv2.findTransformECC",
+            side_effect=echo_initial_warp,
+        ) as find_ecc:
+            result = estimate_shift(
+                reference,
+                reference.copy(),
+                check_tiles=False,
+                use_ecc_refinement=True,
+                ecc_initial_shift_px=initial_shift,
+            )
+
+        reference_work = find_ecc.call_args.args[0]
+        current_work = find_ecc.call_args.args[1]
+        self.assertEqual(reference_work.dtype, np.dtype(np.float32))
+        self.assertEqual(current_work.dtype, np.dtype(np.float32))
+        np.testing.assert_allclose(reference_work, reference.astype(np.float32))
+        np.testing.assert_allclose(current_work, reference.astype(np.float32))
+        np.testing.assert_allclose(result["shift_px"].values, initial_shift)
+
     def test_rgb_ecc_refinement_uses_native_color_images(self):
         reference = np.stack(
             [
