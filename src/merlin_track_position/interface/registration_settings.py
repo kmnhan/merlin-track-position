@@ -21,6 +21,7 @@ __all__ = (
     "REGISTRATION_PHASE_MAX_ITERS_SETTINGS_KEY",
     "REGISTRATION_USE_WINDOW_SETTINGS_KEY",
     "REGISTRATION_USE_ECC_REFINEMENT_SETTINGS_KEY",
+    "REGISTRATION_ECC_USE_WINDOW_SETTINGS_KEY",
     "REGISTRATION_ECC_MOTION_MODEL_SETTINGS_KEY",
     "normalized_registration_config",
     "registration_config_from_settings",
@@ -49,6 +50,7 @@ REGISTRATION_PHASE_L2_SIZE_SETTINGS_KEY = "registration/phase_l2_size"
 REGISTRATION_PHASE_MAX_ITERS_SETTINGS_KEY = "registration/phase_max_iters"
 REGISTRATION_USE_WINDOW_SETTINGS_KEY = "registration/use_window"
 REGISTRATION_USE_ECC_REFINEMENT_SETTINGS_KEY = "registration/use_ecc_refinement"
+REGISTRATION_ECC_USE_WINDOW_SETTINGS_KEY = "registration/ecc_use_window"
 REGISTRATION_ECC_MOTION_MODEL_SETTINGS_KEY = "registration/ecc_motion_model"
 REGISTRATION_CAPTURE_COUNT_SETTINGS_KEY = "registration/capture_count"
 REGISTRATION_CAPTURE_AGGREGATION_SETTINGS_KEY = "registration/capture_aggregation"
@@ -61,6 +63,7 @@ DEFAULT_REGISTRATION_CONFIG: dict[str, object] = {
     "phase_max_iters": 50,
     "use_window": False,
     "use_ecc_refinement": False,
+    "ecc_use_window": False,
     "ecc_motion_model": ECC_MOTION_MODEL_HOMOGRAPHY,
     "capture_count": constants.DEFAULT_CORRECTION_CAPTURE_COUNT,
     "capture_aggregation": CAPTURE_AGGREGATION_MEDIAN_SHIFTS,
@@ -123,6 +126,10 @@ def normalized_registration_config(
             values["use_ecc_refinement"],
             bool(DEFAULT_REGISTRATION_CONFIG["use_ecc_refinement"]),
         ),
+        "ecc_use_window": _as_bool(
+            values["ecc_use_window"],
+            bool(DEFAULT_REGISTRATION_CONFIG["ecc_use_window"]),
+        ),
         "ecc_motion_model": _ecc_motion_model_value(values["ecc_motion_model"]),
         "capture_count": int(capture_count),
         "capture_aggregation": _capture_aggregation_value(
@@ -161,6 +168,10 @@ def registration_config_from_settings(settings: Any) -> dict[str, object]:
             "use_ecc_refinement": settings.value(
                 REGISTRATION_USE_ECC_REFINEMENT_SETTINGS_KEY,
                 DEFAULT_REGISTRATION_CONFIG["use_ecc_refinement"],
+            ),
+            "ecc_use_window": settings.value(
+                REGISTRATION_ECC_USE_WINDOW_SETTINGS_KEY,
+                DEFAULT_REGISTRATION_CONFIG["ecc_use_window"],
             ),
             "ecc_motion_model": settings.value(
                 REGISTRATION_ECC_MOTION_MODEL_SETTINGS_KEY,
@@ -201,6 +212,10 @@ def save_registration_config(
     settings.setValue(
         REGISTRATION_USE_ECC_REFINEMENT_SETTINGS_KEY,
         normalized["use_ecc_refinement"],
+    )
+    settings.setValue(
+        REGISTRATION_ECC_USE_WINDOW_SETTINGS_KEY,
+        normalized["ecc_use_window"],
     )
     settings.setValue(
         REGISTRATION_ECC_MOTION_MODEL_SETTINGS_KEY,
@@ -244,6 +259,7 @@ def registration_config_to_shift_kwargs(
         "phase_l2_size": normalized["phase_l2_size"],
         "phase_max_iters": normalized["phase_max_iters"],
         "use_ecc_refinement": normalized["use_ecc_refinement"],
+        "ecc_use_window": normalized["ecc_use_window"],
         "ecc_motion_model": normalized["ecc_motion_model"],
     }
     if config is not None and "ecc_reference_point_px" in config:

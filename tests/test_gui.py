@@ -44,6 +44,7 @@ from merlin_track_position.interface.registration_settings import (  # noqa: E40
     REGISTRATION_CAPTURE_COUNT_SETTINGS_KEY,
     REGISTRATION_CLIP_HIGH_SETTINGS_KEY,
     REGISTRATION_CLIP_LOW_SETTINGS_KEY,
+    REGISTRATION_ECC_USE_WINDOW_SETTINGS_KEY,
     REGISTRATION_ECC_MOTION_MODEL_SETTINGS_KEY,
     REGISTRATION_PHASE_L2_SIZE_SETTINGS_KEY,
     REGISTRATION_PHASE_MAX_ITERS_SETTINGS_KEY,
@@ -546,6 +547,7 @@ class ShiftMonitorWindowTests(unittest.TestCase):
                     window.phase_max_iters_spin.value(),
                     DEFAULT_REGISTRATION_CONFIG["phase_max_iters"],
                 )
+                self.assertFalse(window.ecc_window_checkbox.isChecked())
             finally:
                 window.close()
 
@@ -753,6 +755,7 @@ class ShiftMonitorWindowTests(unittest.TestCase):
                 window.phase_l2_size_spin.setValue(11)
                 window.phase_max_iters_spin.setValue(51)
                 window.ecc_refinement_checkbox.setChecked(True)
+                window.ecc_window_checkbox.setChecked(True)
                 window.ecc_motion_model_combo.setCurrentIndex(
                     window.ecc_motion_model_combo.findData("affine")
                 )
@@ -781,6 +784,10 @@ class ShiftMonitorWindowTests(unittest.TestCase):
                 )
                 self.assertEqual(
                     settings.values[REGISTRATION_USE_ECC_REFINEMENT_SETTINGS_KEY],
+                    True,
+                )
+                self.assertEqual(
+                    settings.values[REGISTRATION_ECC_USE_WINDOW_SETTINGS_KEY],
                     True,
                 )
                 self.assertEqual(
@@ -821,6 +828,12 @@ class ShiftMonitorWindowTests(unittest.TestCase):
                 )
                 self.assertEqual(
                     registration_config_to_shift_kwargs(saved_configs[-1])[
+                        "ecc_use_window"
+                    ],
+                    True,
+                )
+                self.assertEqual(
+                    registration_config_to_shift_kwargs(saved_configs[-1])[
                         "ecc_motion_model"
                     ],
                     "affine",
@@ -844,6 +857,7 @@ class ShiftMonitorWindowTests(unittest.TestCase):
                 window.phase_l2_size_spin.setValue(9)
                 window.phase_max_iters_spin.setValue(37)
                 window.ecc_refinement_checkbox.setChecked(True)
+                window.ecc_window_checkbox.setChecked(True)
                 window.ecc_motion_model_combo.setCurrentIndex(
                     window.ecc_motion_model_combo.findData("affine")
                 )
@@ -875,6 +889,10 @@ class ShiftMonitorWindowTests(unittest.TestCase):
                     self.assertEqual(exported.attrs["registration_phase_max_iters"], 37)
                     self.assertEqual(
                         exported.attrs["registration_use_ecc_refinement"],
+                        True,
+                    )
+                    self.assertEqual(
+                        exported.attrs["registration_ecc_use_window"],
                         True,
                     )
                     self.assertEqual(
@@ -2523,6 +2541,7 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                             "phase_max_iters": 51,
                             "use_window": True,
                             "use_ecc_refinement": True,
+                            "ecc_use_window": True,
                             "capture_count": 7,
                             "capture_aggregation": "mean_image",
                         }
@@ -2541,6 +2560,7 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                             "phase_l2_size": 11,
                             "phase_max_iters": 51,
                             "use_ecc_refinement": True,
+                            "ecc_use_window": True,
                             "ecc_motion_model": "homography",
                             "capture_count": 7,
                             "capture_aggregation": "mean_image",

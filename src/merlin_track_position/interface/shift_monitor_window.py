@@ -65,8 +65,8 @@ class _ShiftRegistrationThread(QtCore.QThread):
         config: Mapping[str, Any],
         elapsed_s: float,
     ) -> None:
-        reference_array = np.asarray(reference, dtype=np.float64).copy()
-        current_array = np.asarray(current_stack, dtype=np.float64).copy()
+        reference_array = np.asarray(reference).copy()
+        current_array = np.asarray(current_stack).copy()
         normalized_config = normalized_registration_config(config)
         if "ecc_reference_point_px" in config:
             normalized_config["ecc_reference_point_px"] = config[
@@ -211,7 +211,7 @@ class ShiftMonitorWindow(QtWidgets.QWidget):
         controls_layout.addWidget(QtWidgets.QLabel("Max iters"), 4, 0)
         controls_layout.addWidget(self.phase_max_iters_spin, 4, 1)
 
-        self.window_checkbox = QtWidgets.QCheckBox("Hanning window")
+        self.window_checkbox = QtWidgets.QCheckBox("Phase Hanning window")
         self.window_checkbox.setObjectName("shift_monitor_window_checkbox")
         controls_layout.addWidget(self.window_checkbox, 5, 0, 1, 2)
 
@@ -220,6 +220,10 @@ class ShiftMonitorWindow(QtWidgets.QWidget):
             "shift_monitor_ecc_refinement_checkbox"
         )
         controls_layout.addWidget(self.ecc_refinement_checkbox, 6, 0, 1, 2)
+
+        self.ecc_window_checkbox = QtWidgets.QCheckBox("ECC Hanning window")
+        self.ecc_window_checkbox.setObjectName("shift_monitor_ecc_window_checkbox")
+        controls_layout.addWidget(self.ecc_window_checkbox, 7, 0, 1, 2)
 
         self.ecc_motion_model_combo = QtWidgets.QComboBox()
         self.ecc_motion_model_combo.setObjectName(
@@ -230,14 +234,14 @@ class ShiftMonitorWindow(QtWidgets.QWidget):
             "Homography",
             ECC_MOTION_MODEL_HOMOGRAPHY,
         )
-        controls_layout.addWidget(QtWidgets.QLabel("ECC model"), 7, 0)
-        controls_layout.addWidget(self.ecc_motion_model_combo, 7, 1)
+        controls_layout.addWidget(QtWidgets.QLabel("ECC model"), 8, 0)
+        controls_layout.addWidget(self.ecc_motion_model_combo, 8, 1)
 
         self.capture_count_spin = QtWidgets.QSpinBox()
         self.capture_count_spin.setObjectName("shift_monitor_capture_count_spin")
         self.capture_count_spin.setRange(1, 100)
-        controls_layout.addWidget(QtWidgets.QLabel("Images"), 8, 0)
-        controls_layout.addWidget(self.capture_count_spin, 8, 1)
+        controls_layout.addWidget(QtWidgets.QLabel("Images"), 9, 0)
+        controls_layout.addWidget(self.capture_count_spin, 9, 1)
 
         self.capture_aggregation_combo = QtWidgets.QComboBox()
         self.capture_aggregation_combo.setObjectName(
@@ -245,24 +249,24 @@ class ShiftMonitorWindow(QtWidgets.QWidget):
         )
         self.capture_aggregation_combo.addItem("Median shifts", "median_shifts")
         self.capture_aggregation_combo.addItem("Mean image", "mean_image")
-        controls_layout.addWidget(QtWidgets.QLabel("Aggregation"), 9, 0)
-        controls_layout.addWidget(self.capture_aggregation_combo, 9, 1)
+        controls_layout.addWidget(QtWidgets.QLabel("Aggregation"), 10, 0)
+        controls_layout.addWidget(self.capture_aggregation_combo, 10, 1)
 
         self.save_button = QtWidgets.QPushButton("Save")
         self.save_button.setObjectName("shift_monitor_save_button")
         self.reset_button = QtWidgets.QPushButton("Reset")
         self.reset_button.setObjectName("shift_monitor_reset_button")
-        controls_layout.addWidget(self.save_button, 12, 0)
-        controls_layout.addWidget(self.reset_button, 12, 1)
+        controls_layout.addWidget(self.save_button, 13, 0)
+        controls_layout.addWidget(self.reset_button, 13, 1)
 
         self.export_button = QtWidgets.QPushButton("Export HDF5")
         self.export_button.setObjectName("shift_monitor_export_button")
-        controls_layout.addWidget(self.export_button, 13, 0, 1, 2)
+        controls_layout.addWidget(self.export_button, 14, 0, 1, 2)
 
         self.live_checkbox = QtWidgets.QCheckBox("Live")
         self.live_checkbox.setObjectName("shift_monitor_live_checkbox")
         self.live_checkbox.setChecked(True)
-        controls_layout.addWidget(self.live_checkbox, 10, 0, 1, 2)
+        controls_layout.addWidget(self.live_checkbox, 11, 0, 1, 2)
 
         self.sample_period_spin = QtWidgets.QDoubleSpinBox()
         self.sample_period_spin.setObjectName("shift_monitor_sample_period_spin")
@@ -271,8 +275,8 @@ class ShiftMonitorWindow(QtWidgets.QWidget):
         self.sample_period_spin.setSingleStep(0.5)
         self.sample_period_spin.setSuffix(" s")
         self.sample_period_spin.setValue(DEFAULT_MONITOR_SAMPLE_PERIOD_S)
-        controls_layout.addWidget(QtWidgets.QLabel("Monitor period"), 11, 0)
-        controls_layout.addWidget(self.sample_period_spin, 11, 1)
+        controls_layout.addWidget(QtWidgets.QLabel("Monitor period"), 12, 0)
+        controls_layout.addWidget(self.sample_period_spin, 12, 1)
         controls_layout.setColumnStretch(1, 1)
         side_layout.addWidget(controls_group)
 
@@ -353,6 +357,7 @@ class ShiftMonitorWindow(QtWidgets.QWidget):
             self.phase_max_iters_spin,
             self.window_checkbox,
             self.ecc_refinement_checkbox,
+            self.ecc_window_checkbox,
             self.ecc_motion_model_combo,
             self.capture_count_spin,
             self.capture_aggregation_combo,
@@ -383,6 +388,7 @@ class ShiftMonitorWindow(QtWidgets.QWidget):
             self.phase_max_iters_spin,
             self.window_checkbox,
             self.ecc_refinement_checkbox,
+            self.ecc_window_checkbox,
             self.ecc_motion_model_combo,
             self.capture_count_spin,
             self.capture_aggregation_combo,
@@ -398,6 +404,7 @@ class ShiftMonitorWindow(QtWidgets.QWidget):
             self.ecc_refinement_checkbox.setChecked(
                 bool(normalized["use_ecc_refinement"])
             )
+            self.ecc_window_checkbox.setChecked(bool(normalized["ecc_use_window"]))
             index = self.ecc_motion_model_combo.findData(
                 normalized["ecc_motion_model"]
             )
@@ -429,6 +436,7 @@ class ShiftMonitorWindow(QtWidgets.QWidget):
                 "phase_max_iters": self.phase_max_iters_spin.value(),
                 "use_window": self.window_checkbox.isChecked(),
                 "use_ecc_refinement": self.ecc_refinement_checkbox.isChecked(),
+                "ecc_use_window": self.ecc_window_checkbox.isChecked(),
                 "ecc_motion_model": self.ecc_motion_model_combo.currentData(),
                 "capture_count": self.capture_count_spin.value(),
                 "capture_aggregation": self.capture_aggregation_combo.currentData(),

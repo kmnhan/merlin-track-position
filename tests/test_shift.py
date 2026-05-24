@@ -5,7 +5,7 @@ import cv2
 import numpy as np
 from scipy import ndimage
 
-from merlin_track_position.tracking.shift import estimate_shift
+from merlin_track_position.tracking.shift import estimate_shift, normalize_intensity
 
 
 def textured_image(seed=1, shape=(192, 224)):
@@ -14,6 +14,13 @@ def textured_image(seed=1, shape=(192, 224)):
     y, x = np.indices(shape)
     image += 0.3 * np.sin(x / 7.0) + 0.2 * np.cos(y / 11.0)
     return image
+
+
+def textured_uint16(seed=1, shape=(96, 104)):
+    image = textured_image(seed=seed, shape=shape)
+    image -= float(np.min(image))
+    image /= float(np.max(image))
+    return np.asarray(np.rint(image * 4095.0), dtype=np.uint16)
 
 
 class ShiftTests(unittest.TestCase):
@@ -51,7 +58,23 @@ class ShiftTests(unittest.TestCase):
             )
 
         self.assertEqual(phase_correlate.call_args.args[2:], (11, 23))
+        self.assertEqual(phase_correlate.call_args.args[0].dtype, np.dtype(np.float32))
+        self.assertEqual(phase_correlate.call_args.args[1].dtype, np.dtype(np.float32))
         np.testing.assert_allclose(result["shift_px"].values, [1.25, -2.5])
+
+    def test_uint16_phase_registration_uses_float32_work_images(self):
+        reference = textured_uint16(seed=19)
+
+        with patch(
+            "merlin_track_position.tracking.shift.cv2.phaseCorrelateIterative",
+            return_value=(1.25, -2.5),
+        ) as phase_correlate:
+            estimate_shift(reference, reference.copy(), check_tiles=False)
+
+        self.assertEqual(phase_correlate.call_args.args[0].ndim, 2)
+        self.assertEqual(phase_correlate.call_args.args[1].ndim, 2)
+        self.assertEqual(phase_correlate.call_args.args[0].dtype, np.dtype(np.float32))
+        self.assertEqual(phase_correlate.call_args.args[1].dtype, np.dtype(np.float32))
 
     def test_phase_registration_parameters_must_be_positive_integers(self):
         reference = textured_image(seed=15)
@@ -95,7 +118,7 @@ class ShiftTests(unittest.TestCase):
         np.testing.assert_allclose(result["shift_px"].values, [-4.25, 2.75], atol=0.1)
 
     def test_ecc_refinement_returns_homography_displacement_at_center(self):
-        reference = textured_image(seed=7)
+        reference = textured_image(seed=7).astype(np.float32)
         height, width = reference.shape
         center_x = (width - 1.0) / 2.0
         center_y = (height - 1.0) / 2.0
@@ -135,7 +158,7 @@ class ShiftTests(unittest.TestCase):
         np.testing.assert_allclose(result["shift_px"].values, expected_shift, atol=0.1)
 
     def test_ecc_refinement_returns_homography_displacement_at_reference_point(self):
-        reference = textured_image(seed=9)
+        reference = textured_image(seed=9).astype(np.float32)
         height, width = reference.shape
         center_x = (width - 1.0) / 2.0
         center_y = (height - 1.0) / 2.0
@@ -207,27 +230,79 @@ class ShiftTests(unittest.TestCase):
         self.assertEqual(find_ecc.call_args.args[2].shape, (3, 3))
         np.testing.assert_allclose(result["shift_px"].values, expected_shift)
 
-    def test_rgb_input_uses_grayscale_ipc_seed(self):
-        reference_gray = textured_image(seed=17)
+    def test_rgb_input_uses_basler_grayscale_phase_seed(self):
+        red = textured_uint16(seed=17)
+        green = textured_uint16(seed=18)
+        blue = textured_uint16(seed=19)
         reference = np.stack(
-            [reference_gray, 0.5 * reference_gray, 2.0 * reference_gray],
+            [red, green, blue],
             axis=-1,
         )
+        basler_gray = 0.25 * red + 0.625 * green + 0.125 * blue
+        rec709_gray = 0.2126 * red + 0.7152 * green + 0.0722 * blue
 
         with patch(
             "merlin_track_position.tracking.shift.cv2.phaseCorrelateIterative",
             return_value=(1.5, -2.25),
         ) as phase_correlate:
-            result = estimate_shift(reference, reference.copy(), check_tiles=False)
+            result = estimate_shift(
+                reference,
+                reference.copy(),
+                check_tiles=False,
+                clip_percentiles=None,
+            )
 
         self.assertEqual(phase_correlate.call_args.args[0].ndim, 2)
         self.assertEqual(phase_correlate.call_args.args[1].ndim, 2)
+        self.assertEqual(phase_correlate.call_args.args[0].dtype, np.dtype(np.float32))
+        np.testing.assert_allclose(
+            phase_correlate.call_args.args[0],
+            normalize_intensity(basler_gray, clip_percentiles=None),
+            rtol=1e-6,
+            atol=1e-6,
+        )
+        self.assertFalse(
+            np.allclose(
+                phase_correlate.call_args.args[0],
+                normalize_intensity(rec709_gray, clip_percentiles=None),
+                rtol=1e-6,
+                atol=1e-6,
+            )
+        )
         np.testing.assert_allclose(result["shift_px"].values, [1.5, -2.25])
 
-    def test_rgb_ecc_refinement_uses_color_images(self):
-        reference_gray = textured_image(seed=18)
+    def test_uint16_grayscale_ecc_refinement_uses_native_images(self):
+        reference = textured_uint16(seed=18)
+        initial_shift = np.asarray([3.0, -4.0], dtype=np.float64)
+
+        def echo_initial_warp(*args):
+            return 1.0, args[2].copy()
+
+        with patch(
+            "merlin_track_position.tracking.shift.cv2.findTransformECC",
+            side_effect=echo_initial_warp,
+        ) as find_ecc:
+            result = estimate_shift(
+                reference,
+                reference.copy(),
+                check_tiles=False,
+                use_ecc_refinement=True,
+                ecc_initial_shift_px=initial_shift,
+            )
+
+        self.assertEqual(find_ecc.call_args.args[0].ndim, 2)
+        self.assertEqual(find_ecc.call_args.args[1].ndim, 2)
+        self.assertEqual(find_ecc.call_args.args[0].dtype, np.dtype(np.uint16))
+        self.assertEqual(find_ecc.call_args.args[1].dtype, np.dtype(np.uint16))
+        np.testing.assert_allclose(result["shift_px"].values, initial_shift)
+
+    def test_rgb_ecc_refinement_uses_native_color_images(self):
         reference = np.stack(
-            [reference_gray, 0.5 * reference_gray, 2.0 * reference_gray],
+            [
+                textured_uint16(seed=18),
+                textured_uint16(seed=19),
+                textured_uint16(seed=20),
+            ],
             axis=-1,
         )
         initial_shift = np.asarray([3.0, -4.0], dtype=np.float64)
@@ -250,6 +325,37 @@ class ShiftTests(unittest.TestCase):
         self.assertEqual(find_ecc.call_args.args[0].ndim, 3)
         self.assertEqual(find_ecc.call_args.args[1].ndim, 3)
         self.assertEqual(find_ecc.call_args.args[0].shape[-1], 3)
+        self.assertEqual(find_ecc.call_args.args[0].dtype, np.dtype(np.uint16))
+        self.assertEqual(find_ecc.call_args.args[1].dtype, np.dtype(np.uint16))
+        np.testing.assert_allclose(result["shift_px"].values, initial_shift)
+
+    def test_ecc_window_converts_to_float32_and_applies_hanning_window(self):
+        reference = np.full((5, 5), 100, dtype=np.uint16)
+        initial_shift = np.asarray([3.0, -4.0], dtype=np.float64)
+
+        def echo_initial_warp(*args):
+            return 1.0, args[2].copy()
+
+        with patch(
+            "merlin_track_position.tracking.shift.cv2.findTransformECC",
+            side_effect=echo_initial_warp,
+        ) as find_ecc:
+            result = estimate_shift(
+                reference,
+                reference.copy(),
+                check_tiles=False,
+                use_ecc_refinement=True,
+                ecc_initial_shift_px=initial_shift,
+                ecc_use_window=True,
+            )
+
+        reference_work = find_ecc.call_args.args[0]
+        current_work = find_ecc.call_args.args[1]
+        self.assertEqual(reference_work.dtype, np.dtype(np.float32))
+        self.assertEqual(current_work.dtype, np.dtype(np.float32))
+        np.testing.assert_allclose(reference_work[0, :], 0.0)
+        np.testing.assert_allclose(reference_work[:, 0], 0.0)
+        self.assertAlmostEqual(float(reference_work[2, 2]), 100.0)
         np.testing.assert_allclose(result["shift_px"].values, initial_shift)
 
     def test_ecc_refinement_uses_affine_motion_model(self):

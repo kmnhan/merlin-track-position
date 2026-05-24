@@ -11,6 +11,7 @@ import numpy.typing as npt
 import xarray as xr
 
 PIXEL_AXES = ("du_px", "dv_px")
+BASLER_RGB_TO_MONO_WEIGHTS = np.asarray((0.25, 0.625, 0.125), dtype=np.float32)
 
 
 def normalize_intensity(
@@ -21,7 +22,7 @@ def normalize_intensity(
 ) -> np.ndarray:
     """Robustly normalize a grayscale image to zero mean and unit variance."""
 
-    working = np.asarray(image, dtype=np.float64)
+    working = np.asarray(image, dtype=np.float32)
     if working.ndim != 2:
         raise ValueError(f"image must be 2D, got shape {working.shape!r}")
     if working.size == 0:
@@ -39,7 +40,7 @@ def normalize_intensity(
     std = float(np.std(working))
     if std <= eps:
         return np.zeros_like(working)
-    return (working - mean) / std
+    return np.asarray((working - mean) / std, dtype=np.float32)
 
 
 def estimate_shift(
@@ -56,6 +57,7 @@ def estimate_shift(
     ecc_reference_point_px: npt.ArrayLike | None = None,
     ecc_initial_shift_px: npt.ArrayLike | None = None,
     ecc_fallback_to_phase_shift: bool = True,
+    ecc_use_window: bool = False,
 ) -> xr.Dataset:
     """Estimate subpixel translation between two grayscale or RGB images.
 
@@ -70,6 +72,7 @@ def estimate_shift(
     used. ``ecc_initial_shift_px`` overrides the phase-correlation shift used to
     initialize ECC. Pass ``ecc_fallback_to_phase_shift=False`` when the supplied
     ECC seed is trusted and a failed refinement should invalidate the estimate.
+    Pass ``ecc_use_window=True`` to apply a Hanning taper to ECC inputs.
     """
 
     reference_image = _as_registration_image("reference image", reference)
@@ -147,10 +150,10 @@ def estimate_shift(
         )
         try:
             shift_px = _estimate_ecc_shift(
-                _ecc_work_image(reference_image, reference_norm, clip_percentiles),
-                _ecc_work_image(current_image, current_norm, clip_percentiles),
+                reference_image,
+                current_image,
                 ecc_initial_shift,
-                use_window=use_window,
+                use_window=ecc_use_window,
                 motion_model=ecc_motion_model,
                 reference_point_px=ecc_reference_point_px,
             )
@@ -214,7 +217,7 @@ def _estimate_translation(
 
 
 def _as_registration_image(name: str, image: Any) -> np.ndarray:
-    image_array = np.asarray(image, dtype=np.float64)
+    image_array = np.asarray(image)
     if image_array.ndim not in (2, 3):
         raise ValueError(
             f"{name} must be 2D grayscale or 3D RGB, got {image_array.shape!r}"
@@ -223,32 +226,29 @@ def _as_registration_image(name: str, image: Any) -> np.ndarray:
         raise ValueError(f"{name} color images must have exactly 3 channels")
     if image_array.size == 0:
         raise ValueError(f"{name} must not be empty")
-    if not np.isfinite(image_array).all():
+    if (
+        not np.issubdtype(image_array.dtype, np.number)
+        or np.issubdtype(image_array.dtype, np.complexfloating)
+    ):
+        raise ValueError(f"{name} must have a real numeric dtype")
+    if np.issubdtype(image_array.dtype, np.floating) and not np.isfinite(
+        image_array
+    ).all():
         raise ValueError(f"{name} must contain only finite values")
     return image_array
 
 
 def _grayscale_registration_image(image: np.ndarray) -> np.ndarray:
     if image.ndim == 2:
-        return np.asarray(image, dtype=np.float64)
-    # Inputs configured through pylon use RGB output. Keep the conversion explicit
-    # so IPC always receives a single-channel image.
-    weights = np.asarray([0.2126, 0.7152, 0.0722], dtype=np.float64)
-    return np.tensordot(np.asarray(image, dtype=np.float64), weights, axes=([-1], [0]))
-
-
-def _ecc_work_image(
-    image: np.ndarray,
-    grayscale_norm: np.ndarray,
-    clip_percentiles: tuple[float, float] | None,
-) -> np.ndarray:
-    if image.ndim == 2:
-        return grayscale_norm
-    channels = [
-        normalize_intensity(image[..., index], clip_percentiles=clip_percentiles)
-        for index in range(image.shape[2])
-    ]
-    return np.stack(channels, axis=-1)
+        return np.asarray(image, dtype=np.float32)
+    return np.asarray(
+        np.tensordot(
+            np.asarray(image, dtype=np.float32),
+            BASLER_RGB_TO_MONO_WEIGHTS,
+            axes=([-1], [0]),
+        ),
+        dtype=np.float32,
+    )
 
 
 def _positive_int(value: Any, name: str) -> int:
@@ -264,8 +264,8 @@ def _positive_int(value: Any, name: str) -> int:
 
 
 def _estimate_ecc_shift(
-    reference_norm: np.ndarray,
-    current_norm: np.ndarray,
+    reference_image: np.ndarray,
+    current_image: np.ndarray,
     initial_shift_px: np.ndarray,
     *,
     use_window: bool,
@@ -273,8 +273,8 @@ def _estimate_ecc_shift(
     reference_point_px: npt.ArrayLike | None,
 ) -> np.ndarray:
     reference_work, current_work = _registration_work_images(
-        reference_norm,
-        current_norm,
+        reference_image,
+        current_image,
         use_window=use_window,
     )
     initial_shift = np.asarray(initial_shift_px, dtype=np.float64)
@@ -288,8 +288,8 @@ def _estimate_ecc_shift(
         1e-5,
     )
     _correlation, refined_warp = cv2.findTransformECC(
-        np.ascontiguousarray(reference_work, dtype=np.float32),
-        np.ascontiguousarray(current_work, dtype=np.float32),
+        np.ascontiguousarray(reference_work),
+        np.ascontiguousarray(current_work),
         warp,
         motion_code,
         criteria,
@@ -300,7 +300,7 @@ def _estimate_ecc_shift(
     if refined.shape != warp.shape or not np.isfinite(refined).all():
         raise ValueError(f"ECC returned a non-finite {motion_model} warp")
 
-    point = _ecc_reference_point(reference_norm.shape[:2], reference_point_px)
+    point = _ecc_reference_point(reference_image.shape[:2], reference_point_px)
     if motion_code == cv2.MOTION_AFFINE:
         mapped = refined @ np.asarray([point[0], point[1], 1.0], dtype=np.float64)
         shift = mapped - point
@@ -371,19 +371,21 @@ def _ecc_reference_point(
 
 
 def _registration_work_images(
-    reference_norm: np.ndarray,
-    current_norm: np.ndarray,
+    reference_image: np.ndarray,
+    current_image: np.ndarray,
     *,
     use_window: bool,
 ) -> tuple[np.ndarray, np.ndarray]:
-    reference_work = reference_norm
-    current_work = current_norm
+    reference_work = reference_image
+    current_work = current_image
     if use_window:
+        reference_work = np.asarray(reference_work, dtype=np.float32)
+        current_work = np.asarray(current_work, dtype=np.float32)
         window = np.outer(
-            np.hanning(reference_norm.shape[0]),
-            np.hanning(reference_norm.shape[1]),
+            np.hanning(reference_work.shape[0]).astype(np.float32),
+            np.hanning(reference_work.shape[1]).astype(np.float32),
         )
-        if reference_norm.ndim == 3:
+        if reference_work.ndim == 3:
             window = window[..., np.newaxis]
         reference_work = reference_work * window
         current_work = current_work * window
