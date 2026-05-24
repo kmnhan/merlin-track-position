@@ -1254,6 +1254,7 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                 rows["pixel_format"].setCurrentIndex(
                     rows["pixel_format"].findData("BayerRG12")
                 )
+                rows["use_gamma"].setChecked(False)
                 rows["display_transpose"].setChecked(False)
 
                 updated = dialog.configs()["cam1"]
@@ -1264,6 +1265,7 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
         self.assertEqual(updated.model_name, "new-model")
         self.assertEqual(updated.width, 10)
         self.assertEqual(updated.pixel_format, "BayerRG12")
+        self.assertFalse(updated.use_gamma)
         self.assertFalse(updated.display.transpose)
 
     def test_camera_settings_dialog_framegrabber_geometry_is_editable_after_basler(self):

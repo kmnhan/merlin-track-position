@@ -519,6 +519,7 @@ class DevelopmentModeFramegrabTests(unittest.TestCase):
             offset_x=3,
             offset_y=5,
             exposure_us=125000.0,
+            use_gamma=False,
             pixel_format="BayerRG12",
             max_num_buffer=7,
         )
@@ -535,6 +536,7 @@ class DevelopmentModeFramegrabTests(unittest.TestCase):
         self.assertEqual(camera.GainAuto.Value, "Off")
         self.assertEqual(camera.ExposureAuto.Value, "Off")
         self.assertEqual(camera.ExposureTimeAbs.Value, config.exposure_us)
+        self.assertFalse(camera.GammaEnable.Value)
         self.assertEqual(camera.OffsetX.Value, config.offset_x)
         self.assertEqual(camera.OffsetY.Value, config.offset_y)
         self.assertEqual(camera.Width.Value, config.width)
@@ -660,6 +662,7 @@ class DevelopmentModeFramegrabTests(unittest.TestCase):
                 "camera/cam0/model_name": "a2A2590-22gcBAS",
                 "camera/cam0/width": "2592",
                 "camera/cam0/height": "1944",
+                "camera/cam0/use_gamma": "off",
                 "camera/cam0/display_transpose": "true",
                 "camera/cam0/display_invert_x": "1",
                 "camera/cam0/display_invert_y": "false",
@@ -673,6 +676,7 @@ class DevelopmentModeFramegrabTests(unittest.TestCase):
         self.assertEqual(config.model_name, "a2A2590-22gcBAS")
         self.assertEqual(config.width, 2592)
         self.assertEqual(config.height, 1944)
+        self.assertFalse(config.use_gamma)
         self.assertEqual(
             config.display,
             DisplayTransform(transpose=True, invert_x=True, invert_y=False),
@@ -718,10 +722,12 @@ class DevelopmentModeFramegrabTests(unittest.TestCase):
                 width=6,
                 height=5,
                 exposure_us=125000.0,
+                use_gamma=False,
             ),
         }
         metadata = camera_metadata(configs)
         self.assertEqual(metadata["camera_cam1_exposure_us"], 125000.0)
+        self.assertFalse(metadata["camera_cam1_use_gamma"])
         self.assertEqual(metadata["camera_cam1_model_name"], "a2A2590-22gcBAS")
         metadata["camera_cam1_serial_number"] = "serial-b"
 
@@ -734,6 +740,12 @@ class DevelopmentModeFramegrabTests(unittest.TestCase):
         self.assertEqual(
             camera_config_mismatches(metadata, configs),
             ["cam1 exposure_us"],
+        )
+        metadata["camera_cam1_exposure_us"] = 125000.0
+        metadata["camera_cam1_use_gamma"] = True
+        self.assertEqual(
+            camera_config_mismatches(metadata, configs),
+            ["cam1 use_gamma"],
         )
         self.assertEqual(camera_config_mismatches({}, configs), [])
 

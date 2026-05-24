@@ -544,6 +544,7 @@ class CameraSettingsDialog(QtWidgets.QDialog):
                 serial_number=basler_default.serial_number,
                 model_name="",
                 exposure_us=basler_default.exposure_us,
+                use_gamma=basler_default.use_gamma,
                 pixel_format=basler_default.pixel_format,
                 max_num_buffer=basler_default.max_num_buffer,
             )
@@ -667,6 +668,11 @@ class CameraSettingsDialog(QtWidgets.QDialog):
         exposure_spin.setValue(float(config.exposure_us))
         form.addRow("Exposure us", exposure_spin)
         rows["exposure_us"] = exposure_spin
+
+        use_gamma_checkbox = QtWidgets.QCheckBox()
+        use_gamma_checkbox.setChecked(bool(config.use_gamma))
+        form.addRow("Use gamma", use_gamma_checkbox)
+        rows["use_gamma"] = use_gamma_checkbox
 
         pixel_format_combo = QtWidgets.QComboBox()
         for pixel_format in capabilities.pixel_formats:
@@ -802,6 +808,7 @@ class CameraSettingsDialog(QtWidgets.QDialog):
             offset_x=spin_value("offset_x", default.offset_x),
             offset_y=spin_value("offset_y", default.offset_y),
             exposure_us=double_spin_value("exposure_us", default.exposure_us),
+            use_gamma=checkbox_value("use_gamma", default.use_gamma),
             pixel_format=combo_value("pixel_format", default.pixel_format),
             max_num_buffer=spin_value("max_num_buffer", default.max_num_buffer),
             display=DisplayTransform(

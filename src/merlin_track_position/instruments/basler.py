@@ -134,9 +134,11 @@ def _configure_camera(
         _set_exposure_us(camera, float(config.exposure_us))
 
         if genicam.IsWritable(camera.GammaEnable):
-            logger.debug("Enabling gamma correction.")
-            # camera.GammaEnable.Value = False
-            camera.GammaEnable.Value = True
+            logger.debug(
+                "%s gamma correction.",
+                "Enabling" if config.use_gamma else "Disabling",
+            )
+            camera.GammaEnable.Value = bool(config.use_gamma)
 
         for name in ("CenterX", "CenterY"):
             try:
