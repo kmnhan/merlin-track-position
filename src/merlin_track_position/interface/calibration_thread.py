@@ -31,7 +31,7 @@ class CalibrationThread(QtCore.QThread):
         super().__init__(parent)
         self._running = threading.Event()
         self._camera_pair: CameraPairPlugin | None = None
-        self._roi_metadata: dict[str, float] = {}
+        self._roi_metadata: dict[str, Any] = {}
         self._output_path: Path | None = None
         self._n: int = constants.DEFAULT_VISUAL_CALIBRATION_N
         self._step_um: float = constants.DEFAULT_VISUAL_CALIBRATION_STEP_UM
@@ -40,7 +40,7 @@ class CalibrationThread(QtCore.QThread):
     def configure(
         self,
         camera_pair: CameraPairPlugin,
-        roi_metadata: Mapping[str, float],
+        roi_metadata: Mapping[str, Any],
         output_path: str | Path,
         *,
         n: int = constants.DEFAULT_VISUAL_CALIBRATION_N,
@@ -51,9 +51,7 @@ class CalibrationThread(QtCore.QThread):
         if self.isRunning():
             raise RuntimeError("cannot configure calibration while it is running")
         self._camera_pair = camera_pair
-        self._roi_metadata = {
-            str(key): float(value) for key, value in roi_metadata.items()
-        }
+        self._roi_metadata = {str(key): value for key, value in roi_metadata.items()}
         self._output_path = Path(output_path)
         self._n = int(n)
         self._step_um = float(step_um)

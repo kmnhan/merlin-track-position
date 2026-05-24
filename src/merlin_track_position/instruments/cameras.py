@@ -18,10 +18,19 @@ from merlin_track_position.instruments.basler import (
     get_basler_image,
     get_basler_image_stack,
 )
+from merlin_track_position.instruments.camera_config import (
+    SOURCE_BASLER,
+    SOURCE_FRAMEGRABBER,
+    SOURCE_SIMULATED,
+    CameraConfig,
+    default_camera_config,
+    default_camera_configs,
+)
 from merlin_track_position.instruments.framegrab import (
     get_framegrabber_image,
     get_framegrabber_image_stack,
 )
+from merlin_track_position.instruments.simulated_hardware import simulator
 
 RoiGeometry = tuple[float, float, float, float]
 _NO_FRAME = object()
@@ -118,9 +127,13 @@ class FramegrabberCameraPlugin(CameraPlugin):
         self,
         name: str = "cam0",
         *,
+        config: CameraConfig | None = None,
         fresh_frame_timeout_s: float = 5.0,
         fresh_frame_poll_interval_s: float = 0.05,
     ):
+        if config is None:
+            config = default_camera_config(name)
+        self.config = config
         super().__init__(
             name,
             fresh_frame_timeout_s=fresh_frame_timeout_s,
@@ -128,7 +141,7 @@ class FramegrabberCameraPlugin(CameraPlugin):
         )
 
     def _capture_once(self) -> npt.NDArray:
-        return get_framegrabber_image()
+        return _crop_to_config(get_framegrabber_image(), self.config)
 
     def capture_stack(self, frame_count: int) -> tuple[npt.NDArray, npt.NDArray]:
         frame_count = normalize_capture_count(frame_count)
@@ -136,6 +149,7 @@ class FramegrabberCameraPlugin(CameraPlugin):
         stack = np.asarray(
             get_framegrabber_image_stack(frame_count, timeout_ms=timeout_ms)
         )
+        stack = _crop_stack_to_config(stack, self.config)
         self._capture_serial += frame_count
         self._last_frame_key = self._capture_serial
         self._last_image = stack[-1].copy()
@@ -149,9 +163,13 @@ class BaslerCameraPlugin(CameraPlugin):
         self,
         name: str = "cam1",
         *,
+        config: CameraConfig | None = None,
         fresh_frame_timeout_s: float = 5.0,
         fresh_frame_poll_interval_s: float = 0.05,
     ):
+        if config is None:
+            config = default_camera_config(name)
+        self.config = config
         super().__init__(
             name,
             fresh_frame_timeout_s=fresh_frame_timeout_s,
@@ -159,11 +177,11 @@ class BaslerCameraPlugin(CameraPlugin):
         )
 
     def _capture_once(self) -> npt.NDArray:
-        return get_basler_image()
+        return get_basler_image(self.config)
 
     def capture_stack(self, frame_count: int) -> tuple[npt.NDArray, npt.NDArray]:
         frame_count = normalize_capture_count(frame_count)
-        stack = np.asarray(get_basler_image_stack(frame_count))
+        stack = np.asarray(get_basler_image_stack(frame_count, self.config))
         self._capture_serial += frame_count
         self._last_frame_key = self._capture_serial
         self._last_image = stack[-1].copy()
@@ -197,6 +215,34 @@ class CallableCameraPlugin(CameraPlugin):
         if self._use_image_content_key:
             return _ImageContentKey(image)
         return super()._frame_key(image)
+
+
+class SimulatedCameraPlugin(CameraPlugin):
+    """Camera plugin backed by the development-mode simulator."""
+
+    def __init__(
+        self,
+        name: str,
+        *,
+        config: CameraConfig | None = None,
+        fresh_frame_timeout_s: float = 5.0,
+        fresh_frame_poll_interval_s: float = 0.05,
+    ):
+        if config is None:
+            config = default_camera_config(name)
+        self.config = config
+        super().__init__(
+            name,
+            fresh_frame_timeout_s=fresh_frame_timeout_s,
+            fresh_frame_poll_interval_s=fresh_frame_poll_interval_s,
+        )
+
+    def _capture_once(self) -> npt.NDArray:
+        if self.name == "cam0":
+            image = simulator.get_framegrabber_image()
+        else:
+            image = simulator.get_basler_image()
+        return _crop_to_config(image, self.config)
 
 
 class CroppedCameraPlugin(CameraPlugin):
@@ -259,9 +305,28 @@ class CameraPairPlugin:
         )
 
 
+def camera_pair_from_configs(configs: dict[str, CameraConfig]) -> CameraPairPlugin:
+    plugin_types: dict[str, type[CameraPlugin]] = {
+        SOURCE_FRAMEGRABBER: FramegrabberCameraPlugin,
+        SOURCE_BASLER: BaslerCameraPlugin,
+        SOURCE_SIMULATED: SimulatedCameraPlugin,
+    }
+    plugins = []
+    for slot in ("cam0", "cam1"):
+        config = configs[slot]
+        try:
+            plugin_type = plugin_types[config.source_type]
+        except KeyError as exc:
+            raise ValueError(
+                f"unsupported camera source type: {config.source_type!r}"
+            ) from exc
+        plugins.append(plugin_type(config.slot, config=config))
+    return CameraPairPlugin(plugins[0], plugins[1])
+
+
 def default_camera_pair() -> CameraPairPlugin:
     """Return the default two-camera hardware plugin pair."""
-    return CameraPairPlugin(FramegrabberCameraPlugin(), BaslerCameraPlugin())
+    return camera_pair_from_configs(default_camera_configs())
 
 
 def normalize_capture_count(capture_count: int) -> int:
@@ -370,3 +435,13 @@ def crop_image_to_roi(
     y1 = min(max(int(math.ceil(y + height)), y0 + 1), image_height)
 
     return array[y0:y1, x0:x1, ...].copy()
+
+
+def _crop_to_config(image: npt.ArrayLike, config: CameraConfig) -> npt.NDArray:
+    array = np.asarray(image)
+    return array[: int(config.height), : int(config.width), ...].copy()
+
+
+def _crop_stack_to_config(stack: npt.ArrayLike, config: CameraConfig) -> npt.NDArray:
+    array = np.asarray(stack)
+    return array[:, : int(config.height), : int(config.width), ...].copy()

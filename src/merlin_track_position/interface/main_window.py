@@ -28,15 +28,29 @@ from merlin_track_position.constants import (
 )
 from merlin_track_position.instruments.parse_config import get_base_file_dir
 from merlin_track_position.instruments.cameras import (
-    CallableCameraPlugin,
     CameraPairPlugin,
     RoiGeometry,
+    camera_pair_from_configs,
+    crop_image_to_roi,
+)
+from merlin_track_position.instruments.camera_config import (
+    BASLER_OUTPUT_MODES,
+    CAMERA_SLOTS,
+    SOURCE_TYPES,
+    CameraConfig,
+    DisplayTransform,
+    camera_config_mismatches,
+    camera_configs_from_settings,
+    camera_metadata,
+    default_camera_configs,
+    save_camera_config,
 )
 from merlin_track_position.instruments.basler import (
     close_basler_camera,
     get_basler_image,
 )
 from merlin_track_position.instruments.framegrab import get_framegrabber_image
+from merlin_track_position.instruments.simulated_hardware import simulator
 from merlin_track_position.interface.calibration_panel import CalibrationPanel
 from merlin_track_position.interface.calibration_thread import CalibrationThread
 from merlin_track_position.interface.correction_thread import CorrectionThread
@@ -71,7 +85,7 @@ from merlin_track_position.tracking.roi import (
     roi_local_point_from_full_frame,
 )
 
-__all__ = ("CalibrationStartDialog", "MainWindow")
+__all__ = ("CalibrationStartDialog", "CameraSettingsDialog", "MainWindow")
 
 logger = logging.getLogger("merlin_track_position.interface.main_window")
 DEFAULT_CALIBRATION_FILE_NAME = "calibration.h5"
@@ -98,11 +112,11 @@ class _CorrectionUnavailable(RuntimeError):
     """Expected state that prevents a correction run from starting."""
 
 
+_ACTIVE_CAMERA_CONFIGS: dict[str, CameraConfig] = default_camera_configs()
 CAMERA_IMAGE_SIZES: dict[str, tuple[int, int]] = {
     "cam0": (IMAGE_WIDTH_CAM0, IMAGE_HEIGHT_CAM0),
     "cam1": (IMAGE_WIDTH_CAM1, IMAGE_HEIGHT_CAM1),
 }
-TRANSPOSED_IMAGE_DISPLAY_CAMERAS = frozenset({"cam1"})
 IMAGE_REFRESH_INTERVAL_MS = 400
 PERSISTENCE_FLUSH_INTERVAL_MS = 5000
 DEFAULT_AUTO_CORRECTION_INTERVAL_SECONDS = 180.0
@@ -147,6 +161,15 @@ ROI_SCALE_HANDLES: tuple[
 )
 
 
+def _set_active_camera_configs(configs: Mapping[str, CameraConfig]) -> None:
+    global _ACTIVE_CAMERA_CONFIGS, CAMERA_IMAGE_SIZES
+    _ACTIVE_CAMERA_CONFIGS = {slot: configs[slot] for slot in CAMERA_SLOTS}
+    CAMERA_IMAGE_SIZES = {
+        slot: (_ACTIVE_CAMERA_CONFIGS[slot].width, _ACTIVE_CAMERA_CONFIGS[slot].height)
+        for slot in CAMERA_SLOTS
+    }
+
+
 def _default_roi_geometry(
     image_width: float = IMAGE_WIDTH_CAM0,
     image_height: float = IMAGE_HEIGHT_CAM0,
@@ -182,14 +205,14 @@ def _display_geometry(
     geometry: tuple[float, float, float, float],
 ) -> tuple[float, float, float, float]:
     x, y, width, height = geometry
-    if camera in TRANSPOSED_IMAGE_DISPLAY_CAMERAS:
+    if _ACTIVE_CAMERA_CONFIGS[camera].display.transpose:
         return (y, x, height, width)
     return (x, y, width, height)
 
 
 def _display_point(camera: str, point: tuple[float, float]) -> tuple[float, float]:
     u, v = point
-    if camera in TRANSPOSED_IMAGE_DISPLAY_CAMERAS:
+    if _ACTIVE_CAMERA_CONFIGS[camera].display.transpose:
         return (v, u)
     return (u, v)
 
@@ -266,7 +289,7 @@ def _set_image_item_raw_rect(
     image_height = float(image_item.height() or 1.0)
     u_scale = raw_rect.width() / image_width
     v_scale = raw_rect.height() / image_height
-    if camera in TRANSPOSED_IMAGE_DISPLAY_CAMERAS:
+    if _ACTIVE_CAMERA_CONFIGS[camera].display.transpose:
         image_item.setTransform(
             QtGui.QTransform(
                 0.0,
@@ -418,6 +441,120 @@ class CalibrationStartDialog(QtWidgets.QDialog):
         return int(self.n_spin.value()), float(self.step_um_spin.value())
 
 
+class CameraSettingsDialog(QtWidgets.QDialog):
+    def __init__(
+        self,
+        configs: Mapping[str, CameraConfig],
+        parent: QtWidgets.QWidget | None = None,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle("Camera Settings")
+        self._rows: dict[str, dict[str, QtWidgets.QWidget]] = {}
+
+        layout = QtWidgets.QVBoxLayout(self)
+        tabs = QtWidgets.QTabWidget()
+        layout.addWidget(tabs)
+
+        for slot in CAMERA_SLOTS:
+            config = configs[slot]
+            page = QtWidgets.QWidget()
+            form = QtWidgets.QFormLayout(page)
+            rows: dict[str, QtWidgets.QWidget] = {}
+
+            source_combo = QtWidgets.QComboBox()
+            for source_type in SOURCE_TYPES:
+                source_combo.addItem(source_type, source_type)
+            source_combo.setCurrentIndex(
+                max(source_combo.findData(config.source_type), 0)
+            )
+            form.addRow("Source", source_combo)
+            rows["source_type"] = source_combo
+
+            serial_edit = QtWidgets.QLineEdit(config.serial_number)
+            form.addRow("Serial", serial_edit)
+            rows["serial_number"] = serial_edit
+
+            for name, label, value, minimum, maximum in (
+                ("width", "Width", config.width, 1, 10000),
+                ("height", "Height", config.height, 1, 10000),
+                ("offset_x", "Offset X", config.offset_x, 0, 10000),
+                ("offset_y", "Offset Y", config.offset_y, 0, 10000),
+                ("max_num_buffer", "Max buffers", config.max_num_buffer, 1, 1000),
+            ):
+                spin = QtWidgets.QSpinBox()
+                spin.setRange(minimum, maximum)
+                spin.setValue(int(value))
+                form.addRow(label, spin)
+                rows[name] = spin
+
+            exposure_spin = QtWidgets.QDoubleSpinBox()
+            exposure_spin.setRange(0.0, 10_000_000.0)
+            exposure_spin.setDecimals(3)
+            exposure_spin.setValue(float(config.exposure_us))
+            form.addRow("Exposure us", exposure_spin)
+            rows["exposure_us"] = exposure_spin
+
+            pixel_format_edit = QtWidgets.QLineEdit(config.pixel_format)
+            form.addRow("Pixel format", pixel_format_edit)
+            rows["pixel_format"] = pixel_format_edit
+
+            output_combo = QtWidgets.QComboBox()
+            for output_mode in BASLER_OUTPUT_MODES:
+                output_combo.addItem(output_mode, output_mode)
+            output_combo.setCurrentIndex(
+                max(output_combo.findData(config.output_mode), 0)
+            )
+            form.addRow("Output mode", output_combo)
+            rows["output_mode"] = output_combo
+
+            for name, label, value in (
+                ("display_transpose", "Display transpose", config.display.transpose),
+                ("display_invert_x", "Display invert X", config.display.invert_x),
+                ("display_invert_y", "Display invert Y", config.display.invert_y),
+            ):
+                checkbox = QtWidgets.QCheckBox()
+                checkbox.setChecked(bool(value))
+                form.addRow(label, checkbox)
+                rows[name] = checkbox
+
+            self._rows[slot] = rows
+            tabs.addTab(page, slot)
+
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok
+            | QtWidgets.QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def configs(self) -> dict[str, CameraConfig]:
+        configs: dict[str, CameraConfig] = {}
+        defaults = default_camera_configs()
+        for slot, rows in self._rows.items():
+            default = defaults[slot]
+            configs[slot] = CameraConfig(
+                slot=slot,
+                source_type=str(rows["source_type"].currentData()),  # type: ignore[attr-defined]
+                serial_number=rows["serial_number"].text().strip(),  # type: ignore[attr-defined]
+                width=int(rows["width"].value()),  # type: ignore[attr-defined]
+                height=int(rows["height"].value()),  # type: ignore[attr-defined]
+                offset_x=int(rows["offset_x"].value()),  # type: ignore[attr-defined]
+                offset_y=int(rows["offset_y"].value()),  # type: ignore[attr-defined]
+                exposure_us=float(rows["exposure_us"].value()),  # type: ignore[attr-defined]
+                pixel_format=rows["pixel_format"].text().strip()
+                or default.pixel_format,  # type: ignore[attr-defined]
+                output_mode=str(rows["output_mode"].currentData()),  # type: ignore[attr-defined]
+                max_num_buffer=int(rows["max_num_buffer"].value()),  # type: ignore[attr-defined]
+                display=DisplayTransform(
+                    transpose=bool(rows["display_transpose"].isChecked()),  # type: ignore[attr-defined]
+                    invert_x=bool(rows["display_invert_x"].isChecked()),  # type: ignore[attr-defined]
+                    invert_y=bool(rows["display_invert_y"].isChecked()),  # type: ignore[attr-defined]
+                ),
+            )
+        return configs
+
+
 class _ImageCaptureThread(QtCore.QThread):
     sigImageReady = QtCore.Signal(str, object)
     sigImageCaptureFailed = QtCore.Signal(str, str)
@@ -497,6 +634,9 @@ class _MainWindowGUI(QtWidgets.QMainWindow):
         self.shift_monitor_action = QtGui.QAction("Shift Monitor", self)
         self.shift_monitor_action.setObjectName("shift_monitor_action")
         tools_menu.addAction(self.shift_monitor_action)
+        self.camera_settings_action = QtGui.QAction("Camera Settings", self)
+        self.camera_settings_action.setObjectName("camera_settings_action")
+        tools_menu.addAction(self.camera_settings_action)
 
         central_widget = QtWidgets.QWidget()
         self.setCentralWidget(central_widget)
@@ -538,10 +678,9 @@ class _MainWindowGUI(QtWidgets.QMainWindow):
             image_plot = self.image_graphics_layout.addPlot(row=row, col=0)
             image_plot.setTitle(camera)
             image_plot.setAspectLocked(True)
+            display_transform = _ACTIVE_CAMERA_CONFIGS[camera].display
             bottom_label, left_label = (
-                ("v", "u")
-                if camera in TRANSPOSED_IMAGE_DISPLAY_CAMERAS
-                else ("u", "v")
+                ("v", "u") if display_transform.transpose else ("u", "v")
             )
             image_plot.setLabel(
                 "bottom",
@@ -556,8 +695,8 @@ class _MainWindowGUI(QtWidgets.QMainWindow):
                 siPrefixEnableRanges=(),
             )
             image_plot.showGrid(x=True, y=True, alpha=0.2)
-            image_plot.invertX(camera in TRANSPOSED_IMAGE_DISPLAY_CAMERAS)
-            image_plot.invertY(True)
+            image_plot.invertX(display_transform.invert_x)
+            image_plot.invertY(display_transform.invert_y)
 
             image_item = pg.ImageItem(axisOrder="row-major")
             sample_img = np.ones(
@@ -631,9 +770,13 @@ class _MainWindowGUI(QtWidgets.QMainWindow):
 
 class MainWindow(_MainWindowGUI):
     def __init__(self, parent: QtCore.QObject | None = None):
+        settings = QtCore.QSettings("merlin-track-position", "Track Positions")
+        camera_configs = camera_configs_from_settings(settings)
+        _set_active_camera_configs(camera_configs)
         super().__init__(parent)
 
-        self._settings = QtCore.QSettings("merlin-track-position", "Track Positions")
+        self._settings = settings
+        self._camera_configs = camera_configs
         self._registration_config = registration_config_from_settings(self._settings)
         self._shift_monitor_window: ShiftMonitorWindow | None = None
         self.calibration_panel.auto_correction_interval_spinbox.setValue(
@@ -668,13 +811,13 @@ class MainWindow(_MainWindowGUI):
         self._image_refresh_threads = {
             "cam0": _ImageCaptureThread(
                 "cam0",
-                self._capture_cam0_image,
+                lambda: self._capture_camera_image("cam0"),
                 IMAGE_REFRESH_INTERVAL_MS,
                 self,
             ),
             "cam1": _ImageCaptureThread(
                 "cam1",
-                self._capture_cam1_image,
+                lambda: self._capture_camera_image("cam1"),
                 IMAGE_REFRESH_INTERVAL_MS,
                 self,
             ),
@@ -716,13 +859,11 @@ class MainWindow(_MainWindowGUI):
                 )
             )
             self.image_targets[camera].sigDragStarted.connect(
-                lambda *args, camera=camera: self._on_beam_target_drag_started(
-                    camera
-                )
+                lambda *args, camera=camera: self._on_beam_target_drag_started(camera)
             )
             self.image_targets[camera].sigPositionChangeFinished.connect(
-                lambda *args, camera=camera: self._on_beam_target_position_change_finished(
-                    camera
+                lambda *args, camera=camera: (
+                    self._on_beam_target_position_change_finished(camera)
                 )
             )
         self._update_beam_target_visibility()
@@ -754,6 +895,9 @@ class MainWindow(_MainWindowGUI):
             self._on_new_calibration_clicked
         )
         self.shift_monitor_action.triggered.connect(self._on_shift_monitor_triggered)
+        self.camera_settings_action.triggered.connect(
+            self._on_camera_settings_triggered
+        )
         self._calibration_thread.sigCalibrationReady.connect(
             self._on_new_calibration_ready
         )
@@ -769,9 +913,7 @@ class MainWindow(_MainWindowGUI):
         )
         self._correction_thread.sigCorrectionReady.connect(self._on_correction_ready)
         self._correction_thread.sigCorrectionFailed.connect(self._on_correction_failed)
-        self._detect_shift_thread.sigDetectionReady.connect(
-            self._on_detect_shift_ready
-        )
+        self._detect_shift_thread.sigDetectionReady.connect(self._on_detect_shift_ready)
         self._detect_shift_thread.sigDetectionFailed.connect(
             self._on_detect_shift_failed
         )
@@ -844,12 +986,16 @@ class MainWindow(_MainWindowGUI):
         return min(max(interval_seconds, spinbox.minimum()), spinbox.maximum())
 
     def _stored_correction_mode(self) -> str:
-        mode = str(
-            self._settings.value(
-                CORRECTION_MODE_SETTINGS_KEY,
-                DEFAULT_CORRECTION_MODE,
+        mode = (
+            str(
+                self._settings.value(
+                    CORRECTION_MODE_SETTINGS_KEY,
+                    DEFAULT_CORRECTION_MODE,
+                )
             )
-        ).strip().lower()
+            .strip()
+            .lower()
+        )
         if mode not in {"camera", "beam"}:
             return DEFAULT_CORRECTION_MODE
         return mode
@@ -896,6 +1042,22 @@ class MainWindow(_MainWindowGUI):
         self._shift_monitor_window.show()
         self._shift_monitor_window.raise_()
         self._shift_monitor_window.activateWindow()
+
+    @QtCore.Slot()
+    def _on_camera_settings_triggered(self) -> None:
+        dialog = CameraSettingsDialog(self._camera_configs, self)
+        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+        configs = dialog.configs()
+        for config in configs.values():
+            save_camera_config(self._settings, config)
+        self._settings.sync()
+        close_basler_camera()
+        QtWidgets.QMessageBox.information(
+            self,
+            "Camera settings saved",
+            "Camera settings were saved. Reopen this window before using changed hardware settings.",
+        )
 
     @QtCore.Slot(object)
     def _on_registration_config_saved(self, config: object) -> None:
@@ -1042,6 +1204,9 @@ class MainWindow(_MainWindowGUI):
             return "Correction is unavailable while shift detection is running."
         if self._calibration_path is None or not self._calibration_path.exists():
             return "Correction requires a calibration file on disk."
+        mismatch_message = self._camera_config_mismatch_message()
+        if mismatch_message is not None:
+            return mismatch_message
         return None
 
     def _detection_unavailable_message(self) -> str | None:
@@ -1053,7 +1218,26 @@ class MainWindow(_MainWindowGUI):
             return "Shift detection is unavailable while correction is running."
         if self._detect_shift_thread.isRunning():
             return "Shift detection is already in progress."
+        mismatch_message = self._camera_config_mismatch_message()
+        if mismatch_message is not None:
+            return mismatch_message
         return None
+
+    def _camera_config_mismatch_message(self) -> str | None:
+        if self._calibration is None:
+            return None
+        mismatches = camera_config_mismatches(
+            self._calibration.attrs,
+            self._camera_configs,
+        )
+        if not mismatches:
+            return None
+        return (
+            "Loaded calibration camera metadata does not match current camera "
+            "settings: "
+            + ", ".join(mismatches)
+            + ". Recalibrate after changing cameras."
+        )
 
     def _start_correction(self, *, motor_backend: object | None = None) -> None:
         unavailable_message = self._correction_unavailable_message()
@@ -1256,11 +1440,16 @@ class MainWindow(_MainWindowGUI):
 
     def _registration_roi_metadata(self) -> Mapping[str, object]:
         if self._calibration is None:
-            return _roi_metadata_from_geometries(self._current_roi_geometries())
-        roi_geometries = _roi_geometries_from_calibration_metadata(self._calibration)
-        if roi_geometries is None:
-            return {}
-        return _roi_metadata_from_geometries(roi_geometries)
+            roi_geometries = self._current_roi_geometries()
+        else:
+            roi_geometries = _roi_geometries_from_calibration_metadata(
+                self._calibration
+            )
+            if roi_geometries is None:
+                return {}
+        metadata = dict(_roi_metadata_from_geometries(roi_geometries))
+        metadata.update(camera_metadata(self._camera_configs))
+        return metadata
 
     def _apply_calibration_beam_target_metadata(
         self,
@@ -1323,7 +1512,9 @@ class MainWindow(_MainWindowGUI):
             loaded_point = self._loaded_calibration_beam_target_point(camera)
             if loaded_point is None:
                 return False
-            current_point = np.asarray(self._beam_target_point(camera), dtype=np.float64)
+            current_point = np.asarray(
+                self._beam_target_point(camera), dtype=np.float64
+            )
             if not np.allclose(current_point, loaded_point, rtol=0.0, atol=1e-6):
                 return True
         return False
@@ -1349,13 +1540,21 @@ class MainWindow(_MainWindowGUI):
         self._set_shift_monitor_beam_targets()
         self._update_reset_beam_target_button()
 
-    def _capture_cam0_image(self) -> np.ndarray:
-        with self._image_capture_locks["cam0"]:
-            return get_framegrabber_image()
-
-    def _capture_cam1_image(self) -> np.ndarray:
-        with self._image_capture_locks["cam1"]:
-            return get_basler_image()
+    def _capture_camera_image(self, camera: str) -> np.ndarray:
+        with self._image_capture_locks[camera]:
+            config = self._camera_configs[camera]
+            if config.source_type == "framegrabber":
+                image = get_framegrabber_image()
+            elif config.source_type == "basler":
+                return get_basler_image(config)
+            elif camera == "cam0":
+                image = simulator.get_framegrabber_image()
+            else:
+                image = simulator.get_basler_image()
+            return crop_image_to_roi(
+                image,
+                (0.0, 0.0, float(config.width), float(config.height)),
+            )
 
     @QtCore.Slot(str, object)
     def _on_image_capture_ready(self, camera: str, image: object) -> None:
@@ -2025,7 +2224,9 @@ class MainWindow(_MainWindowGUI):
         try:
             self._restore_image_auto_refresh_after_calibration()
             if not isinstance(result, xr.Dataset):
-                raise TypeError("shift detection thread did not return an xarray Dataset")
+                raise TypeError(
+                    "shift detection thread did not return an xarray Dataset"
+                )
             self._set_roi_editing_enabled(False)
             self.calibration_panel.show_detection_result(result)
             self._set_reference_preview_button_enabled(True)
@@ -2130,15 +2331,10 @@ class MainWindow(_MainWindowGUI):
         )
 
     def _current_roi_geometries(self) -> dict[str, RoiGeometry]:
-        return {
-            camera: self._get_roi_geometry(camera) for camera in CAMERA_IMAGE_SIZES
-        }
+        return {camera: self._get_roi_geometry(camera) for camera in CAMERA_IMAGE_SIZES}
 
     def _camera_pair_for_current_images(self) -> CameraPairPlugin:
-        return CameraPairPlugin(
-            CallableCameraPlugin("cam0", self._capture_cam0_image),
-            CallableCameraPlugin("cam1", self._capture_cam1_image),
-        )
+        return camera_pair_from_configs(self._camera_configs)
 
     def _set_roi_geometry(
         self,

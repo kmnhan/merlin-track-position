@@ -100,8 +100,7 @@ def absolute_command_positions(command_delta, center=(1.0, 2.0, 3.0)):
 
 def empty_capture_stacks(probe_count, shape=(8, 9), capture_count=1):
     return [
-        np.zeros((capture_count, *shape), dtype=np.float32)
-        for _ in range(probe_count)
+        np.zeros((capture_count, *shape), dtype=np.float32) for _ in range(probe_count)
     ]
 
 
@@ -352,7 +351,7 @@ class ShiftDetectionTests(unittest.TestCase):
                 "beam_target_cam1_u": 4.0,
                 "beam_target_cam1_v": 2.0,
             }
-            )
+        )
 
         with (
             patch(
@@ -456,6 +455,64 @@ class VisualCalibrationTests(unittest.TestCase):
         np.testing.assert_allclose(result["capture_shift_mad_px"].values, 1.0)
         self.assertEqual(result.attrs["capture_count"], 2)
         self.assertEqual(result.attrs["capture_aggregation"], "median_shifts")
+
+    def test_measure_image_error_accepts_color_capture_stacks(self):
+        shifts = iter(
+            (
+                np.asarray([1.0, 2.0]),
+                np.asarray([3.0, 4.0]),
+                np.asarray([5.0, 6.0]),
+                np.asarray([7.0, 8.0]),
+            )
+        )
+        calls = []
+
+        def fake_estimate_shift(reference, current, **kwargs):
+            calls.append((np.asarray(reference).copy(), np.asarray(current).copy()))
+            del kwargs
+            return xr.Dataset(
+                {"shift_px": (("pixel_axis",), next(shifts))},
+                coords={"pixel_axis": list(PIXEL_AXES)},
+                attrs={"warnings": ""},
+            )
+
+        reference_cam0 = np.zeros((2, 3, 3), dtype=np.uint16)
+        reference_cam1 = np.zeros((4, 5, 3), dtype=np.uint16)
+        current_cam0 = np.stack(
+            (
+                np.full((2, 3, 3), 10, dtype=np.uint16),
+                np.full((2, 3, 3), 20, dtype=np.uint16),
+            ),
+            axis=0,
+        )
+        current_cam1 = np.stack(
+            (
+                np.full((4, 5, 3), 30, dtype=np.uint16),
+                np.full((4, 5, 3), 40, dtype=np.uint16),
+            ),
+            axis=0,
+        )
+
+        with patch(
+            "merlin_track_position.tracking.calibration_core.estimate_shift",
+            side_effect=fake_estimate_shift,
+        ):
+            result = calibration_core.measure_image_error(
+                reference_cam0,
+                current_cam0,
+                reference_cam1,
+                current_cam1,
+            )
+
+        self.assertEqual(len(calls), 4)
+        self.assertTrue(all(reference.ndim == 3 for reference, _current in calls))
+        self.assertTrue(all(current.ndim == 3 for _reference, current in calls))
+        self.assertEqual(result["current_cam0"].dims, ("y_cam0", "x_cam0", "channel_cam0"))
+        self.assertEqual(result["current_cam1"].dims, ("y_cam1", "x_cam1", "channel_cam1"))
+        np.testing.assert_allclose(
+            result["shift_px"].values,
+            [[2.0, 3.0], [6.0, 7.0]],
+        )
 
     def test_measure_image_error_mean_image_registers_averaged_image_once(self):
         shifts = iter((np.asarray([1.0, 2.0]), np.asarray([3.0, 4.0])))
@@ -614,18 +671,18 @@ class VisualCalibrationTests(unittest.TestCase):
     def test_visual_calibration_probe_offsets_cover_old_backlash_path(self):
         offsets = _make_visual_probe_offsets_um(5, 10.0)
         expected_offsets = (-20.0, -10.0, 10.0, 20.0)
-        expected_rows = {
-            (0.0, 0.0, z_offset) for z_offset in expected_offsets
-        } | {
-            (0.0, y_offset, 0.0) for y_offset in expected_offsets
-        } | {
-            (x_offset, 0.0, 0.0) for x_offset in expected_offsets
-        } | {
-            (x_offset, y_offset, z_offset)
-            for x_offset in (-10.0, 10.0)
-            for y_offset in (-10.0, 10.0)
-            for z_offset in (-10.0, 10.0)
-        } | {(0.0, 0.0, 0.0)}
+        expected_rows = (
+            {(0.0, 0.0, z_offset) for z_offset in expected_offsets}
+            | {(0.0, y_offset, 0.0) for y_offset in expected_offsets}
+            | {(x_offset, 0.0, 0.0) for x_offset in expected_offsets}
+            | {
+                (x_offset, y_offset, z_offset)
+                for x_offset in (-10.0, 10.0)
+                for y_offset in (-10.0, 10.0)
+                for z_offset in (-10.0, 10.0)
+            }
+            | {(0.0, 0.0, 0.0)}
+        )
 
         self.assertEqual({tuple(row) for row in offsets}, expected_rows)
         self.assertEqual(offsets.shape[0], len(expected_rows))
@@ -1182,6 +1239,39 @@ class VisualCalibrationTests(unittest.TestCase):
         np.testing.assert_array_equal(loaded["reference_cam0"].values, reference_cam0)
         np.testing.assert_array_equal(loaded["reference_cam1"].values, reference_cam1)
 
+    def test_saved_calibration_accepts_color_reference_images(self):
+        dataset = calibration_dataset()
+        reference_cam0 = np.arange(4 * 5 * 3, dtype=np.uint16).reshape(4, 5, 3)
+        reference_cam1 = np.arange(6 * 7 * 3, dtype=np.uint16).reshape(6, 7, 3)
+        dataset = dataset.assign_coords(
+            {
+                "channel_cam0": np.arange(3),
+                "channel_cam1": np.arange(3),
+            }
+        )
+        dataset["reference_cam0"] = (
+            ("y_cam0", "x_cam0", "channel_cam0"),
+            reference_cam0,
+        )
+        dataset["reference_cam1"] = (
+            ("y_cam1", "x_cam1", "channel_cam1"),
+            reference_cam1,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "calibration.h5"
+            save_calibration_dataset(dataset, path)
+            loaded = load_calibration_dataset(path)
+
+        self.assertEqual(
+            loaded["reference_cam0"].dims, ("y_cam0", "x_cam0", "channel_cam0")
+        )
+        self.assertEqual(
+            loaded["reference_cam1"].dims, ("y_cam1", "x_cam1", "channel_cam1")
+        )
+        np.testing.assert_array_equal(loaded["reference_cam0"].values, reference_cam0)
+        np.testing.assert_array_equal(loaded["reference_cam1"].values, reference_cam1)
+
     def test_spooled_calibration_write_compresses_reference_images(self):
         dataset = calibration_dataset()
         dataset["reference_cam0"] = (
@@ -1404,7 +1494,9 @@ class CorrectionTests(unittest.TestCase):
         measurement_iter = iter(measurements)
 
         if isinstance(positions, dict):
-            position_map = {str(axis): float(value) for axis, value in positions.items()}
+            position_map = {
+                str(axis): float(value) for axis, value in positions.items()
+            }
         else:
             position_values = tuple(float(value) for value in positions)
             if len(position_values) == len(COMMAND_AXES):
@@ -1744,7 +1836,9 @@ class CorrectionTests(unittest.TestCase):
         self.assertEqual(result.attrs["correction_current_polar_deg"], 10.0)
         self.assertEqual(result.attrs["correction_polar_deg"], 10.0)
         self.assertEqual(result.attrs["correction_beam_runtime_xz_angle_deg"], 55.0)
-        self.assertEqual(result.attrs["correction_analyzer_runtime_xz_angle_deg"], -10.0)
+        self.assertEqual(
+            result.attrs["correction_analyzer_runtime_xz_angle_deg"], -10.0
+        )
 
     def test_beam_mode_does_not_move_when_dual_view_residual_is_within_tolerance(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2327,7 +2421,9 @@ class CorrectionTests(unittest.TestCase):
             actual_delta[index] = goal - np.array([10.0, 20.0, 30.0])[index]
         np.testing.assert_allclose(actual_delta, expected_delta, atol=1e-12)
         np.testing.assert_allclose(result["px_per_cmd_mm"].values, runtime_jacobian)
-        np.testing.assert_allclose(result["axis_scale_cmd_mm"].values, runtime_axis_scale)
+        np.testing.assert_allclose(
+            result["axis_scale_cmd_mm"].values, runtime_axis_scale
+        )
         self.assertTrue(result.attrs["correction_polar_rotation_applied"])
         self.assertEqual(result.attrs["correction_calibration_polar_deg"], 0.0)
         self.assertEqual(result.attrs["correction_current_polar_deg"], 90.0)
@@ -2391,9 +2487,7 @@ class CorrectionTests(unittest.TestCase):
             _, _, vh = np.linalg.svd(controllable_basis.T, full_matrices=True)
             normalized_null_error = vh[-1]
             shift = (
-                10.0
-                * np.asarray(design["image_scale"])
-                * normalized_null_error
+                10.0 * np.asarray(design["image_scale"]) * normalized_null_error
             ).reshape(len(CAMERAS), len(PIXEL_AXES))
             self.assertGreater(
                 weighted_pixel_residual(
@@ -3021,14 +3115,15 @@ class CorrectionTests(unittest.TestCase):
                 max_normalized_step=TEST_CORRECTION_MAX_NORMALIZED_STEP,
                 weights=TEST_CORRECTION_WEIGHTS,
             )
-            sanitized_delta = correct_module._validate_command_correction(expected_delta)
+            sanitized_delta = correct_module._validate_command_correction(
+                expected_delta
+            )
             active_indices = tuple(
                 index for index, value in enumerate(sanitized_delta) if value != 0.0
             )
             active_axes = tuple(COMMAND_AXES[index] for index in active_indices)
             active_goals = tuple(
-                np.array([0.5, 0.0, 0.0], dtype=float)[index]
-                + sanitized_delta[index]
+                np.array([0.5, 0.0, 0.0], dtype=float)[index] + sanitized_delta[index]
                 for index in active_indices
             )
             self.assertLess(abs(expected_delta[0]), 0.1)
@@ -3239,32 +3334,36 @@ class CorrectionTests(unittest.TestCase):
                 )
                 current_cam0 = np.full((4, 5), image_value, dtype=np.uint16)
                 current_cam1 = np.full((6, 7), image_value + 1, dtype=np.uint16)
-                updated = shift_dataset(x_shift(float(image_value))).assign(
-                    current_cam0=(("y_cam0", "x_cam0"), current_cam0),
-                    current_cam1=(("y_cam1", "x_cam1"), current_cam1),
-                    move_command_delta_mm=(
-                        ("move", "command_axis"),
-                        move_values,
-                        {"units": "commanded-mm"},
-                    ),
-                    move_feedback_valid=(
-                        ("move",),
-                        np.ones(move_count, dtype=bool),
-                    ),
-                    iteration_shift_px=(
-                        ("iteration", "camera", "pixel_axis"),
-                        iteration_values,
-                        {"units": "px"},
-                    ),
-                    iteration_weighted_residual_px=(
-                        ("iteration",),
-                        np.linspace(2.0, 1.0, iteration_count),
-                        {"units": "px"},
-                    ),
-                ).assign_coords(
-                    move=np.arange(move_count, dtype=np.int64),
-                    iteration=np.arange(iteration_count, dtype=np.int64),
-                    command_axis=list(COMMAND_AXES),
+                updated = (
+                    shift_dataset(x_shift(float(image_value)))
+                    .assign(
+                        current_cam0=(("y_cam0", "x_cam0"), current_cam0),
+                        current_cam1=(("y_cam1", "x_cam1"), current_cam1),
+                        move_command_delta_mm=(
+                            ("move", "command_axis"),
+                            move_values,
+                            {"units": "commanded-mm"},
+                        ),
+                        move_feedback_valid=(
+                            ("move",),
+                            np.ones(move_count, dtype=bool),
+                        ),
+                        iteration_shift_px=(
+                            ("iteration", "camera", "pixel_axis"),
+                            iteration_values,
+                            {"units": "px"},
+                        ),
+                        iteration_weighted_residual_px=(
+                            ("iteration",),
+                            np.linspace(2.0, 1.0, iteration_count),
+                            {"units": "px"},
+                        ),
+                    )
+                    .assign_coords(
+                        move=np.arange(move_count, dtype=np.int64),
+                        iteration=np.arange(iteration_count, dtype=np.int64),
+                        command_axis=list(COMMAND_AXES),
+                    )
                 )
                 return updated.assign_attrs(
                     {
@@ -3440,81 +3539,91 @@ class CorrectionTests(unittest.TestCase):
             detected_move_delta_mm.sum(axis=0, keepdims=True),
             jacobian,
         )[0]
-        first = shift_dataset(x_shift(1.0)).assign(
-            px_per_cmd_mm=(
-                ("camera", "pixel_axis", "command_axis"),
-                jacobian,
-                {"units": "px/commanded-mm"},
-            ),
-            move_command_delta_mm=(
-                ("move", "command_axis"),
-                np.array(
-                    [
-                        [0.001, -0.002, 0.0],
-                        [0.0, 0.003, -0.004],
-                    ],
-                    dtype=float,
+        first = (
+            shift_dataset(x_shift(1.0))
+            .assign(
+                px_per_cmd_mm=(
+                    ("camera", "pixel_axis", "command_axis"),
+                    jacobian,
+                    {"units": "px/commanded-mm"},
                 ),
-                {"units": "commanded-mm"},
-            ),
-            iteration_shift_px=(
-                ("iteration", "camera", "pixel_axis"),
-                np.stack(
-                    (
-                        np.zeros_like(detected_total_delta_px),
-                        detected_total_delta_px,
-                    )
+                move_command_delta_mm=(
+                    ("move", "command_axis"),
+                    np.array(
+                        [
+                            [0.001, -0.002, 0.0],
+                            [0.0, 0.003, -0.004],
+                        ],
+                        dtype=float,
+                    ),
+                    {"units": "commanded-mm"},
                 ),
-                {"units": "px"},
-            ),
-            iteration_weighted_residual_px=(
-                ("iteration",),
-                np.array([2.5, 0.75], dtype=float),
-                {"units": "px"},
-            ),
-        ).assign_coords(
-            move=np.arange(2, dtype=np.int64),
-            iteration=np.arange(2, dtype=np.int64),
-            command_axis=list(COMMAND_AXES),
-        ).assign_attrs(
-            {
-                "calibration_path": "calibration.h5",
-                "correction_history_completed": True,
-                "correction_history_run_id": 2,
-                "correction_move_finished_at": "2026-05-19T03:00:05-07:00",
-            }
+                iteration_shift_px=(
+                    ("iteration", "camera", "pixel_axis"),
+                    np.stack(
+                        (
+                            np.zeros_like(detected_total_delta_px),
+                            detected_total_delta_px,
+                        )
+                    ),
+                    {"units": "px"},
+                ),
+                iteration_weighted_residual_px=(
+                    ("iteration",),
+                    np.array([2.5, 0.75], dtype=float),
+                    {"units": "px"},
+                ),
+            )
+            .assign_coords(
+                move=np.arange(2, dtype=np.int64),
+                iteration=np.arange(2, dtype=np.int64),
+                command_axis=list(COMMAND_AXES),
+            )
+            .assign_attrs(
+                {
+                    "calibration_path": "calibration.h5",
+                    "correction_history_completed": True,
+                    "correction_history_run_id": 2,
+                    "correction_move_finished_at": "2026-05-19T03:00:05-07:00",
+                }
+            )
         )
-        second = shift_dataset(x_shift(2.0)).assign(
-            px_per_cmd_mm=(
-                ("camera", "pixel_axis", "command_axis"),
-                jacobian,
-                {"units": "px/commanded-mm"},
-            ),
-            move_command_delta_mm=(
-                ("move", "command_axis"),
-                np.empty((0, len(COMMAND_AXES)), dtype=float),
-                {"units": "commanded-mm"},
-            ),
-            move_measured_delta_px=(
-                ("move", "camera", "pixel_axis"),
-                np.empty((0, len(CAMERAS), len(PIXEL_AXES)), dtype=float),
-                {"units": "px"},
-            ),
-            iteration_weighted_residual_px=(
-                ("iteration",),
-                np.array([1.25], dtype=float),
-                {"units": "px"},
-            ),
-        ).assign_coords(
-            move=np.arange(0, dtype=np.int64),
-            iteration=np.arange(1, dtype=np.int64),
-            command_axis=list(COMMAND_AXES),
-        ).assign_attrs(
-            {
-                "calibration_path": "calibration.h5",
-                "correction_history_completed": True,
-                "correction_history_run_id": 0,
-            }
+        second = (
+            shift_dataset(x_shift(2.0))
+            .assign(
+                px_per_cmd_mm=(
+                    ("camera", "pixel_axis", "command_axis"),
+                    jacobian,
+                    {"units": "px/commanded-mm"},
+                ),
+                move_command_delta_mm=(
+                    ("move", "command_axis"),
+                    np.empty((0, len(COMMAND_AXES)), dtype=float),
+                    {"units": "commanded-mm"},
+                ),
+                move_measured_delta_px=(
+                    ("move", "camera", "pixel_axis"),
+                    np.empty((0, len(CAMERAS), len(PIXEL_AXES)), dtype=float),
+                    {"units": "px"},
+                ),
+                iteration_weighted_residual_px=(
+                    ("iteration",),
+                    np.array([1.25], dtype=float),
+                    {"units": "px"},
+                ),
+            )
+            .assign_coords(
+                move=np.arange(0, dtype=np.int64),
+                iteration=np.arange(1, dtype=np.int64),
+                command_axis=list(COMMAND_AXES),
+            )
+            .assign_attrs(
+                {
+                    "calibration_path": "calibration.h5",
+                    "correction_history_completed": True,
+                    "correction_history_run_id": 0,
+                }
+            )
         )
 
         with tempfile.TemporaryDirectory() as tmpdir:

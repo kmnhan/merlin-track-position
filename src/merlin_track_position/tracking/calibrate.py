@@ -23,6 +23,8 @@ from merlin_track_position.tracking.calibration_core import (
     COMMAND_AXES,
     PROBE_COMMAND_DELTA_MODE_ABSOLUTE_CENTER,
     PROBE_COMMAND_DELTA_MODE_ATTR,
+    _image_coords,
+    _image_dims,
     fit_jacobian_calibration,
     load_calibration_dataset,
     save_calibration_dataset_deferred,
@@ -248,22 +250,19 @@ def _replace_reference_images(
                 "reference_cam1",
                 "y_cam0",
                 "x_cam0",
+                "channel_cam0",
                 "y_cam1",
                 "x_cam1",
+                "channel_cam1",
             )
             if name in calibration.variables
         ]
     )
     updated = updated.assign_coords(
-        {
-            "y_cam0": np.arange(reference_cam0.shape[0], dtype=np.int64),
-            "x_cam0": np.arange(reference_cam0.shape[1], dtype=np.int64),
-            "y_cam1": np.arange(reference_cam1.shape[0], dtype=np.int64),
-            "x_cam1": np.arange(reference_cam1.shape[1], dtype=np.int64),
-        }
+        _image_coords("cam0", reference_cam0) | _image_coords("cam1", reference_cam1)
     )
-    updated["reference_cam0"] = (("y_cam0", "x_cam0"), reference_cam0)
-    updated["reference_cam1"] = (("y_cam1", "x_cam1"), reference_cam1)
+    updated["reference_cam0"] = (_image_dims("cam0", reference_cam0), reference_cam0)
+    updated["reference_cam1"] = (_image_dims("cam1", reference_cam1), reference_cam1)
     validate_visual_calibration_dataset(updated)
     return updated
 

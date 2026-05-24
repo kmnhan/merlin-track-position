@@ -21,8 +21,7 @@ ROI_ATTR_KEYS: dict[str, tuple[str, str, str, str]] = {
     for camera in CAMERAS
 }
 BEAM_TARGET_ATTR_KEYS: dict[str, tuple[str, str]] = {
-    camera: (f"beam_target_{camera}_u", f"beam_target_{camera}_v")
-    for camera in CAMERAS
+    camera: (f"beam_target_{camera}_u", f"beam_target_{camera}_v") for camera in CAMERAS
 }
 CAMERA_IMAGE_SHAPES: dict[str, tuple[int, int]] = {
     "cam0": (constants.IMAGE_HEIGHT_CAM0, constants.IMAGE_WIDTH_CAM0),
@@ -75,7 +74,9 @@ def beam_target_point_from_attrs_or_default(
         try:
             point = np.asarray([float(attrs[key]) for key in keys], dtype=np.float64)
         except (TypeError, ValueError) as exc:
-            raise ValueError(f"beam target metadata for {camera} must be numeric") from exc
+            raise ValueError(
+                f"beam target metadata for {camera} must be numeric"
+            ) from exc
         if not np.isfinite(point).all():
             raise ValueError(f"beam target metadata for {camera} must be finite")
         return point
@@ -93,13 +94,16 @@ def default_beam_target_point(
 ) -> npt.NDArray[np.float64]:
     roi_geometry = roi_geometry_from_attrs(attrs, camera)
     if roi_geometry is None:
-        image_height, image_width = CAMERA_IMAGE_SHAPES[camera]
+        image_height, image_width = camera_image_shape_from_attrs(attrs, camera)
         return np.asarray(
             [(image_width - 1.0) / 2.0, (image_height - 1.0) / 2.0],
             dtype=np.float64,
         )
 
-    x0, y0, x1, y1 = roi_crop_bounds(roi_geometry, CAMERA_IMAGE_SHAPES[camera])
+    x0, y0, x1, y1 = roi_crop_bounds(
+        roi_geometry,
+        camera_image_shape_from_attrs(attrs, camera),
+    )
     return np.asarray(
         [x0 + (x1 - x0 - 1.0) / 2.0, y0 + (y1 - y0 - 1.0) / 2.0],
         dtype=np.float64,
@@ -117,7 +121,7 @@ def roi_local_point_from_full_frame(
 
     roi_geometry = roi_geometry_from_attrs(attrs, camera)
     if roi_geometry is None:
-        image_height, image_width = CAMERA_IMAGE_SHAPES[camera]
+        image_height, image_width = camera_image_shape_from_attrs(attrs, camera)
         return np.asarray(
             [
                 min(max(full_point[0], 0.0), image_width - 1.0),
@@ -126,7 +130,10 @@ def roi_local_point_from_full_frame(
             dtype=np.float64,
         )
 
-    x0, y0, x1, y1 = roi_crop_bounds(roi_geometry, CAMERA_IMAGE_SHAPES[camera])
+    x0, y0, x1, y1 = roi_crop_bounds(
+        roi_geometry,
+        camera_image_shape_from_attrs(attrs, camera),
+    )
     clamped = np.asarray(
         [
             min(max(full_point[0], float(x0)), float(x1 - 1)),
@@ -183,7 +190,7 @@ def matching_reference_and_stack(
 
     expected_roi_shape = _roi_crop_shape(
         roi_geometry,
-        CAMERA_IMAGE_SHAPES[camera],
+        camera_image_shape_from_attrs(attrs, camera),
     )
     if reference_array.shape[:2] == expected_roi_shape:
         matching_reference = reference_array
@@ -209,3 +216,17 @@ def _roi_crop_shape(
 ) -> tuple[int, int]:
     x0, y0, x1, y1 = roi_crop_bounds(roi_geometry, image_shape)
     return y1 - y0, x1 - x0
+
+
+def camera_image_shape_from_attrs(
+    attrs: Mapping[str, Any],
+    camera: str,
+) -> tuple[int, int]:
+    try:
+        height = int(attrs[f"camera_{camera}_height"])
+        width = int(attrs[f"camera_{camera}_width"])
+    except (KeyError, TypeError, ValueError):
+        return CAMERA_IMAGE_SHAPES[camera]
+    if height < 1 or width < 1:
+        return CAMERA_IMAGE_SHAPES[camera]
+    return height, width

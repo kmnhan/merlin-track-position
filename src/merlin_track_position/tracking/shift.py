@@ -1,4 +1,4 @@
-"""Subpixel whole-frame shift estimation for grayscale image pairs."""
+"""Subpixel whole-frame shift estimation for grayscale or RGB image pairs."""
 
 from __future__ import annotations
 
@@ -57,10 +57,10 @@ def estimate_shift(
     ecc_initial_shift_px: npt.ArrayLike | None = None,
     ecc_fallback_to_phase_shift: bool = True,
 ) -> xr.Dataset:
-    """Estimate subpixel translation between two grayscale images.
+    """Estimate subpixel translation between two grayscale or RGB images.
 
-    By default, images are percentile-clipped, normalized, and registered with
-    OpenCV iterative phase correlation.
+    By default, images are percentile-clipped, normalized, converted to grayscale
+    when needed, and registered with OpenCV iterative phase correlation.
     Pass ``use_window=True`` to apply a Hanning taper before registration.
     Pass ``check_tiles=True`` to compare local tile shifts against the full-frame
     estimate.
@@ -72,18 +72,8 @@ def estimate_shift(
     ECC seed is trusted and a failed refinement should invalidate the estimate.
     """
 
-    reference_image = np.asarray(reference, dtype=np.float64)
-    current_image = np.asarray(current, dtype=np.float64)
-    if reference_image.ndim != 2:
-        raise ValueError(
-            f"reference image must be 2D, got shape {reference_image.shape!r}"
-        )
-    if current_image.ndim != 2:
-        raise ValueError(f"current image must be 2D, got shape {current_image.shape!r}")
-    if reference_image.size == 0 or current_image.size == 0:
-        raise ValueError("images must not be empty")
-    if not np.isfinite(reference_image).all() or not np.isfinite(current_image).all():
-        raise ValueError("images must contain only finite values")
+    reference_image = _as_registration_image("reference image", reference)
+    current_image = _as_registration_image("current image", current)
     if reference_image.shape != current_image.shape:
         raise ValueError(
             "reference and current images must have identical shapes; "
@@ -92,9 +82,12 @@ def estimate_shift(
     phase_l2_size = _positive_int(phase_l2_size, "phase_l2_size")
     phase_max_iters = _positive_int(phase_max_iters, "phase_max_iters")
 
-    dynamic_range = float(np.max(reference_image) - np.min(reference_image))
-    standard_deviation = float(np.std(reference_image))
-    gy, gx = np.gradient(reference_image)
+    reference_gray = _grayscale_registration_image(reference_image)
+    current_gray = _grayscale_registration_image(current_image)
+
+    dynamic_range = float(np.max(reference_gray) - np.min(reference_gray))
+    standard_deviation = float(np.std(reference_gray))
+    gy, gx = np.gradient(reference_gray)
     gradient_rms = float(np.sqrt(np.mean(gx * gx + gy * gy)))
 
     diagnostic_warnings: list[str] = []
@@ -108,11 +101,11 @@ def estimate_shift(
         )
 
     reference_norm = normalize_intensity(
-        reference_image,
+        reference_gray,
         clip_percentiles=clip_percentiles,
     )
     current_norm = normalize_intensity(
-        current_image,
+        current_gray,
         clip_percentiles=clip_percentiles,
     )
 
@@ -139,9 +132,10 @@ def estimate_shift(
     explicit_ecc_initial_shift = None
     if use_ecc_refinement and ecc_initial_shift_px is not None:
         explicit_ecc_initial_shift = np.asarray(ecc_initial_shift_px, dtype=np.float64)
-        if explicit_ecc_initial_shift.shape != (2,) or not np.isfinite(
-            explicit_ecc_initial_shift
-        ).all():
+        if (
+            explicit_ecc_initial_shift.shape != (2,)
+            or not np.isfinite(explicit_ecc_initial_shift).all()
+        ):
             raise ValueError("ecc_initial_shift_px must be a finite 2-vector")
     if use_ecc_refinement and (
         explicit_ecc_initial_shift is not None or np.isfinite(shift_px).all()
@@ -153,8 +147,8 @@ def estimate_shift(
         )
         try:
             shift_px = _estimate_ecc_shift(
-                reference_norm,
-                current_norm,
+                _ecc_work_image(reference_image, reference_norm, clip_percentiles),
+                _ecc_work_image(current_image, current_norm, clip_percentiles),
                 ecc_initial_shift,
                 use_window=use_window,
                 motion_model=ecc_motion_model,
@@ -219,6 +213,44 @@ def _estimate_translation(
     return shift_px
 
 
+def _as_registration_image(name: str, image: Any) -> np.ndarray:
+    image_array = np.asarray(image, dtype=np.float64)
+    if image_array.ndim not in (2, 3):
+        raise ValueError(
+            f"{name} must be 2D grayscale or 3D RGB, got {image_array.shape!r}"
+        )
+    if image_array.ndim == 3 and image_array.shape[2] != 3:
+        raise ValueError(f"{name} color images must have exactly 3 channels")
+    if image_array.size == 0:
+        raise ValueError(f"{name} must not be empty")
+    if not np.isfinite(image_array).all():
+        raise ValueError(f"{name} must contain only finite values")
+    return image_array
+
+
+def _grayscale_registration_image(image: np.ndarray) -> np.ndarray:
+    if image.ndim == 2:
+        return np.asarray(image, dtype=np.float64)
+    # Inputs configured through pylon use RGB output. Keep the conversion explicit
+    # so IPC always receives a single-channel image.
+    weights = np.asarray([0.2126, 0.7152, 0.0722], dtype=np.float64)
+    return np.tensordot(np.asarray(image, dtype=np.float64), weights, axes=([-1], [0]))
+
+
+def _ecc_work_image(
+    image: np.ndarray,
+    grayscale_norm: np.ndarray,
+    clip_percentiles: tuple[float, float] | None,
+) -> np.ndarray:
+    if image.ndim == 2:
+        return grayscale_norm
+    channels = [
+        normalize_intensity(image[..., index], clip_percentiles=clip_percentiles)
+        for index in range(image.shape[2])
+    ]
+    return np.stack(channels, axis=-1)
+
+
 def _positive_int(value: Any, name: str) -> int:
     if isinstance(value, bool):
         raise ValueError(f"{name} must be a positive integer")
@@ -268,7 +300,7 @@ def _estimate_ecc_shift(
     if refined.shape != warp.shape or not np.isfinite(refined).all():
         raise ValueError(f"ECC returned a non-finite {motion_model} warp")
 
-    point = _ecc_reference_point(reference_norm.shape, reference_point_px)
+    point = _ecc_reference_point(reference_norm.shape[:2], reference_point_px)
     if motion_code == cv2.MOTION_AFFINE:
         mapped = refined @ np.asarray([point[0], point[1], 1.0], dtype=np.float64)
         shift = mapped - point
@@ -351,6 +383,8 @@ def _registration_work_images(
             np.hanning(reference_norm.shape[0]),
             np.hanning(reference_norm.shape[1]),
         )
+        if reference_norm.ndim == 3:
+            window = window[..., np.newaxis]
         reference_work = reference_work * window
         current_work = current_work * window
     return reference_work, current_work

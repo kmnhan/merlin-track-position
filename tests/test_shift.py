@@ -77,7 +77,9 @@ class ShiftTests(unittest.TestCase):
         result = estimate_shift(reference, current, check_tiles=True)
 
         np.testing.assert_allclose(result["shift_px"].values, [-1.75, 1.25], atol=0.25)
-        self.assertNotIn("tile shift estimates are inconsistent", result.attrs["warnings"])
+        self.assertNotIn(
+            "tile shift estimates are inconsistent", result.attrs["warnings"]
+        )
 
     def test_ecc_refinement_keeps_translation_sign_convention(self):
         reference = textured_image(seed=6)
@@ -205,6 +207,51 @@ class ShiftTests(unittest.TestCase):
         self.assertEqual(find_ecc.call_args.args[2].shape, (3, 3))
         np.testing.assert_allclose(result["shift_px"].values, expected_shift)
 
+    def test_rgb_input_uses_grayscale_ipc_seed(self):
+        reference_gray = textured_image(seed=17)
+        reference = np.stack(
+            [reference_gray, 0.5 * reference_gray, 2.0 * reference_gray],
+            axis=-1,
+        )
+
+        with patch(
+            "merlin_track_position.tracking.shift.cv2.phaseCorrelateIterative",
+            return_value=(1.5, -2.25),
+        ) as phase_correlate:
+            result = estimate_shift(reference, reference.copy(), check_tiles=False)
+
+        self.assertEqual(phase_correlate.call_args.args[0].ndim, 2)
+        self.assertEqual(phase_correlate.call_args.args[1].ndim, 2)
+        np.testing.assert_allclose(result["shift_px"].values, [1.5, -2.25])
+
+    def test_rgb_ecc_refinement_uses_color_images(self):
+        reference_gray = textured_image(seed=18)
+        reference = np.stack(
+            [reference_gray, 0.5 * reference_gray, 2.0 * reference_gray],
+            axis=-1,
+        )
+        initial_shift = np.asarray([3.0, -4.0], dtype=np.float64)
+
+        def echo_initial_warp(*args):
+            return 1.0, args[2].copy()
+
+        with patch(
+            "merlin_track_position.tracking.shift.cv2.findTransformECC",
+            side_effect=echo_initial_warp,
+        ) as find_ecc:
+            result = estimate_shift(
+                reference,
+                reference.copy(),
+                check_tiles=False,
+                use_ecc_refinement=True,
+                ecc_initial_shift_px=initial_shift,
+            )
+
+        self.assertEqual(find_ecc.call_args.args[0].ndim, 3)
+        self.assertEqual(find_ecc.call_args.args[1].ndim, 3)
+        self.assertEqual(find_ecc.call_args.args[0].shape[-1], 3)
+        np.testing.assert_allclose(result["shift_px"].values, initial_shift)
+
     def test_ecc_refinement_uses_affine_motion_model(self):
         reference = textured_image(seed=11)
         point = np.asarray([71.5, 83.25], dtype=np.float64)
@@ -299,7 +346,9 @@ class ShiftTests(unittest.TestCase):
                 use_ecc_refinement=True,
             )
 
-        np.testing.assert_allclose(result["shift_px"].values, baseline["shift_px"].values)
+        np.testing.assert_allclose(
+            result["shift_px"].values, baseline["shift_px"].values
+        )
         self.assertIn("ECC refinement failed: forced failure", result.attrs["warnings"])
 
     def test_ecc_refinement_failure_can_disable_phase_fallback(self):

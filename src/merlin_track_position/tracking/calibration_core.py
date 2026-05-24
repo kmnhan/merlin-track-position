@@ -99,9 +99,7 @@ def fit_jacobian_calibration(
     pre_readback_position_mm: Sequence[Sequence[float]],
     post_readback_position_mm: Sequence[Sequence[float]],
     min_shift_px: float = constants.DEFAULT_VISUAL_CALIBRATION_MIN_SHIFT_PX,
-    condition_warning_threshold: float = (
-        constants.DEFAULT_JACOBIAN_CONDITION_WARNING
-    ),
+    condition_warning_threshold: float = (constants.DEFAULT_JACOBIAN_CONDITION_WARNING),
     capture_aggregation: str = CAPTURE_AGGREGATION_MEDIAN_SHIFTS,
     additional_context: dict[str, Any] | None = None,
     progress_callback: ProgressCallback | None = None,
@@ -216,9 +214,9 @@ def fit_jacobian_calibration(
         raise ValueError("min_shift_px must be finite and non-negative")
     response_norms = np.linalg.norm(observation, axis=1)
     fit_probe_rows = _nonzero_command_rows(command_delta)
-    small_probe_indices = np.nonzero(
-        (response_norms < min_shift_px) & fit_probe_rows
-    )[0]
+    small_probe_indices = np.nonzero((response_norms < min_shift_px) & fit_probe_rows)[
+        0
+    ]
     if small_probe_indices.size:
         probe_text = ", ".join(str(int(index)) for index in small_probe_indices)
         raise ValueError(
@@ -292,11 +290,9 @@ def fit_jacobian_calibration(
         "command_axis": list(COMMAND_AXES),
         "camera": list(CAMERAS),
         "pixel_axis": list(PIXEL_AXES),
-        "y_cam0": np.arange(reference_image_cam0.shape[0], dtype=np.int64),
-        "x_cam0": np.arange(reference_image_cam0.shape[1], dtype=np.int64),
-        "y_cam1": np.arange(reference_image_cam1.shape[0], dtype=np.int64),
-        "x_cam1": np.arange(reference_image_cam1.shape[1], dtype=np.int64),
     }
+    coords |= _image_coords("cam0", reference_image_cam0)
+    coords |= _image_coords("cam1", reference_image_cam1)
     dataset = xr.Dataset(
         data_vars={
             "px_per_cmd_mm": (
@@ -309,8 +305,14 @@ def fit_jacobian_calibration(
                 axis_scale,
                 {"units": "commanded-mm"},
             ),
-            "reference_cam0": (("y_cam0", "x_cam0"), reference_image_cam0),
-            "reference_cam1": (("y_cam1", "x_cam1"), reference_image_cam1),
+            "reference_cam0": (
+                _image_dims("cam0", reference_image_cam0),
+                reference_image_cam0,
+            ),
+            "reference_cam1": (
+                _image_dims("cam1", reference_image_cam1),
+                reference_image_cam1,
+            ),
             "probe_command_delta_mm": (
                 ("probe", "command_axis"),
                 command_delta,
@@ -389,13 +391,10 @@ def validate_visual_calibration_dataset(dataset: xr.Dataset) -> None:
 
     if jacobian.shape != (len(CAMERAS), len(PIXEL_AXES), len(COMMAND_AXES)):
         raise ValueError(
-            "px_per_cmd_mm must have shape "
-            "(camera, pixel_axis, command_axis)"
+            "px_per_cmd_mm must have shape (camera, pixel_axis, command_axis)"
         )
     if not np.isfinite(jacobian).all():
-        raise ValueError(
-            "px_per_cmd_mm must contain only finite values"
-        )
+        raise ValueError("px_per_cmd_mm must contain only finite values")
     jacobian_observation = jacobian.reshape(
         len(OBSERVATION_AXES),
         len(COMMAND_AXES),
@@ -422,8 +421,8 @@ def validate_visual_calibration_dataset(dataset: xr.Dataset) -> None:
         axis_scale > scale_bounds[:, 1]
     ):
         raise ValueError("axis_scale_cmd_mm must stay within configured bounds")
-    if reference_cam0.ndim != 2 or reference_cam1.ndim != 2:
-        raise ValueError("reference_cam0 and reference_cam1 must be 2D images")
+    if reference_cam0.ndim not in (2, 3) or reference_cam1.ndim not in (2, 3):
+        raise ValueError("reference_cam0 and reference_cam1 must be 2D or 3D images")
     if reference_cam0.size == 0 or reference_cam1.size == 0:
         raise ValueError("reference images must not be empty")
     _validate_real_finite_numeric_image("reference_cam0", reference_cam0)
@@ -762,17 +761,21 @@ def measure_image_error(
                     ),
                 },
             ),
-            "current_cam0": (("y_cam0", "x_cam0"), current_image_cam0),
-            "current_cam1": (("y_cam1", "x_cam1"), current_image_cam1),
+            "current_cam0": (
+                _image_dims("cam0", current_image_cam0),
+                current_image_cam0,
+            ),
+            "current_cam1": (
+                _image_dims("cam1", current_image_cam1),
+                current_image_cam1,
+            ),
         },
         coords={
             "camera": list(CAMERAS),
             "pixel_axis": list(PIXEL_AXES),
-            "y_cam0": np.arange(current_image_cam0.shape[0], dtype=np.int64),
-            "x_cam0": np.arange(current_image_cam0.shape[1], dtype=np.int64),
-            "y_cam1": np.arange(current_image_cam1.shape[0], dtype=np.int64),
-            "x_cam1": np.arange(current_image_cam1.shape[1], dtype=np.int64),
-        },
+        }
+        | _image_coords("cam0", current_image_cam0)
+        | _image_coords("cam1", current_image_cam1),
         attrs={
             "capture_count": capture_count,
             "capture_aggregation": capture_aggregation,
@@ -824,9 +827,7 @@ def solve_lqr_command_correction(
 ) -> np.ndarray:
     """Solve the nominal image-space LQR correction in commanded-mm units."""
 
-    jacobian_observation = _jacobian_to_observation(
-        _as_jacobian(px_per_cmd_mm)
-    )
+    jacobian_observation = _jacobian_to_observation(_as_jacobian(px_per_cmd_mm))
     observation = _shift_to_observation(_shift_values(shift))
     return solve_lqr_observation_command_correction(
         jacobian_observation,
@@ -917,9 +918,7 @@ def lqr_projected_residual(
 ) -> float:
     """Return ``||U_c.T @ S_e^-1 @ e||`` for the LQR stopping criterion."""
 
-    jacobian_observation = _jacobian_to_observation(
-        _as_jacobian(px_per_cmd_mm)
-    )
+    jacobian_observation = _jacobian_to_observation(_as_jacobian(px_per_cmd_mm))
     design = compute_lqr_correction_design(
         jacobian_observation,
         axis_scale_cmd_mm,
@@ -993,10 +992,7 @@ def compute_lqr_correction_design(
     svd_relative_tolerance = float(svd_relative_tolerance)
     if not np.isfinite(motor_penalty) or motor_penalty <= 0.0:
         raise ValueError("motor_penalty must be finite and positive")
-    if (
-        not np.isfinite(svd_relative_tolerance)
-        or svd_relative_tolerance <= 0.0
-    ):
+    if not np.isfinite(svd_relative_tolerance) or svd_relative_tolerance <= 0.0:
         raise ValueError("svd_relative_tolerance must be finite and positive")
 
     image_scale = _lqr_image_scale_from_weights(
@@ -1004,9 +1000,9 @@ def compute_lqr_correction_design(
         weights,
         observation_count,
     )
-    normalized_jacobian = (
-        jacobian * axis_scale[np.newaxis, :]
-    ) / image_scale[:, np.newaxis]
+    normalized_jacobian = (jacobian * axis_scale[np.newaxis, :]) / image_scale[
+        :, np.newaxis
+    ]
     left_singular_vectors, singular_values, _ = np.linalg.svd(
         normalized_jacobian,
         full_matrices=False,
@@ -1251,8 +1247,7 @@ def update_lqr_kalman_state(
 
     innovation = normalized_measurement - controllable_basis @ state_pred
     innovation_covariance = (
-        controllable_basis @ covariance_pred @ controllable_basis.T
-        + measurement_cov
+        controllable_basis @ covariance_pred @ controllable_basis.T + measurement_cov
     )
     innovation_mahalanobis = float(
         innovation @ np.linalg.solve(innovation_covariance, innovation)
@@ -1377,9 +1372,7 @@ def _covariance_matrix(
         raise ValueError(f"{name} must contain only finite values")
     matrix = 0.5 * (matrix + matrix.T)
     eigenvalues = np.linalg.eigvalsh(matrix)
-    if np.min(eigenvalues) < -1e-12 or (
-        not allow_zero and np.min(eigenvalues) <= 0.0
-    ):
+    if np.min(eigenvalues) < -1e-12 or (not allow_zero and np.min(eigenvalues) <= 0.0):
         bound = "positive semidefinite" if allow_zero else "positive definite"
         raise ValueError(f"{name} must be {bound}")
     return matrix
@@ -1719,8 +1712,10 @@ def _estimate_capture_shift(
 
 def _as_reference_image(name: str, image: Any) -> np.ndarray:
     image_array = np.asarray(image)
-    if image_array.ndim != 2:
-        raise ValueError(f"{name} must be 2D, got {image_array.shape!r}")
+    if image_array.ndim not in (2, 3):
+        raise ValueError(f"{name} must be 2D or 3D, got {image_array.shape!r}")
+    if image_array.ndim == 3 and image_array.shape[2] != 3:
+        raise ValueError(f"{name} color images must have exactly 3 channels")
     if image_array.size == 0:
         raise ValueError(f"{name} must not be empty")
     _validate_real_finite_numeric_image(name, image_array)
@@ -1739,13 +1734,17 @@ def _as_capture_arrays(
     first_shape: tuple[int, int] | None = None
     first_capture_count: int | None = None
     for index, image in enumerate(image_values):
-        if image.ndim != 3:
-            raise ValueError(f"{name}[{index}] must be 3D, got {image.shape!r}")
+        if image.ndim not in (3, 4):
+            raise ValueError(f"{name}[{index}] must be 3D or 4D, got {image.shape!r}")
         capture_array = image
         if capture_array.shape[0] < 1:
             raise ValueError(f"{name}[{index}] must contain at least one capture")
         if capture_array.shape[1] == 0 or capture_array.shape[2] == 0:
             raise ValueError(f"{name}[{index}] images must not be empty")
+        if capture_array.ndim == 4 and capture_array.shape[3] != 3:
+            raise ValueError(
+                f"{name}[{index}] color images must have exactly 3 channels"
+            )
         if first_capture_count is None:
             first_capture_count = int(capture_array.shape[0])
         elif capture_array.shape[0] != first_capture_count:
@@ -1862,6 +1861,24 @@ def _validate_real_finite_numeric_image(name: str, image: np.ndarray) -> None:
         raise ValueError(f"{name} must be real-valued")
     if np.issubdtype(dtype, np.floating) and not np.isfinite(image).all():
         raise ValueError(f"{name} must contain only finite values")
+
+
+def _image_dims(camera: str, image: np.ndarray) -> tuple[str, ...]:
+    dims = (f"y_{camera}", f"x_{camera}")
+    if np.asarray(image).ndim == 3:
+        return (*dims, f"channel_{camera}")
+    return dims
+
+
+def _image_coords(camera: str, image: np.ndarray) -> dict[str, np.ndarray]:
+    array = np.asarray(image)
+    coords = {
+        f"y_{camera}": np.arange(array.shape[0], dtype=np.int64),
+        f"x_{camera}": np.arange(array.shape[1], dtype=np.int64),
+    }
+    if array.ndim == 3:
+        coords[f"channel_{camera}"] = np.arange(array.shape[2], dtype=np.int64)
+    return coords
 
 
 def _representative_capture_image(
@@ -2211,20 +2228,19 @@ def _as_jacobian(values: np.ndarray) -> np.ndarray:
     jacobian = np.asarray(values, dtype=np.float64)
     if jacobian.shape != (len(CAMERAS), len(PIXEL_AXES), len(COMMAND_AXES)):
         raise ValueError(
-            "px_per_cmd_mm must have shape "
-            "(camera, pixel_axis, command_axis)"
+            "px_per_cmd_mm must have shape (camera, pixel_axis, command_axis)"
         )
     if not np.isfinite(jacobian).all():
-        raise ValueError(
-            "px_per_cmd_mm must contain only finite values"
-        )
+        raise ValueError("px_per_cmd_mm must contain only finite values")
     return jacobian
 
 
 def _as_observation_model(values: np.ndarray) -> np.ndarray:
     model = np.asarray(values, dtype=np.float64)
     if model.ndim != 2 or model.shape[1] != len(COMMAND_AXES):
-        raise ValueError("observation model must have shape (observation, command_axis)")
+        raise ValueError(
+            "observation model must have shape (observation, command_axis)"
+        )
     if model.shape[0] < 1:
         raise ValueError("observation model must include at least one observation")
     if not np.isfinite(model).all():

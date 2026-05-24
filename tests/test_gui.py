@@ -18,12 +18,19 @@ from merlin_track_position.interface.calibration_panel import (  # noqa: E402
 )
 import merlin_track_position.interface.main_window as main_window  # noqa: E402
 from merlin_track_position.interface.main_window import (  # noqa: E402
+    CameraSettingsDialog,
     CalibrationStartDialog,
     MainWindow,
     _clamp_roi_geometry,
     _default_roi_geometry,
     _roi_geometries_from_calibration_metadata,
     _roi_metadata_from_geometries,
+)
+from merlin_track_position.instruments.camera_config import (  # noqa: E402
+    SOURCE_BASLER,
+    SOURCE_FRAMEGRABBER,
+    CameraConfig,
+    DisplayTransform,
 )
 from merlin_track_position.interface.registration_settings import (  # noqa: E402
     DEFAULT_REGISTRATION_CONFIG,
@@ -582,10 +589,7 @@ class ShiftMonitorWindowTests(unittest.TestCase):
     def test_monitor_buffers_capture_count_frames_per_submission(self):
         get_qapp()
         settings = FakeSettings()
-        frames = [
-            np.full((2, 2), value, dtype=float)
-            for value in (1.0, 2.0, 3.0, 4.0)
-        ]
+        frames = [np.full((2, 2), value, dtype=float) for value in (1.0, 2.0, 3.0, 4.0)]
 
         with patched_shift_monitor_worker():
             window = ShiftMonitorWindow(settings)
@@ -1142,6 +1146,62 @@ class CalibrationPanelTests(unittest.TestCase):
 
 
 class MainWindowCalibrationStateTests(unittest.TestCase):
+    def test_camera_display_transform_comes_from_settings(self):
+        get_qapp()
+        settings = FakeSettings()
+        settings.values.update(
+            {
+                "camera/cam0/display_transpose": True,
+                "camera/cam0/display_invert_x": True,
+                "camera/cam0/display_invert_y": False,
+            }
+        )
+        with patched_main_window_runtime(settings):
+            window = MainWindow()
+            try:
+                self.assertEqual(
+                    main_window._display_geometry("cam0", (1.0, 2.0, 3.0, 4.0)),
+                    (2.0, 1.0, 4.0, 3.0),
+                )
+                view_state = window.image_plots["cam0"].vb.state
+                self.assertTrue(view_state["xInverted"])
+                self.assertFalse(view_state["yInverted"])
+            finally:
+                window.close()
+
+    def test_camera_settings_dialog_returns_updated_configs(self):
+        get_qapp()
+        configs = {
+            "cam0": CameraConfig(
+                slot="cam0",
+                source_type=SOURCE_FRAMEGRABBER,
+                width=4,
+                height=3,
+            ),
+            "cam1": CameraConfig(
+                slot="cam1",
+                source_type=SOURCE_BASLER,
+                serial_number="old",
+                width=6,
+                height=5,
+                display=DisplayTransform(transpose=True, invert_x=True, invert_y=True),
+            ),
+        }
+        dialog = CameraSettingsDialog(configs)
+        try:
+            rows = dialog._rows["cam1"]
+            rows["serial_number"].setText("new-serial")
+            rows["width"].setValue(9)
+            rows["display_transpose"].setChecked(False)
+
+            updated = dialog.configs()["cam1"]
+        finally:
+            dialog.close()
+
+        self.assertEqual(updated.serial_number, "new-serial")
+        self.assertEqual(updated.width, 9)
+        self.assertFalse(updated.display.transpose)
+
     def test_fresh_window_has_editable_roi_and_new_calibration_button(self):
         get_qapp()
         with patched_main_window_runtime():
@@ -1370,7 +1430,9 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                 self.assertEqual(step_um, 10.0)
                 self.assertEqual(
                     shift_kwargs,
-                    registration_config_to_measurement_kwargs(window._registration_config),
+                    registration_config_to_measurement_kwargs(
+                        window._registration_config
+                    ),
                 )
                 self.assertEqual(roi_metadata["roi_cam0_x"], 1.0)
                 self.assertEqual(roi_metadata["roi_cam1_y"], 4.0)
@@ -1842,7 +1904,9 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                     self.assertEqual(thread.correction_mode, "beam")
                     self.assertEqual(
                         thread.shift_kwargs,
-                        registration_config_to_measurement_kwargs(window._registration_config),
+                        registration_config_to_measurement_kwargs(
+                            window._registration_config
+                        ),
                     )
                     self.assertTrue(
                         window.calibration_panel.auto_correction_checkbox.isEnabled()
@@ -2080,7 +2144,9 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                     self.assertEqual(thread.correction_mode, "beam")
                     self.assertEqual(
                         thread.shift_kwargs,
-                        registration_config_to_measurement_kwargs(window._registration_config),
+                        registration_config_to_measurement_kwargs(
+                            window._registration_config
+                        ),
                     )
                     self.assertIsNotNone(thread.camera_pair)
                     self.assertIn(
@@ -2251,7 +2317,9 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                     self.assertIs(thread.calibration, window._calibration)
                     self.assertEqual(
                         thread.shift_kwargs,
-                        registration_config_to_measurement_kwargs(window._registration_config),
+                        registration_config_to_measurement_kwargs(
+                            window._registration_config
+                        ),
                     )
                     self.assertIsNotNone(thread.camera_pair)
                     self.assertIsNone(window._last_correction_result)
@@ -2329,7 +2397,9 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                     self.assertEqual(thread.correction_mode, "beam")
                     self.assertEqual(
                         thread.shift_kwargs,
-                        registration_config_to_measurement_kwargs(window._registration_config),
+                        registration_config_to_measurement_kwargs(
+                            window._registration_config
+                        ),
                     )
                     self.assertIsNotNone(thread.camera_pair)
                     self.assertEqual(window._server.result_calls, [])
@@ -2586,9 +2656,7 @@ class CalibrationStartDialogTests(unittest.TestCase):
         self.assertIsNotNone(
             dialog.findChild(QtWidgets.QLineEdit, "calibration_output_path_edit")
         )
-        self.assertIsNotNone(
-            dialog.findChild(QtWidgets.QSpinBox, "calibration_n_spin")
-        )
+        self.assertIsNotNone(dialog.findChild(QtWidgets.QSpinBox, "calibration_n_spin"))
         self.assertIsNotNone(
             dialog.findChild(QtWidgets.QDoubleSpinBox, "calibration_step_um_spin")
         )

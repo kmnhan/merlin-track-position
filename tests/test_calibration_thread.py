@@ -98,6 +98,8 @@ class CalibrationThreadTests(unittest.TestCase):
                 "roi_cam0_y": 2.0,
                 "roi_cam0_width": 3.0,
                 "roi_cam0_height": 4.0,
+                "camera_cam1_source_type": "basler",
+                "camera_cam1_serial_number": "1234",
             }
             thread.configure(
                 camera_pair,
@@ -133,6 +135,8 @@ class CalibrationThreadTests(unittest.TestCase):
         self.assertEqual(processing_steps, [(0, 2), (1, 2), (2, 2)])
         self.assertEqual(len(ready), 1)
         self.assertEqual(ready[0].attrs["roi_cam0_width"], 3.0)
+        self.assertEqual(ready[0].attrs["camera_cam1_source_type"], "basler")
+        self.assertEqual(ready[0].attrs["camera_cam1_serial_number"], "1234")
         self.assertEqual(failed, [])
 
     def test_run_emits_failure_when_run_calibration_raises(self):

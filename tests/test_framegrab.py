@@ -13,11 +13,22 @@ from merlin_track_position.instruments.basler import (
     get_basler_image,
     get_basler_image_stack,
 )
+from merlin_track_position.instruments.camera_config import (
+    BASLER_OUTPUT_RGB8,
+    SOURCE_BASLER,
+    SOURCE_FRAMEGRABBER,
+    CameraConfig,
+    DisplayTransform,
+    camera_config_mismatches,
+    camera_config_from_settings,
+    camera_metadata,
+)
 from merlin_track_position.instruments.cameras import (
     BaslerCameraPlugin,
     CallableCameraPlugin,
     CameraPairPlugin,
     FramegrabberCameraPlugin,
+    camera_pair_from_configs,
     capture_image_and_display_stacks,
     capture_image_stack,
     crop_image_to_roi,
@@ -185,6 +196,34 @@ class FakeGrabResult:
 
     def GetErrorDescription(self):
         return "fake failure"
+
+
+class FakeConvertedImage:
+    def __init__(self, array):
+        self.array = np.asarray(array)
+
+    def GetArray(self):
+        return self.array
+
+
+class FakeImageFormatConverter:
+    def __init__(self, converted):
+        self.converted = np.asarray(converted)
+        self.OutputPixelFormat = None
+        self.OutputBitAlignment = None
+        self.convert_calls = []
+
+    def Convert(self, grab_result):
+        self.convert_calls.append(grab_result)
+        return FakeConvertedImage(self.converted)
+
+
+class FakeSettings:
+    def __init__(self, values):
+        self.values = dict(values)
+
+    def value(self, key, fallback=None):
+        return self.values.get(str(key), fallback)
 
 
 class DevelopmentModeFramegrabTests(unittest.TestCase):
@@ -360,23 +399,196 @@ class DevelopmentModeFramegrabTests(unittest.TestCase):
         self.assertEqual(socket.recv_count, 3)
 
     def test_basler_configuration_sets_manual_exposure_and_expected_aoi(self):
+        config = CameraConfig(
+            slot="cam1",
+            source_type=SOURCE_BASLER,
+            serial_number="abc",
+            width=23,
+            height=17,
+            offset_x=3,
+            offset_y=5,
+            exposure_us=125000.0,
+            pixel_format="BayerRG12",
+            max_num_buffer=7,
+        )
         camera = FakeBaslerCamera()
 
         with patch(
             "merlin_track_position.instruments.basler.genicam.IsWritable",
             lambda node: node.writable,
         ):
-            basler._configure_camera(camera)
+            basler._configure_camera(camera, config)
 
         self.assertEqual(camera.UserSetSelector.Value, "Default")
         self.assertTrue(camera.UserSetLoad.executed)
         self.assertEqual(camera.GainAuto.Value, "Off")
         self.assertEqual(camera.ExposureAuto.Value, "Off")
-        self.assertEqual(camera.ExposureTimeAbs.Value, constants.BASLER_EXPOSURE)
-        self.assertEqual(camera.OffsetX.Value, camera.OffsetX.Min)
-        self.assertEqual(camera.OffsetY.Value, camera.OffsetY.Min)
-        self.assertEqual(camera.Width.Value, constants.IMAGE_WIDTH_CAM1)
-        self.assertEqual(camera.Height.Value, constants.IMAGE_HEIGHT_CAM1)
+        self.assertEqual(camera.ExposureTimeAbs.Value, config.exposure_us)
+        self.assertEqual(camera.OffsetX.Value, config.offset_x)
+        self.assertEqual(camera.OffsetY.Value, config.offset_y)
+        self.assertEqual(camera.Width.Value, config.width)
+        self.assertEqual(camera.Height.Value, config.height)
+        self.assertEqual(camera.PixelFormat.Value, config.pixel_format)
+
+    def test_camera_config_from_settings_normalizes_slot_values(self):
+        settings = FakeSettings(
+            {
+                "camera/cam0/source_type": SOURCE_BASLER,
+                "camera/cam0/serial_number": "1234",
+                "camera/cam0/width": "2592",
+                "camera/cam0/height": "1944",
+                "camera/cam0/output_mode": BASLER_OUTPUT_RGB8,
+                "camera/cam0/display_transpose": "true",
+                "camera/cam0/display_invert_x": "1",
+                "camera/cam0/display_invert_y": "false",
+            }
+        )
+
+        config = camera_config_from_settings(settings, "cam0")
+
+        self.assertEqual(config.source_type, SOURCE_BASLER)
+        self.assertEqual(config.serial_number, "1234")
+        self.assertEqual(config.width, 2592)
+        self.assertEqual(config.height, 1944)
+        self.assertEqual(config.output_mode, BASLER_OUTPUT_RGB8)
+        self.assertEqual(
+            config.display,
+            DisplayTransform(transpose=True, invert_x=True, invert_y=False),
+        )
+
+    def test_camera_pair_from_configs_maps_algorithm_slots_to_sources(self):
+        configs = {
+            "cam0": CameraConfig(
+                slot="cam0",
+                source_type=SOURCE_BASLER,
+                serial_number="left",
+                width=5,
+                height=4,
+            ),
+            "cam1": CameraConfig(
+                slot="cam1",
+                source_type=SOURCE_FRAMEGRABBER,
+                width=7,
+                height=6,
+            ),
+        }
+
+        pair = camera_pair_from_configs(configs)
+
+        self.assertIsInstance(pair.cam0, BaslerCameraPlugin)
+        self.assertIsInstance(pair.cam1, FramegrabberCameraPlugin)
+        self.assertEqual(pair.cam0.config.serial_number, "left")
+        self.assertEqual(pair.cam1.config.width, 7)
+
+    def test_camera_config_mismatch_checks_only_present_metadata(self):
+        configs = {
+            "cam0": CameraConfig(
+                slot="cam0",
+                source_type=SOURCE_FRAMEGRABBER,
+                width=4,
+                height=3,
+            ),
+            "cam1": CameraConfig(
+                slot="cam1",
+                source_type=SOURCE_BASLER,
+                serial_number="serial-a",
+                width=6,
+                height=5,
+                exposure_us=125000.0,
+            ),
+        }
+        metadata = camera_metadata(configs)
+        self.assertEqual(metadata["camera_cam1_exposure_us"], 125000.0)
+        metadata["camera_cam1_serial_number"] = "serial-b"
+
+        self.assertEqual(
+            camera_config_mismatches(metadata, configs),
+            ["cam1 serial_number"],
+        )
+        metadata["camera_cam1_serial_number"] = "serial-a"
+        metadata["camera_cam1_exposure_us"] = 100000.0
+        self.assertEqual(
+            camera_config_mismatches(metadata, configs),
+            ["cam1 exposure_us"],
+        )
+        self.assertEqual(camera_config_mismatches({}, configs), [])
+
+    def test_distinct_basler_configs_keep_distinct_sessions(self):
+        raw0 = np.arange(6, dtype=np.uint16).reshape(2, 3)
+        raw1 = raw0 + 10
+        camera0 = FakeBaslerCamera([raw0])
+        camera1 = FakeBaslerCamera([raw1])
+        config0 = CameraConfig(
+            slot="cam0",
+            source_type=SOURCE_BASLER,
+            serial_number="a",
+            width=3,
+            height=2,
+        )
+        config1 = CameraConfig(
+            slot="cam1",
+            source_type=SOURCE_BASLER,
+            serial_number="b",
+            width=3,
+            height=2,
+        )
+
+        def camera_for_serial(serial):
+            return {"a": camera0, "b": camera1}[serial]
+
+        with (
+            patch.object(constants, "IS_DAQ_PC", True),
+            patch(
+                "merlin_track_position.instruments.basler.genicam.IsWritable",
+                lambda node: node.writable,
+            ),
+            patch.object(
+                basler,
+                "_get_camera_by_serial_number",
+                side_effect=camera_for_serial,
+            ),
+        ):
+            image0 = get_basler_image(config0)
+            image1 = get_basler_image(config1)
+
+        np.testing.assert_array_equal(image0, raw0)
+        np.testing.assert_array_equal(image1, raw1)
+        self.assertEqual(camera0.open_count, 1)
+        self.assertEqual(camera1.open_count, 1)
+
+    def test_basler_rgb_output_uses_pylon_converter(self):
+        raw = np.arange(6, dtype=np.uint16).reshape(2, 3)
+        converted = np.zeros((2, 3, 3), dtype=np.uint8)
+        converted[..., 0] = 10
+        camera = FakeBaslerCamera([raw])
+        converter = FakeImageFormatConverter(converted)
+        config = CameraConfig(
+            slot="cam1",
+            source_type=SOURCE_BASLER,
+            serial_number="rgb",
+            width=3,
+            height=2,
+            output_mode=BASLER_OUTPUT_RGB8,
+            pixel_format="BayerRG12",
+        )
+
+        with (
+            patch.object(constants, "IS_DAQ_PC", True),
+            patch(
+                "merlin_track_position.instruments.basler.genicam.IsWritable",
+                lambda node: node.writable,
+            ),
+            patch.object(basler, "_get_camera_by_serial_number", return_value=camera),
+            patch.object(
+                basler.pylon,
+                "ImageFormatConverter",
+                return_value=converter,
+            ),
+        ):
+            image = get_basler_image(config)
+
+        np.testing.assert_array_equal(image, converted)
+        self.assertEqual(len(converter.convert_calls), 1)
 
     def test_daq_mode_basler_image_accepts_expected_shape(self):
         raw = np.arange(6, dtype=np.uint16).reshape(2, 3)
@@ -385,8 +597,9 @@ class DevelopmentModeFramegrabTests(unittest.TestCase):
             patch.object(constants, "IS_DAQ_PC", True),
             patch.object(constants, "IMAGE_HEIGHT_CAM1", 2),
             patch.object(constants, "IMAGE_WIDTH_CAM1", 3),
-            patch.object(basler, "_grab_single_image", return_value=raw),
+            patch.object(basler, "_session_for_config") as session_for_config,
         ):
+            session_for_config.return_value.get_image.return_value = raw
             image = get_basler_image()
 
         np.testing.assert_array_equal(image, raw)
@@ -511,9 +724,10 @@ class DevelopmentModeFramegrabTests(unittest.TestCase):
             patch.object(constants, "IS_DAQ_PC", True),
             patch.object(constants, "IMAGE_HEIGHT_CAM1", 2),
             patch.object(constants, "IMAGE_WIDTH_CAM1", 3),
-            patch.object(basler, "_grab_single_image", return_value=raw),
+            patch.object(basler, "_session_for_config") as session_for_config,
         ):
-            with self.assertRaisesRegex(RuntimeError, "does not match constants"):
+            session_for_config.return_value.get_image.return_value = raw
+            with self.assertRaisesRegex(RuntimeError, "does not match configured"):
                 get_basler_image()
 
     def test_capture_image_stack_discards_repeated_fresh_camera_frames(self):
@@ -632,7 +846,7 @@ class DevelopmentModeFramegrabTests(unittest.TestCase):
             captured_cam0, captured_cam1 = capture_image_stack(camera_pair, 2)
 
         get_cam0_stack.assert_called_once_with(2, timeout_ms=10000)
-        get_cam1_stack.assert_called_once_with(2)
+        self.assertEqual(get_cam1_stack.call_args.args[0], 2)
         sleep.assert_not_called()
         np.testing.assert_array_equal(captured_cam0, stack_cam0)
         np.testing.assert_array_equal(captured_cam1, stack_cam1)
