@@ -578,24 +578,24 @@ class VisualCalibrationTests(unittest.TestCase):
     def test_visual_calibration_probe_count_uses_default_n(self):
         self.assertEqual(visual_calibration_probe_count(), 21)
 
-    def test_visual_calibration_probe_offsets_match_old_backlash_path(self):
+    def test_visual_calibration_probe_offsets_match_z_ordered_backlash_path(self):
         offsets = _make_visual_probe_offsets_um(3, 10.0)
         expected_um = np.asarray(
             [
-                [0.0, 0.0, 10.0],
-                [0.0, 0.0, -10.0],
                 [0.0, 10.0, 0.0],
-                [10.0, 10.0, 10.0],
-                [-10.0, 10.0, 10.0],
-                [-10.0, 10.0, -10.0],
-                [10.0, 10.0, -10.0],
-                [10.0, -10.0, -10.0],
-                [10.0, -10.0, 10.0],
-                [-10.0, -10.0, 10.0],
-                [-10.0, -10.0, -10.0],
                 [0.0, -10.0, 0.0],
                 [10.0, 0.0, 0.0],
                 [-10.0, 0.0, 0.0],
+                [0.0, 0.0, 10.0],
+                [10.0, 10.0, 10.0],
+                [-10.0, 10.0, 10.0],
+                [10.0, -10.0, 10.0],
+                [-10.0, -10.0, 10.0],
+                [0.0, 0.0, -10.0],
+                [-10.0, 10.0, -10.0],
+                [10.0, 10.0, -10.0],
+                [10.0, -10.0, -10.0],
+                [-10.0, -10.0, -10.0],
                 [0.0, 0.0, 0.0],
             ],
             dtype=float,
@@ -604,10 +604,12 @@ class VisualCalibrationTests(unittest.TestCase):
         np.testing.assert_allclose(offsets, expected_um)
         np.testing.assert_allclose(offsets[-1], 0.0, atol=1e-15)
 
-    def test_visual_calibration_movement_deltas_minimize_negative_y_moves(self):
-        deltas = np.asarray(_make_visual_probe_deltas(3, 10.0), dtype=float)
-        np.testing.assert_allclose(np.sum(deltas, axis=0), 0.0, atol=1e-15)
-        self.assertEqual(np.count_nonzero(deltas[:, 1] < 0.0), 1)
+    def test_visual_calibration_movement_deltas_minimize_negative_z_moves(self):
+        for n in (3, 5):
+            with self.subTest(n=n):
+                deltas = np.asarray(_make_visual_probe_deltas(n, 10.0), dtype=float)
+                np.testing.assert_allclose(np.sum(deltas, axis=0), 0.0, atol=1e-15)
+                self.assertEqual(np.count_nonzero(deltas[:, 2] < 0.0), 1)
 
     def test_visual_calibration_probe_offsets_cover_old_backlash_path(self):
         offsets = _make_visual_probe_offsets_um(5, 10.0)

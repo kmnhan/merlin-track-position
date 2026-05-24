@@ -327,6 +327,9 @@ def _make_visual_probe_offsets_um(n: int, step_um: float) -> np.ndarray:
     for x_offset in (*positive_offsets, *negative_offsets):
         rows.append([x_offset, 0.0, 0.0])
 
+    # Minimize negative Z moves to reduce backlash effects, then sort by increasing
+    # distance from origin.
+    rows.sort(key=lambda row: (0 if row[2] >= 0.0 else 1, row[2]))
     rows.append([0.0, 0.0, 0.0])
     return np.asarray(rows, dtype=np.float64)
 
