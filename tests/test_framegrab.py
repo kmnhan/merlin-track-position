@@ -341,6 +341,38 @@ class DevelopmentModeFramegrabTests(unittest.TestCase):
         self.assertEqual(image.dtype, np.uint16)
         self.assertEqual(socket.recv_count, 1)
 
+    def test_daq_mode_framegrabber_image_uses_configured_crop(self):
+        raw = np.arange(4 * 5, dtype=np.uint16).reshape(4, 5)
+        message = framegrabber_message(
+            raw,
+            framegrab_module.LABVIEW_UNIX_EPOCH_OFFSET_MS + 1,
+        )
+        socket = FakeFramegrabberSocket([message])
+        config = CameraConfig(
+            slot="cam0",
+            source_type=SOURCE_FRAMEGRABBER,
+            width=3,
+            height=2,
+            offset_x=1,
+            offset_y=1,
+        )
+
+        with (
+            patch.object(constants, "IS_DAQ_PC", True),
+            patch(
+                "merlin_track_position.instruments.framegrab.time.time_ns",
+                return_value=0,
+            ),
+            patch(
+                "merlin_track_position.instruments.framegrab.zmq.Context.instance",
+                return_value=FakeFramegrabberContext(socket),
+            ),
+        ):
+            image = get_framegrabber_image(config=config)
+
+        np.testing.assert_array_equal(image, raw[1:3, 1:4])
+        self.assertEqual(socket.recv_count, 1)
+
     def test_daq_mode_framegrabber_discards_frames_not_later_than_request(self):
         stale = np.zeros((3, 4), dtype=np.uint16)
         fresh = stale + 7
@@ -404,6 +436,71 @@ class DevelopmentModeFramegrabTests(unittest.TestCase):
         time_ns.assert_called_once()
         self.assertEqual(socket.recv_count, 4)
         np.testing.assert_array_equal(stack, np.stack([fresh0, fresh1]))
+
+    def test_daq_mode_framegrabber_stack_uses_configured_crop(self):
+        raw0 = np.arange(4 * 5, dtype=np.uint16).reshape(4, 5)
+        raw1 = raw0 + 100
+        request_start_ms = framegrab_module.LABVIEW_UNIX_EPOCH_OFFSET_MS + 1000
+        socket = FakeFramegrabberSocket(
+            [
+                framegrabber_message(raw0, request_start_ms + 1),
+                framegrabber_message(raw1, request_start_ms + 2),
+            ]
+        )
+        config = CameraConfig(
+            slot="cam0",
+            source_type=SOURCE_FRAMEGRABBER,
+            width=2,
+            height=3,
+            offset_x=2,
+            offset_y=1,
+        )
+
+        with (
+            patch.object(constants, "IS_DAQ_PC", True),
+            patch(
+                "merlin_track_position.instruments.framegrab.time.time_ns",
+                return_value=1_000_000_000,
+            ),
+            patch(
+                "merlin_track_position.instruments.framegrab.zmq.Context.instance",
+                return_value=FakeFramegrabberContext(socket),
+            ),
+        ):
+            stack = get_framegrabber_image_stack(2, config=config)
+
+        expected = np.stack([raw0[1:4, 2:4], raw1[1:4, 2:4]])
+        np.testing.assert_array_equal(stack, expected)
+
+    def test_daq_mode_framegrabber_crop_rejects_too_small_raw_frame(self):
+        raw = np.zeros((2, 3), dtype=np.uint16)
+        message = framegrabber_message(
+            raw,
+            framegrab_module.LABVIEW_UNIX_EPOCH_OFFSET_MS + 1,
+        )
+        socket = FakeFramegrabberSocket([message])
+        config = CameraConfig(
+            slot="cam0",
+            source_type=SOURCE_FRAMEGRABBER,
+            width=3,
+            height=2,
+            offset_x=1,
+            offset_y=0,
+        )
+
+        with (
+            patch.object(constants, "IS_DAQ_PC", True),
+            patch(
+                "merlin_track_position.instruments.framegrab.time.time_ns",
+                return_value=0,
+            ),
+            patch(
+                "merlin_track_position.instruments.framegrab.zmq.Context.instance",
+                return_value=FakeFramegrabberContext(socket),
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "configured crop"):
+                get_framegrabber_image(config=config)
 
     def test_daq_mode_framegrabber_times_out_when_only_stale_frames_arrive(self):
         raw = np.zeros((3, 4), dtype=np.uint16)
@@ -979,11 +1076,38 @@ class DevelopmentModeFramegrabTests(unittest.TestCase):
         ):
             captured_cam0, captured_cam1 = capture_image_stack(camera_pair, 2)
 
-        get_cam0_stack.assert_called_once_with(2, timeout_ms=10000)
+        self.assertEqual(get_cam0_stack.call_args.args, (2,))
+        self.assertEqual(get_cam0_stack.call_args.kwargs["timeout_ms"], 10000)
+        self.assertIs(
+            get_cam0_stack.call_args.kwargs["config"],
+            camera_pair.cam0.config,
+        )
         self.assertEqual(get_cam1_stack.call_args.args[0], 2)
         sleep.assert_not_called()
         np.testing.assert_array_equal(captured_cam0, stack_cam0)
         np.testing.assert_array_equal(captured_cam1, stack_cam1)
+
+    def test_framegrabber_camera_plugin_does_not_double_crop_configured_stack(self):
+        config = CameraConfig(
+            slot="cam0",
+            source_type=SOURCE_FRAMEGRABBER,
+            width=3,
+            height=2,
+            offset_x=2,
+            offset_y=1,
+        )
+        stack = np.arange(2 * 3, dtype=np.uint16).reshape(1, 2, 3)
+        plugin = FramegrabberCameraPlugin(config=config)
+
+        with patch(
+            "merlin_track_position.instruments.cameras.get_framegrabber_image_stack",
+            return_value=stack,
+        ) as get_stack:
+            captured, display = plugin.capture_stack(1)
+
+        self.assertIs(get_stack.call_args.kwargs["config"], config)
+        np.testing.assert_array_equal(captured, stack)
+        np.testing.assert_array_equal(display, stack)
 
     def test_capture_image_stack_works_with_cropped_camera_callables(self):
         stale_cam0 = np.arange(4 * 5).reshape(4, 5)

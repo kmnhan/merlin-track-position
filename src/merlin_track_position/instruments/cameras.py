@@ -141,15 +141,18 @@ class FramegrabberCameraPlugin(CameraPlugin):
         )
 
     def _capture_once(self) -> npt.NDArray:
-        return _crop_to_config(get_framegrabber_image(), self.config)
+        return get_framegrabber_image(config=self.config)
 
     def capture_stack(self, frame_count: int) -> tuple[npt.NDArray, npt.NDArray]:
         frame_count = normalize_capture_count(frame_count)
         timeout_ms = max(1, int(self.fresh_frame_timeout_s * 1000.0 * frame_count))
         stack = np.asarray(
-            get_framegrabber_image_stack(frame_count, timeout_ms=timeout_ms)
+            get_framegrabber_image_stack(
+                frame_count,
+                timeout_ms=timeout_ms,
+                config=self.config,
+            )
         )
-        stack = _crop_stack_to_config(stack, self.config)
         self._capture_serial += frame_count
         self._last_frame_key = self._capture_serial
         self._last_image = stack[-1].copy()
@@ -242,7 +245,15 @@ class SimulatedCameraPlugin(CameraPlugin):
             image = simulator.get_framegrabber_image()
         else:
             image = simulator.get_basler_image()
-        return _crop_to_config(image, self.config)
+        return crop_image_to_roi(
+            image,
+            (
+                float(self.config.offset_x),
+                float(self.config.offset_y),
+                float(self.config.width),
+                float(self.config.height),
+            ),
+        )
 
 
 class CroppedCameraPlugin(CameraPlugin):
@@ -435,13 +446,3 @@ def crop_image_to_roi(
     y1 = min(max(int(math.ceil(y + height)), y0 + 1), image_height)
 
     return array[y0:y1, x0:x1, ...].copy()
-
-
-def _crop_to_config(image: npt.ArrayLike, config: CameraConfig) -> npt.NDArray:
-    array = np.asarray(image)
-    return array[: int(config.height), : int(config.width), ...].copy()
-
-
-def _crop_stack_to_config(stack: npt.ArrayLike, config: CameraConfig) -> npt.NDArray:
-    array = np.asarray(stack)
-    return array[:, : int(config.height), : int(config.width), ...].copy()

@@ -1246,6 +1246,66 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
         self.assertEqual(updated.pixel_format, "BayerRG12")
         self.assertFalse(updated.display.transpose)
 
+    def test_camera_settings_dialog_framegrabber_geometry_is_editable_after_basler(self):
+        get_qapp()
+        device = BaslerDevice("old", "old-model", "old-full-name")
+        capabilities = BaslerCameraCapabilities(
+            device,
+            width=BaslerValueRange(1, 12, 1),
+            height=BaslerValueRange(1, 12, 1),
+            offset_x=BaslerValueRange(0, 12, 1),
+            offset_y=BaslerValueRange(0, 12, 1),
+            exposure_us=BaslerValueRange(1.0, 1000000.0, 1.0),
+            pixel_formats=("Mono12",),
+        )
+        configs = {
+            "cam0": CameraConfig(
+                slot="cam0",
+                source_type=SOURCE_BASLER,
+                serial_number="old",
+                width=6,
+                height=5,
+            ),
+            "cam1": CameraConfig(
+                slot="cam1",
+                source_type=SOURCE_FRAMEGRABBER,
+                width=6,
+                height=5,
+            ),
+        }
+        with (
+            patch(
+                "merlin_track_position.interface.main_window.list_basler_devices",
+                return_value=(device,),
+            ),
+            patch(
+                "merlin_track_position.interface.main_window.read_basler_capabilities",
+                return_value=capabilities,
+            ),
+        ):
+            dialog = CameraSettingsDialog(configs)
+            try:
+                rows = dialog._rows["cam0"]
+                rows["source_type"].setCurrentIndex(
+                    rows["source_type"].findData(SOURCE_FRAMEGRABBER)
+                )
+                rows["width"].setValue(9000)
+                rows["height"].setValue(8000)
+                rows["offset_x"].setValue(123)
+                rows["offset_y"].setValue(456)
+
+                updated = dialog.configs()["cam0"]
+                self.assertTrue(rows["offset_x"].isEnabled())
+                self.assertFalse(rows["pixel_format"].isEnabled())
+            finally:
+                dialog.close()
+
+        self.assertEqual(updated.source_type, SOURCE_FRAMEGRABBER)
+        self.assertEqual(updated.width, 9000)
+        self.assertEqual(updated.height, 8000)
+        self.assertEqual(updated.offset_x, 123)
+        self.assertEqual(updated.offset_y, 456)
+
     def test_camera_settings_dialog_blocks_basler_without_connected_device(self):
         get_qapp()
         configs = {

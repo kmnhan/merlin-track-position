@@ -20,10 +20,6 @@ from merlin_track_position.constants import (
     DEFAULT_VISUAL_CALIBRATION_N,
     DEFAULT_VISUAL_CALIBRATION_MIN_SHIFT_PX,
     DEFAULT_VISUAL_CALIBRATION_STEP_UM,
-    IMAGE_HEIGHT_CAM0,
-    IMAGE_HEIGHT_CAM1,
-    IMAGE_WIDTH_CAM0,
-    IMAGE_WIDTH_CAM1,
     IS_DAQ_PC,
 )
 from merlin_track_position.instruments.parse_config import get_base_file_dir
@@ -42,6 +38,7 @@ from merlin_track_position.instruments.camera_config import (
     camera_config_mismatches,
     camera_configs_from_settings,
     camera_metadata,
+    default_camera_config,
     default_camera_configs,
     save_camera_config,
 )
@@ -118,8 +115,8 @@ class _CorrectionUnavailable(RuntimeError):
 
 _ACTIVE_CAMERA_CONFIGS: dict[str, CameraConfig] = default_camera_configs()
 CAMERA_IMAGE_SIZES: dict[str, tuple[int, int]] = {
-    "cam0": (IMAGE_WIDTH_CAM0, IMAGE_HEIGHT_CAM0),
-    "cam1": (IMAGE_WIDTH_CAM1, IMAGE_HEIGHT_CAM1),
+    slot: (_ACTIVE_CAMERA_CONFIGS[slot].width, _ACTIVE_CAMERA_CONFIGS[slot].height)
+    for slot in CAMERA_SLOTS
 }
 IMAGE_REFRESH_INTERVAL_MS = 400
 PERSISTENCE_FLUSH_INTERVAL_MS = 5000
@@ -175,9 +172,15 @@ def _set_active_camera_configs(configs: Mapping[str, CameraConfig]) -> None:
 
 
 def _default_roi_geometry(
-    image_width: float = IMAGE_WIDTH_CAM0,
-    image_height: float = IMAGE_HEIGHT_CAM0,
+    image_width: float | None = None,
+    image_height: float | None = None,
 ) -> tuple[float, float, float, float]:
+    if image_width is None or image_height is None:
+        default_config = default_camera_config("cam0")
+        if image_width is None:
+            image_width = float(default_config.width)
+        if image_height is None:
+            image_height = float(default_config.height)
     width = 0.25 * image_width
     height = 0.25 * image_height
     return (
@@ -190,9 +193,15 @@ def _default_roi_geometry(
 
 def _clamp_roi_geometry(
     geometry: tuple[float, float, float, float],
-    image_width: float = IMAGE_WIDTH_CAM0,
-    image_height: float = IMAGE_HEIGHT_CAM0,
+    image_width: float | None = None,
+    image_height: float | None = None,
 ) -> tuple[float, float, float, float]:
+    if image_width is None or image_height is None:
+        default_config = default_camera_config("cam0")
+        if image_width is None:
+            image_width = float(default_config.width)
+        if image_height is None:
+            image_height = float(default_config.height)
     x, y, width, height = geometry
     if not all(math.isfinite(value) for value in geometry):
         return _default_roi_geometry(image_width, image_height)
@@ -572,11 +581,21 @@ class CameraSettingsDialog(QtWidgets.QDialog):
         serial_combo.setEnabled(is_basler)
         pixel_format_combo.setEnabled(is_basler)
         rows["exposure_us"].setEnabled(is_basler)
-        rows["offset_x"].setEnabled(is_basler)
-        rows["offset_y"].setEnabled(is_basler)
+        rows["output_mode"].setEnabled(is_basler)
         rows["max_num_buffer"].setEnabled(is_basler)
 
         if not is_basler:
+            for name, minimum, maximum in (
+                ("width", 1, 10000),
+                ("height", 1, 10000),
+                ("offset_x", 0, 10000),
+                ("offset_y", 0, 10000),
+            ):
+                spin = cast(QtWidgets.QSpinBox, rows[name])
+                spin.setEnabled(True)
+                spin.setRange(minimum, maximum)
+                spin.setSingleStep(1)
+            pixel_format_combo.clear()
             model_label.setText("")
             return
 
@@ -1691,7 +1710,7 @@ class MainWindow(_MainWindowGUI):
         with self._image_capture_locks[camera]:
             config = self._camera_configs[camera]
             if config.source_type == "framegrabber":
-                image = get_framegrabber_image()
+                return get_framegrabber_image(config=config)
             elif config.source_type == "basler":
                 return get_basler_image(config)
             elif camera == "cam0":
@@ -1700,7 +1719,12 @@ class MainWindow(_MainWindowGUI):
                 image = simulator.get_basler_image()
             return crop_image_to_roi(
                 image,
-                (0.0, 0.0, float(config.width), float(config.height)),
+                (
+                    float(config.offset_x),
+                    float(config.offset_y),
+                    float(config.width),
+                    float(config.height),
+                ),
             )
 
     @QtCore.Slot(str, object)

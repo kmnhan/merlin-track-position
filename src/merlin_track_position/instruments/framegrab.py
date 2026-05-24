@@ -8,20 +8,30 @@ import numpy.typing as npt
 import zmq
 
 from merlin_track_position import constants
+from merlin_track_position.instruments.camera_config import (
+    CameraConfig,
+    default_camera_config,
+)
 from merlin_track_position.instruments.simulated_hardware import simulator
 
 LABVIEW_UNIX_EPOCH_OFFSET_MS = 2_082_844_800_000
 
 
-def get_framegrabber_image(timeout_ms: int = 5000) -> npt.NDArray:
+def get_framegrabber_image(
+    timeout_ms: int = 5000,
+    *,
+    config: CameraConfig | None = None,
+) -> npt.NDArray:
     """Request one fresh image from the FrameGrabber LabVIEW panel."""
 
-    return get_framegrabber_image_stack(1, timeout_ms=timeout_ms)[0]
+    return get_framegrabber_image_stack(1, timeout_ms=timeout_ms, config=config)[0]
 
 
 def get_framegrabber_image_stack(
     frame_count: int,
     timeout_ms: int = 5000,
+    *,
+    config: CameraConfig | None = None,
 ) -> npt.NDArray:
     """Request consecutive fresh images from the FrameGrabber LabVIEW panel.
 
@@ -32,11 +42,18 @@ def get_framegrabber_image_stack(
     timeout_ms
         Maximum time set to the zmq RCVTIMEO option, to wait for a response before
         raising TimeoutError.
+    config
+        Logical camera configuration used to crop raw framegrabber frames.
     """
     frame_count = _validate_frame_count(frame_count)
+    if config is None:
+        config = default_camera_config("cam0")
     if not constants.IS_DAQ_PC:
         return np.stack(
-            [simulator.get_framegrabber_image() for _ in range(frame_count)],
+            [
+                _crop_frame_to_config(simulator.get_framegrabber_image(), config)
+                for _ in range(frame_count)
+            ],
             axis=0,
         )
 
@@ -75,13 +92,10 @@ def get_framegrabber_image_stack(
             if frame_dt <= last_accepted_dt:
                 continue
 
-            frames.append(
-                np.frombuffer(data, dtype=np.dtype(meta["dtype"]))
-                .reshape(tuple(meta["shape"]))[
-                    : constants.IMAGE_HEIGHT_CAM0, : constants.IMAGE_WIDTH_CAM0
-                ]
-                .copy()
+            raw = np.frombuffer(data, dtype=np.dtype(meta["dtype"])).reshape(
+                tuple(meta["shape"])
             )
+            frames.append(_crop_frame_to_config(raw, config))
             last_accepted_dt = frame_dt
 
     return np.stack(frames, axis=0)
@@ -92,3 +106,31 @@ def _validate_frame_count(frame_count: int) -> int:
     if value < 1:
         raise ValueError("frame_count must be >= 1")
     return value
+
+
+def _crop_frame_to_config(
+    image: npt.ArrayLike,
+    config: CameraConfig,
+) -> npt.NDArray:
+    array = np.asarray(image)
+    if array.ndim < 2:
+        raise RuntimeError(
+            f"Framegrabber image must be at least 2D, got shape {array.shape!r}"
+        )
+    x0 = int(config.offset_x)
+    y0 = int(config.offset_y)
+    width = int(config.width)
+    height = int(config.height)
+    if x0 < 0 or y0 < 0 or width < 1 or height < 1:
+        raise RuntimeError(
+            "Framegrabber configured crop must have non-negative offsets and "
+            f"positive size, got offset=({x0}, {y0}) size=({width}, {height})"
+        )
+    x1 = x0 + width
+    y1 = y0 + height
+    if array.shape[0] < y1 or array.shape[1] < x1:
+        raise RuntimeError(
+            f"Framegrabber image shape {array.shape[:2]!r} cannot satisfy "
+            f"configured crop x={x0}..{x1}, y={y0}..{y1}"
+        )
+    return array[y0:y1, x0:x1, ...].copy()

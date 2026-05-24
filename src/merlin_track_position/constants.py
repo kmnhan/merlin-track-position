@@ -124,7 +124,7 @@ DEFAULT_LQR_CORRECTION_KALMAN_MEASUREMENT_COVARIANCE: (
 DEFAULT_LQR_CORRECTION_KALMAN_INITIAL_COVARIANCE: float = 1.0
 DEFAULT_LQR_CORRECTION_KALMAN_INNOVATION_GATE: float = 25.0
 
-# Image size for initial crop from each camera array.
+# Default logical image sizes used to seed camera configs and legacy metadata fallbacks.
 IMAGE_WIDTH_CAM0: int = 704
 IMAGE_HEIGHT_CAM0: int = 480
 IMAGE_WIDTH_CAM1: int = 1440
