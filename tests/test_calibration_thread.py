@@ -107,7 +107,7 @@ class CalibrationThreadTests(unittest.TestCase):
                 output_path,
                 n=3,
                 step_um=10.0,
-                shift_kwargs={"phase_max_iters": 25},
+                shift_kwargs={"use_window": True},
             )
             with patch(
                 "merlin_track_position.interface.calibration_thread.run_calibration",
@@ -124,7 +124,7 @@ class CalibrationThreadTests(unittest.TestCase):
                     3,
                     10.0,
                     roi_metadata,
-                    {"phase_max_iters": 25},
+                    {"use_window": True},
                 )
             ],
         )
@@ -333,7 +333,7 @@ class DetectShiftThreadTests(unittest.TestCase):
         thread.configure(
             calibration,
             camera_pair,
-            shift_kwargs={"phase_l2_size": 9},
+            shift_kwargs={"use_window": True},
         )
         with patch(
             "merlin_track_position.interface.detection_thread.detect_shift",
@@ -341,7 +341,7 @@ class DetectShiftThreadTests(unittest.TestCase):
         ):
             thread.run()
 
-        self.assertEqual(calls, [(calibration, camera_pair, {"phase_l2_size": 9})])
+        self.assertEqual(calls, [(calibration, camera_pair, {"use_window": True})])
         self.assertEqual(ready, [result])
         self.assertEqual(failed, [])
 

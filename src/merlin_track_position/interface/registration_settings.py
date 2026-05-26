@@ -17,8 +17,6 @@ __all__ = (
     "REGISTRATION_CLIP_ENABLED_SETTINGS_KEY",
     "REGISTRATION_CLIP_LOW_SETTINGS_KEY",
     "REGISTRATION_CLIP_HIGH_SETTINGS_KEY",
-    "REGISTRATION_PHASE_L2_SIZE_SETTINGS_KEY",
-    "REGISTRATION_PHASE_MAX_ITERS_SETTINGS_KEY",
     "REGISTRATION_USE_WINDOW_SETTINGS_KEY",
     "REGISTRATION_USE_ECC_REFINEMENT_SETTINGS_KEY",
     "REGISTRATION_ECC_USE_WINDOW_SETTINGS_KEY",
@@ -46,8 +44,6 @@ REGISTRATION_CAPTURE_COUNT_MAX = 100
 REGISTRATION_CLIP_ENABLED_SETTINGS_KEY = "registration/clip_enabled"
 REGISTRATION_CLIP_LOW_SETTINGS_KEY = "registration/clip_low"
 REGISTRATION_CLIP_HIGH_SETTINGS_KEY = "registration/clip_high"
-REGISTRATION_PHASE_L2_SIZE_SETTINGS_KEY = "registration/phase_l2_size"
-REGISTRATION_PHASE_MAX_ITERS_SETTINGS_KEY = "registration/phase_max_iters"
 REGISTRATION_USE_WINDOW_SETTINGS_KEY = "registration/use_window"
 REGISTRATION_USE_ECC_REFINEMENT_SETTINGS_KEY = "registration/use_ecc_refinement"
 REGISTRATION_ECC_USE_WINDOW_SETTINGS_KEY = "registration/ecc_use_window"
@@ -59,8 +55,6 @@ DEFAULT_REGISTRATION_CONFIG: dict[str, object] = {
     "clip_enabled": True,
     "clip_low": 1.0,
     "clip_high": 99.0,
-    "phase_l2_size": 7,
-    "phase_max_iters": 50,
     "use_window": False,
     "use_ecc_refinement": False,
     "ecc_use_window": False,
@@ -90,20 +84,6 @@ def normalized_registration_config(
         clip_low = float(DEFAULT_REGISTRATION_CONFIG["clip_low"])
         clip_high = float(DEFAULT_REGISTRATION_CONFIG["clip_high"])
 
-    phase_l2_size = _as_int(
-        values["phase_l2_size"],
-        DEFAULT_REGISTRATION_CONFIG["phase_l2_size"],
-    )
-    if phase_l2_size < 1:
-        phase_l2_size = int(DEFAULT_REGISTRATION_CONFIG["phase_l2_size"])
-
-    phase_max_iters = _as_int(
-        values["phase_max_iters"],
-        DEFAULT_REGISTRATION_CONFIG["phase_max_iters"],
-    )
-    if phase_max_iters < 1:
-        phase_max_iters = int(DEFAULT_REGISTRATION_CONFIG["phase_max_iters"])
-
     capture_count = _as_int(
         values["capture_count"],
         DEFAULT_REGISTRATION_CONFIG["capture_count"],
@@ -116,8 +96,6 @@ def normalized_registration_config(
         "clip_enabled": clip_enabled,
         "clip_low": float(clip_low),
         "clip_high": float(clip_high),
-        "phase_l2_size": int(phase_l2_size),
-        "phase_max_iters": int(phase_max_iters),
         "use_window": _as_bool(
             values["use_window"],
             bool(DEFAULT_REGISTRATION_CONFIG["use_window"]),
@@ -152,14 +130,6 @@ def registration_config_from_settings(settings: Any) -> dict[str, object]:
             "clip_high": settings.value(
                 REGISTRATION_CLIP_HIGH_SETTINGS_KEY,
                 DEFAULT_REGISTRATION_CONFIG["clip_high"],
-            ),
-            "phase_l2_size": settings.value(
-                REGISTRATION_PHASE_L2_SIZE_SETTINGS_KEY,
-                DEFAULT_REGISTRATION_CONFIG["phase_l2_size"],
-            ),
-            "phase_max_iters": settings.value(
-                REGISTRATION_PHASE_MAX_ITERS_SETTINGS_KEY,
-                DEFAULT_REGISTRATION_CONFIG["phase_max_iters"],
             ),
             "use_window": settings.value(
                 REGISTRATION_USE_WINDOW_SETTINGS_KEY,
@@ -200,14 +170,6 @@ def save_registration_config(
     )
     settings.setValue(REGISTRATION_CLIP_LOW_SETTINGS_KEY, normalized["clip_low"])
     settings.setValue(REGISTRATION_CLIP_HIGH_SETTINGS_KEY, normalized["clip_high"])
-    settings.setValue(
-        REGISTRATION_PHASE_L2_SIZE_SETTINGS_KEY,
-        normalized["phase_l2_size"],
-    )
-    settings.setValue(
-        REGISTRATION_PHASE_MAX_ITERS_SETTINGS_KEY,
-        normalized["phase_max_iters"],
-    )
     settings.setValue(REGISTRATION_USE_WINDOW_SETTINGS_KEY, normalized["use_window"])
     settings.setValue(
         REGISTRATION_USE_ECC_REFINEMENT_SETTINGS_KEY,
@@ -256,8 +218,6 @@ def registration_config_to_shift_kwargs(
     shift_kwargs = {
         "clip_percentiles": clip_percentiles,
         "use_window": normalized["use_window"],
-        "phase_l2_size": normalized["phase_l2_size"],
-        "phase_max_iters": normalized["phase_max_iters"],
         "use_ecc_refinement": normalized["use_ecc_refinement"],
         "ecc_use_window": normalized["ecc_use_window"],
         "ecc_motion_model": normalized["ecc_motion_model"],

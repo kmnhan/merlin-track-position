@@ -1233,6 +1233,7 @@ class DevelopmentModeFramegrabTests(unittest.TestCase):
             shifted,
             check_tiles=False,
             clip_percentiles=None,
+            use_ecc_refinement=True,
         )
 
         self.assertGreater(float(np.mean(np.abs(shifted - reference))), 0.0)
@@ -1261,6 +1262,7 @@ class DevelopmentModeFramegrabTests(unittest.TestCase):
             shifted,
             check_tiles=False,
             clip_percentiles=None,
+            use_ecc_refinement=True,
         )
 
         self.assertGreater(float(np.mean(np.abs(shifted - reference))), 0.0)

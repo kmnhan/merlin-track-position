@@ -42,64 +42,63 @@ class ShiftTests(unittest.TestCase):
 
         np.testing.assert_allclose(result["shift_px"].values, [6.25, -4.4], atol=0.25)
 
-    def test_opencv_iterative_phase_parameters_and_sign_convention(self):
+    def test_opencv_phase_registration_sign_convention(self):
         reference = textured_image(seed=4)
 
         with patch(
-            "merlin_track_position.tracking.shift.cv2.phaseCorrelateIterative",
-            return_value=(1.25, -2.5),
+            "merlin_track_position.tracking.shift.cv2.phaseCorrelate",
+            side_effect=(
+                ((1.25, -2.5), 0.95),
+                ((-1.25, 2.5), 0.95),
+            ),
         ) as phase_correlate:
             result = estimate_shift(
                 reference,
                 reference.copy(),
                 check_tiles=False,
-                phase_l2_size=11,
-                phase_max_iters=23,
             )
 
-        self.assertEqual(phase_correlate.call_args.args[2:], (11, 23))
-        self.assertEqual(phase_correlate.call_args.args[0].dtype, np.dtype(np.float32))
-        self.assertEqual(phase_correlate.call_args.args[1].dtype, np.dtype(np.float32))
+        self.assertEqual(phase_correlate.call_count, 2)
+        self.assertEqual(
+            phase_correlate.call_args_list[0].args[0].dtype,
+            np.dtype(np.float32),
+        )
+        self.assertEqual(
+            phase_correlate.call_args_list[0].args[1].dtype,
+            np.dtype(np.float32),
+        )
         np.testing.assert_allclose(result["shift_px"].values, [1.25, -2.5])
 
     def test_uint16_phase_registration_uses_float32_work_images(self):
         reference = textured_uint16(seed=19)
 
         with patch(
-            "merlin_track_position.tracking.shift.cv2.phaseCorrelateIterative",
-            return_value=(1.25, -2.5),
+            "merlin_track_position.tracking.shift.cv2.phaseCorrelate",
+            side_effect=(
+                ((1.25, -2.5), 0.95),
+                ((-1.25, 2.5), 0.95),
+            ),
         ) as phase_correlate:
             estimate_shift(reference, reference.copy(), check_tiles=False)
 
-        self.assertEqual(phase_correlate.call_args.args[0].ndim, 2)
-        self.assertEqual(phase_correlate.call_args.args[1].ndim, 2)
-        self.assertEqual(phase_correlate.call_args.args[0].dtype, np.dtype(np.float32))
-        self.assertEqual(phase_correlate.call_args.args[1].dtype, np.dtype(np.float32))
+        self.assertEqual(phase_correlate.call_args_list[0].args[0].ndim, 2)
+        self.assertEqual(phase_correlate.call_args_list[0].args[1].ndim, 2)
+        self.assertEqual(
+            phase_correlate.call_args_list[0].args[0].dtype,
+            np.dtype(np.float32),
+        )
+        self.assertEqual(
+            phase_correlate.call_args_list[0].args[1].dtype,
+            np.dtype(np.float32),
+        )
 
-    def test_phase_registration_parameters_must_be_positive_integers(self):
-        reference = textured_image(seed=15)
-        current = reference.copy()
-
-        for kwargs in (
-            {"phase_l2_size": 0},
-            {"phase_l2_size": 1.5},
-            {"phase_l2_size": True},
-            {"phase_max_iters": 0},
-            {"phase_max_iters": 1.5},
-            {"phase_max_iters": False},
-        ):
-            with self.subTest(kwargs=kwargs):
-                name = next(iter(kwargs))
-                with self.assertRaisesRegex(ValueError, name):
-                    estimate_shift(reference, current, check_tiles=False, **kwargs)
-
-    def test_tile_consistency_uses_opencv_iterative_phase_registration(self):
+    def test_tile_consistency_uses_opencv_phase_registration(self):
         reference = textured_image(seed=16)
         current = ndimage.shift(reference, shift=(1.25, -1.75), order=3, mode="wrap")
 
         result = estimate_shift(reference, current, check_tiles=True)
 
-        np.testing.assert_allclose(result["shift_px"].values, [-1.75, 1.25], atol=0.25)
+        np.testing.assert_allclose(result["shift_px"].values, [-1.75, 1.25], atol=0.45)
         self.assertNotIn(
             "tile shift estimates are inconsistent", result.attrs["warnings"]
         )
@@ -242,8 +241,11 @@ class ShiftTests(unittest.TestCase):
         rec709_gray = 0.2126 * red + 0.7152 * green + 0.0722 * blue
 
         with patch(
-            "merlin_track_position.tracking.shift.cv2.phaseCorrelateIterative",
-            return_value=(1.5, -2.25),
+            "merlin_track_position.tracking.shift.cv2.phaseCorrelate",
+            side_effect=(
+                ((1.5, -2.25), 0.95),
+                ((-1.5, 2.25), 0.95),
+            ),
         ) as phase_correlate:
             result = estimate_shift(
                 reference,
@@ -252,18 +254,21 @@ class ShiftTests(unittest.TestCase):
                 clip_percentiles=None,
             )
 
-        self.assertEqual(phase_correlate.call_args.args[0].ndim, 2)
-        self.assertEqual(phase_correlate.call_args.args[1].ndim, 2)
-        self.assertEqual(phase_correlate.call_args.args[0].dtype, np.dtype(np.float32))
+        self.assertEqual(phase_correlate.call_args_list[0].args[0].ndim, 2)
+        self.assertEqual(phase_correlate.call_args_list[0].args[1].ndim, 2)
+        self.assertEqual(
+            phase_correlate.call_args_list[0].args[0].dtype,
+            np.dtype(np.float32),
+        )
         np.testing.assert_allclose(
-            phase_correlate.call_args.args[0],
+            phase_correlate.call_args_list[0].args[0],
             normalize_intensity(basler_gray, clip_percentiles=None),
             rtol=1e-6,
             atol=1e-6,
         )
         self.assertFalse(
             np.allclose(
-                phase_correlate.call_args.args[0],
+                phase_correlate.call_args_list[0].args[0],
                 normalize_intensity(rec709_gray, clip_percentiles=None),
                 rtol=1e-6,
                 atol=1e-6,

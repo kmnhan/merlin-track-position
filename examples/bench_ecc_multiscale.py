@@ -29,6 +29,19 @@ import numpy as np
 
 CAMERAS = ("cam0", "cam1")
 PIXEL_AXES = ("du_px", "dv_px")
+ECC_ALGORITHMS = (
+    "single_ecc_raw",
+    "multi_ecc_raw",
+    "single_ecc_norm",
+    "multi_ecc_norm",
+)
+REFERENCE_ALGORITHMS = ("phase_only",) + ECC_ALGORITHMS
+ECC_NATIVE_DTYPES = (
+    np.dtype(np.uint8),
+    np.dtype(np.uint16),
+    np.dtype(np.float32),
+    np.dtype(np.float64),
+)
 
 
 @dataclass(frozen=True)
@@ -37,6 +50,7 @@ class ImageRecord:
     camera: str
     image: np.ndarray
     shift_px: np.ndarray
+    polar_delta_deg: float
 
 
 @dataclass(frozen=True)
@@ -47,6 +61,11 @@ class Result:
     motion_model: str
     algorithm: str
     seed: str
+    reference_u_px: float
+    reference_v_px: float
+    phase_du_px: float
+    phase_dv_px: float
+    polar_delta_deg: float
     expected_du_px: float
     expected_dv_px: float
     measured_du_px: float
@@ -57,6 +76,7 @@ class Result:
     elapsed_ms: float
     success: bool
     message: str
+    warp_json: str
 
 
 def main() -> None:
@@ -80,19 +100,35 @@ def main() -> None:
         )
         for camera in CAMERAS
     }
+    reference_points = beam_target_local_points(
+        calibration_reference,
+        calibration_attrs,
+    )
     records = load_history_records(args.history)
 
     verify_cv2(args.output_dir)
+    with (args.output_dir / "reference_points.json").open("w") as file:
+        json.dump(
+            {camera: point.tolist() for camera, point in reference_points.items()},
+            file,
+            indent=2,
+        )
 
     results: list[Result] = []
     for motion_model in ("affine", "homography"):
         results.extend(
-            run_reference_history_cases(reference_crops, records, motion_model)
+            run_reference_history_cases(
+                reference_crops,
+                reference_points,
+                records,
+                motion_model,
+            )
         )
-        results.extend(run_adjacent_history_cases(records, motion_model))
+        results.extend(run_adjacent_history_cases(records, reference_points, motion_model))
         results.extend(
             run_synthetic_cases(
                 reference_crops,
+                reference_points,
                 records,
                 motion_model,
                 max_bases=args.max_synthetic_bases,
@@ -136,6 +172,9 @@ def load_history_records(path: Path) -> list[ImageRecord]:
         for run in sorted(handle):
             group = handle[run]
             shifts = np.asarray(group["shift_px"], dtype=np.float64)
+            polar_delta_deg = float(
+                scalar_attr(group.attrs.get("correction_polar_delta_deg", 0.0))
+            )
             for camera_index, camera in enumerate(CAMERAS):
                 records.append(
                     ImageRecord(
@@ -143,6 +182,7 @@ def load_history_records(path: Path) -> list[ImageRecord]:
                         camera=camera,
                         image=group[f"current_{camera}"][()],
                         shift_px=shifts[camera_index].copy(),
+                        polar_delta_deg=polar_delta_deg,
                     )
                 )
     return records
@@ -162,6 +202,15 @@ def crop_to_roi(
     attrs: dict[str, object],
     camera: str,
 ) -> np.ndarray:
+    x0, y0, x1, y1 = roi_crop_bounds(image, attrs, camera)
+    return image[y0:y1, x0:x1]
+
+
+def roi_crop_bounds(
+    image: np.ndarray,
+    attrs: dict[str, object],
+    camera: str,
+) -> tuple[int, int, int, int]:
     x = float(attrs[f"roi_{camera}_x"])
     y = float(attrs[f"roi_{camera}_y"])
     width = float(attrs[f"roi_{camera}_width"])
@@ -175,11 +224,37 @@ def crop_to_roi(
     y0 = min(max(int(math.floor(y)), 0), image_height - 1)
     x1 = min(max(int(math.ceil(x + width)), x0 + 1), image_width)
     y1 = min(max(int(math.ceil(y + height)), y0 + 1), image_height)
-    return image[y0:y1, x0:x1]
+    return x0, y0, x1, y1
+
+
+def beam_target_local_points(
+    references: dict[str, np.ndarray],
+    attrs: dict[str, object],
+) -> dict[str, np.ndarray]:
+    points: dict[str, np.ndarray] = {}
+    for camera in CAMERAS:
+        x0, y0, x1, y1 = roi_crop_bounds(references[camera], attrs, camera)
+        full_point = np.asarray(
+            [
+                float(attrs[f"beam_target_{camera}_u"]),
+                float(attrs[f"beam_target_{camera}_v"]),
+            ],
+            dtype=np.float64,
+        )
+        clamped = np.asarray(
+            [
+                min(max(full_point[0], float(x0)), float(x1 - 1)),
+                min(max(full_point[1], float(y0)), float(y1 - 1)),
+            ],
+            dtype=np.float64,
+        )
+        points[camera] = clamped - np.asarray([float(x0), float(y0)])
+    return points
 
 
 def run_reference_history_cases(
     reference_crops: dict[str, np.ndarray],
+    reference_points: dict[str, np.ndarray],
     records: list[ImageRecord],
     motion_model: str,
 ) -> list[Result]:
@@ -188,18 +263,20 @@ def run_reference_history_cases(
         reference = reference_crops[record.camera]
         case_id = f"{record.run}:{record.camera}:reference"
         expected = record.shift_px
-        for algorithm in ("phase_only", "single_ecc", "multi_ecc"):
+        for algorithm in REFERENCE_ALGORITHMS:
             results.append(
                 evaluate_pair(
                     reference,
                     record.image,
                     expected,
+                    reference_points[record.camera],
                     family="reference_history",
                     case_id=case_id,
                     camera=record.camera,
                     motion_model=motion_model,
                     algorithm=algorithm,
                     seed="phase",
+                    polar_delta_deg=record.polar_delta_deg,
                 )
             )
     return results
@@ -207,6 +284,7 @@ def run_reference_history_cases(
 
 def run_adjacent_history_cases(
     records: list[ImageRecord],
+    reference_points: dict[str, np.ndarray],
     motion_model: str,
 ) -> list[Result]:
     results: list[Result] = []
@@ -218,18 +296,23 @@ def run_adjacent_history_cases(
         for left, right in zip(camera_records, camera_records[1:], strict=False):
             expected = right.shift_px - left.shift_px
             case_id = f"{left.run}_to_{right.run}:{camera}"
-            for algorithm in ("phase_only", "single_ecc", "multi_ecc"):
+            for algorithm in REFERENCE_ALGORITHMS:
                 results.append(
                     evaluate_pair(
                         left.image,
                         right.image,
                         expected,
+                        reference_points[camera],
                         family="adjacent_history",
                         case_id=case_id,
                         camera=camera,
                         motion_model=motion_model,
                         algorithm=algorithm,
                         seed="phase",
+                        polar_delta_deg=max(
+                            abs(left.polar_delta_deg),
+                            abs(right.polar_delta_deg),
+                        ),
                     )
                 )
     return results
@@ -237,6 +320,7 @@ def run_adjacent_history_cases(
 
 def run_synthetic_cases(
     reference_crops: dict[str, np.ndarray],
+    reference_points: dict[str, np.ndarray],
     records: list[ImageRecord],
     motion_model: str,
     *,
@@ -247,21 +331,23 @@ def run_synthetic_cases(
     for camera, label, image in bases:
         for transform_name, warp in synthetic_transforms(image.shape):
             sample = warp_image(image, warp)
-            expected = point_shift(warp, image_center(image.shape))
+            expected = point_shift(warp, reference_points[camera])
             case_id = f"{label}:{transform_name}"
             for seed in ("phase", "identity"):
-                for algorithm in ("single_ecc", "multi_ecc"):
+                for algorithm in ECC_ALGORITHMS:
                     results.append(
                         evaluate_pair(
                             image,
                             sample,
                             expected,
+                            reference_points[camera],
                             family="synthetic",
                             case_id=case_id,
                             camera=camera,
                             motion_model=motion_model,
                             algorithm=algorithm,
                             seed=seed,
+                            polar_delta_deg=0.0,
                         )
                     )
     return results
@@ -391,6 +477,7 @@ def evaluate_pair(
     reference: np.ndarray,
     sample: np.ndarray,
     expected_shift: np.ndarray,
+    reference_point_px: np.ndarray,
     *,
     family: str,
     case_id: str,
@@ -398,8 +485,10 @@ def evaluate_pair(
     motion_model: str,
     algorithm: str,
     seed: str,
+    polar_delta_deg: float,
 ) -> Result:
     start = time.perf_counter()
+    phase_shift = np.asarray([float("nan"), float("nan")], dtype=np.float64)
     try:
         reference_norm = normalize_intensity(reference)
         sample_norm = normalize_intensity(sample)
@@ -413,9 +502,12 @@ def evaluate_pair(
             corr = normalized_correlation(reference_norm, sample_norm, warp)
         else:
             measured, warp, corr = ecc_refine(
+                reference,
+                sample,
                 reference_norm,
                 sample_norm,
                 phase_shift,
+                reference_point_px,
                 motion_model=motion_model,
                 algorithm=algorithm,
             )
@@ -428,6 +520,11 @@ def evaluate_pair(
             motion_model=motion_model,
             algorithm=algorithm,
             seed=seed,
+            reference_u_px=float(reference_point_px[0]),
+            reference_v_px=float(reference_point_px[1]),
+            phase_du_px=float(phase_shift[0]),
+            phase_dv_px=float(phase_shift[1]),
+            polar_delta_deg=float(polar_delta_deg),
             expected_du_px=float(expected_shift[0]),
             expected_dv_px=float(expected_shift[1]),
             measured_du_px=float(measured[0]),
@@ -438,6 +535,7 @@ def evaluate_pair(
             elapsed_ms=elapsed_ms,
             success=True,
             message="",
+            warp_json=json.dumps(np.asarray(warp, dtype=np.float64).tolist()),
         )
     except Exception as exc:
         elapsed_ms = (time.perf_counter() - start) * 1000.0
@@ -448,6 +546,11 @@ def evaluate_pair(
             motion_model=motion_model,
             algorithm=algorithm,
             seed=seed,
+            reference_u_px=float(reference_point_px[0]),
+            reference_v_px=float(reference_point_px[1]),
+            phase_du_px=float(phase_shift[0]),
+            phase_dv_px=float(phase_shift[1]),
+            polar_delta_deg=float(polar_delta_deg),
             expected_du_px=float(expected_shift[0]),
             expected_dv_px=float(expected_shift[1]),
             measured_du_px=float("nan"),
@@ -458,6 +561,7 @@ def evaluate_pair(
             elapsed_ms=elapsed_ms,
             success=False,
             message=str(exc).replace("\n", " ")[:400],
+            warp_json="",
         )
 
 
@@ -478,28 +582,45 @@ def normalize_intensity(
 
 
 def phase_correlate(reference: np.ndarray, sample: np.ndarray) -> np.ndarray:
-    shift = cv2.phaseCorrelateIterative(
-        np.ascontiguousarray(reference, dtype=np.float32),
-        np.ascontiguousarray(sample, dtype=np.float32),
-        7,
-        50,
+    reference_phase = np.ascontiguousarray(reference, dtype=np.float32)
+    sample_phase = np.ascontiguousarray(sample, dtype=np.float32)
+    forward_shift, _forward_response = cv2.phaseCorrelate(
+        reference_phase,
+        sample_phase,
     )
-    return np.asarray(shift, dtype=np.float64)
+    reverse_shift, _reverse_response = cv2.phaseCorrelate(
+        sample_phase,
+        reference_phase,
+    )
+    return 0.5 * (
+        np.asarray(forward_shift, dtype=np.float64)
+        - np.asarray(reverse_shift, dtype=np.float64)
+    )
 
 
 def ecc_refine(
-    reference: np.ndarray,
-    sample: np.ndarray,
+    reference_raw: np.ndarray,
+    sample_raw: np.ndarray,
+    reference_norm: np.ndarray,
+    sample_norm: np.ndarray,
     initial_shift_px: np.ndarray,
+    reference_point_px: np.ndarray,
     *,
     motion_model: str,
     algorithm: str,
 ) -> tuple[np.ndarray, np.ndarray, float]:
     motion_code = motion_code_for_model(motion_model)
     warp = initial_warp(motion_model, initial_shift_px)
-    reference_work = np.ascontiguousarray(reference, dtype=np.float32)
-    sample_work = np.ascontiguousarray(sample, dtype=np.float32)
-    if algorithm == "single_ecc":
+    algorithm_kind, input_mode = algorithm.split("_ecc_", maxsplit=1)
+    if input_mode == "raw":
+        reference_work, sample_work = ecc_input_images(reference_raw, sample_raw)
+    elif input_mode == "norm":
+        reference_work = np.ascontiguousarray(reference_norm, dtype=np.float32)
+        sample_work = np.ascontiguousarray(sample_norm, dtype=np.float32)
+    else:
+        raise ValueError(f"unsupported ECC input mode {input_mode!r}")
+
+    if algorithm_kind == "single":
         corr, refined = cv2.findTransformECC(
             reference_work,
             sample_work,
@@ -509,7 +630,7 @@ def ecc_refine(
             None,
             5,
         )
-    elif algorithm == "multi_ecc":
+    elif algorithm_kind == "multi":
         params = cv2.ECCParameters()
         params.motionType = motion_code
         params.nlevels = 4
@@ -524,8 +645,28 @@ def ecc_refine(
     else:
         raise ValueError(f"unsupported algorithm {algorithm!r}")
     refined = np.asarray(refined, dtype=np.float64)
-    shift = point_shift(refined, image_center(reference.shape))
+    shift = point_shift(refined, reference_point_px)
     return shift, refined, float(corr)
+
+
+def ecc_input_images(
+    reference: np.ndarray,
+    sample: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    reference_array = np.asarray(reference)
+    sample_array = np.asarray(sample)
+    if (
+        reference_array.dtype == sample_array.dtype
+        and reference_array.dtype in ECC_NATIVE_DTYPES
+    ):
+        return (
+            np.ascontiguousarray(reference_array),
+            np.ascontiguousarray(sample_array),
+        )
+    return (
+        np.ascontiguousarray(reference_array, dtype=np.float32),
+        np.ascontiguousarray(sample_array, dtype=np.float32),
+    )
 
 
 def motion_code_for_model(motion_model: str) -> int:
@@ -698,7 +839,7 @@ def make_plots(results: list[Result], output_dir: Path) -> None:
         family_results = [r for r in results if r.family == family and r.success]
         labels = []
         values = []
-        for algorithm in ("phase_only", "single_ecc", "multi_ecc"):
+        for algorithm in REFERENCE_ALGORITHMS:
             for model in ("affine", "homography"):
                 subset = [
                     r.error_px
@@ -732,45 +873,53 @@ def make_visual_checks(
     image_dir = output_dir / "visual_checks"
     image_dir.mkdir(exist_ok=True)
     records_by_key = {(record.run, record.camera): record for record in records}
-    selected = [
+    visual_candidates = [
         result
-        for result in sorted(
-            (
-                r
-                for r in results
-                if r.family == "reference_history"
-                and r.algorithm in {"single_ecc", "multi_ecc"}
-                and r.seed == "phase"
-                and r.success
-                and np.isfinite(r.error_px)
-            ),
-            key=lambda item: item.error_px,
-            reverse=True,
-        )[:8]
+        for result in results
+        if result.family == "reference_history"
+        and result.algorithm in ECC_ALGORITHMS
+        and result.seed == "phase"
+        and result.success
+        and np.isfinite(result.error_px)
+        and result.warp_json
     ]
+    selected_by_key: dict[tuple[str, str, str, str], Result] = {}
+    for result in sorted(
+        visual_candidates,
+        key=lambda item: item.error_px,
+        reverse=True,
+    )[:12]:
+        selected_by_key[
+            (result.case_id, result.camera, result.motion_model, result.algorithm)
+        ] = result
+    for result in visual_candidates:
+        if result.case_id.startswith("run_000108:"):
+            selected_by_key[
+                (result.case_id, result.camera, result.motion_model, result.algorithm)
+            ] = result
+    selected = sorted(
+        selected_by_key.values(),
+        key=lambda item: (item.case_id, item.motion_model, item.algorithm),
+    )
     for result in selected:
         run = result.case_id.split(":", 1)[0]
         record = records_by_key[(run, result.camera)]
-        reference = normalize_intensity(reference_crops[result.camera])
-        sample = normalize_intensity(record.image)
-        initial = np.asarray([result.measured_du_px, result.measured_dv_px])
-        try:
-            _, warp, _ = ecc_refine(
-                reference,
-                sample,
-                initial,
-                motion_model=result.motion_model,
-                algorithm=result.algorithm,
-            )
-        except Exception:
-            continue
+        reference, sample = visual_work_images(
+            reference_crops[result.camera],
+            record.image,
+            result.algorithm,
+        )
+        warp = np.asarray(json.loads(result.warp_json), dtype=np.float64)
         warped = warp_sample_to_reference(sample, warp)
-        diff = np.abs(reference - warped)
+        reference_display = display_image(reference)
+        sample_display = display_image(sample)
+        warped_display = display_image(warped)
+        diff = np.abs(reference_display - warped_display)
         fig, axes = plt.subplots(1, 4, figsize=(10, 3))
         panels = [
-            ("reference", reference),
-            ("sample", sample),
-            ("warped sample", warped),
+            ("reference", reference_display),
+            ("sample", sample_display),
+            ("warped sample", warped_display),
             ("abs diff", diff),
         ]
         for axis, (title, image) in zip(axes, panels, strict=True):
@@ -779,8 +928,9 @@ def make_visual_checks(
             axis.set_axis_off()
         fig.suptitle(
             f"{result.case_id} {result.motion_model}/{result.algorithm} "
-            f"err={result.error_px:.3g}px corr={result.correlation:.3g}",
-            fontsize=10,
+            f"err={result.error_px:.3g}px corr={result.correlation:.3g} "
+            f"point=({result.reference_u_px:.1f},{result.reference_v_px:.1f})",
+            fontsize=9,
         )
         fig.tight_layout()
         safe = result.case_id.replace(":", "_").replace("/", "_")
@@ -789,6 +939,30 @@ def make_visual_checks(
             dpi=180,
         )
         plt.close(fig)
+
+
+def visual_work_images(
+    reference: np.ndarray,
+    sample: np.ndarray,
+    algorithm: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    if algorithm.endswith("_raw"):
+        return ecc_input_images(reference, sample)
+    if algorithm.endswith("_norm"):
+        return normalize_intensity(reference), normalize_intensity(sample)
+    raise ValueError(f"unsupported visual algorithm {algorithm!r}")
+
+
+def display_image(image: np.ndarray) -> np.ndarray:
+    work = np.asarray(image, dtype=np.float32)
+    low, high = np.percentile(work, (1.0, 99.0))
+    if high > low:
+        work = np.clip(work, low, high)
+    work = work - float(np.mean(work))
+    std = float(np.std(work))
+    if std <= 1e-12:
+        return work
+    return work / std
 
 
 def median(values: list[float]) -> float:

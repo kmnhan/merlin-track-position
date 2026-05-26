@@ -106,13 +106,13 @@ For each camera, compute the sub-pixel shift against the reference image:
 
 ```math
 (\Delta u_{i,k}, \Delta v_{i,k})
-= \text{IPC}(I_{i,k}, I_i^\star),
+= \text{phaseCorrelate}(I_{i,k}, I_i^\star),
 \quad i \in \{0,1\}.
 ```
 
-The implementation uses Iterative Phase Correlation (IPC) for registration, but any
-sub-pixel image-registration method that produces a shift in the same sign convention
-can be used.
+The implementation uses OpenCV phase correlation for registration, but any sub-pixel
+image-registration method that produces a shift in the same sign convention can be
+used.
 
 The implemented sign convention must satisfy
 

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import operator
 from typing import Any
 
 import cv2
@@ -55,8 +54,6 @@ def estimate_shift(
     *,
     clip_percentiles: tuple[float, float] | None = (1.0, 99.0),
     use_window: bool = False,
-    phase_l2_size: int = 7,
-    phase_max_iters: int = 50,
     check_tiles: bool = False,
     use_ecc_refinement: bool = False,
     ecc_motion_model: str = "homography",
@@ -68,7 +65,7 @@ def estimate_shift(
     """Estimate subpixel translation between two grayscale or RGB images.
 
     By default, images are percentile-clipped, normalized, converted to grayscale
-    when needed, and registered with OpenCV iterative phase correlation.
+    when needed, and registered with OpenCV phase correlation.
     Pass ``use_window=True`` to apply a Hanning taper before registration.
     Pass ``check_tiles=True`` to compare local tile shifts against the full-frame
     estimate.
@@ -88,9 +85,6 @@ def estimate_shift(
             "reference and current images must have identical shapes; "
             f"got {reference_image.shape!r} and {current_image.shape!r}"
         )
-    phase_l2_size = _positive_int(phase_l2_size, "phase_l2_size")
-    phase_max_iters = _positive_int(phase_max_iters, "phase_max_iters")
-
     reference_gray = _grayscale_registration_image(reference_image)
     current_gray = _grayscale_registration_image(current_image)
 
@@ -128,8 +122,6 @@ def estimate_shift(
             reference_norm,
             current_norm,
             use_window=use_window,
-            phase_l2_size=phase_l2_size,
-            phase_max_iters=phase_max_iters,
         )
 
     if not np.isfinite(shift_px).all():
@@ -174,8 +166,6 @@ def estimate_shift(
             current_norm,
             shift_px,
             use_window=use_window,
-            phase_l2_size=phase_l2_size,
-            phase_max_iters=phase_max_iters,
         )
         if tile_warning is not None:
             diagnostic_warnings.append(tile_warning)
@@ -194,15 +184,11 @@ def _estimate_translation(
     current_norm: np.ndarray,
     *,
     use_window: bool,
-    phase_l2_size: int,
-    phase_max_iters: int,
 ) -> np.ndarray:
     if reference_norm.shape != current_norm.shape:
         raise ValueError("images must have identical shapes")
     if min(reference_norm.shape) < 3:
         raise ValueError("images must be at least 3x3 pixels")
-    l2_size = _positive_int(phase_l2_size, "phase_l2_size")
-    max_iters = _positive_int(phase_max_iters, "phase_max_iters")
 
     reference_work, current_work = _registration_work_images(
         reference_norm,
@@ -210,15 +196,22 @@ def _estimate_translation(
         use_window=use_window,
     )
 
-    shift_xy = cv2.phaseCorrelateIterative(
-        np.ascontiguousarray(reference_work, dtype=np.float32),
-        np.ascontiguousarray(current_work, dtype=np.float32),
-        l2_size,
-        max_iters,
+    reference_phase = np.ascontiguousarray(reference_work, dtype=np.float32)
+    current_phase = np.ascontiguousarray(current_work, dtype=np.float32)
+    forward_shift_xy, _forward_response = cv2.phaseCorrelate(
+        reference_phase,
+        current_phase,
     )
-    shift_px = np.asarray(shift_xy, dtype=np.float64)
+    reverse_shift_xy, _reverse_response = cv2.phaseCorrelate(
+        current_phase,
+        reference_phase,
+    )
+    shift_px = 0.5 * (
+        np.asarray(forward_shift_xy, dtype=np.float64)
+        - np.asarray(reverse_shift_xy, dtype=np.float64)
+    )
     if shift_px.shape != (2,):
-        raise ValueError("phaseCorrelateIterative returned an unexpected shift shape")
+        raise ValueError("phaseCorrelate returned an unexpected shift shape")
     return shift_px
 
 
@@ -255,18 +248,6 @@ def _grayscale_registration_image(image: np.ndarray) -> np.ndarray:
         ),
         dtype=np.float32,
     )
-
-
-def _positive_int(value: Any, name: str) -> int:
-    if isinstance(value, bool):
-        raise ValueError(f"{name} must be a positive integer")
-    try:
-        numeric = operator.index(value)
-    except TypeError as exc:
-        raise ValueError(f"{name} must be a positive integer") from exc
-    if numeric < 1:
-        raise ValueError(f"{name} must be a positive integer")
-    return int(numeric)
 
 
 def _estimate_ecc_shift(
@@ -425,8 +406,6 @@ def _tile_consistency(
     full_shift_px: np.ndarray,
     *,
     use_window: bool,
-    phase_l2_size: int,
-    phase_max_iters: int,
 ) -> str | None:
     height, width = reference_norm.shape
     grid = 3 if min(height, width) >= 192 else 2
@@ -450,8 +429,6 @@ def _tile_consistency(
                 reference_tile,
                 current_tile,
                 use_window=use_window,
-                phase_l2_size=phase_l2_size,
-                phase_max_iters=phase_max_iters,
             )
             if np.isfinite(tile_shift).all():
                 shifts.append(tile_shift)
