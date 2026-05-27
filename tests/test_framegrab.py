@@ -4,6 +4,7 @@ import unittest
 from importlib import resources
 from unittest.mock import patch
 
+import cv2
 import numpy as np
 
 from merlin_track_position import constants
@@ -123,6 +124,7 @@ class FakeBaslerCamera:
         self.UserSetLoad = FakeCommand()
         self.GainAuto = FakeNode("Continuous")
         self.GammaSelector = FakeNode()
+        self.Gamma = FakeNode(1.0, minimum=0.0, maximum=4.0, increment=0.001)
         self.ExposureAuto = FakeNode("Continuous")
         self.ExposureTimeAbs = FakeNode()
         self.GammaEnable = FakeNode(False)
@@ -519,7 +521,7 @@ class DevelopmentModeFramegrabTests(unittest.TestCase):
             offset_x=3,
             offset_y=5,
             exposure_us=125000.0,
-            use_gamma=False,
+            gamma=1.2,
             pixel_format="BayerRG12",
             max_num_buffer=7,
         )
@@ -534,14 +536,38 @@ class DevelopmentModeFramegrabTests(unittest.TestCase):
         self.assertEqual(camera.UserSetSelector.Value, "Default")
         self.assertTrue(camera.UserSetLoad.executed)
         self.assertEqual(camera.GainAuto.Value, "Off")
+        self.assertEqual(camera.GammaSelector.Value, "User")
         self.assertEqual(camera.ExposureAuto.Value, "Off")
         self.assertEqual(camera.ExposureTimeAbs.Value, config.exposure_us)
-        self.assertFalse(camera.GammaEnable.Value)
+        self.assertTrue(camera.GammaEnable.Value)
+        self.assertEqual(camera.Gamma.Value, config.gamma)
         self.assertEqual(camera.OffsetX.Value, config.offset_x)
         self.assertEqual(camera.OffsetY.Value, config.offset_y)
         self.assertEqual(camera.Width.Value, config.width)
         self.assertEqual(camera.Height.Value, config.height)
         self.assertEqual(camera.PixelFormat.Value, config.pixel_format)
+
+    def test_basler_configuration_accepts_missing_gamma_enable_node(self):
+        config = CameraConfig(
+            slot="cam1",
+            source_type=SOURCE_BASLER,
+            serial_number="abc",
+            width=23,
+            height=17,
+            exposure_us=125000.0,
+            gamma=1.2,
+            pixel_format="BayerRG12",
+        )
+        camera = FakeBaslerCamera()
+        del camera.GammaEnable
+
+        with patch(
+            "merlin_track_position.instruments.basler.genicam.IsWritable",
+            lambda node: node.writable,
+        ):
+            basler._configure_camera(camera, config)
+
+        self.assertEqual(camera.Gamma.Value, config.gamma)
 
     def test_basler_discovery_lists_connected_devices(self):
         camera = FakeBaslerCamera()
@@ -662,7 +688,7 @@ class DevelopmentModeFramegrabTests(unittest.TestCase):
                 "camera/cam0/model_name": "a2A2590-22gcBAS",
                 "camera/cam0/width": "2592",
                 "camera/cam0/height": "1944",
-                "camera/cam0/use_gamma": "off",
+                "camera/cam0/gamma": "1.2",
                 "camera/cam0/display_transpose": "true",
                 "camera/cam0/display_invert_x": "1",
                 "camera/cam0/display_invert_y": "false",
@@ -676,7 +702,7 @@ class DevelopmentModeFramegrabTests(unittest.TestCase):
         self.assertEqual(config.model_name, "a2A2590-22gcBAS")
         self.assertEqual(config.width, 2592)
         self.assertEqual(config.height, 1944)
-        self.assertFalse(config.use_gamma)
+        self.assertEqual(config.gamma, 1.2)
         self.assertEqual(
             config.display,
             DisplayTransform(transpose=True, invert_x=True, invert_y=False),
@@ -722,12 +748,12 @@ class DevelopmentModeFramegrabTests(unittest.TestCase):
                 width=6,
                 height=5,
                 exposure_us=125000.0,
-                use_gamma=False,
+                gamma=1.2,
             ),
         }
         metadata = camera_metadata(configs)
         self.assertEqual(metadata["camera_cam1_exposure_us"], 125000.0)
-        self.assertFalse(metadata["camera_cam1_use_gamma"])
+        self.assertEqual(metadata["camera_cam1_gamma"], 1.2)
         self.assertEqual(metadata["camera_cam1_model_name"], "a2A2590-22gcBAS")
         metadata["camera_cam1_serial_number"] = "serial-b"
 
@@ -742,10 +768,10 @@ class DevelopmentModeFramegrabTests(unittest.TestCase):
             ["cam1 exposure_us"],
         )
         metadata["camera_cam1_exposure_us"] = 125000.0
-        metadata["camera_cam1_use_gamma"] = True
+        metadata["camera_cam1_gamma"] = 1.0
         self.assertEqual(
             camera_config_mismatches(metadata, configs),
-            ["cam1 use_gamma"],
+            ["cam1 gamma"],
         )
         self.assertEqual(camera_config_mismatches({}, configs), [])
 
@@ -817,6 +843,67 @@ class DevelopmentModeFramegrabTests(unittest.TestCase):
 
         np.testing.assert_array_equal(image, raw)
         self.assertEqual(camera.MaxNumBuffer.Value, 7)
+
+    def test_basler_capture_demosaics_bayer_for_processing(self):
+        raw = np.arange(4 * 4, dtype=np.uint16).reshape(4, 4)
+        camera = FakeBaslerCamera([raw])
+        config = CameraConfig(
+            slot="cam1",
+            source_type=SOURCE_BASLER,
+            serial_number="bayer",
+            width=4,
+            height=4,
+            pixel_format="BayerRG12",
+        )
+
+        with (
+            patch.object(constants, "IS_DAQ_PC", True),
+            patch(
+                "merlin_track_position.instruments.basler.genicam.IsWritable",
+                lambda node: node.writable,
+            ),
+            patch.object(basler, "_get_camera_by_serial_number", return_value=camera),
+        ):
+            image = get_basler_image(config)
+
+        expected = cv2.cvtColor(raw, cv2.COLOR_BayerRG2RGB)
+        np.testing.assert_array_equal(image, expected)
+        self.assertEqual(image.shape, (4, 4, 3))
+        self.assertEqual(image.dtype, np.uint16)
+
+    def test_basler_image_stack_demosaics_bayer_for_processing(self):
+        raw0 = np.arange(4 * 4, dtype=np.uint16).reshape(4, 4)
+        raw1 = raw0 + 10
+        camera = FakeBaslerCamera([raw0, raw1])
+        config = CameraConfig(
+            slot="cam1",
+            source_type=SOURCE_BASLER,
+            serial_number="bayer",
+            width=4,
+            height=4,
+            pixel_format="BayerRG12",
+        )
+
+        with (
+            patch.object(constants, "IS_DAQ_PC", True),
+            patch(
+                "merlin_track_position.instruments.basler.genicam.IsWritable",
+                lambda node: node.writable,
+            ),
+            patch.object(basler, "_get_camera_by_serial_number", return_value=camera),
+        ):
+            stack = get_basler_image_stack(2, config)
+
+        expected = np.stack(
+            [
+                cv2.cvtColor(raw0, cv2.COLOR_BayerRG2RGB),
+                cv2.cvtColor(raw1, cv2.COLOR_BayerRG2RGB),
+            ],
+            axis=0,
+        )
+        np.testing.assert_array_equal(stack, expected)
+        self.assertEqual(stack.shape, (2, 4, 4, 3))
+        self.assertEqual(stack.dtype, np.uint16)
 
     def test_daq_mode_basler_image_accepts_expected_shape(self):
         raw = np.arange(6, dtype=np.uint16).reshape(2, 3)

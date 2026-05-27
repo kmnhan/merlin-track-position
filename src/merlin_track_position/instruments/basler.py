@@ -8,6 +8,7 @@ import logging
 import math
 import threading
 
+import cv2
 import numpy as np
 import numpy.typing as npt
 from pypylon import genicam, pylon
@@ -20,6 +21,12 @@ from merlin_track_position.instruments.camera_config import (
 from merlin_track_position.instruments.simulated_hardware import simulator
 
 logger = logging.getLogger("merlin_track_position.instruments.basler")
+BAYER_TO_RGB_CONVERSIONS = {
+    "bayerbg": cv2.COLOR_BayerBG2RGB,
+    "bayergb": cv2.COLOR_BayerGB2RGB,
+    "bayergr": cv2.COLOR_BayerGR2RGB,
+    "bayerrg": cv2.COLOR_BayerRG2RGB,
+}
 
 
 @dataclass(frozen=True)
@@ -45,6 +52,7 @@ class BaslerCameraCapabilities:
     offset_y: BaslerValueRange
     exposure_us: BaslerValueRange
     pixel_formats: tuple[str, ...]
+    gamma: BaslerValueRange | None = None
 
 
 def preferred_basler_pixel_format(
@@ -120,25 +128,52 @@ def _configure_camera(
         # if genicam.IsWritable(camera.ReverseY):
         #     camera.ReverseY.Value = False
 
-        if genicam.IsWritable(camera.GainAuto):
+        try:
+            gain_auto = camera.GainAuto
+        except (AttributeError, genicam.GenericException):
+            gain_auto = None
+        if gain_auto is not None and genicam.IsWritable(gain_auto):
             logger.debug("Disabling automatic gain control.")
-            camera.GainAuto.Value = "Off"
+            gain_auto.Value = "Off"
 
-        if genicam.IsWritable(camera.GammaSelector):
-            logger.debug("Setting gamma selector to sRGB.")
-            camera.GammaSelector.Value = "sRGB"
-
-        if genicam.IsWritable(camera.ExposureAuto):
+        try:
+            exposure_auto = camera.ExposureAuto
+        except (AttributeError, genicam.GenericException):
+            exposure_auto = None
+        if exposure_auto is not None and genicam.IsWritable(exposure_auto):
             logger.debug("Disabling automatic exposure control.")
-            camera.ExposureAuto.Value = "Off"
+            exposure_auto.Value = "Off"
         _set_exposure_us(camera, float(config.exposure_us))
 
-        if genicam.IsWritable(camera.GammaEnable):
-            logger.debug(
-                "%s gamma correction.",
-                "Enabling" if config.use_gamma else "Disabling",
-            )
-            camera.GammaEnable.Value = bool(config.use_gamma)
+        gamma = float(config.gamma)
+        gamma_enabled = not math.isclose(gamma, 1.0, rel_tol=1e-9, abs_tol=1e-9)
+        gamma_node = None
+        try:
+            gamma_node = camera.Gamma
+        except (AttributeError, genicam.GenericException):
+            if gamma_enabled:
+                raise genicam.RuntimeException("Gamma is not available") from None
+        if gamma_node is not None:
+            try:
+                gamma_enable = camera.GammaEnable
+            except (AttributeError, genicam.GenericException):
+                gamma_enable = None
+            if gamma_enable is not None and genicam.IsWritable(gamma_enable):
+                gamma_enable.Value = gamma_enabled
+            try:
+                gamma_selector = camera.GammaSelector
+            except (AttributeError, genicam.GenericException):
+                gamma_selector = None
+            if gamma_selector is not None and genicam.IsWritable(gamma_selector):
+                entries = _enum_entries(gamma_selector)
+                if not entries or "User" in entries:
+                    logger.debug("Setting gamma selector to User.")
+                    gamma_selector.Value = "User"
+            if genicam.IsWritable(gamma_node):
+                logger.debug("Setting gamma to %s.", config.gamma)
+                gamma_node.Value = gamma
+            elif gamma_enabled:
+                raise genicam.RuntimeException("Gamma is not writable")
 
         for name in ("CenterX", "CenterY"):
             try:
@@ -276,6 +311,14 @@ def _basler_config_errors(
             f"exposure_us={config.exposure_us:g} is outside valid range "
             f"{_range_text(capabilities.exposure_us, integer=False)}"
         )
+    if capabilities.gamma is None:
+        if not math.isclose(float(config.gamma), 1.0, rel_tol=1e-9, abs_tol=1e-9):
+            errors.append("gamma is not available")
+    elif not _value_in_range(float(config.gamma), capabilities.gamma):
+        errors.append(
+            f"gamma={config.gamma:g} is outside valid range "
+            f"{_range_text(capabilities.gamma, integer=False)}"
+        )
     if (
         capabilities.pixel_formats
         and config.pixel_format not in capabilities.pixel_formats
@@ -318,6 +361,10 @@ def _camera_capabilities(
     camera: pylon.InstantCamera,
     device: BaslerDevice,
 ) -> BaslerCameraCapabilities:
+    try:
+        gamma_node = camera.Gamma
+    except (AttributeError, genicam.GenericException):
+        gamma_node = None
     return BaslerCameraCapabilities(
         device=device,
         width=_value_range(camera.Width, default_increment=1.0),
@@ -326,6 +373,11 @@ def _camera_capabilities(
         offset_y=_value_range(camera.OffsetY, default_increment=1.0),
         exposure_us=_value_range(_exposure_node(camera), default_increment=0.0),
         pixel_formats=_enum_entries(camera.PixelFormat),
+        gamma=(
+            _value_range(gamma_node, default_increment=0.0)
+            if gamma_node is not None
+            else None
+        ),
     )
 
 
@@ -501,6 +553,7 @@ def get_basler_image(config: CameraConfig | None = None) -> npt.NDArray:
         image = _simulated_image(config)
     else:
         image = _session_for_config(config).get_image()
+    image = _decode_basler_image(image, config)
     _validate_image_shape(image, config)
     return np.asarray(image).copy()
 
@@ -521,6 +574,7 @@ def get_basler_image_stack(
     else:
         images = _session_for_config(config).get_images(frame_count)
     images = np.asarray(images)
+    images = _decode_basler_image_stack(images, config)
     if images.ndim < 3:
         raise RuntimeError(
             f"Basler image stack must be at least 3D, got {images.shape!r}"
@@ -539,6 +593,47 @@ def _simulated_image(config: CameraConfig) -> npt.NDArray:
         : int(config.width),
         ...,
     ].copy()
+
+
+def _decode_basler_image(image: npt.NDArray, config: CameraConfig) -> npt.NDArray:
+    image_array = np.asarray(image)
+    conversion = _bayer_to_rgb_conversion(config.pixel_format)
+    if conversion is None or image_array.ndim != 2 or min(image_array.shape) < 2:
+        return image_array
+    return cv2.cvtColor(np.ascontiguousarray(image_array), conversion)
+
+
+def _decode_basler_image_stack(
+    images: npt.NDArray,
+    config: CameraConfig,
+) -> npt.NDArray:
+    image_array = np.asarray(images)
+    conversion = _bayer_to_rgb_conversion(config.pixel_format)
+    if (
+        conversion is None
+        or image_array.ndim != 3
+        or min(image_array.shape[1:3]) < 2
+    ):
+        return image_array
+    return np.stack(
+        [
+            cv2.cvtColor(np.ascontiguousarray(image), conversion)
+            for image in image_array
+        ],
+        axis=0,
+    )
+
+
+def _bayer_to_rgb_conversion(pixel_format: str) -> int | None:
+    normalized = str(pixel_format).strip().lower()
+    return next(
+        (
+            conversion
+            for prefix, conversion in BAYER_TO_RGB_CONVERSIONS.items()
+            if normalized.startswith(prefix)
+        ),
+        None,
+    )
 
 
 def _validate_image_shape(image: npt.NDArray, config: CameraConfig) -> None:

@@ -33,7 +33,7 @@ class CameraConfig:
     offset_x: int = 0
     offset_y: int = 0
     exposure_us: float = 0.0
-    use_gamma: bool = True
+    gamma: float = 1.0
     pixel_format: str = "Mono12"
     max_num_buffer: int = 10
     display: DisplayTransform = DisplayTransform()
@@ -49,7 +49,7 @@ class CameraConfig:
             self.offset_x,
             self.offset_y,
             self.exposure_us,
-            self.use_gamma,
+            self.gamma,
             self.pixel_format,
             self.max_num_buffer,
         )
@@ -116,9 +116,9 @@ def camera_config_from_settings(settings: Any, slot: str) -> CameraConfig:
             settings.value(f"{prefix}/exposure_us", default.exposure_us),
             default.exposure_us,
         ),
-        use_gamma=_bool_value(
-            settings.value(f"{prefix}/use_gamma", default.use_gamma),
-            default.use_gamma,
+        gamma=_nonnegative_float(
+            settings.value(f"{prefix}/gamma", default.gamma),
+            default.gamma,
         ),
         pixel_format=str(
             settings.value(f"{prefix}/pixel_format", default.pixel_format)
@@ -160,7 +160,7 @@ def save_camera_config(settings: Any, config: CameraConfig) -> None:
     settings.setValue(f"{prefix}/offset_x", int(config.offset_x))
     settings.setValue(f"{prefix}/offset_y", int(config.offset_y))
     settings.setValue(f"{prefix}/exposure_us", float(config.exposure_us))
-    settings.setValue(f"{prefix}/use_gamma", bool(config.use_gamma))
+    settings.setValue(f"{prefix}/gamma", float(config.gamma))
     settings.setValue(f"{prefix}/pixel_format", config.pixel_format)
     settings.setValue(f"{prefix}/max_num_buffer", int(config.max_num_buffer))
     settings.setValue(f"{prefix}/display_transpose", bool(config.display.transpose))
@@ -182,7 +182,7 @@ def camera_metadata(configs: Mapping[str, CameraConfig]) -> dict[str, object]:
         metadata[f"{prefix}_offset_x"] = int(config.offset_x)
         metadata[f"{prefix}_offset_y"] = int(config.offset_y)
         metadata[f"{prefix}_exposure_us"] = float(config.exposure_us)
-        metadata[f"{prefix}_use_gamma"] = bool(config.use_gamma)
+        metadata[f"{prefix}_gamma"] = float(config.gamma)
         metadata[f"{prefix}_pixel_format"] = config.pixel_format
     return metadata
 
@@ -204,7 +204,7 @@ def camera_config_mismatches(
             ("offset_x", config.offset_x, int),
             ("offset_y", config.offset_y, int),
             ("exposure_us", config.exposure_us, float),
-            ("use_gamma", config.use_gamma, _bool_value_for_metadata),
+            ("gamma", config.gamma, float),
             ("pixel_format", config.pixel_format, str),
         )
         for name, expected, converter in comparisons:
@@ -228,22 +228,6 @@ def camera_config_mismatches(
             if actual != expected:
                 mismatches.append(f"{slot} {name}")
     return mismatches
-
-
-def _bool_value_for_metadata(value: object) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        lowered = value.strip().lower()
-        if lowered in {"1", "true", "yes", "on"}:
-            return True
-        if lowered in {"0", "false", "no", "off"}:
-            return False
-        raise ValueError(f"invalid boolean metadata: {value!r}")
-    numeric = int(value)  # type: ignore[arg-type]
-    if numeric not in (0, 1):
-        raise ValueError(f"invalid boolean metadata: {value!r}")
-    return bool(numeric)
 
 
 def _slot_value(value: str) -> str:

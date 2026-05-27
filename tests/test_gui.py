@@ -5,6 +5,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
+import cv2
 import h5py
 import numpy as np
 import xarray as xr
@@ -1163,6 +1164,34 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
             finally:
                 window.close()
 
+    def test_bayer_basler_image_is_demosaiced_for_display(self):
+        get_qapp()
+        settings = FakeSettings()
+        settings.values.update(
+            {
+                "camera/cam1/source_type": SOURCE_BASLER,
+                "camera/cam1/width": 4,
+                "camera/cam1/height": 4,
+                "camera/cam1/pixel_format": "BayerRG12",
+            }
+        )
+        raw = np.arange(4 * 4, dtype=np.uint16).reshape(4, 4)
+        with patched_main_window_runtime(settings):
+            window = MainWindow()
+            try:
+                window._on_image_capture_ready("cam1", raw)
+
+                np.testing.assert_array_equal(
+                    window.image_items["cam1"].image,
+                    cv2.cvtColor(raw, cv2.COLOR_BayerRG2RGB),
+                )
+                np.testing.assert_array_equal(
+                    window._latest_images_by_camera["cam1"],
+                    raw,
+                )
+            finally:
+                window.close()
+
     def test_camera_settings_dialog_returns_updated_configs(self):
         get_qapp()
         device_old = BaslerDevice("old", "old-model", "old-full-name")
@@ -1224,7 +1253,7 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                 rows["pixel_format"].setCurrentIndex(
                     rows["pixel_format"].findData("BayerRG12")
                 )
-                rows["use_gamma"].setChecked(False)
+                rows["gamma"].setValue(1.2)
                 rows["display_transpose"].setChecked(False)
 
                 updated = dialog.configs()["cam1"]
@@ -1235,7 +1264,7 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
         self.assertEqual(updated.model_name, "new-model")
         self.assertEqual(updated.width, 10)
         self.assertEqual(updated.pixel_format, "BayerRG12")
-        self.assertFalse(updated.use_gamma)
+        self.assertEqual(updated.gamma, 1.2)
         self.assertFalse(updated.display.transpose)
 
     def test_camera_settings_dialog_framegrabber_geometry_is_editable_after_basler(self):

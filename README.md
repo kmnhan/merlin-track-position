@@ -106,7 +106,7 @@ For each camera, compute the sub-pixel shift against the reference image:
 
 ```math
 (\Delta u_{i,k}, \Delta v_{i,k})
-= \text{phaseCorrelate}(I_{i,k}, I_i^\star),
+= \text{phaseCorrelate}(I_i^\star, I_{i,k}),
 \quad i \in \{0,1\}.
 ```
 

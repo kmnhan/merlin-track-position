@@ -11,6 +11,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
 
+import cv2
 import numpy as np
 import pyqtgraph as pg
 import xarray as xr
@@ -147,6 +148,12 @@ LEGACY_AUTO_CORRECTION_INTERVAL_MINUTES_SETTINGS_KEY = (
 )
 AUTO_CORRECTION_INTERVAL_MS_PER_SECOND = 1_000
 AUTO_CORRECTION_INTERVAL_MS_PER_MINUTE = 60_000
+BAYER_DISPLAY_CONVERSIONS = {
+    "bayerbg": cv2.COLOR_BayerBG2RGB,
+    "bayergb": cv2.COLOR_BayerGB2RGB,
+    "bayergr": cv2.COLOR_BayerGR2RGB,
+    "bayerrg": cv2.COLOR_BayerRG2RGB,
+}
 ROI_SETTINGS_KEYS: dict[str, tuple[str, str, str, str]] = {
     camera: (
         f"roi/{camera}/x",
@@ -341,6 +348,26 @@ def _set_image_item_raw_rect(
     transform.translate(raw_rect.x(), raw_rect.y())
     transform.scale(u_scale, v_scale)
     image_item.setTransform(transform)
+
+
+def _display_image_for_camera(image: object, config: CameraConfig) -> object:
+    if config.source_type != SOURCE_BASLER:
+        return image
+    image_array = np.asarray(image)
+    if image_array.ndim != 2:
+        return image
+    pixel_format = config.pixel_format.strip().lower()
+    conversion = next(
+        (
+            conversion
+            for prefix, conversion in BAYER_DISPLAY_CONVERSIONS.items()
+            if pixel_format.startswith(prefix)
+        ),
+        None,
+    )
+    if conversion is None or min(image_array.shape) < 2:
+        return image
+    return cv2.cvtColor(np.ascontiguousarray(image_array), conversion)
 
 
 def _roi_metadata_from_geometries(
@@ -544,7 +571,7 @@ class CameraSettingsDialog(QtWidgets.QDialog):
                 serial_number=basler_default.serial_number,
                 model_name="",
                 exposure_us=basler_default.exposure_us,
-                use_gamma=basler_default.use_gamma,
+                gamma=basler_default.gamma,
                 pixel_format=basler_default.pixel_format,
                 max_num_buffer=basler_default.max_num_buffer,
             )
@@ -669,10 +696,19 @@ class CameraSettingsDialog(QtWidgets.QDialog):
         form.addRow("Exposure us", exposure_spin)
         rows["exposure_us"] = exposure_spin
 
-        use_gamma_checkbox = QtWidgets.QCheckBox()
-        use_gamma_checkbox.setChecked(bool(config.use_gamma))
-        form.addRow("Use gamma", use_gamma_checkbox)
-        rows["use_gamma"] = use_gamma_checkbox
+        gamma_range = capabilities.gamma
+        gamma_spin = QtWidgets.QDoubleSpinBox()
+        gamma_spin.setRange(
+            gamma_range.minimum if gamma_range is not None else 0.0,
+            gamma_range.maximum if gamma_range is not None else 4.0,
+        )
+        gamma_spin.setSingleStep(
+            max(gamma_range.increment, 0.001) if gamma_range is not None else 0.1
+        )
+        gamma_spin.setDecimals(3)
+        gamma_spin.setValue(float(config.gamma))
+        form.addRow("Gamma", gamma_spin)
+        rows["gamma"] = gamma_spin
 
         pixel_format_combo = QtWidgets.QComboBox()
         for pixel_format in capabilities.pixel_formats:
@@ -808,7 +844,7 @@ class CameraSettingsDialog(QtWidgets.QDialog):
             offset_x=spin_value("offset_x", default.offset_x),
             offset_y=spin_value("offset_y", default.offset_y),
             exposure_us=double_spin_value("exposure_us", default.exposure_us),
-            use_gamma=checkbox_value("use_gamma", default.use_gamma),
+            gamma=double_spin_value("gamma", default.gamma),
             pixel_format=combo_value("pixel_format", default.pixel_format),
             max_num_buffer=spin_value("max_num_buffer", default.max_num_buffer),
             display=DisplayTransform(
@@ -2033,7 +2069,9 @@ class MainWindow(_MainWindowGUI):
         rect: QtCore.QRectF,
     ) -> None:
         image_item = self.image_items[camera]
-        image_item.setImage(image)
+        image_item.setImage(
+            _display_image_for_camera(image, self._camera_configs[camera])
+        )
         raw_rect = QtCore.QRectF(rect)
         _set_image_item_raw_rect(camera, image_item, raw_rect)
         self._image_raw_rects[camera] = raw_rect
