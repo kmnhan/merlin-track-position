@@ -149,10 +149,10 @@ LEGACY_AUTO_CORRECTION_INTERVAL_MINUTES_SETTINGS_KEY = (
 AUTO_CORRECTION_INTERVAL_MS_PER_SECOND = 1_000
 AUTO_CORRECTION_INTERVAL_MS_PER_MINUTE = 60_000
 BAYER_DISPLAY_CONVERSIONS = {
-    "bayerbg": cv2.COLOR_BayerBG2RGB,
-    "bayergb": cv2.COLOR_BayerGB2RGB,
-    "bayergr": cv2.COLOR_BayerGR2RGB,
-    "bayerrg": cv2.COLOR_BayerRG2RGB,
+    "bayerbg": cv2.COLOR_BayerBGGR2RGB,
+    "bayergb": cv2.COLOR_BayerGBRG2RGB,
+    "bayergr": cv2.COLOR_BayerGRBG2RGB,
+    "bayerrg": cv2.COLOR_BayerRGGB2RGB,
 }
 ROI_SETTINGS_KEYS: dict[str, tuple[str, str, str, str]] = {
     camera: (

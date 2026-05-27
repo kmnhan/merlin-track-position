@@ -1175,7 +1175,11 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                 "camera/cam1/pixel_format": "BayerRG12",
             }
         )
-        raw = np.arange(4 * 4, dtype=np.uint16).reshape(4, 4)
+        raw = np.empty((4, 4), dtype=np.uint16)
+        raw[0::2, 0::2] = 4000
+        raw[0::2, 1::2] = 1000
+        raw[1::2, 0::2] = 1000
+        raw[1::2, 1::2] = 100
         with patched_main_window_runtime(settings):
             window = MainWindow()
             try:
@@ -1183,7 +1187,11 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
 
                 np.testing.assert_array_equal(
                     window.image_items["cam1"].image,
-                    cv2.cvtColor(raw, cv2.COLOR_BayerRG2RGB),
+                    cv2.cvtColor(raw, cv2.COLOR_BayerRGGB2RGB),
+                )
+                self.assertGreater(
+                    float(window.image_items["cam1"].image[..., 0].mean()),
+                    float(window.image_items["cam1"].image[..., 2].mean()),
                 )
                 np.testing.assert_array_equal(
                     window._latest_images_by_camera["cam1"],

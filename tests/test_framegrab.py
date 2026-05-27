@@ -845,7 +845,11 @@ class DevelopmentModeFramegrabTests(unittest.TestCase):
         self.assertEqual(camera.MaxNumBuffer.Value, 7)
 
     def test_basler_capture_demosaics_bayer_for_processing(self):
-        raw = np.arange(4 * 4, dtype=np.uint16).reshape(4, 4)
+        raw = np.empty((4, 4), dtype=np.uint16)
+        raw[0::2, 0::2] = 4000
+        raw[0::2, 1::2] = 1000
+        raw[1::2, 0::2] = 1000
+        raw[1::2, 1::2] = 100
         camera = FakeBaslerCamera([raw])
         config = CameraConfig(
             slot="cam1",
@@ -866,13 +870,18 @@ class DevelopmentModeFramegrabTests(unittest.TestCase):
         ):
             image = get_basler_image(config)
 
-        expected = cv2.cvtColor(raw, cv2.COLOR_BayerRG2RGB)
+        expected = cv2.cvtColor(raw, cv2.COLOR_BayerRGGB2RGB)
         np.testing.assert_array_equal(image, expected)
         self.assertEqual(image.shape, (4, 4, 3))
         self.assertEqual(image.dtype, np.uint16)
+        self.assertGreater(float(image[..., 0].mean()), float(image[..., 2].mean()))
 
     def test_basler_image_stack_demosaics_bayer_for_processing(self):
-        raw0 = np.arange(4 * 4, dtype=np.uint16).reshape(4, 4)
+        raw0 = np.empty((4, 4), dtype=np.uint16)
+        raw0[0::2, 0::2] = 4000
+        raw0[0::2, 1::2] = 1000
+        raw0[1::2, 0::2] = 1000
+        raw0[1::2, 1::2] = 100
         raw1 = raw0 + 10
         camera = FakeBaslerCamera([raw0, raw1])
         config = CameraConfig(
@@ -896,14 +905,15 @@ class DevelopmentModeFramegrabTests(unittest.TestCase):
 
         expected = np.stack(
             [
-                cv2.cvtColor(raw0, cv2.COLOR_BayerRG2RGB),
-                cv2.cvtColor(raw1, cv2.COLOR_BayerRG2RGB),
+                cv2.cvtColor(raw0, cv2.COLOR_BayerRGGB2RGB),
+                cv2.cvtColor(raw1, cv2.COLOR_BayerRGGB2RGB),
             ],
             axis=0,
         )
         np.testing.assert_array_equal(stack, expected)
         self.assertEqual(stack.shape, (2, 4, 4, 3))
         self.assertEqual(stack.dtype, np.uint16)
+        self.assertGreater(float(stack[..., 0].mean()), float(stack[..., 2].mean()))
 
     def test_daq_mode_basler_image_accepts_expected_shape(self):
         raw = np.arange(6, dtype=np.uint16).reshape(2, 3)
