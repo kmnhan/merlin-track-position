@@ -56,7 +56,7 @@ TEST_LQR_MOTOR_PENALTY = 100.0
 TEST_LQR_SVD_RELATIVE_TOLERANCE = 1e-6
 
 
-def px_per_cmd_mm():
+def px_per_readback_mm():
     return np.array(
         [
             [[270.0, -140.0, 70.0], [90.0, 310.0, -120.0]],
@@ -144,37 +144,46 @@ def assert_hdf5_image_dataset_compressed(
 
 def calibration_dataset(jacobian=None):
     if jacobian is None:
-        jacobian = px_per_cmd_mm()
+        jacobian = px_per_readback_mm()
     command_delta = probe_deltas()
     measured = measured_from_jacobian(command_delta, jacobian)
-    pre_commanded = np.cumsum(
-        np.vstack([np.zeros((1, 3)), command_delta[:-1]]),
-        axis=0,
+    pre_commanded, post_commanded = absolute_command_positions(
+        command_delta,
+        center=(0.0, 0.0, 0.0),
     )
-    post_commanded = pre_commanded + command_delta
+    readback_offset = np.zeros(len(COMMAND_AXES), dtype=float)
+    initial_readback = readback_offset.copy()
+    pre_readback = pre_commanded + readback_offset
+    post_readback = post_commanded + readback_offset
+    readback_delta = post_readback - initial_readback
     dataset = xr.Dataset(
         data_vars={
-            "px_per_cmd_mm": (
+            "px_per_readback_mm": (
                 ("camera", "pixel_axis", "command_axis"),
                 jacobian,
             ),
-            "axis_scale_cmd_mm": (("command_axis",), np.array([0.5, 0.5, 0.5])),
+            "axis_scale_readback_mm": (("command_axis",), np.array([0.5, 0.5, 0.5])),
             "reference_cam0": (("y_cam0", "x_cam0"), np.zeros((4, 5))),
             "reference_cam1": (("y_cam1", "x_cam1"), np.zeros((6, 7))),
             "probe_command_delta_mm": (("probe", "command_axis"), command_delta),
+            "probe_readback_delta_mm": (("probe", "command_axis"), readback_delta),
             "probe_measured_delta_px": (
                 ("probe", "camera", "pixel_axis"),
                 measured,
+            ),
+            "initial_readback_position_mm": (
+                ("command_axis",),
+                initial_readback,
             ),
             "pre_commanded_position_mm": (("probe", "command_axis"), pre_commanded),
             "post_commanded_position_mm": (("probe", "command_axis"), post_commanded),
             "pre_readback_position_mm": (
                 ("probe", "command_axis"),
-                pre_commanded + 10.0,
+                pre_readback,
             ),
             "post_readback_position_mm": (
                 ("probe", "command_axis"),
-                post_commanded - 7.0,
+                post_readback,
             ),
         },
         coords={
@@ -187,10 +196,29 @@ def calibration_dataset(jacobian=None):
             "y_cam1": np.arange(6),
             "x_cam1": np.arange(7),
         },
-        attrs={"warnings": "", "polar": 0.0},
+        attrs={
+            "warnings": "",
+            "polar": 0.0,
+            "initial_x_mm": float(initial_readback[0]),
+            "initial_y_mm": float(initial_readback[1]),
+            "initial_z_mm": float(initial_readback[2]),
+        },
     )
     validate_visual_calibration_dataset(dataset)
     return dataset
+
+
+def legacy_command_space_calibration_dataset():
+    return (
+        calibration_dataset()
+        .rename(
+            {
+                "px_per_readback_mm": "px_per_cmd_mm",
+                "axis_scale_readback_mm": "axis_scale_cmd_mm",
+            }
+        )
+        .drop_vars(("initial_readback_position_mm", "probe_readback_delta_mm"))
+    )
 
 
 class ShiftDetectionTests(unittest.TestCase):
@@ -199,7 +227,7 @@ class ShiftDetectionTests(unittest.TestCase):
         calibration = calibration_dataset()
         shift = measured_from_jacobian(
             offset_mm.reshape(1, len(COMMAND_AXES)),
-            calibration["px_per_cmd_mm"].values,
+            calibration["px_per_readback_mm"].values,
         )[0]
         measurement = shift_dataset(shift).assign_attrs(
             {"warnings": "registration warning"}
@@ -226,7 +254,7 @@ class ShiftDetectionTests(unittest.TestCase):
             capture.assert_called_once()
             self.assertEqual(capture.call_args.args[4], 1)
             np.testing.assert_allclose(
-                result["estimated_command_offset_mm"].values,
+                result["estimated_readback_offset_mm"].values,
                 offset_mm,
                 atol=1e-12,
             )
@@ -244,10 +272,26 @@ class ShiftDetectionTests(unittest.TestCase):
             self.assertEqual(dict(calibration.attrs), attrs_before)
             self.assertFalse(correction_history_path(path).exists())
 
+    def test_live_detect_and_correction_reject_legacy_command_space_calibration(self):
+        legacy = legacy_command_space_calibration_dataset()
+        message = "legacy command-space calibration.*re-run calibration"
+
+        with self.assertRaisesRegex(ValueError, message):
+            detect_shift(legacy, object(), capture_count=1)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "legacy-calibration.h5"
+            path.touch()
+            with self.assertRaisesRegex(ValueError, message):
+                correct_module.do_correction(
+                    legacy.assign_attrs(calibration_path=str(path)),
+                    object(),
+                    capture_count=1,
+                )
+
     def test_detect_shift_rotates_estimated_offset_for_current_polar(self):
         calibration = calibration_dataset()
-        runtime_jacobian = correct_module._rotate_px_per_cmd_mm_for_polar_delta(
-            calibration["px_per_cmd_mm"].values,
+        runtime_jacobian = correct_module._rotate_px_per_readback_mm_for_polar_delta(
+            calibration["px_per_readback_mm"].values,
             90.0,
         )
         offset_mm = np.asarray([0.0, 0.0, 0.020], dtype=float)
@@ -270,7 +314,7 @@ class ShiftDetectionTests(unittest.TestCase):
             result = detect_shift(calibration, object(), capture_count=1)
 
         np.testing.assert_allclose(
-            result["estimated_command_offset_mm"].values,
+            result["estimated_readback_offset_mm"].values,
             offset_mm,
             atol=1e-12,
         )
@@ -290,8 +334,8 @@ class ShiftDetectionTests(unittest.TestCase):
             initial_y_mm=2.0,
             initial_z_mm=3.0,
         )
-        runtime_jacobian = correct_module._rotate_px_per_cmd_mm_for_polar_delta(
-            calibration["px_per_cmd_mm"].values,
+        runtime_jacobian = correct_module._rotate_px_per_readback_mm_for_polar_delta(
+            calibration["px_per_readback_mm"].values,
             90.0,
         )
         current_position = np.asarray([1.0, 2.0, 3.020], dtype=float)
@@ -507,8 +551,12 @@ class VisualCalibrationTests(unittest.TestCase):
         self.assertEqual(len(calls), 4)
         self.assertTrue(all(reference.ndim == 3 for reference, _current in calls))
         self.assertTrue(all(current.ndim == 3 for _reference, current in calls))
-        self.assertEqual(result["current_cam0"].dims, ("y_cam0", "x_cam0", "channel_cam0"))
-        self.assertEqual(result["current_cam1"].dims, ("y_cam1", "x_cam1", "channel_cam1"))
+        self.assertEqual(
+            result["current_cam0"].dims, ("y_cam0", "x_cam0", "channel_cam0")
+        )
+        self.assertEqual(
+            result["current_cam1"].dims, ("y_cam1", "x_cam1", "channel_cam1")
+        )
         np.testing.assert_allclose(
             result["shift_px"].values,
             [[2.0, 3.0], [6.0, 7.0]],
@@ -567,7 +615,7 @@ class VisualCalibrationTests(unittest.TestCase):
 
     def test_fit_calibration_mean_image_records_aggregation(self):
         command_delta = probe_deltas()
-        expected = px_per_cmd_mm()
+        expected = px_per_readback_mm()
         measured = measured_from_jacobian(command_delta, expected)
         shift_values = iter(
             measured[probe_index, camera_index]
@@ -614,6 +662,7 @@ class VisualCalibrationTests(unittest.TestCase):
                     capture_count=2,
                 ),
                 command_delta_mm=command_delta,
+                initial_readback_position_mm=np.zeros(3),
                 pre_commanded_position_mm=np.zeros((command_delta.shape[0], 3)),
                 post_commanded_position_mm=command_delta,
                 pre_readback_position_mm=np.zeros((command_delta.shape[0], 3)),
@@ -731,6 +780,10 @@ class VisualCalibrationTests(unittest.TestCase):
             np.testing.assert_array_equal(kwargs["reference_cam1"], expected_crop_cam1)
             np.testing.assert_allclose(kwargs["command_delta_mm"], expected_offsets)
             np.testing.assert_allclose(
+                kwargs["initial_readback_position_mm"],
+                np.zeros(len(COMMAND_AXES)),
+            )
+            np.testing.assert_allclose(
                 kwargs["post_commanded_position_mm"],
                 expected_offsets,
             )
@@ -832,9 +885,9 @@ class VisualCalibrationTests(unittest.TestCase):
 
         sleep.assert_called_once_with(4.0)
 
-    def test_fitted_px_per_cmd_mm_matches_synthetic_response(self):
+    def test_fitted_px_per_readback_mm_matches_synthetic_response(self):
         command_delta = probe_deltas()
-        expected = px_per_cmd_mm()
+        expected = px_per_readback_mm()
         measured = measured_from_jacobian(command_delta, expected)
         shift_values = iter(
             measured[probe_index, camera_index]
@@ -864,23 +917,24 @@ class VisualCalibrationTests(unittest.TestCase):
                 before_images_cam1=empty_capture_stacks(len(command_delta)),
                 after_images_cam1=empty_capture_stacks(len(command_delta)),
                 command_delta_mm=command_delta,
+                initial_readback_position_mm=np.zeros(3),
                 pre_commanded_position_mm=pre,
                 post_commanded_position_mm=post,
-                pre_readback_position_mm=pre + 100.0,
-                post_readback_position_mm=post - 50.0,
+                pre_readback_position_mm=pre,
+                post_readback_position_mm=post,
                 min_shift_px=0.0,
                 n_jobs=1,
             )
 
         np.testing.assert_allclose(
-            calibration["px_per_cmd_mm"].values,
+            calibration["px_per_readback_mm"].values,
             expected,
             atol=1e-10,
         )
 
     def test_fitted_absolute_center_offsets_accept_zero_closure_row(self):
         command_delta = _make_visual_probe_offsets_um(3, 10.0) / 1000.0
-        expected = px_per_cmd_mm()
+        expected = px_per_readback_mm()
         measured = measured_from_jacobian(command_delta, expected)
         shift_values = iter(
             measured[probe_index, camera_index]
@@ -909,6 +963,7 @@ class VisualCalibrationTests(unittest.TestCase):
                 before_images_cam1=empty_capture_stacks(len(command_delta)),
                 after_images_cam1=empty_capture_stacks(len(command_delta)),
                 command_delta_mm=command_delta,
+                initial_readback_position_mm=np.array([1.0, 2.0, 3.0]),
                 pre_commanded_position_mm=pre,
                 post_commanded_position_mm=post,
                 pre_readback_position_mm=pre,
@@ -929,7 +984,7 @@ class VisualCalibrationTests(unittest.TestCase):
         )
         np.testing.assert_allclose(command_delta[-1], 0.0, atol=1e-15)
         np.testing.assert_allclose(
-            calibration["px_per_cmd_mm"].values,
+            calibration["px_per_readback_mm"].values,
             expected,
             atol=1e-10,
         )
@@ -939,11 +994,11 @@ class VisualCalibrationTests(unittest.TestCase):
             atol=1e-15,
         )
 
-    def test_fitted_px_per_cmd_mm_uses_raw_repeats_and_warns_on_transient_spread(
+    def test_fitted_px_per_readback_mm_uses_raw_repeats_and_warns_on_transient_spread(
         self,
     ):
         command_delta = np.asarray(_make_visual_probe_deltas(5, 15.0), dtype=float)
-        expected = px_per_cmd_mm()
+        expected = px_per_readback_mm()
         measured = measured_from_jacobian(command_delta, expected)
         biased_observation = measured.reshape(command_delta.shape[0], 4).copy()
         command_groups: dict[tuple[float, ...], list[int]] = {}
@@ -984,6 +1039,7 @@ class VisualCalibrationTests(unittest.TestCase):
                 before_images_cam1=empty_capture_stacks(len(command_delta)),
                 after_images_cam1=empty_capture_stacks(len(command_delta)),
                 command_delta_mm=command_delta,
+                initial_readback_position_mm=np.zeros(3),
                 pre_commanded_position_mm=pre,
                 post_commanded_position_mm=post,
                 pre_readback_position_mm=pre,
@@ -996,10 +1052,10 @@ class VisualCalibrationTests(unittest.TestCase):
             command_delta,
             biased_observation,
         )
-        raw_px_per_cmd_mm = raw_fit.T.reshape(len(CAMERAS), len(PIXEL_AXES), 3)
+        raw_px_per_readback_mm = raw_fit.T.reshape(len(CAMERAS), len(PIXEL_AXES), 3)
         np.testing.assert_allclose(
-            calibration["px_per_cmd_mm"].values,
-            raw_px_per_cmd_mm,
+            calibration["px_per_readback_mm"].values,
+            raw_px_per_readback_mm,
             atol=1e-10,
         )
         np.testing.assert_allclose(
@@ -1014,7 +1070,7 @@ class VisualCalibrationTests(unittest.TestCase):
 
     def test_fitted_visual_calibration_preserves_reference_image_dtype(self):
         command_delta = probe_deltas()
-        expected = px_per_cmd_mm()
+        expected = px_per_readback_mm()
         measured = measured_from_jacobian(command_delta, expected)
         shift_values = iter(
             measured[probe_index, camera_index]
@@ -1051,6 +1107,7 @@ class VisualCalibrationTests(unittest.TestCase):
                 before_images_cam1=capture_stacks,
                 after_images_cam1=capture_stacks,
                 command_delta_mm=command_delta,
+                initial_readback_position_mm=np.zeros(3),
                 pre_commanded_position_mm=pre,
                 post_commanded_position_mm=post,
                 pre_readback_position_mm=pre,
@@ -1111,6 +1168,7 @@ class VisualCalibrationTests(unittest.TestCase):
                 before_images_cam1=empty_capture_stacks(len(command_delta)),
                 after_images_cam1=empty_capture_stacks(len(command_delta)),
                 command_delta_mm=command_delta,
+                initial_readback_position_mm=np.zeros(3),
                 pre_commanded_position_mm=pre,
                 post_commanded_position_mm=post,
                 pre_readback_position_mm=pre,
@@ -1127,14 +1185,14 @@ class VisualCalibrationTests(unittest.TestCase):
             _axis_scale_bounds,
             _target_response,
         ) = derive_axis_scale_from_jacobian(
-            calibration["px_per_cmd_mm"].values,
-            calibration["probe_command_delta_mm"].values,
+            calibration["px_per_readback_mm"].values,
+            calibration["probe_readback_delta_mm"].values,
         )
         np.testing.assert_allclose(axis_sensitivity, [1000.0, 10.0, 100.0], atol=1e-9)
         np.testing.assert_allclose(axis_scale_unclamped, [0.003, 0.3, 0.03], atol=1e-9)
         np.testing.assert_allclose(derived_axis_scale, [0.1, 0.3, 0.1], atol=1e-9)
         np.testing.assert_allclose(
-            calibration["axis_scale_cmd_mm"].values,
+            calibration["axis_scale_readback_mm"].values,
             [0.1, 0.3, 0.1],
             atol=1e-9,
         )
@@ -1144,16 +1202,16 @@ class VisualCalibrationTests(unittest.TestCase):
         np.testing.assert_allclose(
             dataset["probe_measured_delta_px"].values,
             measured_from_jacobian(
-                dataset["probe_command_delta_mm"].values,
-                dataset["px_per_cmd_mm"].values,
+                dataset["probe_readback_delta_mm"].values,
+                dataset["px_per_readback_mm"].values,
             ),
         )
 
     def test_saved_calibration_drops_redundant_derived_fields(self):
         redundant_vars = (
-            "axis_scale_unclamped_cmd_mm",
-            "axis_sensitivity_px_per_cmd_mm",
-            "axis_scale_bounds_cmd_mm",
+            "axis_scale_unclamped_readback_mm",
+            "axis_sensitivity_px_per_readback_mm",
+            "axis_scale_bounds_readback_mm",
             "axis_scale_target_response_px",
             "probe_predicted_delta_px",
             "probe_residual_delta_px",
@@ -1171,7 +1229,7 @@ class VisualCalibrationTests(unittest.TestCase):
             calibration_dataset()
             .assign(
                 {
-                    "axis_sensitivity_px_per_cmd_mm": (
+                    "axis_sensitivity_px_per_readback_mm": (
                         ("command_axis",),
                         np.ones(len(COMMAND_AXES)),
                     ),
@@ -1375,6 +1433,7 @@ class VisualCalibrationTests(unittest.TestCase):
                 before_images_cam1=empty_capture_stacks(3, shape=(3, 3)),
                 after_images_cam1=empty_capture_stacks(3, shape=(3, 3)),
                 command_delta_mm=command_delta,
+                initial_readback_position_mm=np.zeros(3),
                 pre_commanded_position_mm=np.zeros((3, 3)),
                 post_commanded_position_mm=command_delta,
                 pre_readback_position_mm=np.zeros((3, 3)),
@@ -1383,9 +1442,9 @@ class VisualCalibrationTests(unittest.TestCase):
                 n_jobs=1,
             )
 
-    def test_rank_deficient_px_per_cmd_mm_is_rejected(self):
+    def test_rank_deficient_px_per_readback_mm_is_rejected(self):
         bad = calibration_dataset()
-        bad["px_per_cmd_mm"] = (
+        bad["px_per_readback_mm"] = (
             ("camera", "pixel_axis", "command_axis"),
             np.ones((2, 2, 3), dtype=float),
         )
@@ -1394,9 +1453,11 @@ class VisualCalibrationTests(unittest.TestCase):
 
     def test_command_delta_mismatch_is_rejected(self):
         bad = calibration_dataset()
+        post_commanded = bad["post_commanded_position_mm"].values.copy()
+        post_commanded[0, 0] += 0.01
         bad["post_commanded_position_mm"] = (
             ("probe", "command_axis"),
-            bad["post_commanded_position_mm"].values + 0.01,
+            post_commanded,
         )
 
         with self.assertRaisesRegex(ValueError, "must equal"):
@@ -1411,7 +1472,7 @@ class VisualCalibrationTests(unittest.TestCase):
                 "probe_command_delta_mode": "absolute_center_offset",
             }
         )
-        command_delta = dataset["probe_command_delta_mm"].values
+        command_delta = dataset["probe_readback_delta_mm"].values
         pre, post = absolute_command_positions(command_delta)
         dataset["pre_commanded_position_mm"] = (
             ("probe", "command_axis"),
@@ -1429,12 +1490,20 @@ class VisualCalibrationTests(unittest.TestCase):
             ("probe", "command_axis"),
             post,
         )
+        dataset["initial_readback_position_mm"] = (
+            ("command_axis",),
+            np.array([1.0, 2.0, 3.0], dtype=float),
+        )
+        dataset["probe_readback_delta_mm"] = (
+            ("probe", "command_axis"),
+            post - np.array([1.0, 2.0, 3.0], dtype=float),
+        )
 
         validate_visual_calibration_dataset(dataset)
 
     def test_axis_scale_outside_configured_bounds_is_rejected(self):
         bad = calibration_dataset()
-        bad["axis_scale_cmd_mm"] = (
+        bad["axis_scale_readback_mm"] = (
             ("command_axis",),
             np.array([10.0, 0.5, 0.5], dtype=float),
         )
@@ -1475,6 +1544,7 @@ class VisualCalibrationTests(unittest.TestCase):
                 before_images_cam1=empty_capture_stacks(3, shape=(3, 3)),
                 after_images_cam1=empty_capture_stacks(3, shape=(3, 3)),
                 command_delta_mm=command_delta,
+                initial_readback_position_mm=np.zeros(3),
                 pre_commanded_position_mm=np.zeros((3, 3)),
                 post_commanded_position_mm=command_delta,
                 pre_readback_position_mm=np.zeros((3, 3)),
@@ -1527,8 +1597,8 @@ class CorrectionTests(unittest.TestCase):
         )
 
     def test_polar_rotation_maps_runtime_axes_into_calibration_basis(self):
-        calibration_jacobian = px_per_cmd_mm()
-        rotated = correct_module._rotate_px_per_cmd_mm_for_polar_delta(
+        calibration_jacobian = px_per_readback_mm()
+        rotated = correct_module._rotate_px_per_readback_mm_for_polar_delta(
             calibration_jacobian,
             90.0,
         )
@@ -1729,7 +1799,7 @@ class CorrectionTests(unittest.TestCase):
             offset_mm = 0.020 * np.asarray(geometry["beam_unit"], dtype=float)
             shift = measured_from_jacobian(
                 offset_mm.reshape(1, len(COMMAND_AXES)),
-                calibration["px_per_cmd_mm"].values,
+                calibration["px_per_readback_mm"].values,
             )[0]
             hardware_patches = self.patch_hardware(
                 [shift_dataset(shift), shift_dataset(np.zeros((2, 2)))],
@@ -1852,7 +1922,7 @@ class CorrectionTests(unittest.TestCase):
             offset_mm = 0.0002 * np.asarray(geometry["beam_unit"], dtype=float)
             shift = measured_from_jacobian(
                 offset_mm.reshape(1, len(COMMAND_AXES)),
-                calibration["px_per_cmd_mm"].values,
+                calibration["px_per_readback_mm"].values,
             )[0]
             hardware_patches = self.patch_hardware([shift_dataset(shift)])
             with (
@@ -1891,7 +1961,7 @@ class CorrectionTests(unittest.TestCase):
             offset_mm = 0.010 * transverse + np.array([0.0, 0.005, 0.0])
             shift = measured_from_jacobian(
                 offset_mm.reshape(1, len(COMMAND_AXES)),
-                calibration["px_per_cmd_mm"].values,
+                calibration["px_per_readback_mm"].values,
             )[0]
             hardware_patches = self.patch_hardware(
                 [shift_dataset(shift), shift_dataset(np.zeros((2, 2)))],
@@ -1921,15 +1991,15 @@ class CorrectionTests(unittest.TestCase):
         self.assertIn("iteration_analyzer_offset_mm", result)
         self.assertFalse(result.attrs["correction_lqr_kalman_filter_enabled"])
 
-    def test_correction_uses_command_state_not_readback_state(self):
+    def test_correction_requests_delta_from_current_readback_state(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = self.save_calibration(tmpdir)
             p0 = np.array([[60.0, -40.0], [20.0, 10.0]], dtype=float)
             p1 = np.zeros((2, 2), dtype=float)
             expected_delta = solve_lqr_command_correction(
-                calibration_dataset()["px_per_cmd_mm"].values,
+                calibration_dataset()["px_per_readback_mm"].values,
                 shift_dataset(p0),
-                calibration_dataset()["axis_scale_cmd_mm"].values,
+                calibration_dataset()["axis_scale_readback_mm"].values,
                 gain=TEST_CORRECTION_GAIN,
                 image_scale_px=TEST_LQR_IMAGE_SCALE_PX,
                 motor_penalty=TEST_LQR_MOTOR_PENALTY,
@@ -2086,10 +2156,8 @@ class CorrectionTests(unittest.TestCase):
                 "get",
                 "measure",
                 "move",
-                "get",
                 "measure",
                 "move",
-                "get",
                 "measure",
             ],
         )
@@ -2126,9 +2194,11 @@ class CorrectionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = self.save_calibration(tmpdir)
             calibration = calibration_dataset()
-            runtime_jacobian = correct_module._rotate_px_per_cmd_mm_for_polar_delta(
-                calibration["px_per_cmd_mm"].values,
-                90.0,
+            runtime_jacobian = (
+                correct_module._rotate_px_per_readback_mm_for_polar_delta(
+                    calibration["px_per_readback_mm"].values,
+                    90.0,
+                )
             )
             offset_mm = np.asarray([0.0, 0.0, 0.020], dtype=float)
             shift = measured_from_jacobian(
@@ -2171,7 +2241,9 @@ class CorrectionTests(unittest.TestCase):
         self.assertEqual(len(backend.moves), 1)
         self.assertTrue(result.attrs["correction_polar_rotation_applied"])
         self.assertEqual(result.attrs["correction_current_polar_deg"], 90.0)
-        np.testing.assert_allclose(result["px_per_cmd_mm"].values, runtime_jacobian)
+        np.testing.assert_allclose(
+            result["px_per_readback_mm"].values, runtime_jacobian
+        )
 
     def test_correction_initial_measurement_seeds_ecc_from_runtime_geometry(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2182,9 +2254,11 @@ class CorrectionTests(unittest.TestCase):
                 initial_z_mm=30.0,
             )
             save_calibration_dataset(calibration, path)
-            runtime_jacobian = correct_module._rotate_px_per_cmd_mm_for_polar_delta(
-                calibration["px_per_cmd_mm"].values,
-                90.0,
+            runtime_jacobian = (
+                correct_module._rotate_px_per_readback_mm_for_polar_delta(
+                    calibration["px_per_readback_mm"].values,
+                    90.0,
+                )
             )
             current_position = np.asarray([10.0, 20.0, 30.020], dtype=float)
             expected_seed = measured_from_jacobian(
@@ -2311,9 +2385,9 @@ class CorrectionTests(unittest.TestCase):
             p0 = np.array([[60.0, -40.0], [20.0, 10.0]], dtype=float)
             p1 = np.zeros((len(CAMERAS), len(PIXEL_AXES)), dtype=float)
             expected_delta = solve_lqr_command_correction(
-                calibration["px_per_cmd_mm"].values,
+                calibration["px_per_readback_mm"].values,
                 shift_dataset(p0),
-                calibration["axis_scale_cmd_mm"].values,
+                calibration["axis_scale_readback_mm"].values,
                 gain=TEST_CORRECTION_GAIN,
                 image_scale_px=TEST_LQR_IMAGE_SCALE_PX,
                 motor_penalty=TEST_LQR_MOTOR_PENALTY,
@@ -2362,13 +2436,15 @@ class CorrectionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = self.save_calibration(tmpdir)
             calibration = calibration_dataset()
-            runtime_jacobian = correct_module._rotate_px_per_cmd_mm_for_polar_delta(
-                calibration["px_per_cmd_mm"].values,
-                90.0,
+            runtime_jacobian = (
+                correct_module._rotate_px_per_readback_mm_for_polar_delta(
+                    calibration["px_per_readback_mm"].values,
+                    90.0,
+                )
             )
             runtime_axis_scale, *_ = derive_axis_scale_from_jacobian(
                 runtime_jacobian,
-                calibration["probe_command_delta_mm"].values,
+                calibration["probe_readback_delta_mm"].values,
             )
             offset_mm = np.asarray([0.0, 0.0, 0.020], dtype=float)
             shift = measured_from_jacobian(
@@ -2386,7 +2462,9 @@ class CorrectionTests(unittest.TestCase):
                 max_normalized_step=TEST_CORRECTION_MAX_NORMALIZED_STEP,
                 weights=TEST_CORRECTION_WEIGHTS,
             )
-            expected_delta = correct_module._validate_command_correction(expected_delta)
+            expected_delta = correct_module._validate_readback_correction(
+                expected_delta
+            )
             hardware_patches = self.patch_hardware(
                 [shift_dataset(shift), shift_dataset(np.zeros((2, 2)))],
                 positions={"x": 10.0, "y": 20.0, "z": 30.0, "p": 90.0},
@@ -2420,9 +2498,11 @@ class CorrectionTests(unittest.TestCase):
             index = COMMAND_AXES.index(axis)
             actual_delta[index] = goal - np.array([10.0, 20.0, 30.0])[index]
         np.testing.assert_allclose(actual_delta, expected_delta, atol=1e-12)
-        np.testing.assert_allclose(result["px_per_cmd_mm"].values, runtime_jacobian)
         np.testing.assert_allclose(
-            result["axis_scale_cmd_mm"].values, runtime_axis_scale
+            result["px_per_readback_mm"].values, runtime_jacobian
+        )
+        np.testing.assert_allclose(
+            result["axis_scale_readback_mm"].values, runtime_axis_scale
         )
         self.assertTrue(result.attrs["correction_polar_rotation_applied"])
         self.assertEqual(result.attrs["correction_calibration_polar_deg"], 0.0)
@@ -2455,12 +2535,12 @@ class CorrectionTests(unittest.TestCase):
 
         move.assert_not_called()
         np.testing.assert_allclose(
-            result["px_per_cmd_mm"].values,
-            calibration["px_per_cmd_mm"].values,
+            result["px_per_readback_mm"].values,
+            calibration["px_per_readback_mm"].values,
         )
         np.testing.assert_allclose(
-            result["axis_scale_cmd_mm"].values,
-            calibration["axis_scale_cmd_mm"].values,
+            result["axis_scale_readback_mm"].values,
+            calibration["axis_scale_readback_mm"].values,
         )
         self.assertFalse(result.attrs["correction_polar_rotation_applied"])
         self.assertEqual(result.attrs["correction_polar_applied_delta_deg"], 0.0)
@@ -2470,11 +2550,11 @@ class CorrectionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = self.save_calibration(tmpdir)
             calibration = calibration_dataset()
-            jacobian = calibration["px_per_cmd_mm"].values.reshape(
+            jacobian = calibration["px_per_readback_mm"].values.reshape(
                 len(CAMERAS) * len(PIXEL_AXES),
                 len(COMMAND_AXES),
             )
-            axis_scale = calibration["axis_scale_cmd_mm"].values
+            axis_scale = calibration["axis_scale_readback_mm"].values
             design = calibration_core.compute_lqr_correction_design(
                 jacobian,
                 axis_scale,
@@ -2539,9 +2619,9 @@ class CorrectionTests(unittest.TestCase):
             p0 = np.array([[60.0, -40.0], [20.0, 10.0]], dtype=float)
             p1 = np.zeros((len(CAMERAS), len(PIXEL_AXES)), dtype=float)
             expected_delta = solve_lqr_command_correction(
-                calibration["px_per_cmd_mm"].values,
+                calibration["px_per_readback_mm"].values,
                 shift_dataset(p0),
-                calibration["axis_scale_cmd_mm"].values,
+                calibration["axis_scale_readback_mm"].values,
                 gain=TEST_CORRECTION_GAIN,
                 image_scale_px=TEST_LQR_IMAGE_SCALE_PX,
                 motor_penalty=TEST_LQR_MOTOR_PENALTY,
@@ -2705,9 +2785,9 @@ class CorrectionTests(unittest.TestCase):
             lqr_gain = 0.25
             lqr_max_step = 0.125
             expected_delta = solve_lqr_command_correction(
-                calibration["px_per_cmd_mm"].values,
+                calibration["px_per_readback_mm"].values,
                 shift_dataset(p0),
-                calibration["axis_scale_cmd_mm"].values,
+                calibration["axis_scale_readback_mm"].values,
                 gain=lqr_gain,
                 image_scale_px=TEST_LQR_IMAGE_SCALE_PX,
                 motor_penalty=TEST_LQR_MOTOR_PENALTY,
@@ -2756,9 +2836,9 @@ class CorrectionTests(unittest.TestCase):
             calibration = calibration_dataset()
             p0 = x_shift(30.0)
             correction_delta = solve_lqr_command_correction(
-                calibration["px_per_cmd_mm"].values,
+                calibration["px_per_readback_mm"].values,
                 shift_dataset(p0),
-                calibration["axis_scale_cmd_mm"].values,
+                calibration["axis_scale_readback_mm"].values,
                 gain=TEST_CORRECTION_GAIN,
                 image_scale_px=TEST_LQR_IMAGE_SCALE_PX,
                 motor_penalty=TEST_LQR_MOTOR_PENALTY,
@@ -2767,7 +2847,7 @@ class CorrectionTests(unittest.TestCase):
                 weights=TEST_CORRECTION_WEIGHTS,
             )
             predicted_delta = (
-                calibration["px_per_cmd_mm"].values.reshape(
+                calibration["px_per_readback_mm"].values.reshape(
                     len(CAMERAS) * len(PIXEL_AXES), len(COMMAND_AXES)
                 )
                 @ correction_delta
@@ -2795,7 +2875,7 @@ class CorrectionTests(unittest.TestCase):
                 hardware_patches[2],
                 patch(
                     "merlin_track_position.tracking.correct.move_motors_and_wait",
-                    return_value=(10.0, 20.0, 30.0),
+                    side_effect=lambda _axes, goals, **_kwargs: tuple(goals),
                 ),
             ):
                 result = do_correction(
@@ -2823,11 +2903,11 @@ class CorrectionTests(unittest.TestCase):
 
     def test_lqr_gain_is_stable_and_reduces_predicted_residual(self):
         calibration = calibration_dataset()
-        jacobian = calibration["px_per_cmd_mm"].values.reshape(
+        jacobian = calibration["px_per_readback_mm"].values.reshape(
             len(CAMERAS) * len(PIXEL_AXES),
             len(COMMAND_AXES),
         )
-        axis_scale = calibration["axis_scale_cmd_mm"].values
+        axis_scale = calibration["axis_scale_readback_mm"].values
         feedback_gain, eigenvalues, rank, singular_values = (
             calibration_core._compute_lqr_feedback_gain(
                 jacobian,
@@ -2849,7 +2929,7 @@ class CorrectionTests(unittest.TestCase):
 
         shift = np.array([[60.0, -40.0], [20.0, 10.0]], dtype=float)
         correction = solve_lqr_command_correction(
-            calibration["px_per_cmd_mm"].values,
+            calibration["px_per_readback_mm"].values,
             shift_dataset(shift),
             axis_scale,
             gain=TEST_CORRECTION_GAIN,
@@ -2864,11 +2944,11 @@ class CorrectionTests(unittest.TestCase):
 
     def test_lqr_kalman_helpers_update_and_gate_measurements(self):
         calibration = calibration_dataset()
-        jacobian = calibration["px_per_cmd_mm"].values.reshape(
+        jacobian = calibration["px_per_readback_mm"].values.reshape(
             len(CAMERAS) * len(PIXEL_AXES),
             len(COMMAND_AXES),
         )
-        axis_scale = calibration["axis_scale_cmd_mm"].values
+        axis_scale = calibration["axis_scale_readback_mm"].values
         design = calibration_core.compute_lqr_correction_design(
             jacobian,
             axis_scale,
@@ -2968,7 +3048,7 @@ class CorrectionTests(unittest.TestCase):
         correction = solve_lqr_command_correction(
             jacobian,
             shift_dataset(np.array([[10.0, 0.0], [0.0, 0.0]])),
-            axis_scale_cmd_mm=[1.0, 1.0, 1.0],
+            axis_scale_readback_mm=[1.0, 1.0, 1.0],
             gain=1.0,
             image_scale_px=TEST_LQR_IMAGE_SCALE_PX,
             motor_penalty=TEST_LQR_MOTOR_PENALTY,
@@ -2993,7 +3073,7 @@ class CorrectionTests(unittest.TestCase):
             save_calibration_dataset(calibration, path)
             offset_mm = np.array([0.020, 0.0, 0.0], dtype=float)
             p0 = (
-                calibration["px_per_cmd_mm"].values.reshape(
+                calibration["px_per_readback_mm"].values.reshape(
                     len(CAMERAS) * len(PIXEL_AXES), len(COMMAND_AXES)
                 )
                 @ offset_mm
@@ -3083,8 +3163,8 @@ class CorrectionTests(unittest.TestCase):
             np.array([10.0 + active_delta_mm], dtype=float),
         )
         np.testing.assert_allclose(
-            result["move_command_delta_mm"].values,
-            [[active_delta_mm, 0.0, 0.0]],
+            result["move_final_readback_position_mm"].values,
+            [[10.0 + active_delta_mm, 20.0, 30.0]],
         )
         self.assertEqual(
             result["move_active_axis_mask"].values.tolist(),
@@ -3098,16 +3178,16 @@ class CorrectionTests(unittest.TestCase):
             calibration = calibration_dataset()
             offset_mm = np.array([0.020, 0.0, 0.0], dtype=float)
             p0 = (
-                calibration["px_per_cmd_mm"].values.reshape(
+                calibration["px_per_readback_mm"].values.reshape(
                     len(CAMERAS) * len(PIXEL_AXES), len(COMMAND_AXES)
                 )
                 @ offset_mm
             ).reshape(len(CAMERAS), len(PIXEL_AXES))
             p1 = np.zeros((len(CAMERAS), len(PIXEL_AXES)), dtype=float)
             expected_delta = solve_lqr_command_correction(
-                calibration["px_per_cmd_mm"].values,
+                calibration["px_per_readback_mm"].values,
                 shift_dataset(p0),
-                calibration["axis_scale_cmd_mm"].values,
+                calibration["axis_scale_readback_mm"].values,
                 gain=TEST_CORRECTION_GAIN,
                 image_scale_px=TEST_LQR_IMAGE_SCALE_PX,
                 motor_penalty=TEST_LQR_MOTOR_PENALTY,
@@ -3115,7 +3195,7 @@ class CorrectionTests(unittest.TestCase):
                 max_normalized_step=TEST_CORRECTION_MAX_NORMALIZED_STEP,
                 weights=TEST_CORRECTION_WEIGHTS,
             )
-            sanitized_delta = correct_module._validate_command_correction(
+            sanitized_delta = correct_module._validate_readback_correction(
                 expected_delta
             )
             active_indices = tuple(
@@ -3171,7 +3251,7 @@ class CorrectionTests(unittest.TestCase):
             calibration = calibration_dataset()
             offset_mm = np.array([0.020, 0.0, 0.0], dtype=float)
             p0 = (
-                calibration["px_per_cmd_mm"].values.reshape(
+                calibration["px_per_readback_mm"].values.reshape(
                     len(CAMERAS) * len(PIXEL_AXES), len(COMMAND_AXES)
                 )
                 @ offset_mm
@@ -3221,7 +3301,7 @@ class CorrectionTests(unittest.TestCase):
                 hardware_patches[2],
                 patch(
                     "merlin_track_position.tracking.correct.move_motors_and_wait",
-                    return_value=(10.0, 20.0, 30.0),
+                    side_effect=lambda _axes, goals, **_kwargs: tuple(goals),
                 ),
             ):
                 result = do_correction(
@@ -3334,15 +3414,30 @@ class CorrectionTests(unittest.TestCase):
                 )
                 current_cam0 = np.full((4, 5), image_value, dtype=np.uint16)
                 current_cam1 = np.full((6, 7), image_value + 1, dtype=np.uint16)
+                final_readbacks = np.cumsum(move_values, axis=0)
                 updated = (
                     shift_dataset(x_shift(float(image_value)))
                     .assign(
                         current_cam0=(("y_cam0", "x_cam0"), current_cam0),
                         current_cam1=(("y_cam1", "x_cam1"), current_cam1),
-                        move_command_delta_mm=(
+                        initial_readback_position_mm=(
+                            ("command_axis",),
+                            np.zeros(len(COMMAND_AXES), dtype=float),
+                            {"units": "readback-mm"},
+                        ),
+                        final_readback_position_mm=(
+                            ("command_axis",),
+                            (
+                                final_readbacks[-1]
+                                if move_count
+                                else np.zeros(len(COMMAND_AXES), dtype=float)
+                            ),
+                            {"units": "readback-mm"},
+                        ),
+                        move_final_readback_position_mm=(
                             ("move", "command_axis"),
-                            move_values,
-                            {"units": "commanded-mm"},
+                            final_readbacks,
+                            {"units": "readback-mm"},
                         ),
                         move_feedback_valid=(
                             ("move",),
@@ -3388,9 +3483,9 @@ class CorrectionTests(unittest.TestCase):
                 group = history_file["run_000000"]
                 self.assertEqual(group["move"].maxshape, (None,))
                 self.assertEqual(group["iteration"].maxshape, (None,))
-                self.assertIsNone(group["move_command_delta_mm"].maxshape[0])
+                self.assertIsNone(group["move_final_readback_position_mm"].maxshape[0])
                 self.assertIsNone(group["iteration_shift_px"].maxshape[0])
-                self.assertEqual(group["move_command_delta_mm"].shape[0], 2)
+                self.assertEqual(group["move_final_readback_position_mm"].shape[0], 2)
                 self.assertEqual(group["iteration_shift_px"].shape[0], 3)
 
             loaded = load_latest_correction_history_dataset(calibration_path)
@@ -3401,8 +3496,8 @@ class CorrectionTests(unittest.TestCase):
         self.assertEqual(loaded.sizes["move"], 2)
         self.assertEqual(loaded.sizes["iteration"], 3)
         np.testing.assert_allclose(
-            loaded["move_command_delta_mm"].values,
-            np.array([[0.0, 0.001, 0.002], [0.003, 0.004, 0.005]]),
+            loaded["move_final_readback_position_mm"].values,
+            np.array([[0.0, 0.001, 0.002], [0.003, 0.005, 0.007]]),
         )
         np.testing.assert_array_equal(
             loaded["current_cam0"].values,
@@ -3527,7 +3622,7 @@ class CorrectionTests(unittest.TestCase):
         )
 
     def test_correction_total_move_by_axis_from_history(self):
-        jacobian = px_per_cmd_mm()
+        jacobian = px_per_readback_mm()
         detected_move_delta_mm = np.array(
             [
                 [0.0005, -0.001, 0.002],
@@ -3542,21 +3637,31 @@ class CorrectionTests(unittest.TestCase):
         first = (
             shift_dataset(x_shift(1.0))
             .assign(
-                px_per_cmd_mm=(
+                px_per_readback_mm=(
                     ("camera", "pixel_axis", "command_axis"),
                     jacobian,
-                    {"units": "px/commanded-mm"},
+                    {"units": "px/readback-mm"},
                 ),
-                move_command_delta_mm=(
+                initial_readback_position_mm=(
+                    ("command_axis",),
+                    np.zeros(len(COMMAND_AXES), dtype=float),
+                    {"units": "readback-mm"},
+                ),
+                final_readback_position_mm=(
+                    ("command_axis",),
+                    np.array([0.001, 0.001, -0.004], dtype=float),
+                    {"units": "readback-mm"},
+                ),
+                move_final_readback_position_mm=(
                     ("move", "command_axis"),
                     np.array(
                         [
                             [0.001, -0.002, 0.0],
-                            [0.0, 0.003, -0.004],
+                            [0.001, 0.001, -0.004],
                         ],
                         dtype=float,
                     ),
-                    {"units": "commanded-mm"},
+                    {"units": "readback-mm"},
                 ),
                 iteration_shift_px=(
                     ("iteration", "camera", "pixel_axis"),
@@ -3591,15 +3696,25 @@ class CorrectionTests(unittest.TestCase):
         second = (
             shift_dataset(x_shift(2.0))
             .assign(
-                px_per_cmd_mm=(
+                px_per_readback_mm=(
                     ("camera", "pixel_axis", "command_axis"),
                     jacobian,
-                    {"units": "px/commanded-mm"},
+                    {"units": "px/readback-mm"},
                 ),
-                move_command_delta_mm=(
+                initial_readback_position_mm=(
+                    ("command_axis",),
+                    np.zeros(len(COMMAND_AXES), dtype=float),
+                    {"units": "readback-mm"},
+                ),
+                final_readback_position_mm=(
+                    ("command_axis",),
+                    np.zeros(len(COMMAND_AXES), dtype=float),
+                    {"units": "readback-mm"},
+                ),
+                move_final_readback_position_mm=(
                     ("move", "command_axis"),
                     np.empty((0, len(COMMAND_AXES)), dtype=float),
-                    {"units": "commanded-mm"},
+                    {"units": "readback-mm"},
                 ),
                 move_measured_delta_px=(
                     ("move", "camera", "pixel_axis"),
@@ -3648,7 +3763,7 @@ class CorrectionTests(unittest.TestCase):
         np.testing.assert_array_equal(moves["run_id"].values, np.array([0, 2]))
         self.assertEqual(
             moves["move_source"].values.tolist(),
-            ["commanded", "detected"],
+            ["readback", "detected"],
         )
         self.assertEqual(moves["command_axis"].values.tolist(), list(COMMAND_AXES))
         np.testing.assert_allclose(
@@ -3760,7 +3875,7 @@ class CorrectionTests(unittest.TestCase):
                 first_progress = progress_results[0]
                 self.assertFalse(first_progress.attrs["correction_history_completed"])
                 self.assertEqual(first_progress.sizes["move"], 0)
-                self.assertIn("correction_cmd_mm", first_progress)
+                self.assertIn("correction_readback_delta_mm", first_progress)
                 return (10.0, 20.0, 30.0)
 
             with (

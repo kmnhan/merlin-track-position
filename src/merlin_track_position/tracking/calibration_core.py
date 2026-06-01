@@ -1,4 +1,4 @@
-"""Calibration and correction in commanded-mm space."""
+"""Calibration and correction in readback-mm space."""
 
 from __future__ import annotations
 
@@ -51,21 +51,23 @@ CaptureShiftResult = tuple[np.ndarray, tuple[str, ...]]
 IndexedCaptureShiftResult = tuple[int, int, int, np.ndarray, tuple[str, ...]]
 
 REQUIRED_CALIBRATION_VARIABLES: tuple[str, ...] = (
-    "px_per_cmd_mm",
-    "axis_scale_cmd_mm",
+    "px_per_readback_mm",
+    "axis_scale_readback_mm",
     "reference_cam0",
     "reference_cam1",
     "probe_command_delta_mm",
+    "probe_readback_delta_mm",
     "probe_measured_delta_px",
+    "initial_readback_position_mm",
     "pre_commanded_position_mm",
     "post_commanded_position_mm",
     "pre_readback_position_mm",
     "post_readback_position_mm",
 )
 REDUNDANT_CALIBRATION_VARIABLES: tuple[str, ...] = (
-    "axis_scale_unclamped_cmd_mm",
-    "axis_sensitivity_px_per_cmd_mm",
-    "axis_scale_bounds_cmd_mm",
+    "axis_scale_unclamped_readback_mm",
+    "axis_sensitivity_px_per_readback_mm",
+    "axis_scale_bounds_readback_mm",
     "axis_scale_target_response_px",
     "probe_predicted_delta_px",
     "probe_residual_delta_px",
@@ -94,6 +96,7 @@ def fit_jacobian_calibration(
     before_images_cam1: Sequence[Any],
     after_images_cam1: Sequence[Any],
     command_delta_mm: Sequence[Sequence[float]],
+    initial_readback_position_mm: Sequence[float],
     pre_commanded_position_mm: Sequence[Sequence[float]],
     post_commanded_position_mm: Sequence[Sequence[float]],
     pre_readback_position_mm: Sequence[Sequence[float]],
@@ -106,15 +109,16 @@ def fit_jacobian_calibration(
     n_jobs: int | None = None,
     **shift_kwargs: Any,
 ) -> xr.Dataset:
-    """Fit a local Jacobian from commanded-mm motor probes.
+    """Fit a local Jacobian from readback-mm motor probes.
 
-    The fitted model is linear through the local command point:
+    The fitted model is linear through the local readback point:
 
     ``[du0, dv0, du1, dv1] = J @ [dx_mm, dy_mm, dz_mm]``.
 
     ``command_delta_mm`` may be either legacy move deltas or center-relative
-    absolute commanded offsets. The corresponding commanded-position arrays are
-    used to validate which convention is present.
+    absolute requested offsets. The corresponding commanded-position arrays are
+    used to validate which convention is present, but the fit itself uses
+    encoder readback deltas from the reference position.
     """
 
     if "reference_index" in shift_kwargs:
@@ -157,6 +161,10 @@ def fit_jacobian_calibration(
         after_cam1,
     )
     command_delta = _as_probe_command_matrix("command_delta_mm", command_delta_mm)
+    initial_readback = _as_command_axis_vector(
+        "initial_readback_position_mm",
+        initial_readback_position_mm,
+    )
     pre_commanded = _as_probe_command_matrix(
         "pre_commanded_position_mm",
         pre_commanded_position_mm,
@@ -173,6 +181,7 @@ def fit_jacobian_calibration(
         "post_readback_position_mm",
         post_readback_position_mm,
     )
+    readback_delta = post_readback - initial_readback
     for name, values in (
         ("command_delta_mm", command_delta),
         ("pre_commanded_position_mm", pre_commanded),
@@ -213,7 +222,7 @@ def fit_jacobian_calibration(
     if not np.isfinite(min_shift_px) or min_shift_px < 0.0:
         raise ValueError("min_shift_px must be finite and non-negative")
     response_norms = np.linalg.norm(observation, axis=1)
-    fit_probe_rows = _nonzero_command_rows(command_delta)
+    fit_probe_rows = _nonzero_command_rows(readback_delta)
     small_probe_indices = np.nonzero((response_norms < min_shift_px) & fit_probe_rows)[
         0
     ]
@@ -224,15 +233,19 @@ def fit_jacobian_calibration(
             f"{min_shift_px:.4g} px for probe(s): {probe_text}"
         )
 
-    fit_command_delta = command_delta[fit_probe_rows]
+    fit_readback_delta = readback_delta[fit_probe_rows]
     fit_observation = observation[fit_probe_rows]
-    command_rank = int(np.linalg.matrix_rank(fit_command_delta))
-    if command_rank < len(COMMAND_AXES):
-        raise ValueError("probe command deltas must span x/y/z command space")
+    readback_rank = int(np.linalg.matrix_rank(fit_readback_delta))
+    if readback_rank < len(COMMAND_AXES):
+        raise ValueError("probe readback deltas must span x/y/z readback space")
 
-    coef = _fit_robust_calibration_response(fit_command_delta, fit_observation)
-    px_per_cmd_mm = coef.T.reshape(len(CAMERAS), len(PIXEL_AXES), len(COMMAND_AXES))
-    jacobian_observation = px_per_cmd_mm.reshape(
+    coef = _fit_robust_calibration_response(fit_readback_delta, fit_observation)
+    px_per_readback_mm = coef.T.reshape(
+        len(CAMERAS),
+        len(PIXEL_AXES),
+        len(COMMAND_AXES),
+    )
+    jacobian_observation = px_per_readback_mm.reshape(
         len(OBSERVATION_AXES),
         len(COMMAND_AXES),
     )
@@ -258,7 +271,10 @@ def fit_jacobian_calibration(
             f"{condition_number:.4g} > {condition_warning_threshold:.4g}"
         )
 
-    axis_scale, *_ = derive_axis_scale_from_jacobian(px_per_cmd_mm, fit_command_delta)
+    axis_scale, *_ = derive_axis_scale_from_jacobian(
+        px_per_readback_mm,
+        fit_readback_delta,
+    )
     warnings = list(format_probe_warning_lines(measurement_warnings, command_delta))
     warnings.extend(
         format_probe_repeatability_warning_lines(
@@ -295,15 +311,15 @@ def fit_jacobian_calibration(
     coords |= _image_coords("cam1", reference_image_cam1)
     dataset = xr.Dataset(
         data_vars={
-            "px_per_cmd_mm": (
+            "px_per_readback_mm": (
                 ("camera", "pixel_axis", "command_axis"),
-                px_per_cmd_mm,
-                {"units": "px/commanded-mm"},
+                px_per_readback_mm,
+                {"units": "px/readback-mm"},
             ),
-            "axis_scale_cmd_mm": (
+            "axis_scale_readback_mm": (
                 ("command_axis",),
                 axis_scale,
-                {"units": "commanded-mm"},
+                {"units": "readback-mm"},
             ),
             "reference_cam0": (
                 _image_dims("cam0", reference_image_cam0),
@@ -318,10 +334,20 @@ def fit_jacobian_calibration(
                 command_delta,
                 {"units": "commanded-mm"},
             ),
+            "probe_readback_delta_mm": (
+                ("probe", "command_axis"),
+                readback_delta,
+                {"units": "readback-mm"},
+            ),
             "probe_measured_delta_px": (
                 ("probe", "camera", "pixel_axis"),
                 measured_delta_px,
                 {"units": "px"},
+            ),
+            "initial_readback_position_mm": (
+                ("command_axis",),
+                initial_readback,
+                {"units": "readback-mm"},
             ),
             "pre_commanded_position_mm": (
                 ("probe", "command_axis"),
@@ -368,6 +394,20 @@ def fit_jacobian_calibration(
 def validate_visual_calibration_dataset(dataset: xr.Dataset) -> None:
     """Validate the required calibration schema."""
 
+    if (
+        "px_per_readback_mm" not in dataset
+        and "axis_scale_readback_mm" not in dataset
+        and (
+            "px_per_cmd_mm" in dataset
+            or "axis_scale_cmd_mm" in dataset
+            or "estimated_command_offset_mm" in dataset
+        )
+    ):
+        raise ValueError(
+            "legacy command-space calibration is not valid for live "
+            "readback-space detection/correction; re-run calibration"
+        )
+
     missing = tuple(
         name for name in REQUIRED_CALIBRATION_VARIABLES if name not in dataset
     )
@@ -376,12 +416,20 @@ def validate_visual_calibration_dataset(dataset: xr.Dataset) -> None:
             "missing required calibration variables: " + ", ".join(missing)
         )
 
-    jacobian = np.asarray(dataset["px_per_cmd_mm"].values, dtype=float)
-    axis_scale = np.asarray(dataset["axis_scale_cmd_mm"].values, dtype=float)
+    jacobian = np.asarray(dataset["px_per_readback_mm"].values, dtype=float)
+    axis_scale = np.asarray(dataset["axis_scale_readback_mm"].values, dtype=float)
     reference_cam0 = np.asarray(dataset["reference_cam0"].values)
     reference_cam1 = np.asarray(dataset["reference_cam1"].values)
     command_delta = np.asarray(dataset["probe_command_delta_mm"].values, dtype=float)
+    readback_delta = np.asarray(
+        dataset["probe_readback_delta_mm"].values,
+        dtype=float,
+    )
     measured_delta = np.asarray(dataset["probe_measured_delta_px"].values, dtype=float)
+    initial_readback = np.asarray(
+        dataset["initial_readback_position_mm"].values,
+        dtype=float,
+    )
     pre_commanded = np.asarray(dataset["pre_commanded_position_mm"].values, dtype=float)
     post_commanded = np.asarray(
         dataset["post_commanded_position_mm"].values, dtype=float
@@ -391,10 +439,10 @@ def validate_visual_calibration_dataset(dataset: xr.Dataset) -> None:
 
     if jacobian.shape != (len(CAMERAS), len(PIXEL_AXES), len(COMMAND_AXES)):
         raise ValueError(
-            "px_per_cmd_mm must have shape (camera, pixel_axis, command_axis)"
+            "px_per_readback_mm must have shape (camera, pixel_axis, command_axis)"
         )
     if not np.isfinite(jacobian).all():
-        raise ValueError("px_per_cmd_mm must contain only finite values")
+        raise ValueError("px_per_readback_mm must contain only finite values")
     jacobian_observation = jacobian.reshape(
         len(OBSERVATION_AXES),
         len(COMMAND_AXES),
@@ -413,14 +461,14 @@ def validate_visual_calibration_dataset(dataset: xr.Dataset) -> None:
             f"{constants.DEFAULT_JACOBIAN_CONDITION_WARNING:.4g}"
         )
     if axis_scale.shape != (len(COMMAND_AXES),):
-        raise ValueError("axis_scale_cmd_mm must have shape (command_axis,)")
+        raise ValueError("axis_scale_readback_mm must have shape (command_axis,)")
     if not np.isfinite(axis_scale).all() or np.any(axis_scale <= 0.0):
-        raise ValueError("axis_scale_cmd_mm must contain finite positive values")
+        raise ValueError("axis_scale_readback_mm must contain finite positive values")
     scale_bounds = _axis_scale_bounds_array()
     if np.any(axis_scale < scale_bounds[:, 0]) or np.any(
         axis_scale > scale_bounds[:, 1]
     ):
-        raise ValueError("axis_scale_cmd_mm must stay within configured bounds")
+        raise ValueError("axis_scale_readback_mm must stay within configured bounds")
     if reference_cam0.ndim not in (2, 3) or reference_cam1.ndim not in (2, 3):
         raise ValueError("reference_cam0 and reference_cam1 must be 2D or 3D images")
     if reference_cam0.size == 0 or reference_cam1.size == 0:
@@ -432,15 +480,23 @@ def validate_visual_calibration_dataset(dataset: xr.Dataset) -> None:
     expected_probe_shape = (probe_count, len(COMMAND_AXES))
     if command_delta.shape != expected_probe_shape:
         raise ValueError("probe_command_delta_mm must have shape (probe, command_axis)")
+    if readback_delta.shape != expected_probe_shape:
+        raise ValueError(
+            "probe_readback_delta_mm must have shape (probe, command_axis)"
+        )
     if probe_count < 1:
         raise ValueError("probe_command_delta_mm must contain at least one probe")
+    if initial_readback.shape != (len(COMMAND_AXES),):
+        raise ValueError("initial_readback_position_mm must have shape (command_axis,)")
     if measured_delta.shape != (probe_count, len(CAMERAS), len(PIXEL_AXES)):
         raise ValueError(
             "probe_measured_delta_px must have shape (probe, camera, pixel_axis)"
         )
     for name, values in (
         ("probe_command_delta_mm", command_delta),
+        ("probe_readback_delta_mm", readback_delta),
         ("probe_measured_delta_px", measured_delta),
+        ("initial_readback_position_mm", initial_readback),
         ("pre_commanded_position_mm", pre_commanded),
         ("post_commanded_position_mm", post_commanded),
         ("pre_readback_position_mm", pre_readback),
@@ -462,9 +518,14 @@ def validate_visual_calibration_dataset(dataset: xr.Dataset) -> None:
         post_commanded,
         dataset.attrs,
     )
-    command_rank = int(np.linalg.matrix_rank(command_delta))
-    if command_rank < len(COMMAND_AXES):
-        raise ValueError("probe_command_delta_mm must span x/y/z command space")
+    if not np.allclose(post_readback - initial_readback, readback_delta):
+        raise ValueError(
+            "probe_readback_delta_mm must equal "
+            "post_readback_position_mm - initial_readback_position_mm"
+        )
+    readback_rank = int(np.linalg.matrix_rank(readback_delta))
+    if readback_rank < len(COMMAND_AXES):
+        raise ValueError("probe_readback_delta_mm must span x/y/z readback space")
 
 
 def _canonical_visual_calibration_dataset(dataset: xr.Dataset) -> xr.Dataset:
@@ -790,12 +851,12 @@ def estimate_command_offset(
     *,
     weights: Sequence[float] | np.ndarray | None = None,
 ) -> np.ndarray:
-    """Convert observed two-camera image error to estimated command offset."""
+    """Convert observed two-camera image error to estimated readback offset."""
 
     if isinstance(calibration_or_jacobian, xr.Dataset):
         validate_visual_calibration_dataset(calibration_or_jacobian)
         jacobian = np.asarray(
-            calibration_or_jacobian["px_per_cmd_mm"].values,
+            calibration_or_jacobian["px_per_readback_mm"].values,
             dtype=np.float64,
         )
     else:
@@ -810,9 +871,9 @@ def estimate_command_offset(
 
 
 def solve_lqr_command_correction(
-    px_per_cmd_mm: np.ndarray,
+    px_per_readback_mm: np.ndarray,
     shift: xr.Dataset | xr.DataArray | Sequence[float],
-    axis_scale_cmd_mm: Sequence[float],
+    axis_scale_readback_mm: Sequence[float],
     *,
     gain: float = constants.DEFAULT_LQR_CORRECTION_GAIN,
     image_scale_px: float = constants.DEFAULT_LQR_CORRECTION_IMAGE_SCALE_PX,
@@ -825,14 +886,14 @@ def solve_lqr_command_correction(
     ),
     weights: Sequence[float] | np.ndarray | None = None,
 ) -> np.ndarray:
-    """Solve the nominal image-space LQR correction in commanded-mm units."""
+    """Solve the nominal image-space LQR correction in readback-mm units."""
 
-    jacobian_observation = _jacobian_to_observation(_as_jacobian(px_per_cmd_mm))
+    jacobian_observation = _jacobian_to_observation(_as_jacobian(px_per_readback_mm))
     observation = _shift_to_observation(_shift_values(shift))
     return solve_lqr_observation_command_correction(
         jacobian_observation,
         observation,
-        axis_scale_cmd_mm,
+        axis_scale_readback_mm,
         gain=gain,
         image_scale=image_scale_px,
         motor_penalty=motor_penalty,
@@ -845,7 +906,7 @@ def solve_lqr_command_correction(
 def solve_lqr_observation_command_correction(
     observation_model: np.ndarray,
     observation: Sequence[float] | np.ndarray,
-    axis_scale_cmd_mm: Sequence[float],
+    axis_scale_readback_mm: Sequence[float],
     *,
     gain: float = constants.DEFAULT_LQR_CORRECTION_GAIN,
     image_scale: float | Sequence[float] | np.ndarray = (
@@ -867,11 +928,11 @@ def solve_lqr_observation_command_correction(
         observation,
         observation_model.shape[0],
     )
-    axis_scale = np.asarray(axis_scale_cmd_mm, dtype=np.float64)
+    axis_scale = np.asarray(axis_scale_readback_mm, dtype=np.float64)
     if axis_scale.shape != (len(COMMAND_AXES),):
-        raise ValueError("axis_scale_cmd_mm must have one value for x/y/z")
+        raise ValueError("axis_scale_readback_mm must have one value for x/y/z")
     if not np.isfinite(axis_scale).all() or np.any(axis_scale <= 0.0):
-        raise ValueError("axis_scale_cmd_mm must contain finite positive values")
+        raise ValueError("axis_scale_readback_mm must contain finite positive values")
 
     gain = float(gain)
     if not np.isfinite(gain) or gain <= 0.0:
@@ -890,24 +951,24 @@ def solve_lqr_observation_command_correction(
         weights=weights,
     )
     state = lqr_observation_state_from_design(design, observation_values)
-    correction_cmd_mm = solve_lqr_state_command_correction(
+    correction_readback_mm = solve_lqr_state_command_correction(
         design,
         state,
         gain=gain,
         max_normalized_step=max_normalized_step,
     )
 
-    if correction_cmd_mm.shape != (len(COMMAND_AXES),):
+    if correction_readback_mm.shape != (len(COMMAND_AXES),):
         raise ValueError("computed correction has unexpected shape")
-    if not np.isfinite(correction_cmd_mm).all():
+    if not np.isfinite(correction_readback_mm).all():
         raise ValueError("computed correction contains non-finite values")
-    return correction_cmd_mm
+    return correction_readback_mm
 
 
 def lqr_projected_residual(
-    px_per_cmd_mm: np.ndarray,
+    px_per_readback_mm: np.ndarray,
     shift: xr.Dataset | xr.DataArray | Sequence[float],
-    axis_scale_cmd_mm: Sequence[float],
+    axis_scale_readback_mm: Sequence[float],
     *,
     image_scale_px: float = constants.DEFAULT_LQR_CORRECTION_IMAGE_SCALE_PX,
     motor_penalty: float = constants.DEFAULT_LQR_CORRECTION_MOTOR_PENALTY,
@@ -918,10 +979,10 @@ def lqr_projected_residual(
 ) -> float:
     """Return ``||U_c.T @ S_e^-1 @ e||`` for the LQR stopping criterion."""
 
-    jacobian_observation = _jacobian_to_observation(_as_jacobian(px_per_cmd_mm))
+    jacobian_observation = _jacobian_to_observation(_as_jacobian(px_per_readback_mm))
     design = compute_lqr_correction_design(
         jacobian_observation,
-        axis_scale_cmd_mm,
+        axis_scale_readback_mm,
         image_scale_px=image_scale_px,
         motor_penalty=motor_penalty,
         svd_relative_tolerance=svd_relative_tolerance,
@@ -970,7 +1031,7 @@ def lqr_observation_state_from_design(
 
 def compute_lqr_correction_design(
     jacobian_observation: np.ndarray,
-    axis_scale_cmd_mm: Sequence[float],
+    axis_scale_readback_mm: Sequence[float],
     *,
     image_scale_px: float | Sequence[float] | np.ndarray,
     motor_penalty: float,
@@ -982,11 +1043,11 @@ def compute_lqr_correction_design(
     jacobian = _as_observation_model(jacobian_observation)
     observation_count = jacobian.shape[0]
 
-    axis_scale = np.asarray(axis_scale_cmd_mm, dtype=np.float64)
+    axis_scale = np.asarray(axis_scale_readback_mm, dtype=np.float64)
     if axis_scale.shape != (len(COMMAND_AXES),):
-        raise ValueError("axis_scale_cmd_mm must have one value for x/y/z")
+        raise ValueError("axis_scale_readback_mm must have one value for x/y/z")
     if not np.isfinite(axis_scale).all() or np.any(axis_scale <= 0.0):
-        raise ValueError("axis_scale_cmd_mm must contain finite positive values")
+        raise ValueError("axis_scale_readback_mm must contain finite positive values")
 
     motor_penalty = float(motor_penalty)
     svd_relative_tolerance = float(svd_relative_tolerance)
@@ -1065,7 +1126,7 @@ def compute_lqr_correction_design(
 
 def _compute_lqr_feedback_gain(
     jacobian_observation: np.ndarray,
-    axis_scale_cmd_mm: Sequence[float],
+    axis_scale_readback_mm: Sequence[float],
     *,
     image_scale_px: float,
     motor_penalty: float,
@@ -1074,7 +1135,7 @@ def _compute_lqr_feedback_gain(
 ) -> tuple[np.ndarray, np.ndarray, int, np.ndarray]:
     design = compute_lqr_correction_design(
         jacobian_observation,
-        axis_scale_cmd_mm,
+        axis_scale_readback_mm,
         image_scale_px=image_scale_px,
         motor_penalty=motor_penalty,
         svd_relative_tolerance=svd_relative_tolerance,
@@ -1119,17 +1180,17 @@ def solve_lqr_state_command_correction(
         if np.isnan(max_normalized_step) or max_normalized_step <= 0.0:
             raise ValueError("max_normalized_step must be positive or None")
 
-    normalized_command = -gain * (normalized_feedback_gain @ state_values)
+    normalized_correction = -gain * (normalized_feedback_gain @ state_values)
     if max_normalized_step is not None and np.isfinite(max_normalized_step):
-        max_component = float(np.max(np.abs(normalized_command)))
+        max_component = float(np.max(np.abs(normalized_correction)))
         if max_component > max_normalized_step:
-            normalized_command *= max_normalized_step / max_component
-    correction_cmd_mm = axis_scale * normalized_command
-    if correction_cmd_mm.shape != (len(COMMAND_AXES),):
+            normalized_correction *= max_normalized_step / max_component
+    correction_readback_mm = axis_scale * normalized_correction
+    if correction_readback_mm.shape != (len(COMMAND_AXES),):
         raise ValueError("computed correction has unexpected shape")
-    if not np.isfinite(correction_cmd_mm).all():
+    if not np.isfinite(correction_readback_mm).all():
         raise ValueError("computed correction contains non-finite values")
-    return correction_cmd_mm
+    return correction_readback_mm
 
 
 def initialize_lqr_kalman_state(
@@ -1170,14 +1231,14 @@ def initialize_lqr_kalman_state(
 def predict_lqr_kalman_state(
     state: Sequence[float] | np.ndarray,
     covariance: Sequence[Sequence[float]] | np.ndarray,
-    command_delta_mm: Sequence[float] | np.ndarray,
+    readback_delta_mm: Sequence[float] | np.ndarray,
     lqr_design: Mapping[str, Any],
     *,
     process_noise: float | Sequence[Sequence[float]] | np.ndarray = (
         constants.DEFAULT_LQR_CORRECTION_KALMAN_PROCESS_NOISE
     ),
 ) -> dict[str, np.ndarray]:
-    """Predict the LQR Kalman state after a commanded motor offset."""
+    """Predict the LQR Kalman state after an executed readback offset."""
 
     rank = int(lqr_design["rank"])
     state_values = _state_vector(state, rank, "state")
@@ -1188,12 +1249,12 @@ def predict_lqr_kalman_state(
         "input_matrix",
         (rank, len(COMMAND_AXES)),
     )
-    command = np.asarray(command_delta_mm, dtype=np.float64)
-    if command.shape != (len(COMMAND_AXES),):
-        raise ValueError("command_delta_mm must have one value for x/y/z")
-    if not np.isfinite(command).all():
-        raise ValueError("command_delta_mm must contain only finite values")
-    normalized_command = command / axis_scale
+    readback_delta = np.asarray(readback_delta_mm, dtype=np.float64)
+    if readback_delta.shape != (len(COMMAND_AXES),):
+        raise ValueError("readback_delta_mm must have one value for x/y/z")
+    if not np.isfinite(readback_delta).all():
+        raise ValueError("readback_delta_mm must contain only finite values")
+    normalized_command = readback_delta / axis_scale
     q = _covariance_matrix(process_noise, rank, "process_noise", allow_zero=True)
     return {
         "state": state_values + input_matrix @ normalized_command,
@@ -1792,6 +1853,15 @@ def _as_probe_command_matrix(
     return matrix
 
 
+def _as_command_axis_vector(name: str, values: Sequence[float]) -> np.ndarray:
+    vector = np.asarray(values, dtype=np.float64)
+    if vector.shape != (len(COMMAND_AXES),):
+        raise ValueError(f"{name} must have shape (command_axis,)")
+    if not np.isfinite(vector).all():
+        raise ValueError(f"{name} must contain only finite values")
+    return vector
+
+
 def _nonzero_command_rows(command_delta: np.ndarray) -> np.ndarray:
     return np.linalg.norm(command_delta, axis=1) > 1e-12
 
@@ -1804,20 +1874,32 @@ def _validate_probe_command_delta_position_semantics(
 ) -> None:
     if np.allclose(post_commanded - pre_commanded, command_delta):
         return
-    center = _initial_commanded_position_from_attrs(attrs)
-    if center is not None and np.allclose(post_commanded - center, command_delta):
+    del attrs
+    center_candidates = post_commanded - command_delta
+    if np.allclose(center_candidates, center_candidates[0]):
         return
     raise ValueError(
         "probe_command_delta_mm must equal either "
         "post_commanded_position_mm - pre_commanded_position_mm or "
-        "post_commanded_position_mm - initial commanded center"
+        "post_commanded_position_mm - a constant commanded center"
     )
 
 
-def _initial_commanded_position_from_attrs(
+def _initial_readback_position_from_attrs(
     attrs: Mapping[Any, Any],
 ) -> np.ndarray | None:
-    values: list[float] = []
+    if "initial_readback_position_mm" in attrs:
+        try:
+            values = np.asarray(
+                attrs["initial_readback_position_mm"],
+                dtype=np.float64,
+            )
+        except (TypeError, ValueError):
+            return None
+        if values.shape == (len(COMMAND_AXES),) and np.isfinite(values).all():
+            return values
+
+    values_list: list[float] = []
     for name in ("initial_x_mm", "initial_y_mm", "initial_z_mm"):
         if name not in attrs:
             return None
@@ -1827,8 +1909,8 @@ def _initial_commanded_position_from_attrs(
             return None
         if value.size != 1 or not np.isfinite(value[0]):
             return None
-        values.append(float(value[0]))
-    return np.asarray(values, dtype=np.float64)
+        values_list.append(float(value[0]))
+    return np.asarray(values_list, dtype=np.float64)
 
 
 def _common_capture_count(
@@ -2135,21 +2217,24 @@ def _fit_robust_calibration_response(
 
 
 def derive_axis_scale_from_jacobian(
-    px_per_cmd_mm: np.ndarray,
-    command_delta: np.ndarray,
+    px_per_readback_mm: np.ndarray,
+    readback_delta: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
-    """Derive correction command normalization scales from fitted sensitivity."""
+    """Derive correction readback normalization scales from fitted sensitivity."""
 
-    axis_sensitivity = np.linalg.norm(_jacobian_to_observation(px_per_cmd_mm), axis=0)
+    axis_sensitivity = np.linalg.norm(
+        _jacobian_to_observation(px_per_readback_mm),
+        axis=0,
+    )
     if not np.isfinite(axis_sensitivity).all() or np.any(axis_sensitivity <= 0.0):
         raise ValueError("Jacobian axis sensitivity must be finite and positive")
 
-    command_delta = np.asarray(command_delta, dtype=np.float64)
-    if command_delta.ndim != 2 or command_delta.shape[1] != len(COMMAND_AXES):
-        raise ValueError("command_delta must have shape (probe, command_axis)")
-    probe_step = np.max(np.abs(command_delta), axis=0)
+    readback_delta = np.asarray(readback_delta, dtype=np.float64)
+    if readback_delta.ndim != 2 or readback_delta.shape[1] != len(COMMAND_AXES):
+        raise ValueError("readback_delta must have shape (probe, command_axis)")
+    probe_step = np.max(np.abs(readback_delta), axis=0)
     if not np.isfinite(probe_step).all() or np.any(probe_step <= 0.0):
-        raise ValueError("command deltas must include a finite non-zero step per axis")
+        raise ValueError("readback deltas must include a finite non-zero step per axis")
 
     probe_response = axis_sensitivity * probe_step
     scale_target = float(np.median(probe_response))
@@ -2228,10 +2313,10 @@ def _as_jacobian(values: np.ndarray) -> np.ndarray:
     jacobian = np.asarray(values, dtype=np.float64)
     if jacobian.shape != (len(CAMERAS), len(PIXEL_AXES), len(COMMAND_AXES)):
         raise ValueError(
-            "px_per_cmd_mm must have shape (camera, pixel_axis, command_axis)"
+            "px_per_readback_mm must have shape (camera, pixel_axis, command_axis)"
         )
     if not np.isfinite(jacobian).all():
-        raise ValueError("px_per_cmd_mm must contain only finite values")
+        raise ValueError("px_per_readback_mm must contain only finite values")
     return jacobian
 
 

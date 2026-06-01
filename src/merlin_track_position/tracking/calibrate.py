@@ -42,7 +42,7 @@ logger = logging.getLogger("merlin_track_position.tracking.calibrate")
 def visual_calibration_probe_count(
     n: int = constants.DEFAULT_VISUAL_CALIBRATION_N,
 ) -> int:
-    """Return the number of commanded-mm probes in the visual calibration."""
+    """Return the number of requested probes in the visual calibration."""
 
     return len(
         _make_visual_probe_offsets_um(
@@ -72,8 +72,8 @@ def run_calibration(
 ) -> xr.Dataset:
     """Run and save a calibration.
 
-    Motor positions are treated as commanded-mm coordinates. Readback positions are
-    recorded only as diagnostics; they are not used to fit the Jacobian.
+    Motor readbacks are treated as the calibrated x/y/z coordinates. Requested
+    positions are retained as diagnostics for command-vs-readback comparison.
     """
 
     capture_count = normalize_capture_count(capture_count)
@@ -89,8 +89,8 @@ def run_calibration(
     }
 
     x0, y0, z0, polar, tilt, cam = get_positions(("x", "y", "z", "p", "t", "cam"))
-    initial_commanded_position = np.asarray([x0, y0, z0], dtype=np.float64)
-    commanded_position = initial_commanded_position.copy()
+    initial_readback_position = np.asarray([x0, y0, z0], dtype=np.float64)
+    requested_position = initial_readback_position.copy()
 
     if not np.isclose(cam, 5.0):
         # Camera 5 is the sample-view video-switch position used for alignment.
@@ -129,7 +129,7 @@ def run_calibration(
     post_readback_position_mm: list[np.ndarray] = []
 
     for probe_index, offset in enumerate(probe_offsets):
-        pre_commanded = commanded_position.copy()
+        pre_commanded = requested_position.copy()
         pre_readback = np.asarray(get_positions(COMMAND_AXES), dtype=np.float64)
         logger.info(
             "Probe %d/%d: commanded offset mm=(%.4g, %.4g, %.4g)",
@@ -139,7 +139,7 @@ def run_calibration(
             offset[1],
             offset[2],
         )
-        target_position = initial_commanded_position + offset
+        target_position = initial_readback_position + offset
         final_readback = np.asarray(
             move_motors_and_wait(
                 COMMAND_AXES,
@@ -166,7 +166,7 @@ def run_calibration(
         pre_readback_position_mm.append(pre_readback)
         post_readback_position_mm.append(final_readback)
 
-        commanded_position = target_position
+        requested_position = target_position
         if step_callback is not None:
             display_cam0, display_cam1 = after_display_stacks
             step_callback(
@@ -199,6 +199,7 @@ def run_calibration(
         before_images_cam1=before_images_cam1,
         after_images_cam1=after_images_cam1,
         command_delta_mm=command_delta_mm,
+        initial_readback_position_mm=initial_readback_position,
         pre_commanded_position_mm=pre_commanded_position_mm,
         post_commanded_position_mm=post_commanded_position_mm,
         pre_readback_position_mm=pre_readback_position_mm,

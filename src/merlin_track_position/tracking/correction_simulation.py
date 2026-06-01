@@ -37,7 +37,11 @@ OBSERVATION_AXES = (
 ROBUST_MOTOR_ERROR_MODEL_UM: Mapping[str, Any] = {
     "name": "correction_history_correlated_laplace_slip_v1",
     "tail_probability": 0.1223021582733813,
-    "central_location_um": (2.0950474805045225, 0.054132964742873727, -0.4107579641032021),
+    "central_location_um": (
+        2.0950474805045225,
+        0.054132964742873727,
+        -0.4107579641032021,
+    ),
     "central_basis": (
         (0.83784987, 0.52060870, 0.16423816),
         (-0.18361913, -0.01456508, 0.98288955),
@@ -105,11 +109,11 @@ def initial_offsets_from_correction_history(
     *,
     weights: Sequence[float] | np.ndarray | None = None,
 ) -> np.ndarray:
-    """Project correction-history initial image shifts into command-space microns."""
+    """Project correction-history initial image shifts into readback-space microns."""
 
     calibration = load_calibration_dataset(calibration_path)
-    px_per_cmd_mm = np.asarray(
-        calibration["px_per_cmd_mm"].values,
+    px_per_readback_mm = np.asarray(
+        calibration["px_per_readback_mm"].values,
         dtype=np.float64,
     )
     offsets: list[np.ndarray] = []
@@ -122,7 +126,7 @@ def initial_offsets_from_correction_history(
             if shifts.shape[0] == 0:
                 continue
             offset_mm = estimate_command_offset(
-                px_per_cmd_mm,
+                px_per_readback_mm,
                 np.asarray(shifts[0], dtype=np.float64),
                 weights=_weights_or_default(weights),
             )
@@ -353,15 +357,18 @@ def _simulate_correction(
     initial_um = _initial_offsets(initial_offsets_um, trials_per_offset)
     trial_count = initial_um.shape[0]
     config_count = len(configs)
-    px_per_cmd_mm = np.asarray(
-        calibration["px_per_cmd_mm"].values,
+    px_per_readback_mm = np.asarray(
+        calibration["px_per_readback_mm"].values,
         dtype=np.float64,
     )
-    jacobian_observation = px_per_cmd_mm.reshape(
+    jacobian_observation = px_per_readback_mm.reshape(
         len(CAMERAS) * len(PIXEL_AXES),
         len(COMMAND_AXES),
     )
-    axis_scale = np.asarray(calibration["axis_scale_cmd_mm"].values, dtype=np.float64)
+    axis_scale = np.asarray(
+        calibration["axis_scale_readback_mm"].values,
+        dtype=np.float64,
+    )
     command_models = [
         _command_model(config, jacobian_observation, axis_scale, weights_values)
         for config in configs
@@ -473,9 +480,7 @@ def _simulate_correction(
                             kalman_predicted_covariance[trial_index],
                             shifts[trial_index],
                             model["lqr_design"],
-                            measurement_noise=model[
-                                "lqr_kalman_measurement_noise"
-                            ],
+                            measurement_noise=model["lqr_kalman_measurement_noise"],
                             measurement_covariance=model[
                                 "lqr_kalman_measurement_covariance"
                             ],
@@ -491,9 +496,7 @@ def _simulate_correction(
                 criterion_residuals
             )
 
-            newly_converged = (~done) & (
-                criterion_residuals <= lqr_projected_tolerance
-            )
+            newly_converged = (~done) & (criterion_residuals <= lqr_projected_tolerance)
             converged[config_index, newly_converged] = True
             done[newly_converged] = True
             if iteration == max_moves:
@@ -960,7 +963,9 @@ def _shift_image(reference: np.ndarray, shift_px: np.ndarray) -> np.ndarray:
 
 
 def _weighted_residuals(shifts: np.ndarray, weights: np.ndarray) -> np.ndarray:
-    observations = np.asarray(shifts, dtype=np.float64).reshape(-1, len(OBSERVATION_AXES))
+    observations = np.asarray(shifts, dtype=np.float64).reshape(
+        -1, len(OBSERVATION_AXES)
+    )
     return np.sqrt(np.sum(weights[np.newaxis, :] * observations * observations, axis=1))
 
 
@@ -1107,9 +1112,7 @@ def _simulation_kalman_covariance_config(
         raise ValueError(f"{name} must contain only finite values")
     values = 0.5 * (values + values.T)
     eigenvalues = np.linalg.eigvalsh(values)
-    if np.min(eigenvalues) < -1e-12 or (
-        not allow_zero and np.min(eigenvalues) <= 0.0
-    ):
+    if np.min(eigenvalues) < -1e-12 or (not allow_zero and np.min(eigenvalues) <= 0.0):
         bound = "positive semidefinite" if allow_zero else "positive definite"
         raise ValueError(f"{name} must be {bound}")
     return values

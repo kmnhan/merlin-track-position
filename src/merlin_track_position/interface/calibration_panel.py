@@ -50,7 +50,7 @@ METRIC_ROWS: tuple[tuple[str, str, str], ...] = (
         "probe_count",
         "Probes",
         _tooltip_html(
-            ("Number of commanded-mm before/after visual probes.",),
+            ("Number of readback-mm before/after visual probes.",),
             ("The default calibration uses repeated +axis/-axis probes.",),
         ),
     ),
@@ -59,7 +59,7 @@ METRIC_ROWS: tuple[tuple[str, str, str], ...] = (
         "Condition number",
         _tooltip_html(
             (
-                "<tt>np.linalg.cond(px_per_cmd_mm)</tt> after reshaping "
+                "<tt>np.linalg.cond(px_per_readback_mm)</tt> after reshaping "
                 "to the 4x3 observation matrix.",
             ),
             (
@@ -69,19 +69,21 @@ METRIC_ROWS: tuple[tuple[str, str, str], ...] = (
         ),
     ),
     (
-        "axis_scale_cmd_mm",
-        "Axis scale cmd mm",
+        "axis_scale_readback_mm",
+        "Axis scale mm",
         _tooltip_html(
-            ("Saved x/y/z command scales used by normalized LQR correction.",),
-            ("These are commanded-mm normalization scales, not measured physical travel.",),
+            ("Saved x/y/z readback scales used by normalized LQR correction.",),
+            (
+                "These are readback-mm normalization scales, not measured physical travel.",
+            ),
         ),
     ),
     (
-        "axis_sensitivity_px_per_cmd_mm",
-        "Axis response px/cmd mm",
+        "axis_sensitivity_px_per_readback_mm",
+        "Axis response px/mm",
         _tooltip_html(
             ("Euclidean image response of each command-axis column.",),
-            ("This is the per-axis command-to-image response.",),
+            ("This is the per-axis readback-to-image response.",),
         ),
     ),
     (
@@ -98,7 +100,7 @@ METRIC_ROWS: tuple[tuple[str, str, str], ...] = (
         _tooltip_html(
             ("Residual is measured probe image delta minus prediction.",),
             (
-                "Lower means the local linear command-to-image model is more consistent.",
+                "Lower means the local linear readback-to-image model is more consistent.",
             ),
         ),
     ),
@@ -111,21 +113,21 @@ METRIC_ROWS: tuple[tuple[str, str, str], ...] = (
         ),
     ),
     (
-        "residual_rms_cmd_mm",
-        "Residual RMS cmd mm",
+        "residual_rms_readback_mm",
+        "Residual RMS mm",
         _tooltip_html(
             (
                 "Pixel residuals are converted through "
-                "<tt>pinv(px_per_cmd_mm)</tt> into commanded-mm coordinates.",
+                "<tt>pinv(px_per_readback_mm)</tt> into readback-mm coordinates.",
             ),
-            ("This is a command-space fit-error diagnostic, not physical microns.",),
+            ("This is a readback-space fit-error diagnostic, not physical microns.",),
         ),
     ),
     (
-        "residual_max_cmd_mm",
-        "Residual max cmd mm",
+        "residual_max_readback_mm",
+        "Residual max mm",
         _tooltip_html(
-            ("Largest command-space residual length among all probes.",),
+            ("Largest readback-space residual length among all probes.",),
             ("Large values point to poor local repeatability or a bad probe.",),
         ),
     ),
@@ -133,10 +135,8 @@ METRIC_ROWS: tuple[tuple[str, str, str], ...] = (
         "readback_command_rms_mm",
         "Readback disagreement RMS mm",
         _tooltip_html(
-            (
-                "RMS of readback motion minus commanded trajectory motion.",
-            ),
-            ("Readback is diagnostic only and does not affect the fitted Jacobian.",),
+            ("RMS of readback motion minus commanded trajectory motion.",),
+            ("Large values mean requested and encoder-readback motion disagree.",),
         ),
     ),
     (
@@ -154,7 +154,7 @@ REPEATABILITY_ROWS: tuple[tuple[str, str, str], ...] = (
         "Mean RMS std px",
         _tooltip_html(
             (
-                "Repeated probes with identical commanded-mm offsets are grouped.",
+                "Repeated probes with identical readback-mm offsets are grouped.",
                 "The four camera/pixel components are RMS-combined after sample std.",
             ),
             (
@@ -167,7 +167,7 @@ REPEATABILITY_ROWS: tuple[tuple[str, str, str], ...] = (
         "Max RMS std px",
         _tooltip_html(
             ("Largest repeated-probe RMS standard deviation.",),
-            ("Highlights the least repeatable commanded move direction.",),
+            ("Highlights the least repeatable readback move direction.",),
         ),
     ),
 )
@@ -205,13 +205,31 @@ def _format_axis_triplet_um(values_mm: object) -> str:
 
 
 def _correction_move_delta_mm(result: xr.Dataset) -> np.ndarray:
-    if "move_command_delta_mm" not in result:
+    if (
+        "move_final_readback_position_mm" not in result
+        or "initial_readback_position_mm" not in result
+    ):
         return np.empty((0, len(COMMAND_AXES)), dtype=float)
 
-    values = np.asarray(result["move_command_delta_mm"].values, dtype=float)
-    if values.ndim != 2 or values.shape[1] != len(COMMAND_AXES):
+    final_readback = np.asarray(
+        result["move_final_readback_position_mm"].values,
+        dtype=float,
+    )
+    initial_readback = np.asarray(
+        result["initial_readback_position_mm"].values,
+        dtype=float,
+    )
+    if (
+        final_readback.ndim != 2
+        or final_readback.shape[1] != len(COMMAND_AXES)
+        or initial_readback.shape != (len(COMMAND_AXES),)
+    ):
         return np.empty((0, len(COMMAND_AXES)), dtype=float)
-    return values
+    if final_readback.shape[0] == 0:
+        return np.empty((0, len(COMMAND_AXES)), dtype=float)
+
+    previous = np.vstack((initial_readback[np.newaxis, :], final_readback[:-1]))
+    return final_readback - previous
 
 
 def _correction_move_residuals(
@@ -263,47 +281,47 @@ def _format_duration(seconds: float | None) -> str:
 def _calibration_arrays(dataset: xr.Dataset) -> dict[str, np.ndarray]:
     validate_visual_calibration_dataset(dataset)
     command_delta = np.asarray(dataset["probe_command_delta_mm"].values, dtype=float)
+    readback_delta = np.asarray(dataset["probe_readback_delta_mm"].values, dtype=float)
     measured_shift = np.asarray(dataset["probe_measured_delta_px"].values, dtype=float)
-    px_per_cmd_mm = np.asarray(
-        dataset["px_per_cmd_mm"].values,
+    px_per_readback_mm = np.asarray(
+        dataset["px_per_readback_mm"].values,
         dtype=float,
     )
-    jacobian_observation = px_per_cmd_mm.reshape(
+    jacobian_observation = px_per_readback_mm.reshape(
         len(OBSERVATION_AXES),
         len(COMMAND_AXES),
     )
-    pixel_to_command = np.linalg.pinv(jacobian_observation)
-    predicted_shift = (command_delta @ jacobian_observation.T).reshape(
-        command_delta.shape[0],
+    pixel_to_readback = np.linalg.pinv(jacobian_observation)
+    predicted_shift = (readback_delta @ jacobian_observation.T).reshape(
+        readback_delta.shape[0],
         len(CAMERAS),
         len(PIXEL_AXES),
     )
     residual_shift = measured_shift - predicted_shift
-    residual_command = (
+    residual_readback = (
         residual_shift.reshape(
-            command_delta.shape[0],
+            readback_delta.shape[0],
             len(OBSERVATION_AXES),
         )
-        @ pixel_to_command.T
+        @ pixel_to_readback.T
     )
-    commanded_motion = (
-        np.asarray(dataset["post_commanded_position_mm"].values, dtype=float)
-        - np.asarray(dataset["pre_commanded_position_mm"].values, dtype=float)
-    )
-    readback_motion = (
-        np.asarray(dataset["post_readback_position_mm"].values, dtype=float)
-        - np.asarray(dataset["pre_readback_position_mm"].values, dtype=float)
-    )
+    commanded_motion = np.asarray(
+        dataset["post_commanded_position_mm"].values, dtype=float
+    ) - np.asarray(dataset["pre_commanded_position_mm"].values, dtype=float)
+    readback_motion = np.asarray(
+        dataset["post_readback_position_mm"].values, dtype=float
+    ) - np.asarray(dataset["pre_readback_position_mm"].values, dtype=float)
     readback_disagreement = readback_motion - commanded_motion
     return {
         "command_delta": command_delta,
+        "readback_delta": readback_delta,
         "measured_shift": measured_shift,
-        "px_per_cmd_mm": px_per_cmd_mm,
+        "px_per_readback_mm": px_per_readback_mm,
         "jacobian_observation": jacobian_observation,
-        "pixel_to_command": pixel_to_command,
+        "pixel_to_readback": pixel_to_readback,
         "predicted_shift": predicted_shift,
         "residual_shift": residual_shift,
-        "residual_command": residual_command,
+        "residual_readback": residual_readback,
         "readback_disagreement": readback_disagreement,
     }
 
@@ -341,7 +359,7 @@ def _calibration_summary(dataset: xr.Dataset) -> dict[str, object]:
     command_delta = arrays["command_delta"]
     measured_shift = arrays["measured_shift"]
     residual_shift = arrays["residual_shift"]
-    residual_command = arrays["residual_command"]
+    residual_readback = arrays["residual_readback"]
     readback_disagreement = arrays["readback_disagreement"]
 
     residual_shift_norms = np.sqrt(np.sum(residual_shift * residual_shift, axis=(1, 2)))
@@ -355,16 +373,16 @@ def _calibration_summary(dataset: xr.Dataset) -> dict[str, object]:
         residual_rms_px = math.nan
         residual_max_px = math.nan
 
-    residual_command_norms = np.linalg.norm(residual_command, axis=1)
-    finite_command_norms = residual_command_norms[np.isfinite(residual_command_norms)]
+    residual_readback_norms = np.linalg.norm(residual_readback, axis=1)
+    finite_command_norms = residual_readback_norms[np.isfinite(residual_readback_norms)]
     if finite_command_norms.size:
-        residual_rms_cmd_mm = float(
+        residual_rms_readback_mm = float(
             np.sqrt(np.mean(finite_command_norms * finite_command_norms))
         )
-        residual_max_cmd_mm = float(np.max(finite_command_norms))
+        residual_max_readback_mm = float(np.max(finite_command_norms))
     else:
-        residual_rms_cmd_mm = math.nan
-        residual_max_cmd_mm = math.nan
+        residual_rms_readback_mm = math.nan
+        residual_max_readback_mm = math.nan
 
     readback_norms = np.linalg.norm(readback_disagreement, axis=1)
     finite_readback_norms = readback_norms[np.isfinite(readback_norms)]
@@ -392,7 +410,7 @@ def _calibration_summary(dataset: xr.Dataset) -> dict[str, object]:
     warnings = tuple(dict.fromkeys(warning_lines))
 
     repeatability = _repeatability_summary(command_delta, measured_shift)
-    axis_scale = np.asarray(dataset["axis_scale_cmd_mm"].values, dtype=float)
+    axis_scale = np.asarray(dataset["axis_scale_readback_mm"].values, dtype=float)
     (
         _derived_axis_scale,
         axis_sensitivity,
@@ -400,25 +418,25 @@ def _calibration_summary(dataset: xr.Dataset) -> dict[str, object]:
         axis_scale_bounds,
         axis_scale_target_response_px,
     ) = derive_axis_scale_from_jacobian(
-        arrays["px_per_cmd_mm"],
-        command_delta,
+        arrays["px_per_readback_mm"],
+        arrays["readback_delta"],
     )
     return {
         "probe_count": int(command_delta.shape[0]),
         "condition_number": condition_number,
-        "axis_scale_cmd_mm": axis_scale,
-        "axis_sensitivity_px_per_cmd_mm": axis_sensitivity,
-        "axis_scale_unclamped_cmd_mm": axis_scale_unclamped,
-        "axis_scale_bounds_cmd_mm": axis_scale_bounds,
+        "axis_scale_readback_mm": axis_scale,
+        "axis_sensitivity_px_per_readback_mm": axis_sensitivity,
+        "axis_scale_unclamped_readback_mm": axis_scale_unclamped,
+        "axis_scale_bounds_readback_mm": axis_scale_bounds,
         "axis_scale_target_response_px": axis_scale_target_response_px,
         "residual_rms_px": residual_rms_px,
         "residual_max_px": residual_max_px,
-        "residual_rms_cmd_mm": residual_rms_cmd_mm,
-        "residual_max_cmd_mm": residual_max_cmd_mm,
+        "residual_rms_readback_mm": residual_rms_readback_mm,
+        "residual_max_readback_mm": residual_max_readback_mm,
         "readback_command_rms_mm": readback_command_rms_mm,
         "readback_command_max_mm": readback_command_max_mm,
-        "px_per_cmd_mm": arrays["px_per_cmd_mm"],
-        "pixel_to_command": arrays["pixel_to_command"],
+        "px_per_readback_mm": arrays["px_per_readback_mm"],
+        "pixel_to_readback": arrays["pixel_to_readback"],
         "warnings": warnings,
         "repeatability": repeatability,
     }
@@ -601,10 +619,10 @@ class CalibrationPanel(QtWidgets.QWidget):
             residual_plot = self.residual_graphics_layout.addPlot(row=0, col=column)
             residual_plot.setTitle(f"{x_label}-{y_label}")
             residual_plot.setLabel(
-                "bottom", x_label, units="cmd mm", siPrefixEnableRanges=()
+                "bottom", x_label, units="readback mm", siPrefixEnableRanges=()
             )
             residual_plot.setLabel(
-                "left", y_label, units="cmd mm", siPrefixEnableRanges=()
+                "left", y_label, units="readback mm", siPrefixEnableRanges=()
             )
             residual_plot.showGrid(x=True, y=True, alpha=0.25)
             residual_plot.setAspectLocked(True)
@@ -703,7 +721,7 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.calibration_progress_bar.setFormat(f"{completed} / {total_steps} probes")
         self.calibration_status_label.setText(
             "New calibration in progress. "
-            f"Command offset ({_format_number(dx)}, {_format_number(dy)}, "
+            f"Requested offset ({_format_number(dx)}, {_format_number(dy)}, "
             f"{_format_number(dz)}) mm. "
             f"Elapsed {_format_duration(elapsed_s)}, ETA {_format_duration(eta_s)}."
         )
@@ -827,15 +845,15 @@ class CalibrationPanel(QtWidgets.QWidget):
             else:
                 summary_lines.append("No correction moves were applied.")
 
-        if "estimated_command_offset_mm" in result:
+        if "estimated_readback_offset_mm" in result:
             summary_lines.append(
-                "Estimated command offset: "
-                f"{_format_axis_triplet_um(result['estimated_command_offset_mm'].values)}."
+                "Estimated readback offset: "
+                f"{_format_axis_triplet_um(result['estimated_readback_offset_mm'].values)}."
             )
-        if "correction_cmd_mm" in result:
+        if "correction_readback_delta_mm" in result:
             summary_lines.append(
                 "Next correction: "
-                f"{_format_axis_triplet_um(result['correction_cmd_mm'].values)}."
+                f"{_format_axis_triplet_um(result['correction_readback_delta_mm'].values)}."
             )
 
         self.correction_steps_summary_label.setText("\n".join(summary_lines))
@@ -944,9 +962,9 @@ class CalibrationPanel(QtWidgets.QWidget):
         if "weighted_residual_px" in result:
             residual = float(result["weighted_residual_px"].values)
 
-        if "estimated_command_offset_mm" in result:
+        if "estimated_readback_offset_mm" in result:
             offset_text = _format_axis_triplet_um(
-                result["estimated_command_offset_mm"].values
+                result["estimated_readback_offset_mm"].values
             )
         elif "detected_shift_um" in result:
             values_um = np.asarray(result["detected_shift_um"].values, dtype=float)
@@ -985,19 +1003,19 @@ class CalibrationPanel(QtWidgets.QWidget):
         matrices_layout = QtWidgets.QVBoxLayout(matrices_tab)
         for title, row_labels, column_labels, values in (
             (
-                "px_per_cmd_mm",
+                "px_per_readback_mm",
                 OBSERVATION_AXES,
                 COMMAND_AXES,
-                np.asarray(summary["px_per_cmd_mm"], dtype=float).reshape(
+                np.asarray(summary["px_per_readback_mm"], dtype=float).reshape(
                     len(OBSERVATION_AXES),
                     len(COMMAND_AXES),
                 ),
             ),
             (
-                "pixel_to_command_mm",
+                "pixel_to_readback_mm",
                 COMMAND_AXES,
                 OBSERVATION_AXES,
-                np.asarray(summary["pixel_to_command"], dtype=float),
+                np.asarray(summary["pixel_to_readback"], dtype=float),
             ),
         ):
             table = QtWidgets.QTableWidget(len(row_labels), len(column_labels))
@@ -1039,23 +1057,23 @@ class CalibrationPanel(QtWidgets.QWidget):
         axes_layout = QtWidgets.QVBoxLayout(axes_tab)
         axis_headers = (
             "axis",
-            "axis_scale_cmd_mm",
-            "response_px_per_cmd_mm",
-            "unclamped_scale_cmd_mm",
-            "scale_min_cmd_mm",
-            "scale_max_cmd_mm",
+            "axis_scale_readback_mm",
+            "response_px_per_readback_mm",
+            "unclamped_scale_readback_mm",
+            "scale_min_readback_mm",
+            "scale_max_readback_mm",
         )
-        axis_scale = np.asarray(summary["axis_scale_cmd_mm"], dtype=float)
+        axis_scale = np.asarray(summary["axis_scale_readback_mm"], dtype=float)
         axis_sensitivity = np.asarray(
-            summary["axis_sensitivity_px_per_cmd_mm"],
+            summary["axis_sensitivity_px_per_readback_mm"],
             dtype=float,
         )
         axis_scale_unclamped = np.asarray(
-            summary["axis_scale_unclamped_cmd_mm"],
+            summary["axis_scale_unclamped_readback_mm"],
             dtype=float,
         )
         axis_scale_bounds = np.asarray(
-            summary["axis_scale_bounds_cmd_mm"],
+            summary["axis_scale_bounds_readback_mm"],
             dtype=float,
         )
         axis_table = QtWidgets.QTableWidget(len(COMMAND_AXES), len(axis_headers))
@@ -1099,6 +1117,9 @@ class CalibrationPanel(QtWidgets.QWidget):
             "x_offset_cmd_mm",
             "y_offset_cmd_mm",
             "z_offset_cmd_mm",
+            "x_readback_delta_mm",
+            "y_readback_delta_mm",
+            "z_readback_delta_mm",
             "measured_cam0_du_px",
             "measured_cam0_dv_px",
             "measured_cam1_du_px",
@@ -1111,19 +1132,20 @@ class CalibrationPanel(QtWidgets.QWidget):
             "residual_cam0_dv_px",
             "residual_cam1_du_px",
             "residual_cam1_dv_px",
-            "residual_x_cmd_mm",
-            "residual_y_cmd_mm",
-            "residual_z_cmd_mm",
+            "residual_x_readback_mm",
+            "residual_y_readback_mm",
+            "residual_z_readback_mm",
             "readback_x_disagree_mm",
             "readback_y_disagree_mm",
             "readback_z_disagree_mm",
             "registration_warnings",
         )
         command_delta = arrays["command_delta"]
+        readback_delta = arrays["readback_delta"]
         measured = arrays["measured_shift"]
         predicted = arrays["predicted_shift"]
         residual_px = arrays["residual_shift"]
-        residual_cmd = arrays["residual_command"]
+        residual_readback = arrays["residual_readback"]
         readback_disagreement = arrays["readback_disagreement"]
         warnings = (
             np.asarray(calibration["probe_registration_warnings"].values, dtype=str)
@@ -1154,6 +1176,9 @@ class CalibrationPanel(QtWidgets.QWidget):
                 _format_number(command_delta[row, 0]),
                 _format_number(command_delta[row, 1]),
                 _format_number(command_delta[row, 2]),
+                _format_number(readback_delta[row, 0]),
+                _format_number(readback_delta[row, 1]),
+                _format_number(readback_delta[row, 2]),
                 _format_number(measured[row, 0, 0]),
                 _format_number(measured[row, 0, 1]),
                 _format_number(measured[row, 1, 0]),
@@ -1166,9 +1191,9 @@ class CalibrationPanel(QtWidgets.QWidget):
                 _format_number(residual_px[row, 0, 1]),
                 _format_number(residual_px[row, 1, 0]),
                 _format_number(residual_px[row, 1, 1]),
-                _format_number(residual_cmd[row, 0]),
-                _format_number(residual_cmd[row, 1]),
-                _format_number(residual_cmd[row, 2]),
+                _format_number(residual_readback[row, 0]),
+                _format_number(residual_readback[row, 1]),
+                _format_number(residual_readback[row, 2]),
                 _format_number(readback_disagreement[row, 0]),
                 _format_number(readback_disagreement[row, 1]),
                 _format_number(readback_disagreement[row, 2]),
@@ -1198,14 +1223,14 @@ class CalibrationPanel(QtWidgets.QWidget):
         for residual_plot in self.residual_plots.values():
             residual_plot.clear()
         arrays = _calibration_arrays(calibration)
-        command_delta = arrays["command_delta"]
-        residual = arrays["residual_command"]
+        readback_delta = arrays["readback_delta"]
+        residual = arrays["residual_readback"]
 
         for x_label, y_label, x_index, y_index in RESIDUAL_PROJECTIONS:
             residual_plot = self.residual_plots[f"{x_label}{y_label}"]
             residual_plot.plot(
-                command_delta[:, x_index],
-                command_delta[:, y_index],
+                readback_delta[:, x_index],
+                readback_delta[:, y_index],
                 pen=None,
                 symbol="o",
                 symbolBrush=pg.mkBrush("#1f77b4"),
@@ -1216,9 +1241,11 @@ class CalibrationPanel(QtWidgets.QWidget):
             y_values: list[float] = []
             residual_x_values: list[float] = []
             residual_y_values: list[float] = []
-            for command_row, residual_row in zip(command_delta, residual, strict=True):
-                x0 = command_row[x_index]
-                y0 = command_row[y_index]
+            for readback_row, residual_row in zip(
+                readback_delta, residual, strict=True
+            ):
+                x0 = readback_row[x_index]
+                y0 = readback_row[y_index]
                 dx = residual_row[x_index]
                 dy = residual_row[y_index]
                 if not np.isfinite((x0, y0, dx, dy)).all():

@@ -94,6 +94,8 @@ def load_synthetic_calibration() -> SyntheticCalibration:
 
             if "command_um_to_pixel_3d" in archive_keys:
                 command_um_to_pixel_3d = archive["command_um_to_pixel_3d"]
+            elif "px_per_readback_mm" in archive_keys:
+                command_um_to_pixel_3d = archive["px_per_readback_mm"] / 1000.0
             elif "px_per_cmd_mm" in archive_keys:
                 command_um_to_pixel_3d = archive["px_per_cmd_mm"] / 1000.0
             else:

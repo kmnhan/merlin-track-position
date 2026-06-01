@@ -76,9 +76,7 @@ class CorrectionSimulationTests(unittest.TestCase):
         )
         self.assertEqual(constants.DEFAULT_LQR_CORRECTION_KALMAN_INNOVATION_GATE, 25.0)
         np.testing.assert_allclose(
-            np.asarray(
-                constants.DEFAULT_LQR_CORRECTION_KALMAN_MEASUREMENT_COVARIANCE
-            ),
+            np.asarray(constants.DEFAULT_LQR_CORRECTION_KALMAN_MEASUREMENT_COVARIANCE),
             np.array(
                 [
                     [7.768352e-04, -2.612795e-04, -5.777776e-04, -1.457239e-04],
@@ -93,7 +91,7 @@ class CorrectionSimulationTests(unittest.TestCase):
     def test_initial_offsets_from_correction_history_projects_first_iteration(self):
         calibration = sample_calibration()
         offset_um = np.array([4.0, -3.0, 2.0], dtype=float)
-        jacobian = calibration["px_per_cmd_mm"].values.reshape(4, 3)
+        jacobian = calibration["px_per_readback_mm"].values.reshape(4, 3)
         shift_px = (jacobian @ (offset_um / 1000.0)).reshape(2, 2)
         with tempfile.TemporaryDirectory() as tmpdir:
             calibration_path = Path(tmpdir) / "calibration.h5"
@@ -326,10 +324,10 @@ def _simulate_over_responsive_lqr(
     response_scale: float,
 ) -> dict[str, float]:
     jacobian = np.asarray(
-        calibration["px_per_cmd_mm"].values,
+        calibration["px_per_readback_mm"].values,
         dtype=float,
     ).reshape(4, 3)
-    axis_scale = np.asarray(calibration["axis_scale_cmd_mm"].values, dtype=float)
+    axis_scale = np.asarray(calibration["axis_scale_readback_mm"].values, dtype=float)
     weights = np.asarray(constants.CORRECTION_OBSERVATION_WEIGHTS, dtype=float)
     weight_matrix = np.diag(weights)
     design = compute_lqr_correction_design(

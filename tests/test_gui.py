@@ -40,7 +40,6 @@ from merlin_track_position.instruments.basler import (  # noqa: E402
     BaslerValueRange,
 )
 from merlin_track_position.interface.registration_settings import (  # noqa: E402
-    DEFAULT_REGISTRATION_CONFIG,
     REGISTRATION_CAPTURE_AGGREGATION_SETTINGS_KEY,
     REGISTRATION_CAPTURE_COUNT_SETTINGS_KEY,
     REGISTRATION_CLIP_HIGH_SETTINGS_KEY,
@@ -344,12 +343,16 @@ def correction_result_with_moves() -> xr.Dataset:
                 ("iteration",),
                 np.asarray([1.0, 0.7, 0.25], dtype=float),
             ),
-            "move_command_delta_mm": (
+            "initial_readback_position_mm": (
+                ("command_axis",),
+                np.zeros(len(COMMAND_AXES), dtype=float),
+            ),
+            "move_final_readback_position_mm": (
                 ("move", "command_axis"),
                 np.asarray(
                     [
                         [0.0015, -0.002, 0.0],
-                        [-0.0005, 0.0, 0.00325],
+                        [0.001, -0.002, 0.00325],
                     ],
                     dtype=float,
                 ),
@@ -362,11 +365,11 @@ def correction_result_with_moves() -> xr.Dataset:
                 ("move",),
                 np.asarray([0.7, 0.25], dtype=float),
             ),
-            "estimated_command_offset_mm": (
+            "estimated_readback_offset_mm": (
                 ("command_axis",),
                 np.asarray([0.004, -0.005, 0.006], dtype=float),
             ),
-            "correction_cmd_mm": (
+            "correction_readback_delta_mm": (
                 ("command_axis",),
                 np.asarray([0.00025, 0.0, -0.00075], dtype=float),
             ),
@@ -391,11 +394,11 @@ def correction_result_before_first_move() -> xr.Dataset:
                 ("iteration",),
                 np.asarray([1.0], dtype=float),
             ),
-            "estimated_command_offset_mm": (
+            "estimated_readback_offset_mm": (
                 ("command_axis",),
                 np.asarray([0.004, -0.005, 0.006], dtype=float),
             ),
-            "correction_cmd_mm": (
+            "correction_readback_delta_mm": (
                 ("command_axis",),
                 np.asarray([0.0015, -0.002, 0.0], dtype=float),
             ),
@@ -421,7 +424,7 @@ def detection_result(
     offsets = np.asarray(offsets_mm, dtype=float)
     return xr.Dataset(
         data_vars={
-            "estimated_command_offset_mm": (
+            "estimated_readback_offset_mm": (
                 ("command_axis",),
                 offsets,
             ),
@@ -948,7 +951,7 @@ class GUIHelperTests(unittest.TestCase):
 
 
 class CalibrationPanelTests(unittest.TestCase):
-    def test_summary_reports_px_per_cmd_mm_metrics(self):
+    def test_summary_reports_px_per_readback_mm_metrics(self):
         calibration = build_sample_calibration_dataset(
             image_shape_cam0=(4, 5),
             image_shape_cam1=(6, 7),
@@ -959,8 +962,8 @@ class CalibrationPanelTests(unittest.TestCase):
         self.assertEqual(summary["probe_count"], calibration.sizes["probe"])
         self.assertLess(summary["condition_number"], 100.0)
         np.testing.assert_allclose(
-            summary["axis_scale_cmd_mm"],
-            calibration["axis_scale_cmd_mm"].values,
+            summary["axis_scale_readback_mm"],
+            calibration["axis_scale_readback_mm"].values,
         )
         (
             _derived_axis_scale,
@@ -969,19 +972,19 @@ class CalibrationPanelTests(unittest.TestCase):
             _axis_scale_bounds,
             _target_response,
         ) = derive_axis_scale_from_jacobian(
-            calibration["px_per_cmd_mm"].values,
-            calibration["probe_command_delta_mm"].values,
+            calibration["px_per_readback_mm"].values,
+            calibration["probe_readback_delta_mm"].values,
         )
         np.testing.assert_allclose(
-            summary["axis_sensitivity_px_per_cmd_mm"],
+            summary["axis_sensitivity_px_per_readback_mm"],
             expected_axis_sensitivity,
         )
         self.assertEqual(summary["residual_rms_px"], 0.0)
-        self.assertEqual(summary["residual_max_cmd_mm"], 0.0)
+        self.assertEqual(summary["residual_max_readback_mm"], 0.0)
         self.assertEqual(summary["readback_command_rms_mm"], 0.0)
         np.testing.assert_allclose(
-            summary["px_per_cmd_mm"],
-            calibration["px_per_cmd_mm"].values,
+            summary["px_per_readback_mm"],
+            calibration["px_per_readback_mm"].values,
         )
 
     def test_readback_disagreement_uses_actual_trajectory_motion(self):
@@ -994,7 +997,7 @@ class CalibrationPanelTests(unittest.TestCase):
 
         np.testing.assert_allclose(arrays["readback_disagreement"], 0.0, atol=1e-15)
 
-    def test_calibration_progress_reports_command_offset(self):
+    def test_calibration_progress_reports_requested_offset(self):
         get_qapp()
         panel = CalibrationPanel()
 
@@ -1009,7 +1012,7 @@ class CalibrationPanelTests(unittest.TestCase):
             eta_s=2.0,
         )
 
-        self.assertIn("Command offset", panel.calibration_status_label.text())
+        self.assertIn("Requested offset", panel.calibration_status_label.text())
         self.assertNotIn("Command delta", panel.calibration_status_label.text())
 
     def test_panel_loads_dataset_and_builds_details_dialog(self):
@@ -1029,7 +1032,7 @@ class CalibrationPanelTests(unittest.TestCase):
         self.assertIn("test.h5", panel.calibration_status_label.text())
         self.assertTrue(panel.correct_sample_button.isEnabled())
         self.assertTrue(panel.detect_shift_button.isEnabled())
-        self.assertNotEqual(panel.metric_labels["axis_scale_cmd_mm"].text(), "n/a")
+        self.assertNotEqual(panel.metric_labels["axis_scale_readback_mm"].text(), "n/a")
         self.assertEqual(tabs.tabText(0), "Matrices")
         self.assertEqual(tabs.tabText(1), "Axes")
         self.assertEqual(tabs.tabText(2), "Probes")
@@ -1092,7 +1095,7 @@ class CalibrationPanelTests(unittest.TestCase):
         summary = panel.correction_steps_summary_label.text()
         self.assertIn("No correction moves have been applied yet.", summary)
         self.assertIn(
-            "Estimated command offset: x=4 um, y=-5 um, z=6 um.",
+            "Estimated readback offset: x=4 um, y=-5 um, z=6 um.",
             summary,
         )
         self.assertIn("Next correction: x=1.5 um, y=-2 um, z=0 um.", summary)
@@ -1275,7 +1278,9 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
         self.assertEqual(updated.gamma, 1.2)
         self.assertFalse(updated.display.transpose)
 
-    def test_camera_settings_dialog_framegrabber_geometry_is_editable_after_basler(self):
+    def test_camera_settings_dialog_framegrabber_geometry_is_editable_after_basler(
+        self,
+    ):
         get_qapp()
         device = BaslerDevice("old", "old-model", "old-full-name")
         capabilities = BaslerCameraCapabilities(

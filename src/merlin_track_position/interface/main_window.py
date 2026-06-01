@@ -1446,7 +1446,7 @@ class MainWindow(_MainWindowGUI):
         if (
             result.attrs.get("calibration_persistence_status") == "pending"
             and self._calibration is not None
-            and "px_per_cmd_mm" in result
+            and "px_per_readback_mm" in result
         ):
             calibration = self._calibration.load().copy(deep=True)
             for key, value in result.attrs.items():

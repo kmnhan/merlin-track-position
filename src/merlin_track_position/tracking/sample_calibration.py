@@ -27,10 +27,8 @@ from merlin_track_position.tracking.calibration_core import (
 )
 from merlin_track_position.tracking.calibrate import _make_visual_probe_offsets_um
 
-DEFAULT_SAMPLE_CALIBRATION_PATH = Path(
-    "/Users/khan/Downloads/calibration.h5"
-)
-SAMPLE_PX_PER_CMD_MM = np.array(
+DEFAULT_SAMPLE_CALIBRATION_PATH = Path("/Users/khan/Downloads/calibration.h5")
+SAMPLE_PX_PER_READBACK_MM = np.array(
     [
         [[270.0, -140.0, 70.0], [90.0, 310.0, -120.0]],
         [[-210.0, 180.0, 330.0], [240.0, 50.0, 160.0]],
@@ -44,21 +42,22 @@ def build_sample_calibration_dataset(
     image_shape_cam0: tuple[int, int] = (IMAGE_HEIGHT_CAM0, IMAGE_WIDTH_CAM0),
     image_shape_cam1: tuple[int, int] = (IMAGE_HEIGHT_CAM1, IMAGE_WIDTH_CAM1),
 ) -> xr.Dataset:
-    """Build a deterministic commanded-mm calibration dataset."""
+    """Build a deterministic readback-mm calibration dataset."""
 
     command_delta = _sample_probe_deltas()
-    jacobian_observation = SAMPLE_PX_PER_CMD_MM.reshape(
+    readback_delta = command_delta.copy()
+    jacobian_observation = SAMPLE_PX_PER_READBACK_MM.reshape(
         len(OBSERVATION_AXES),
         len(COMMAND_AXES),
     )
-    measured = (command_delta @ jacobian_observation.T).reshape(
+    measured = (readback_delta @ jacobian_observation.T).reshape(
         command_delta.shape[0],
         len(CAMERAS),
         len(PIXEL_AXES),
     )
     axis_scale, *_ = derive_axis_scale_from_jacobian(
-        SAMPLE_PX_PER_CMD_MM,
-        command_delta,
+        SAMPLE_PX_PER_READBACK_MM,
+        readback_delta,
     )
 
     reference_cam0 = _texture(image_shape_cam0, 1100)
@@ -66,6 +65,7 @@ def build_sample_calibration_dataset(
 
     pre_commanded, post_commanded = _command_positions(command_delta)
     readback_offset = np.array([0.002, -0.004, 0.001], dtype=np.float64)
+    initial_readback = np.array([1.0, 2.0, 3.0], dtype=np.float64) + readback_offset
     pre_readback = pre_commanded + readback_offset
     post_readback = post_commanded + readback_offset
 
@@ -81,15 +81,15 @@ def build_sample_calibration_dataset(
     }
     return xr.Dataset(
         data_vars={
-            "px_per_cmd_mm": (
+            "px_per_readback_mm": (
                 ("camera", "pixel_axis", "command_axis"),
-                SAMPLE_PX_PER_CMD_MM,
-                {"units": "px/commanded-mm"},
+                SAMPLE_PX_PER_READBACK_MM,
+                {"units": "px/readback-mm"},
             ),
-            "axis_scale_cmd_mm": (
+            "axis_scale_readback_mm": (
                 ("command_axis",),
                 axis_scale,
-                {"units": "commanded-mm"},
+                {"units": "readback-mm"},
             ),
             "reference_cam0": (("y_cam0", "x_cam0"), reference_cam0),
             "reference_cam1": (("y_cam1", "x_cam1"), reference_cam1),
@@ -98,10 +98,20 @@ def build_sample_calibration_dataset(
                 command_delta,
                 {"units": "commanded-mm"},
             ),
+            "probe_readback_delta_mm": (
+                ("probe", "command_axis"),
+                readback_delta,
+                {"units": "readback-mm"},
+            ),
             "probe_measured_delta_px": (
                 ("probe", "camera", "pixel_axis"),
                 measured,
                 {"units": "px"},
+            ),
+            "initial_readback_position_mm": (
+                ("command_axis",),
+                initial_readback,
+                {"units": "readback-mm"},
             ),
             "pre_commanded_position_mm": (
                 ("probe", "command_axis"),
@@ -136,9 +146,9 @@ def build_sample_calibration_dataset(
         coords=coords,
         attrs={
             "capture_count": 1,
-            "initial_x_mm": 1.0,
-            "initial_y_mm": 2.0,
-            "initial_z_mm": 3.0,
+            "initial_x_mm": float(initial_readback[0]),
+            "initial_y_mm": float(initial_readback[1]),
+            "initial_z_mm": float(initial_readback[2]),
             PROBE_COMMAND_DELTA_MODE_ATTR: PROBE_COMMAND_DELTA_MODE_ABSOLUTE_CENTER,
             "warnings": "",
         },

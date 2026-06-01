@@ -38,7 +38,7 @@ from merlin_track_position.tracking.calibration_core import (
     update_lqr_kalman_state,
     validate_visual_calibration_dataset,
     weighted_pixel_residual,
-    _initial_commanded_position_from_attrs,
+    _initial_readback_position_from_attrs,
 )
 from merlin_track_position.tracking.persistence import (
     PendingEntry,
@@ -85,7 +85,7 @@ class CorrectionFeedback(NamedTuple):
 
 class CorrectionMotorBackend(Protocol):
     def get_positions(self, motor_aliases: Sequence[str]) -> tuple[float, ...]:
-        """Return commanded motor positions in the order requested."""
+        """Return motor readback positions in the order requested."""
 
     def move_motors_and_wait(
         self,
@@ -155,7 +155,7 @@ def do_correction(
     motor_backend: CorrectionMotorBackend | None = None,
     **shift_kwargs: Any,
 ) -> xr.Dataset:
-    """Run LQR closed-loop visual-servo correction in commanded-mm space."""
+    """Run LQR closed-loop visual-servo correction in readback-mm space."""
 
     calibration, resolved_path = _resolve_calibration_and_path(
         calibration,
@@ -201,12 +201,12 @@ def do_correction(
         raise ValueError("min_command_norm_mm must be finite and non-negative")
     if max_moves < 0:
         raise ValueError("max_moves must be >= 0")
-    logger.info("Reading initial commanded x/y/z and polar positions.")
-    commanded_position_mm, current_polar_deg = (
-        _read_initial_commanded_position_and_polar_deg(motor_backend)
+    logger.info("Reading initial readback x/y/z and polar positions.")
+    readback_position_mm, current_polar_deg = (
+        _read_initial_readback_position_and_polar_deg(motor_backend)
     )
-    logger.info("Initial commanded positions: %s", commanded_position_mm.tolist())
-    jacobian, polar_attrs = _runtime_px_per_cmd_mm_for_polar(
+    logger.info("Initial readback positions: %s", readback_position_mm.tolist())
+    jacobian, polar_attrs = _runtime_px_per_readback_mm_for_polar(
         calibration,
         current_polar_deg,
     )
@@ -248,11 +248,14 @@ def do_correction(
     lqr_kalman_innovation_gate = constants.DEFAULT_LQR_CORRECTION_KALMAN_INNOVATION_GATE
     reference_cam0 = np.asarray(calibration["reference_cam0"].values)
     reference_cam1 = np.asarray(calibration["reference_cam1"].values)
-    axis_scale = np.asarray(calibration["axis_scale_cmd_mm"].values, dtype=np.float64)
+    axis_scale = np.asarray(
+        calibration["axis_scale_readback_mm"].values,
+        dtype=np.float64,
+    )
     if polar_attrs["polar_rotation_applied"]:
         axis_scale, *_ = derive_axis_scale_from_jacobian(
             jacobian,
-            np.asarray(calibration["probe_command_delta_mm"].values, dtype=np.float64),
+            np.asarray(calibration["probe_readback_delta_mm"].values, dtype=np.float64),
         )
     beam_geometry: dict[str, np.ndarray | float] | None = None
     beam_lqr_weights: np.ndarray | None = None
@@ -301,7 +304,7 @@ def do_correction(
         current_gain,
         max_moves,
     )
-    initial_commanded_position_mm = commanded_position_mm.copy()
+    initial_readback_position_mm = readback_position_mm.copy()
     correction_log_path = correction_history_path(resolved_path)
     correction_run_id = _next_correction_history_run_id(correction_log_path)
     correction_started_at_utc = datetime.now(UTC).isoformat()
@@ -314,7 +317,7 @@ def do_correction(
         calibration=calibration,
         jacobian=jacobian,
         polar_attrs=polar_attrs,
-        commanded_position_mm=commanded_position_mm,
+        readback_position_mm=readback_position_mm,
     )
     measurement = _capture_measurement(
         calibration,
@@ -365,7 +368,6 @@ def do_correction(
     iteration_analyzer_offset_mm: list[np.ndarray] = []
     if analyzer_offset_mm is not None:
         iteration_analyzer_offset_mm.append(analyzer_offset_mm)
-    move_command_delta_mm: list[np.ndarray] = []
     move_requested_position_mm: list[np.ndarray] = []
     move_final_readback_position_mm: list[np.ndarray] = []
     move_gain: list[float] = []
@@ -434,7 +436,9 @@ def do_correction(
                 beam_projection_matrix=(
                     None
                     if beam_geometry is None
-                    else np.asarray(beam_geometry["projection_matrix"], dtype=np.float64)
+                    else np.asarray(
+                        beam_geometry["projection_matrix"], dtype=np.float64
+                    )
                 ),
                 beam_lqr_weights=beam_lqr_weights,
                 gain=current_gain,
@@ -463,7 +467,6 @@ def do_correction(
             iteration_lqr_kalman_measurement_accepted=(
                 iteration_lqr_kalman_measurement_accepted
             ),
-            move_command_delta_mm=move_command_delta_mm,
             move_requested_position_mm=move_requested_position_mm,
             move_final_readback_position_mm=move_final_readback_position_mm,
             move_gain=move_gain,
@@ -495,9 +498,7 @@ def do_correction(
             beam_xz_angle_from_analyzer_deg=beam_xz_angle_from_analyzer_deg,
             polar_attrs=polar_attrs,
             beam_polar_deg=(
-                None
-                if beam_geometry is None
-                else float(beam_geometry["polar_deg"])
+                None if beam_geometry is None else float(beam_geometry["polar_deg"])
             ),
             beam_runtime_xz_angle_deg=(
                 None
@@ -529,8 +530,8 @@ def do_correction(
             lqr_kalman_initial_covariance=lqr_kalman_initial_covariance,
             lqr_kalman_innovation_gate=lqr_kalman_innovation_gate,
             correction_backlash_enabled=correction_backlash_enabled,
-            initial_commanded_position_mm=initial_commanded_position_mm,
-            commanded_position_mm=commanded_position_mm,
+            initial_readback_position_mm=initial_readback_position_mm,
+            readback_position_mm=readback_position_mm,
             warnings=warnings,
         )
 
@@ -590,7 +591,7 @@ def do_correction(
         if correction_mode == CORRECTION_MODE_BEAM:
             if beam_geometry is None or beam_observation_mm is None:
                 raise RuntimeError("beam correction geometry was not initialized")
-            raw_correction_cmd_mm = solve_lqr_observation_command_correction(
+            raw_correction_readback_delta_mm = solve_lqr_observation_command_correction(
                 np.asarray(beam_geometry["projection_matrix"], dtype=np.float64),
                 beam_observation_mm,
                 axis_scale,
@@ -604,14 +605,14 @@ def do_correction(
         elif lqr_kalman_filter_enabled:
             if lqr_design is None or lqr_kalman_state is None:
                 raise RuntimeError("LQR Kalman state was not initialized")
-            raw_correction_cmd_mm = solve_lqr_state_command_correction(
+            raw_correction_readback_delta_mm = solve_lqr_state_command_correction(
                 lqr_design,
                 np.asarray(lqr_kalman_state["state"], dtype=np.float64),
                 gain=gain_used,
                 max_normalized_step=max_normalized_step,
             )
         else:
-            raw_correction_cmd_mm = solve_lqr_command_correction(
+            raw_correction_readback_delta_mm = solve_lqr_command_correction(
                 jacobian,
                 measurement,
                 axis_scale,
@@ -622,23 +623,24 @@ def do_correction(
                 svd_relative_tolerance=lqr_svd_relative_tolerance,
                 weights=weights,
             )
-        correction_cmd_mm = _validate_command_correction(raw_correction_cmd_mm)
-        correction_norm_mm = float(np.linalg.norm(correction_cmd_mm))
-        active_indices = _active_correction_indices(correction_cmd_mm)
+        correction_readback_delta_mm = _validate_readback_correction(
+            raw_correction_readback_delta_mm
+        )
+        correction_norm_mm = float(np.linalg.norm(correction_readback_delta_mm))
+        active_indices = _active_correction_indices(correction_readback_delta_mm)
         logger.info(
-            "Computed correction command: estimated_offset_mm=%s, raw_delta_mm=%s, "
+            "Computed correction readback delta: estimated_offset_mm=%s, raw_delta_mm=%s, "
             "delta_mm=%s, norm_mm=%.6g, active_axes=%s",
             estimated_offset_mm.tolist(),
-            raw_correction_cmd_mm.tolist(),
-            correction_cmd_mm.tolist(),
+            raw_correction_readback_delta_mm.tolist(),
+            correction_readback_delta_mm.tolist(),
             correction_norm_mm,
             tuple(COMMAND_AXES[index] for index in active_indices),
         )
         if correction_norm_mm <= min_command_norm_mm or not active_indices:
             warnings.append(
                 _correction_stop_warning(
-                    raw_correction_cmd_mm=raw_correction_cmd_mm,
-                    correction_cmd_mm=correction_cmd_mm,
+                    raw_correction_readback_mm=raw_correction_readback_delta_mm,
                     min_command_norm_mm=min_command_norm_mm,
                 )
             )
@@ -649,24 +651,9 @@ def do_correction(
             )
             break
 
-        lqr_kalman_prediction: dict[str, np.ndarray] | None = None
-        if lqr_kalman_filter_enabled:
-            if lqr_design is None or lqr_kalman_state is None:
-                raise RuntimeError("LQR Kalman state was not initialized")
-            lqr_kalman_prediction = predict_lqr_kalman_state(
-                np.asarray(lqr_kalman_state["state"], dtype=np.float64),
-                np.asarray(lqr_kalman_state["covariance"], dtype=np.float64),
-                correction_cmd_mm,
-                lqr_design,
-                process_noise=lqr_kalman_process_noise,
-            )
-
-        predicted_delta_px = (
-            jacobian_before.reshape(len(CAMERAS) * len(PIXEL_AXES), len(COMMAND_AXES))
-            @ correction_cmd_mm
-        ).reshape(len(CAMERAS), len(PIXEL_AXES))
-        normalized_component = correction_cmd_mm / axis_scale
-        requested_position_mm = commanded_position_mm + correction_cmd_mm
+        pre_move_readback_mm = readback_position_mm.copy()
+        normalized_component = correction_readback_delta_mm / axis_scale
+        requested_position_mm = readback_position_mm + correction_readback_delta_mm
         active_axes = tuple(COMMAND_AXES[index] for index in active_indices)
         active_requested_position_mm = tuple(
             float(requested_position_mm[index]) for index in active_indices
@@ -678,22 +665,48 @@ def do_correction(
         )
         if correction_move_started_at is None:
             correction_move_started_at = _local_timestamp_iso()
-        motor_backend.move_motors_and_wait(
-            active_axes,
-            active_requested_position_mm,
-            max_retries=max_retries,
-            backlash_correction=correction_backlash,
-        )
-        correction_move_finished_at = _local_timestamp_iso()
-        logger.info("Correction motor move returned; reading final x/y/z positions.")
-        final_readback_mm = np.asarray(
-            motor_backend.get_positions(COMMAND_AXES),
+        active_final_readback_mm = np.asarray(
+            motor_backend.move_motors_and_wait(
+                active_axes,
+                active_requested_position_mm,
+                max_retries=max_retries,
+                backlash_correction=correction_backlash,
+            ),
             dtype=np.float64,
         )
-        if final_readback_mm.shape != (len(COMMAND_AXES),):
-            raise ValueError("final command position readback must have x/y/z values")
+        if active_final_readback_mm.shape == (len(COMMAND_AXES),):
+            final_readback_mm = active_final_readback_mm.copy()
+        elif active_final_readback_mm.shape == (len(active_axes),):
+            final_readback_mm = pre_move_readback_mm.copy()
+            final_readback_mm[list(active_indices)] = active_final_readback_mm
+        else:
+            raise ValueError("move result readback must match the moved axes")
+        correction_move_finished_at = _local_timestamp_iso()
+        logger.info(
+            "Correction motor move returned final readbacks: active_axes=%s, "
+            "active_final_readback_mm=%s",
+            active_axes,
+            active_final_readback_mm.tolist(),
+        )
         logger.info("Final readback positions: %s", final_readback_mm.tolist())
-        commanded_position_mm = requested_position_mm
+        executed_readback_delta_mm = final_readback_mm - pre_move_readback_mm
+        predicted_delta_px = (
+            jacobian_before.reshape(len(CAMERAS) * len(PIXEL_AXES), len(COMMAND_AXES))
+            @ executed_readback_delta_mm
+        ).reshape(len(CAMERAS), len(PIXEL_AXES))
+        readback_position_mm = final_readback_mm
+
+        lqr_kalman_prediction: dict[str, np.ndarray] | None = None
+        if lqr_kalman_filter_enabled:
+            if lqr_design is None or lqr_kalman_state is None:
+                raise RuntimeError("LQR Kalman state was not initialized")
+            lqr_kalman_prediction = predict_lqr_kalman_state(
+                np.asarray(lqr_kalman_state["state"], dtype=np.float64),
+                np.asarray(lqr_kalman_state["covariance"], dtype=np.float64),
+                executed_readback_delta_mm,
+                lqr_design,
+                process_noise=lqr_kalman_process_noise,
+            )
 
         logger.info("Capturing post-move correction measurement.")
         after_shift_kwargs = _polar_ecc_seed_shift_kwargs(
@@ -815,7 +828,6 @@ def do_correction(
                 "Residual did not decrease; keeping gain fixed at %g.", current_gain
             )
 
-        move_command_delta_mm.append(correction_cmd_mm)
         move_requested_position_mm.append(requested_position_mm.copy())
         move_final_readback_position_mm.append(final_readback_mm)
         move_gain.append(gain_used)
@@ -993,7 +1005,7 @@ def correction_timestamps_from_history(path: str | Path) -> xr.Dataset:
 def correction_total_move_by_axis_from_history(
     path: str | Path,
 ) -> xr.DataArray:
-    """Extract signed commanded and image-detected x/y/z moves from history."""
+    """Extract signed readback and image-detected x/y/z moves from history."""
 
     timestamps: list[np.datetime64] = []
     residuals: list[float] = []
@@ -1033,16 +1045,32 @@ def correction_total_move_by_axis_from_history(
                 residual_px = float(group["move_post_weighted_residual_px"][-1])
             residuals.append(residual_px)
 
-            commanded = np.full(len(COMMAND_AXES), np.nan, dtype=np.float64)
-            if "move_command_delta_mm" in group:
-                commanded = np.asarray(
-                    group["move_command_delta_mm"][...],
+            readback = np.full(len(COMMAND_AXES), np.nan, dtype=np.float64)
+            if (
+                "initial_readback_position_mm" in group
+                and "final_readback_position_mm" in group
+            ):
+                readback = np.asarray(
+                    group["final_readback_position_mm"][...],
                     dtype=np.float64,
-                ).sum(axis=0)
+                ) - np.asarray(
+                    group["initial_readback_position_mm"][...],
+                    dtype=np.float64,
+                )
+            elif "move_final_readback_position_mm" in group:
+                moves = np.asarray(
+                    group["move_final_readback_position_mm"][...],
+                    dtype=np.float64,
+                )
+                if moves.shape[0] > 0:
+                    readback = moves[-1] - moves[0]
 
             detected = np.full(len(COMMAND_AXES), np.nan, dtype=np.float64)
-            if "px_per_cmd_mm" in group:
-                jacobian = np.asarray(group["px_per_cmd_mm"][...], dtype=np.float64)
+            if "px_per_readback_mm" in group:
+                jacobian = np.asarray(
+                    group["px_per_readback_mm"][...],
+                    dtype=np.float64,
+                )
                 if (
                     "iteration_shift_px" in group
                     and group["iteration_shift_px"].shape[0] >= 2
@@ -1059,7 +1087,7 @@ def correction_total_move_by_axis_from_history(
                     ).sum(axis=0)
                     detected = estimate_command_offset(jacobian, total_delta)
 
-            moves_by_run.append(np.stack((commanded, detected), axis=0))
+            moves_by_run.append(np.stack((readback, detected), axis=0))
 
     dimension = "after_move_timestamp_utc"
     return xr.DataArray(
@@ -1076,12 +1104,12 @@ def correction_total_move_by_axis_from_history(
                 dimension,
                 np.asarray(residuals, dtype=np.float64),
             ),
-            "move_source": ["commanded", "detected"],
+            "move_source": ["readback", "detected"],
             "command_axis": list(COMMAND_AXES),
         },
         name="total_move_mm",
         attrs={
-            "units": "commanded-mm",
+            "units": "readback-mm",
             "long_name": "signed total correction move by source and axis",
         },
     )
@@ -1734,7 +1762,7 @@ def _calibration_polar_deg(calibration: xr.Dataset) -> float:
     return polar_deg
 
 
-def _read_initial_commanded_position_and_polar_deg(
+def _read_initial_readback_position_and_polar_deg(
     motor_backend: CorrectionMotorBackend,
 ) -> tuple[np.ndarray, float]:
     aliases = (*COMMAND_AXES, "p")
@@ -1753,16 +1781,16 @@ def _read_initial_commanded_position_and_polar_deg(
             "falling back to delegated x/y/z plus direct BCS polar read.",
             exc,
         )
-    commanded_position_mm = _position_values(
+    readback_position_mm = _position_values(
         motor_backend.get_positions(COMMAND_AXES),
         len(COMMAND_AXES),
-        "initial command position readback",
+        "initial x/y/z readback",
     )
     current_polar_deg = _single_position_value(
         get_positions(("p",)),
         "current polar readback",
     )
-    return commanded_position_mm, current_polar_deg
+    return readback_position_mm, current_polar_deg
 
 
 def _position_values(values: Sequence[float], count: int, name: str) -> np.ndarray:
@@ -1785,14 +1813,14 @@ def _polar_deadband_deg() -> float:
     return deadband
 
 
-def _runtime_px_per_cmd_mm_for_polar(
+def _runtime_px_per_readback_mm_for_polar(
     calibration: xr.Dataset,
     current_polar_deg: float,
 ) -> tuple[np.ndarray, dict[str, float | bool]]:
     polar_attrs = _runtime_polar_attrs(calibration, current_polar_deg)
-    jacobian = np.asarray(calibration["px_per_cmd_mm"].values, dtype=np.float64)
+    jacobian = np.asarray(calibration["px_per_readback_mm"].values, dtype=np.float64)
     if polar_attrs["polar_rotation_applied"]:
-        jacobian = _rotate_px_per_cmd_mm_for_polar_delta(
+        jacobian = _rotate_px_per_readback_mm_for_polar_delta(
             jacobian,
             float(polar_attrs["polar_applied_delta_deg"]),
         )
@@ -1835,7 +1863,7 @@ def _polar_ecc_seed_shift_kwargs(
     polar_attrs: Mapping[str, float | bool],
     calibration: xr.Dataset | None = None,
     jacobian: np.ndarray | None = None,
-    commanded_position_mm: np.ndarray | None = None,
+    readback_position_mm: np.ndarray | None = None,
     seed_shift_px: np.ndarray | None = None,
 ) -> dict[str, Any]:
     kwargs = dict(shift_kwargs)
@@ -1845,20 +1873,21 @@ def _polar_ecc_seed_shift_kwargs(
         return kwargs
 
     if seed_shift_px is None:
-        if calibration is None or jacobian is None or commanded_position_mm is None:
+        if calibration is None or jacobian is None or readback_position_mm is None:
             raise ValueError(
-                "calibration, jacobian, and commanded_position_mm are required"
+                "calibration, jacobian, and readback_position_mm are required"
             )
-        calibration_position = _initial_commanded_position_from_attrs(calibration.attrs)
+        calibration_position = _initial_readback_position_from_attrs(calibration.attrs)
         if calibration_position is None:
             seed_shift = np.zeros((len(CAMERAS), len(PIXEL_AXES)), dtype=np.float64)
         else:
-            command_delta = np.asarray(commanded_position_mm, dtype=np.float64)
-            if command_delta.shape != (len(COMMAND_AXES),) or not np.isfinite(
-                command_delta
-            ).all():
+            readback_delta = np.asarray(readback_position_mm, dtype=np.float64)
+            if (
+                readback_delta.shape != (len(COMMAND_AXES),)
+                or not np.isfinite(readback_delta).all()
+            ):
                 raise ValueError(
-                    "commanded_position_mm must be a finite command-axis vector"
+                    "readback_position_mm must be a finite command-axis vector"
                 )
             jacobian_array = np.asarray(jacobian, dtype=np.float64)
             if jacobian_array.shape != (
@@ -1871,20 +1900,21 @@ def _polar_ecc_seed_shift_kwargs(
                 )
             if not np.isfinite(jacobian_array).all():
                 raise ValueError("jacobian must contain only finite values")
-            command_delta = command_delta - calibration_position
+            readback_delta = readback_delta - calibration_position
             seed_shift = (
                 jacobian_array.reshape(
                     len(CAMERAS) * len(PIXEL_AXES),
                     len(COMMAND_AXES),
                 )
-                @ command_delta
+                @ readback_delta
             ).reshape(len(CAMERAS), len(PIXEL_AXES))
     else:
         seed_shift = np.asarray(seed_shift_px, dtype=np.float64)
 
-    if seed_shift.shape != (len(CAMERAS), len(PIXEL_AXES)) or not np.isfinite(
-        seed_shift
-    ).all():
+    if (
+        seed_shift.shape != (len(CAMERAS), len(PIXEL_AXES))
+        or not np.isfinite(seed_shift).all()
+    ):
         raise ValueError("seed_shift_px must have shape (camera, pixel_axis)")
 
     kwargs["ecc_initial_shift_px"] = {
@@ -1894,17 +1924,17 @@ def _polar_ecc_seed_shift_kwargs(
     return kwargs
 
 
-def _rotate_px_per_cmd_mm_for_polar_delta(
-    px_per_cmd_mm: np.ndarray,
+def _rotate_px_per_readback_mm_for_polar_delta(
+    px_per_readback_mm: np.ndarray,
     polar_delta_deg: float,
 ) -> np.ndarray:
-    jacobian = np.asarray(px_per_cmd_mm, dtype=np.float64)
+    jacobian = np.asarray(px_per_readback_mm, dtype=np.float64)
     if jacobian.shape != (len(CAMERAS), len(PIXEL_AXES), len(COMMAND_AXES)):
         raise ValueError(
-            "px_per_cmd_mm must have shape (camera, pixel_axis, command_axis)"
+            "px_per_readback_mm must have shape (camera, pixel_axis, command_axis)"
         )
     if not np.isfinite(jacobian).all():
-        raise ValueError("px_per_cmd_mm must contain only finite values")
+        raise ValueError("px_per_readback_mm must contain only finite values")
     delta_deg = float(polar_delta_deg)
     if not np.isfinite(delta_deg):
         raise ValueError("polar_delta_deg must be finite")
@@ -1921,8 +1951,7 @@ def _rotate_px_per_cmd_mm_for_polar_delta(
         dtype=np.float64,
     )
     return (
-        jacobian.reshape(len(CAMERAS) * len(PIXEL_AXES), len(COMMAND_AXES))
-        @ rotation
+        jacobian.reshape(len(CAMERAS) * len(PIXEL_AXES), len(COMMAND_AXES)) @ rotation
     ).reshape(len(CAMERAS), len(PIXEL_AXES), len(COMMAND_AXES))
 
 
@@ -2183,7 +2212,7 @@ def _reported_next_correction(
             svd_relative_tolerance=lqr_svd_relative_tolerance,
             weights=weights,
         )
-    return _validate_command_correction(raw_correction)
+    return _validate_readback_correction(raw_correction)
 
 
 def _build_correction_result(
@@ -2205,7 +2234,6 @@ def _build_correction_result(
     iteration_lqr_kalman_innovation: Sequence[np.ndarray],
     iteration_lqr_kalman_innovation_mahalanobis: Sequence[float],
     iteration_lqr_kalman_measurement_accepted: Sequence[bool],
-    move_command_delta_mm: Sequence[np.ndarray],
     move_requested_position_mm: Sequence[np.ndarray],
     move_final_readback_position_mm: Sequence[np.ndarray],
     move_gain: Sequence[float],
@@ -2257,41 +2285,41 @@ def _build_correction_result(
     lqr_kalman_initial_covariance: float,
     lqr_kalman_innovation_gate: float | None,
     correction_backlash_enabled: bool,
-    initial_commanded_position_mm: np.ndarray,
-    commanded_position_mm: np.ndarray,
+    initial_readback_position_mm: np.ndarray,
+    readback_position_mm: np.ndarray,
     warnings: Sequence[str],
 ) -> xr.Dataset:
     result = measurement.assign(
         {
-            "estimated_command_offset_mm": (
+            "estimated_readback_offset_mm": (
                 ("command_axis",),
                 estimated_offset,
-                {"units": "commanded-mm"},
+                {"units": "readback-mm"},
             ),
-            "correction_cmd_mm": (
+            "correction_readback_delta_mm": (
                 ("command_axis",),
                 next_correction,
-                {"units": "commanded-mm"},
+                {"units": "readback-mm"},
             ),
-            "axis_scale_cmd_mm": (
+            "axis_scale_readback_mm": (
                 ("command_axis",),
                 axis_scale,
-                {"units": "commanded-mm"},
+                {"units": "readback-mm"},
             ),
-            "initial_commanded_position_mm": (
+            "initial_readback_position_mm": (
                 ("command_axis",),
-                initial_commanded_position_mm,
-                {"units": "commanded-mm"},
+                initial_readback_position_mm,
+                {"units": "readback-mm"},
             ),
-            "final_commanded_position_mm": (
+            "final_readback_position_mm": (
                 ("command_axis",),
-                commanded_position_mm,
-                {"units": "commanded-mm"},
+                readback_position_mm,
+                {"units": "readback-mm"},
             ),
-            "px_per_cmd_mm": (
+            "px_per_readback_mm": (
                 ("camera", "pixel_axis", "command_axis"),
                 jacobian,
-                {"units": "px/commanded-mm"},
+                {"units": "px/readback-mm"},
             ),
             "iteration_shift_px": (
                 ("iteration", "camera", "pixel_axis"),
@@ -2307,15 +2335,10 @@ def _build_correction_result(
                 ("iteration",),
                 np.asarray(iteration_criterion_residuals, dtype=np.float64),
             ),
-            "move_command_delta_mm": (
-                ("move", "command_axis"),
-                _stack_or_empty(move_command_delta_mm),
-                {"units": "commanded-mm"},
-            ),
             "move_requested_position_mm": (
                 ("move", "command_axis"),
                 _stack_or_empty(move_requested_position_mm),
-                {"units": "commanded-mm"},
+                {"units": "requested-mm"},
             ),
             "move_final_readback_position_mm": (
                 ("move", "command_axis"),
@@ -2394,12 +2417,12 @@ def _build_correction_result(
                 "beam_offset_mm": (
                     ("beam_axis",),
                     np.asarray(beam_offset_mm, dtype=np.float64),
-                    {"units": "commanded-mm"},
+                    {"units": "readback-mm"},
                 ),
                 "iteration_beam_offset_mm": (
                     ("iteration", "beam_axis"),
                     _stack_beam_or_empty(iteration_beam_offset_mm),
-                    {"units": "commanded-mm"},
+                    {"units": "readback-mm"},
                 ),
             }
         ).assign_coords(beam_axis=list(BEAM_AXES))
@@ -2409,12 +2432,12 @@ def _build_correction_result(
                 "analyzer_offset_mm": (
                     ("analyzer_axis",),
                     np.asarray(analyzer_offset_mm, dtype=np.float64),
-                    {"units": "commanded-mm"},
+                    {"units": "readback-mm"},
                 ),
                 "iteration_analyzer_offset_mm": (
                     ("iteration", "analyzer_axis"),
                     _stack_analyzer_or_empty(iteration_analyzer_offset_mm),
-                    {"units": "commanded-mm"},
+                    {"units": "readback-mm"},
                 ),
             }
         ).assign_coords(analyzer_axis=list(ANALYZER_AXES))
@@ -2490,18 +2513,14 @@ def _build_correction_result(
     }
     if correction_mode == CORRECTION_MODE_BEAM:
         attrs |= {
-            "correction_beam_xz_angle_deg": float(
-                beam_xz_angle_from_analyzer_deg
-            ),
+            "correction_beam_xz_angle_deg": float(beam_xz_angle_from_analyzer_deg),
             "correction_beam_transverse_tolerance_um": float(
                 beam_transverse_tolerance_um
             ),
             "correction_beam_analyzer_transverse_tolerance_um": float(
                 beam_analyzer_transverse_tolerance_um
             ),
-            "correction_beam_vertical_tolerance_um": float(
-                beam_vertical_tolerance_um
-            ),
+            "correction_beam_vertical_tolerance_um": float(beam_vertical_tolerance_um),
             "correction_beam_observation_axes": " ".join(BEAM_OBSERVATION_AXES),
             "correction_lqr_kalman_disabled_reason": (
                 "beam mode uses direct LQR without the camera-space Kalman observer"
@@ -2671,12 +2690,12 @@ def _lqr_state_count(rows: Sequence[np.ndarray]) -> int:
     return int(np.asarray(rows[0]).size)
 
 
-def _validate_command_correction(correction_cmd_mm: np.ndarray) -> np.ndarray:
-    correction = np.asarray(correction_cmd_mm, dtype=np.float64).copy()
+def _validate_readback_correction(correction_readback_mm: np.ndarray) -> np.ndarray:
+    correction = np.asarray(correction_readback_mm, dtype=np.float64).copy()
     if correction.shape != (len(COMMAND_AXES),):
-        raise ValueError("correction_cmd_mm must have one value for x/y/z")
+        raise ValueError("correction_readback_mm must have one value for x/y/z")
     if not np.isfinite(correction).all():
-        raise ValueError("correction_cmd_mm must contain finite values")
+        raise ValueError("correction_readback_mm must contain finite values")
     deadband_um = float(constants.DEFAULT_CORRECTION_MOVE_DELTA_DEADBAND_UM)
     if not np.isfinite(deadband_um) or deadband_um < 0.0:
         raise ValueError(
@@ -2690,14 +2709,13 @@ def _validate_command_correction(correction_cmd_mm: np.ndarray) -> np.ndarray:
 
 def _correction_stop_warning(
     *,
-    raw_correction_cmd_mm: np.ndarray,
-    correction_cmd_mm: np.ndarray,
+    raw_correction_readback_mm: np.ndarray,
     min_command_norm_mm: float,
 ) -> str:
-    raw_norm_mm = float(np.linalg.norm(raw_correction_cmd_mm))
+    raw_norm_mm = float(np.linalg.norm(raw_correction_readback_mm))
     if raw_norm_mm <= min_command_norm_mm:
         return (
-            "computed correction step is below the minimum command norm "
+            "computed correction step is below the minimum move norm "
             f"{min_command_norm_mm:.4g} mm; stopping before another move"
         )
     return (
@@ -2707,9 +2725,11 @@ def _correction_stop_warning(
     )
 
 
-def _active_correction_indices(correction_cmd_mm: np.ndarray) -> tuple[int, ...]:
+def _active_correction_indices(correction_readback_mm: np.ndarray) -> tuple[int, ...]:
     return tuple(
         index
-        for index, value in enumerate(np.asarray(correction_cmd_mm, dtype=np.float64))
+        for index, value in enumerate(
+            np.asarray(correction_readback_mm, dtype=np.float64)
+        )
         if value != 0.0
     )

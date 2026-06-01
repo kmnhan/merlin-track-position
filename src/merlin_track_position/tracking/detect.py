@@ -26,7 +26,7 @@ from merlin_track_position.tracking.correct import (
     _polar_ecc_seed_shift_kwargs,
     _position_values,
     _prefixed_polar_attrs,
-    _runtime_px_per_cmd_mm_for_polar,
+    _runtime_px_per_readback_mm_for_polar,
 )
 
 __all__ = ("detect_shift",)
@@ -43,7 +43,7 @@ def detect_shift(
     weights: Sequence[float] | np.ndarray | None = None,
     **shift_kwargs: Any,
 ) -> xr.Dataset:
-    """Measure signed command-space displacement without moving motors or saving."""
+    """Measure signed readback-space displacement without moving motors or saving."""
 
     validate_visual_calibration_dataset(calibration)
     capture_count = normalize_capture_count(capture_count)
@@ -57,9 +57,9 @@ def detect_shift(
         len(COMMAND_AXES) + 1,
         "current x/y/z/p readback",
     )
-    current_commanded_position_mm = current_position[: len(COMMAND_AXES)].copy()
+    current_readback_position_mm = current_position[: len(COMMAND_AXES)].copy()
     current_polar_deg = float(current_position[-1])
-    jacobian, polar_attrs = _runtime_px_per_cmd_mm_for_polar(
+    jacobian, polar_attrs = _runtime_px_per_readback_mm_for_polar(
         calibration,
         current_polar_deg,
     )
@@ -69,7 +69,7 @@ def detect_shift(
         calibration=calibration,
         jacobian=jacobian,
         polar_attrs=polar_attrs,
-        commanded_position_mm=current_commanded_position_mm,
+        readback_position_mm=current_readback_position_mm,
     )
     measurement = _capture_measurement(
         calibration,
@@ -87,17 +87,17 @@ def detect_shift(
     )
     weighted_residual_px = weighted_pixel_residual(measurement, weights=weights)
     logger.info(
-        "Detected command offset mm=%s, weighted_residual_px=%.6g",
+        "Detected readback offset mm=%s, weighted_residual_px=%.6g",
         estimated_offset_mm.tolist(),
         weighted_residual_px,
     )
     return (
         measurement.assign(
             {
-                "estimated_command_offset_mm": (
+                "estimated_readback_offset_mm": (
                     ("command_axis",),
                     estimated_offset_mm,
-                    {"units": "commanded-mm"},
+                    {"units": "readback-mm"},
                 ),
                 "detected_shift_um": (
                     ("command_axis",),

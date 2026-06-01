@@ -2,7 +2,7 @@
 
 This repository implements image-based sample-position tracking and correction
 for Beamline 4.0.3 MERLIN at the Advanced Light Source. The controller uses a
-locally calibrated Jacobian between commanded motor displacements and
+locally calibrated Jacobian between encoder readback displacements and
 two-camera image displacements, then applies a closed-loop Linear Quadratic
 Regulator (LQR) in the controllable image subspace.
 
@@ -39,7 +39,7 @@ reference image. The reference images are captured at the desired operator
 point, so zero image error means the sample is aligned to that point in the two
 views.
 
-The commanded motor increment is
+The desired encoder readback increment is
 
 ```math
 \Delta a_k =
@@ -50,8 +50,8 @@ The commanded motor increment is
 \end{bmatrix},
 ```
 
-where each component is a commanded BCS motor displacement in millimeters. The
-local command-to-image response is
+where each component is an `x`, `y`, or `z` encoder readback displacement in
+millimeters. The local readback-to-image response is
 
 ```math
 \Delta e_k \approx J\Delta a_k,
@@ -82,11 +82,10 @@ J_{v1,x} & J_{v1,y} & J_{v1,z}
 \end{bmatrix}.
 ```
 
-The Jacobian entries have units of pixels per commanded millimeter. The
-calibration fit uses commanded moves, not encoder readback. Readback is retained
-as diagnostic metadata because backlash, hysteresis, and stale status can make
-readback a poor representation of the command state used by the beamline
-software.
+The Jacobian entries have units of pixels per readback millimeter. The
+calibration fit uses encoder readback displacement from the reference position.
+Requested positions are retained as diagnostic metadata because backlash,
+hysteresis, and settling can make requested and final readback positions differ.
 
 ### Reference Images and Sign Convention
 
@@ -132,22 +131,22 @@ observed image change has the same sign and approximate magnitude as
 Before correction, the Jacobian `J` is estimated from finite-difference
 probe moves:
 
-1. read the initial BCS `x`, `y`, and `z` command positions;
+1. read the initial BCS `x`, `y`, and `z` encoder readback positions;
 2. acquire `reference_cam0` and `reference_cam1`;
 3. generate repeated positive and negative single-axis probes for `x`, `y`, and
    `z`;
 4. for each probe, acquire pre-move images, command the move, acquire post-move
    images, and register the post-move images against the pre-move images;
-5. estimate `px_per_cmd_mm` from the valid
-   `(probe_command_delta_mm, probe_measured_delta_px)` rows;
+5. estimate `px_per_readback_mm` from the valid
+   `(probe_readback_delta_mm, probe_measured_delta_px)` rows;
 6. persist the calibration dataset to disk and reload it from that path.
 
 The default probe magnitudes are
 
 ```text
-x: 0.3 commanded-mm
-y: 0.5 commanded-mm
-z: 0.3 commanded-mm
+x: 0.3 mm requested move
+y: 0.5 mm requested move
+z: 0.3 mm requested move
 ```
 
 with
@@ -156,7 +155,7 @@ with
 DEFAULT_VISUAL_CALIBRATION_REPEATS_PER_DIRECTION = 3
 ```
 
-For probe `i`, the commanded motor displacement is `Delta a_i` and image
+For probe `i`, the encoder readback displacement is `Delta a_i` and image
 registration gives `Delta e_i`. The calibration fit identifies the local model
 
 ```math
@@ -170,11 +169,11 @@ fitted `J`; the residuals are not assumed to be zero at runtime.
 Calibration is rejected if:
 
 - a probe image response is below `DEFAULT_VISUAL_CALIBRATION_MIN_SHIFT_PX`
-  (`2.0 px` by default);
-- the commanded probe deltas do not span the three command axes;
+  (`0.1 px` by default);
+- the readback probe deltas do not span the three command axes;
 - the fitted Jacobian has rank less than 3;
 - the condition number exceeds
-  `DEFAULT_JACOBIAN_CONDITION_WARNING` (`100.0` by default).
+  `DEFAULT_JACOBIAN_CONDITION_WARNING` (`50.0` by default).
 
 The rank and condition-number checks are observability checks. Rank less than 3
 means the three command directions cannot be distinguished in image space. A
@@ -187,11 +186,11 @@ The three motor axes can have different image sensitivities. A one-millimeter
 move along `x` may produce a much larger image shift than a one-millimeter move
 along `z`.
 
-The LQR design therefore uses normalized command coordinates. Each calibration
+The LQR design therefore uses normalized readback coordinates. Each calibration
 dataset stores
 
 ```text
-axis_scale_cmd_mm(command_axis)
+axis_scale_readback_mm(command_axis)
 ```
 
 and correction reuses that saved scale. Let
@@ -211,7 +210,7 @@ s_z
 \end{bmatrix}
 ```
 
-is represented by `axis_scale_cmd_mm`. The normalized command is
+is represented by `axis_scale_readback_mm`. The normalized correction is
 
 ```math
 \tilde a_k = S_m^{-1}\Delta a_k,
@@ -219,13 +218,13 @@ is represented by `axis_scale_cmd_mm`. The normalized command is
 \Delta a_k = S_m\tilde a_k.
 ```
 
-The scale is derived from the fitted Jacobian. For command axis `j`,
+The scale is derived from the fitted Jacobian. For readback axis `j`,
 
 ```math
 c_j = \|J_{:,j}\|_2
 ```
 
-is the image sensitivity in pixels per commanded millimeter. Given the probe
+is the image sensitivity in pixels per readback millimeter. Given the probe
 magnitude
 
 ```math
@@ -244,7 +243,7 @@ The target response is the median over axes:
 r_\star = \text{median}(r_x,r_y,r_z).
 ```
 
-The raw command scale is
+The raw readback scale is
 
 ```math
 s_j^{\mathrm{raw}} = \frac{r_\star}{c_j}.
@@ -264,9 +263,9 @@ s_{j,\max}
 The configured bounds are:
 
 ```text
-x: 0.1 to 0.8 commanded-mm
-y: 0.3 to 1.0 commanded-mm
-z: 0.1 to 0.8 commanded-mm
+x: 0.1 to 0.8 readback-mm
+y: 0.3 to 1.0 readback-mm
+z: 0.1 to 0.8 readback-mm
 ```
 
 ## LQR Design
@@ -313,8 +312,8 @@ after every move.
 
 ### Controllable Image Subspace
 
-The two-camera image error has four components, while the manipulator command
-has three axes. Depending on the local camera geometry, not every image-space
+The two-camera image error has four components, while the manipulator has three
+readback axes. Depending on the local camera geometry, not every image-space
 direction is controllable. The controller therefore uses the controllable
 subspace of the normalized Jacobian.
 
@@ -384,11 +383,11 @@ R_s = \lambda_m I_3.
 The default motor penalty is
 
 ```text
-DEFAULT_LQR_CORRECTION_MOTOR_PENALTY = 100.0
+DEFAULT_LQR_CORRECTION_MOTOR_PENALTY = 25.0
 ```
 
-Larger `lambda_m` produces smaller, slower commands. Smaller `lambda_m` makes
-the controller more aggressive.
+Larger `lambda_m` produces smaller, slower corrections. Smaller `lambda_m`
+makes the controller more aggressive.
 
 The discrete algebraic Riccati equation is
 
@@ -425,14 +424,14 @@ s_k^{\mathrm{meas}} =
 U_c^\mathsf{T}S_e^{-1}e_k^{\mathrm{meas}}.
 ```
 
-The normalized command is
+The normalized correction is
 
 ```math
 \tilde a_k =
 -\alpha_{\mathrm{fb}}K_ss_k^{\mathrm{meas}}.
 ```
 
-The commanded-mm move is
+The readback-mm correction delta is
 
 ```math
 \Delta a_k =
@@ -446,7 +445,7 @@ The default feedback multiplier is
 DEFAULT_LQR_CORRECTION_GAIN = 0.50
 ```
 
-Before motion, the normalized command is capped:
+Before motion, the normalized correction is capped:
 
 ```text
 DEFAULT_LQR_CORRECTION_MAX_NORMALIZED_STEP = 0.25
@@ -457,12 +456,12 @@ BCS target:
 
 ```math
 a_{\mathrm{request}} =
-a_{\mathrm{commanded}} + \Delta a_k.
+a_{\mathrm{readback}} + \Delta a_k.
 ```
 
-The internal `commanded_position_mm` state is initialized from the BCS `x`, `y`,
-and `z` command positions and is advanced to each requested absolute target.
-Post-move readback is logged, but it is not used as the command-state anchor.
+The loop state is initialized from the BCS `x`, `y`, and `z` encoder readback
+positions. After each move, the next iteration is anchored to the returned final
+readback rather than the requested target.
 
 ### Stopping Criterion
 
@@ -539,7 +538,7 @@ camera-direction covariance. If one image direction is noisy, or if two camera
 directions move together because of optical or registration effects, that
 information belongs in the full covariance matrix `R`.
 
-With the observer enabled, the command law becomes
+With the observer enabled, the correction law becomes
 
 ```math
 \tilde a_k =
@@ -644,7 +643,7 @@ DEFAULT_LQR_CORRECTION_KALMAN_MEASUREMENT_NOISE = 1.0
 ### Choosing Process Noise
 
 The process covariance `Q` describes how much the true state can differ from the
-prediction based on the applied motor command and local model. It represents
+prediction based on the executed readback delta and local model. It represents
 real state evolution, not camera readout noise:
 
 - thermal drift during the correction interval;
@@ -694,15 +693,15 @@ with negative eigenvalues clipped to zero.
 The closed-loop LQR correction proceeds as follows:
 
 1. load and validate a saved calibration dataset;
-2. compute the normalized LQR design from `J`, `axis_scale_cmd_mm`,
+2. compute the normalized LQR design from `J`, `axis_scale_readback_mm`,
    `image_scale_px`, `motor_penalty`, and observation weights;
 3. acquire current images and compute `shift_px`;
 4. form the normalized projected state, or initialize/update the Kalman state
    estimate if the observer is enabled;
 5. stop immediately if the projected normalized error is within tolerance;
-6. compute the LQR command in commanded-mm units;
-7. cap the normalized command and stop if the remaining command is below the
-   minimum command norm;
+6. compute the LQR correction in readback-mm units;
+7. cap the normalized correction and stop if the remaining correction is below
+   the minimum move norm;
 8. send absolute BCS-mm targets only for axes with nonzero correction;
 9. wait for the motor move to return and acquire post-move images;
 10. log the measured image change, nominal predicted change, and model
@@ -769,8 +768,8 @@ The correction loop should stop or abort when:
 - image registration reports low contrast, low texture, or inconsistent tile shifts;
 - the current image is outside the field of view;
 - the image error is outside the local linear region of the Jacobian;
-- the proposed motor command would violate position bounds;
-- the command rounds or clips to an ineffective move;
+- the requested target would violate position bounds;
+- the correction rounds or clips to an ineffective move;
 - Kalman innovation gating rejects a measurement;
 - closed-loop error increases repeatedly.
 
@@ -783,8 +782,8 @@ acquired.
 The required calibration variables are:
 
 ```text
-px_per_cmd_mm(camera, pixel_axis, command_axis)
-axis_scale_cmd_mm(command_axis)
+px_per_readback_mm(camera, pixel_axis, command_axis)
+axis_scale_readback_mm(command_axis)
 reference_cam0(y_cam0, x_cam0)
 reference_cam1(y_cam1, x_cam1)
 probe_command_delta_mm(probe, command_axis)
@@ -793,6 +792,8 @@ pre_commanded_position_mm(probe, command_axis)
 post_commanded_position_mm(probe, command_axis)
 pre_readback_position_mm(probe, command_axis)
 post_readback_position_mm(probe, command_axis)
+initial_readback_position_mm(command_axis)
+probe_readback_delta_mm(probe, command_axis)
 ```
 
 `reference_cam0` and `reference_cam1` are full camera-frame references. When a
@@ -811,20 +812,19 @@ as predicted probe shifts, probe residuals, axis sensitivities, scale bounds,
 and condition number. `calibration_path` is attached only to loaded in-memory
 datasets.
 
-Correction outputs are expressed in commanded-mm units:
+Correction outputs are expressed in readback-mm units:
 
 ```text
-estimated_command_offset_mm(command_axis)
-correction_cmd_mm(command_axis)
-axis_scale_cmd_mm(command_axis)
-initial_commanded_position_mm(command_axis)
-final_commanded_position_mm(command_axis)
-px_per_cmd_mm(camera, pixel_axis, command_axis)
+estimated_readback_offset_mm(command_axis)
+correction_readback_delta_mm(command_axis)
+axis_scale_readback_mm(command_axis)
+initial_readback_position_mm(command_axis)
+final_readback_position_mm(command_axis)
+px_per_readback_mm(camera, pixel_axis, command_axis)
 shift_px(camera, pixel_axis)
 iteration_shift_px(iteration, camera, pixel_axis)
 iteration_weighted_residual_px(iteration)
 iteration_correction_criterion_residual(iteration)
-move_command_delta_mm(move, command_axis)
 move_requested_position_mm(move, command_axis)
 move_final_readback_position_mm(move, command_axis)
 move_pre_weighted_residual_px(move)
@@ -841,6 +841,11 @@ move_max_normalized_component(move)
 move_active_axis_mask(move, command_axis)
 ```
 
+Per-move executed deltas are derived from consecutive readback positions:
+`move_final_readback_position_mm - previous_readback_position_mm`, where the
+first previous value is `initial_readback_position_mm`. Requested positions are
+kept as diagnostics for comparing request versus final encoder readback.
+
 When at least one correction move is issued, the correction run also records
 run-level local-time attributes:
 
@@ -849,10 +854,10 @@ correction_move_started_at
 correction_move_finished_at
 ```
 
-The start is captured immediately before the first commanded correction move,
-and the finish is captured immediately after the last commanded correction move
-returns. Values are local ISO timestamps with the local UTC offset included.
-Runs that stop before issuing a motor move omit both attributes.
+The start is captured immediately before the first requested correction move, and
+the finish is captured immediately after the last correction move returns.
+Values are local ISO timestamps with the local UTC offset included. Runs that
+stop before issuing a motor move omit both attributes.
 
 When the Kalman observer is enabled, correction outputs also include:
 
@@ -886,20 +891,20 @@ run_000001
 
 During active correction, the run group is updated after every completed motor
 move without rewriting previous correction runs. Thus the file contains the
-latest available residual trace, motor commands, measured image response,
+latest available residual trace, requested targets, measured image response,
 feedback diagnostics, and Kalman diagnostics when enabled.
 
-At result assembly, the reported command offset is computed from the final image
+At result assembly, the reported readback offset is computed from the final image
 residual and the current Jacobian as a diagnostic estimate:
 
 ```text
-estimated_command_offset_mm
+estimated_readback_offset_mm
 ```
 
 The reported
 
 ```text
-correction_cmd_mm
+correction_readback_delta_mm
 ```
 
 is zero when the loop has converged. Otherwise, it is the next LQR correction
@@ -913,8 +918,8 @@ from merlin_track_position.tracking.correct import do_correction
 result = do_correction("calibration.h5")
 
 print(result["shift_px"].values)  # shape: (camera, pixel_axis)
-print(result["estimated_command_offset_mm"].values)  # [x_mm, y_mm, z_mm]
-print(result["correction_cmd_mm"].values)
+print(result["estimated_readback_offset_mm"].values)  # [x_mm, y_mm, z_mm]
+print(result["correction_readback_delta_mm"].values)
 print(result.attrs["correction_criterion"])
 print(result.attrs["correction_converged"])
 print(result.attrs["warnings"])
@@ -922,7 +927,7 @@ print(result.attrs["warnings"])
 
 ## Calibration Entry Point
 
-Calibration can be initiated from before/after commanded-mm probe moves:
+Calibration can be initiated from before/after probe moves:
 
 ```python
 from merlin_track_position.tracking.calibrate import run_calibration
@@ -935,25 +940,25 @@ calibration = run_calibration(
 The calibration and control model is:
 
 ```text
-[du_cam0, dv_cam0, du_cam1, dv_cam1] = J @ [dx_cmd_mm, dy_cmd_mm, dz_cmd_mm]
+[du_cam0, dv_cam0, du_cam1, dv_cam1] = J @ [dx_readback_mm, dy_readback_mm, dz_readback_mm]
 Jn = inv(Se) @ J @ Sm
 s = Uc.T @ inv(Se) @ measured_pixel_shift
-correction_cmd_mm = -gain * Sm @ Ks @ s
+correction_readback_delta_mm = -gain * Sm @ Ks @ s
 ```
 
 With the Kalman observer enabled, replace the measured projected state `s` with
 the filtered state estimate:
 
 ```text
-correction_cmd_mm = -gain * Sm @ Ks @ x_hat
+correction_readback_delta_mm = -gain * Sm @ Ks @ x_hat
 ```
 
 ## Xarray and HDF5
 
 Calibration results are xarray datasets. The main dataset variables are:
 
-- `px_per_cmd_mm(camera, pixel_axis, command_axis)`
-- `axis_scale_cmd_mm(command_axis)`
+- `px_per_readback_mm(camera, pixel_axis, command_axis)`
+- `axis_scale_readback_mm(command_axis)`
 - `reference_cam0(y_cam0, x_cam0)`
 - `reference_cam1(y_cam1, x_cam1)`
 - `probe_command_delta_mm(probe, command_axis)`
@@ -962,6 +967,8 @@ Calibration results are xarray datasets. The main dataset variables are:
 - `post_commanded_position_mm(probe, command_axis)`
 - `pre_readback_position_mm(probe, command_axis)`
 - `post_readback_position_mm(probe, command_axis)`
+- `initial_readback_position_mm(command_axis)`
+- `probe_readback_delta_mm(probe, command_axis)`
 
 Reference images are saved as full camera frames. GUI ROI bounds, when present,
 define the processing crop used for registration and correction.

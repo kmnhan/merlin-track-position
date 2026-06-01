@@ -71,7 +71,7 @@ DEFAULT_VISUAL_CALIBRATION_MIN_SHIFT_PX: float = 0.1
 # Calibration condition number threshold above which the fit is rejected.
 DEFAULT_JACOBIAN_CONDITION_WARNING: float = 50.0
 
-# Shared closed-loop LQR correction defaults in command-mm visual-servo space.
+# Shared closed-loop LQR correction defaults in readback-mm visual-servo space.
 # Observation weights are ordered as cam0_du, cam0_dv, cam1_du, cam1_dv.
 CORRECTION_OBSERVATION_WEIGHTS: tuple[float, float, float, float] | None = (
     1.0,
