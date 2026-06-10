@@ -1086,7 +1086,6 @@ class CalibrationPanelTests(unittest.TestCase):
         self.assertTrue(panel.residual_graphics_layout.isHidden())
         self.assertFalse(panel.correction_steps_group.isHidden())
         self.assertGreater(panel.correction_steps_table.maximumHeight(), 180)
-        self.assertGreaterEqual(panel.correction_steps_table.minimumHeight(), 260)
         self.assertEqual(panel.correction_steps_table.rowCount(), 0)
         self.assertIn(
             "initial correction measurement",

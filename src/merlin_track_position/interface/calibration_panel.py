@@ -762,7 +762,6 @@ class CalibrationPanel(QtWidgets.QWidget):
             QtWidgets.QHeaderView.ResizeMode.ResizeToContents
         )
         self.correction_steps_table.verticalHeader().setVisible(False)
-        self.correction_steps_table.setMinimumHeight(260)
         correction_steps_layout.addWidget(self.correction_steps_table, stretch=1)
         calibration_layout.addWidget(self.correction_steps_group, stretch=1)
 
