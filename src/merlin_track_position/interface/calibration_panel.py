@@ -740,6 +740,14 @@ class CalibrationPanel(QtWidgets.QWidget):
         stored_orientation_layout.addStretch(1)
         calibration_layout.addWidget(self.stored_orientation_widget)
 
+        self.calibration_file_label = QtWidgets.QLabel()
+        self.calibration_file_label.setObjectName("calibration_file_label")
+        self.calibration_file_label.setWordWrap(True)
+        self.calibration_file_label.setTextInteractionFlags(
+            QtCore.Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        calibration_layout.addWidget(self.calibration_file_label)
+
         self.calibration_status_label = QtWidgets.QLabel()
         self.calibration_status_label.setWordWrap(True)
         calibration_layout.addWidget(self.calibration_status_label)
@@ -890,6 +898,7 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.detect_shift_button.setEnabled(False)
         self.new_calibration_button.setEnabled(True)
         self.new_calibration_button.setText("New calibration")
+        self.calibration_file_label.setText("Calibration file: none")
         self.calibration_status_label.setText("No calibration loaded.")
         self.calibration_progress_bar.setVisible(False)
         self.calibration_progress_bar.setRange(0, 1)
@@ -1055,6 +1064,7 @@ class CalibrationPanel(QtWidgets.QWidget):
         self._set_loaded_idle_controls_enabled(True)
         self._show_stored_orientation(calibration)
         self.calibration_progress_bar.setVisible(False)
+        self.calibration_file_label.setText(f"Calibration file: {display_name}")
         self.calibration_status_label.setText(
             f"Loaded calibration: {display_name} ({summary['probe_count']} probes)"
         )
@@ -1154,6 +1164,7 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.correction_steps_group.setVisible(True)
 
     def show_saved_calibration(self, display_name: str) -> None:
+        self.calibration_file_label.setText(f"Calibration file: {display_name}")
         self.calibration_status_label.setText(f"Saved calibration: {display_name}")
 
     def show_correction_in_progress(self) -> None:

@@ -1078,6 +1078,9 @@ class CalibrationPanelTests(unittest.TestCase):
         table = dialog.findChild(QtWidgets.QTableWidget, "calibration_samples_table")
         axes_table = dialog.findChild(QtWidgets.QTableWidget, "calibration_axes_table")
 
+        self.assertEqual(
+            panel.calibration_file_label.text(), "Calibration file: test.h5"
+        )
         self.assertIn("test.h5", panel.calibration_status_label.text())
         self.assertTrue(panel.correct_sample_button.isEnabled())
         self.assertTrue(panel.detect_shift_button.isEnabled())
@@ -1101,11 +1104,15 @@ class CalibrationPanelTests(unittest.TestCase):
         )
 
         panel.reset()
+        self.assertEqual(panel.calibration_file_label.text(), "Calibration file: none")
         self.assertFalse(panel.correct_sample_button.isEnabled())
         self.assertFalse(panel.detect_shift_button.isEnabled())
 
         panel.show_loaded_calibration(calibration, "test.h5")
         panel.show_correction_in_progress()
+        self.assertEqual(
+            panel.calibration_file_label.text(), "Calibration file: test.h5"
+        )
         self.assertIn("Correction in progress", panel.calibration_status_label.text())
         self.assertFalse(panel.load_calibration_button.isEnabled())
         self.assertFalse(panel.save_calibration_button.isEnabled())
@@ -1138,7 +1145,8 @@ class CalibrationPanelTests(unittest.TestCase):
 
             layout = panel.layout()
             self.assertIs(layout.itemAt(1).widget(), panel.stored_orientation_widget)
-            self.assertIs(layout.itemAt(2).widget(), panel.calibration_status_label)
+            self.assertIs(layout.itemAt(2).widget(), panel.calibration_file_label)
+            self.assertIs(layout.itemAt(3).widget(), panel.calibration_status_label)
             self.assertFalse(panel.stored_orientation_widget.isHidden())
             self.assertEqual(
                 panel.stored_orientation_prefix_label.text(), "Calibrated at"
@@ -1214,7 +1222,7 @@ class CalibrationPanelTests(unittest.TestCase):
         get_qapp()
         panel = CalibrationPanel()
 
-        review_widget = panel.layout().itemAt(4).widget()
+        review_widget = panel.layout().itemAt(5).widget()
         content_layout = review_widget.layout().itemAt(0).layout()
         left_column = content_layout.itemAt(0).layout()
         right_column = content_layout.itemAt(1).layout()
@@ -1222,7 +1230,7 @@ class CalibrationPanelTests(unittest.TestCase):
         self.assertIs(left_column.itemAt(0).widget(), panel.metrics_group)
         self.assertIs(left_column.itemAt(1).widget(), panel.repeatability_group)
         self.assertIs(right_column.itemAt(0).widget(), panel.warnings_group)
-        self.assertIs(panel.layout().itemAt(5).widget(), panel.correction_steps_group)
+        self.assertIs(panel.layout().itemAt(6).widget(), panel.correction_steps_group)
 
     def test_correction_progress_before_first_move_shows_plan(self):
         get_qapp()
@@ -1260,6 +1268,9 @@ class CalibrationPanelTests(unittest.TestCase):
         panel.show_correction_result(result)
 
         table = panel.correction_steps_table
+        self.assertEqual(
+            panel.calibration_file_label.text(), "Calibration file: test.h5"
+        )
         self.assertTrue(panel.calibration_review_widget.isHidden())
         self.assertTrue(panel.metrics_group.isHidden())
         self.assertTrue(panel.warnings_group.isHidden())
@@ -1280,6 +1291,56 @@ class CalibrationPanelTests(unittest.TestCase):
             "Applied total: x=1 um, y=-2 um, z=3.25 um.",
             panel.correction_steps_summary_label.text(),
         )
+
+    def test_calibration_file_label_persists_across_operation_statuses(self):
+        get_qapp()
+        panel = CalibrationPanel()
+        calibration = build_sample_calibration_dataset(
+            image_shape_cam0=(4, 5),
+            image_shape_cam1=(6, 7),
+        )
+        correction = correction_result_with_moves()
+        detection = detection_result()
+        try:
+            panel.show_loaded_calibration(calibration, "test.h5")
+
+            panel.show_correction_in_progress()
+            self.assertEqual(
+                panel.calibration_file_label.text(),
+                "Calibration file: test.h5",
+            )
+
+            panel.show_correction_progress(correction)
+            self.assertEqual(
+                panel.calibration_file_label.text(),
+                "Calibration file: test.h5",
+            )
+
+            panel.show_correction_result(correction)
+            self.assertEqual(
+                panel.calibration_file_label.text(),
+                "Calibration file: test.h5",
+            )
+
+            panel.show_detection_result(detection)
+            self.assertEqual(
+                panel.calibration_file_label.text(),
+                "Calibration file: test.h5",
+            )
+
+            panel.show_stored_axis_move_in_progress("Polar", 12.34567)
+            self.assertEqual(
+                panel.calibration_file_label.text(),
+                "Calibration file: test.h5",
+            )
+
+            panel.show_stored_axis_move_result("Polar", 12.34567, 12.34)
+            self.assertEqual(
+                panel.calibration_file_label.text(),
+                "Calibration file: test.h5",
+            )
+        finally:
+            panel.close()
 
     def test_detection_result_displays_signed_shift_in_microns(self):
         get_qapp()
@@ -3404,6 +3465,10 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                         "Loaded calibration",
                         window.calibration_panel.calibration_status_label.text(),
                     )
+                    self.assertEqual(
+                        window.calibration_panel.calibration_file_label.text(),
+                        "Calibration file: calibration.h5",
+                    )
                     self.assertFalse(
                         window.calibration_panel.calibration_review_widget.isHidden()
                     )
@@ -3461,6 +3526,10 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                     self.assertIn(
                         "Correction did not converge after 3 move(s)",
                         window.calibration_panel.calibration_status_label.text(),
+                    )
+                    self.assertEqual(
+                        window.calibration_panel.calibration_file_label.text(),
+                        "Calibration file: calibration.h5",
                     )
                     self.assertEqual(
                         window.calibration_panel.correction_warnings_text.toPlainText(),
