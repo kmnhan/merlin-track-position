@@ -982,7 +982,7 @@ Saved calibration attributes include:
 
 - `warnings`;
 - initial motor context, such as `initial_x_mm`, `initial_y_mm`,
-  `initial_z_mm`, `polar`, and `tilt`;
+  `initial_z_mm`, `polar`, `tilt`, and `azi`;
 - GUI ROI bounds, such as `roi_cam0_*` and `roi_cam1_*`, when created from the
   GUI.
 

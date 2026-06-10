@@ -792,6 +792,9 @@ class VisualCalibrationTests(unittest.TestCase):
                 kwargs["additional_context"]["probe_command_delta_mode"],
                 "absolute_center_offset",
             )
+            self.assertEqual(kwargs["additional_context"]["polar"], 12.0)
+            self.assertEqual(kwargs["additional_context"]["tilt"], -3.0)
+            self.assertEqual(kwargs["additional_context"]["azi"], 47.5)
             for name, expected_shape in (
                 ("before_images_cam0", (1, *expected_crop_cam0.shape)),
                 ("after_images_cam0", (1, *expected_crop_cam0.shape)),
@@ -811,7 +814,7 @@ class VisualCalibrationTests(unittest.TestCase):
             with (
                 patch(
                     "merlin_track_position.tracking.calibrate.get_positions",
-                    return_value=(0.0, 0.0, 0.0, 0.0, 0.0, 5.0),
+                    return_value=(0.0, 0.0, 0.0, 12.0, -3.0, 47.5, 5.0),
                 ),
                 patch(
                     "merlin_track_position.tracking.calibrate.move_motors_and_wait",
@@ -840,6 +843,7 @@ class VisualCalibrationTests(unittest.TestCase):
         self.assertEqual(calibration["reference_cam1"].shape, full_cam1.shape)
         self.assertEqual(calibration.attrs["roi_cam0_width"], 3.0)
         self.assertEqual(calibration.attrs["roi_cam1_height"], 3.0)
+        self.assertEqual(calibration.attrs["azi"], 47.5)
 
     def test_run_calibration_keeps_camera_switch_sleep(self):
         image_cam0 = np.arange(4 * 5, dtype=np.uint16).reshape(4, 5)
@@ -851,8 +855,8 @@ class VisualCalibrationTests(unittest.TestCase):
 
         def fake_get_positions(aliases):
             aliases = tuple(aliases)
-            if aliases == ("x", "y", "z", "p", "t", "cam"):
-                return (0.0, 0.0, 0.0, 0.0, 0.0, 4.0)
+            if aliases == ("x", "y", "z", "p", "t", "a", "cam"):
+                return (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 4.0)
             return tuple(0.0 for _alias in aliases)
 
         def fake_fit_jacobian_calibration(**kwargs):

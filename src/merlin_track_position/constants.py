@@ -9,6 +9,7 @@ MOTOR_NAMES: dict[str, str] = {
     "y": "Sample Y (Vert)",
     "z": "Sample Z",
     "p": "Polar",
+    "a": "Azimuth",
     "t": "Tilt",
     "cam": "Video Switch",
     "TA": "Cryostat Temp A",

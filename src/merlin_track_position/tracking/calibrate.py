@@ -88,7 +88,9 @@ def run_calibration(
         for camera in CAMERAS
     }
 
-    x0, y0, z0, polar, tilt, cam = get_positions(("x", "y", "z", "p", "t", "cam"))
+    x0, y0, z0, polar, tilt, azi, cam = get_positions(
+        ("x", "y", "z", "p", "t", "a", "cam")
+    )
     initial_readback_position = np.asarray([x0, y0, z0], dtype=np.float64)
     requested_position = initial_readback_position.copy()
 
@@ -184,6 +186,7 @@ def run_calibration(
         "initial_z_mm": float(z0),
         "polar": float(polar),
         "tilt": float(tilt),
+        "azi": float(azi),
         "calibration_path": str(output_path),
         PROBE_COMMAND_DELTA_MODE_ATTR: PROBE_COMMAND_DELTA_MODE_ABSOLUTE_CENTER,
     }
