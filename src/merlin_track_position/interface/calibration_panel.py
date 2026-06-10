@@ -292,12 +292,11 @@ def _correction_step_residuals(
 def _correction_status_residual(result: xr.Dataset) -> tuple[float, str, str]:
     if result.attrs.get("correction_mode") == "beam":
         name = "iteration_correction_criterion_residual"
-        label = "normalized beam/analyzer residual"
         suffix = ""
     else:
         name = "iteration_weighted_residual_px"
-        label = "residual"
         suffix = " px"
+    label = "residual"
     residual = math.nan
     if name in result:
         values = np.asarray(result[name].values, dtype=float)
