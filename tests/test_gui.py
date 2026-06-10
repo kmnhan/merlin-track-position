@@ -2804,6 +2804,69 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                 finally:
                     window.close()
 
+    def test_stored_axis_move_preserves_correction_result_layout(self):
+        get_qapp()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "calibration.h5"
+            calibration = write_sample_calibration(path).assign_attrs(polar=12.34567)
+            result = correction_result_with_moves()
+            with patched_main_window_runtime():
+                window = MainWindow()
+                try:
+                    window._on_new_calibration_ready(calibration)
+                    window._last_correction_result = result
+                    window.calibration_panel.show_correction_result(result)
+                    self.assertTrue(
+                        window.calibration_panel.calibration_review_widget.isHidden()
+                    )
+                    self.assertFalse(
+                        window.calibration_panel.correction_steps_group.isHidden()
+                    )
+
+                    with patch(
+                        "merlin_track_position.interface.main_window.QtWidgets.QMessageBox.warning",
+                        return_value=QtWidgets.QMessageBox.StandardButton.Ok,
+                    ):
+                        window.calibration_panel.stored_orientation_go_buttons[
+                            "polar"
+                        ].click()
+
+                    self.assertTrue(
+                        window.calibration_panel.calibration_review_widget.isHidden()
+                    )
+                    self.assertTrue(window.calibration_panel.metrics_group.isHidden())
+                    self.assertTrue(window.calibration_panel.warnings_group.isHidden())
+                    self.assertTrue(
+                        window.calibration_panel.residual_graphics_layout.isHidden()
+                    )
+                    self.assertFalse(
+                        window.calibration_panel.correction_steps_group.isHidden()
+                    )
+                    self.assertIn(
+                        "Moving Polar",
+                        window.calibration_panel.calibration_status_label.text(),
+                    )
+
+                    window._stored_axis_move_thread.running = False
+                    window._stored_axis_move_thread.sigStoredAxisMoveReady.emit(
+                        "p",
+                        12.34567,
+                        12.34,
+                    )
+
+                    self.assertTrue(
+                        window.calibration_panel.calibration_review_widget.isHidden()
+                    )
+                    self.assertFalse(
+                        window.calibration_panel.correction_steps_group.isHidden()
+                    )
+                    self.assertIn(
+                        "Moved Polar",
+                        window.calibration_panel.calibration_status_label.text(),
+                    )
+                finally:
+                    window.close()
+
     def test_stored_axis_move_failure_restores_loaded_state_and_shows_error(self):
         get_qapp()
         with tempfile.TemporaryDirectory() as tmpdir:

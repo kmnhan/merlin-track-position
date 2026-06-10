@@ -1204,6 +1204,7 @@ class MainWindow(_MainWindowGUI):
         self._roi_editing_enabled = True
         self._beam_target_user_overrides: set[str] = set()
         self._last_correction_result: xr.Dataset | None = None
+        self._stored_axis_move_restore_correction_result = False
         self._server_correction_pending = False
         self._server_correction_target: int | None = None
         self._latest_images: tuple[np.ndarray, np.ndarray] | None = None
@@ -1762,6 +1763,10 @@ class MainWindow(_MainWindowGUI):
 
         ui_marked_busy = False
         try:
+            self._stored_axis_move_restore_correction_result = (
+                self.calibration_panel.display_mode() == "correction"
+                and self._last_correction_result is not None
+            )
             self._pause_image_auto_refresh_for_calibration()
             ui_marked_busy = True
             self._set_roi_editing_enabled(False)
@@ -1773,7 +1778,7 @@ class MainWindow(_MainWindowGUI):
         except Exception as exc:
             if ui_marked_busy:
                 self._restore_image_auto_refresh_after_calibration()
-                self._restore_calibration_idle_state()
+                self._restore_stored_axis_move_idle_state()
             QtWidgets.QMessageBox.critical(
                 self,
                 "Could not move to calibrated position",
@@ -1789,7 +1794,7 @@ class MainWindow(_MainWindowGUI):
     ) -> None:
         display_name = STORED_ORIENTATION_LABELS_BY_ALIAS.get(axis_alias, axis_alias)
         self._restore_image_auto_refresh_after_calibration()
-        self._restore_calibration_idle_state()
+        self._restore_stored_axis_move_idle_state()
         self.calibration_panel.show_stored_axis_move_result(
             display_name,
             target_value,
@@ -1810,7 +1815,7 @@ class MainWindow(_MainWindowGUI):
     ) -> None:
         display_name = STORED_ORIENTATION_LABELS_BY_ALIAS.get(axis_alias, axis_alias)
         self._restore_image_auto_refresh_after_calibration()
-        self._restore_calibration_idle_state()
+        self._restore_stored_axis_move_idle_state()
         logger.error(
             "Stored calibration axis move failed: axis_alias=%s, error=%s",
             axis_alias,
@@ -1821,6 +1826,23 @@ class MainWindow(_MainWindowGUI):
             "Could not move to calibrated position",
             f"{display_name}: {error_message}",
         )
+
+    def _restore_stored_axis_move_idle_state(self) -> None:
+        if (
+            self._stored_axis_move_restore_correction_result
+            and self._last_correction_result is not None
+        ):
+            self._calibration_started_at = None
+            self._calibration_processing_started_at = None
+            self._calibration_total_steps = 0
+            self._set_roi_editing_enabled(False)
+            self.calibration_panel.show_correction_result(self._last_correction_result)
+            self._set_reference_preview_button_enabled(True)
+            self._stored_axis_move_restore_correction_result = False
+            return
+
+        self._stored_axis_move_restore_correction_result = False
+        self._restore_calibration_idle_state()
 
     def _reply_to_pending_server_correction(
         self,

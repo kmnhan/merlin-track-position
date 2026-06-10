@@ -702,7 +702,7 @@ class CalibrationPanel(QtWidgets.QWidget):
         stored_orientation_axes_layout.setSpacing(24)
         self.stored_orientation_axis_widgets: dict[str, QtWidgets.QWidget] = {}
         self.stored_orientation_value_labels: dict[str, QtWidgets.QLabel] = {}
-        self.stored_orientation_go_buttons: dict[str, QtWidgets.QPushButton] = {}
+        self.stored_orientation_go_buttons: dict[str, QtWidgets.QToolButton] = {}
         for attr_name, axis_alias, display_name in STORED_ORIENTATION_AXES:
             axis_widget = QtWidgets.QWidget()
             axis_widget.setObjectName(f"stored_orientation_{attr_name}_widget")
@@ -717,7 +717,9 @@ class CalibrationPanel(QtWidgets.QWidget):
             value_label.setTextInteractionFlags(
                 QtCore.Qt.TextInteractionFlag.TextSelectableByMouse
             )
-            go_button = QtWidgets.QPushButton("Go")
+            go_button = QtWidgets.QToolButton()
+            go_button.setText("Go")
+            go_button.setToolButtonStyle(QtCore.Qt.ToolButtonStyle.ToolButtonTextOnly)
             go_button.setObjectName(f"stored_orientation_{attr_name}_go_button")
             go_button.clicked.connect(
                 lambda _checked=False, alias=axis_alias: (
@@ -870,6 +872,9 @@ class CalibrationPanel(QtWidgets.QWidget):
                 constants.DEFAULT_CORRECTION_MODE
             )
         self.correction_mode_combo.setCurrentIndex(max(index, 0))
+
+    def display_mode(self) -> str:
+        return self._display_mode
 
     def reset(self) -> None:
         self._set_display_mode("empty")
@@ -1266,7 +1271,6 @@ class CalibrationPanel(QtWidgets.QWidget):
         display_name: str,
         target_value: float,
     ) -> None:
-        self._set_display_mode("calibration")
         self._set_loaded_idle_controls_enabled(False)
         self._show_stored_orientation_if_available()
         self.calibration_progress_bar.setVisible(True)
