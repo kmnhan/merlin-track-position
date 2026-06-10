@@ -88,9 +88,9 @@ DEFAULT_CORRECTION_MODE: str = "beam"
 # toward +x in the sample xz plane. Beam-frame tolerances are correction
 # residual scales, in microns, for transverse-in-xz and vertical-y offsets.
 DEFAULT_BEAM_XZ_ANGLE_FROM_ANALYZER_DEG: float = 65.0
-DEFAULT_BEAM_TRANSVERSE_TOLERANCE_UM: float = 3.0
-DEFAULT_BEAM_ANALYZER_TRANSVERSE_TOLERANCE_UM: float = 3.0
-DEFAULT_BEAM_VERTICAL_TOLERANCE_UM: float = 3.0
+DEFAULT_BEAM_TRANSVERSE_TOLERANCE_UM: float = 5.0
+DEFAULT_BEAM_ANALYZER_TRANSVERSE_TOLERANCE_UM: float = 5.0
+DEFAULT_BEAM_VERTICAL_TOLERANCE_UM: float = 5.0
 
 # LQR solver weights and numerical tolerance.
 DEFAULT_LQR_CORRECTION_GAIN: float = 0.50
