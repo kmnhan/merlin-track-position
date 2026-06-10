@@ -137,7 +137,10 @@ class FakeBaslerCamera:
         self.PixelFormat = FakeNode()
         self.MaxNumBuffer = FakeNode(10)
         self.arrays = list(arrays or [])
-        self.grab_succeeded = grab_succeeded
+        if isinstance(grab_succeeded, (list, tuple)):
+            self.grab_succeeded = list(grab_succeeded)
+        else:
+            self.grab_succeeded = bool(grab_succeeded)
         self.open_count = 0
         self.close_count = 0
         self.start_grabbing_count = 0
@@ -177,7 +180,11 @@ class FakeBaslerCamera:
                 (constants.IMAGE_HEIGHT_CAM1, constants.IMAGE_WIDTH_CAM1),
                 dtype=np.uint16,
             )
-        return FakeGrabResult(array, succeeded=self.grab_succeeded)
+        if isinstance(self.grab_succeeded, list):
+            succeeded = self.grab_succeeded.pop(0) if self.grab_succeeded else True
+        else:
+            succeeded = self.grab_succeeded
+        return FakeGrabResult(array, succeeded=succeeded)
 
 
 class FakeBaslerDevice:
@@ -979,6 +986,31 @@ class DevelopmentModeFramegrabTests(unittest.TestCase):
         self.assertEqual(camera.open_count, 1)
         self.assertEqual(camera.start_grabbing_count, 1)
         self.assertEqual(camera.retrieve_result_count, 2)
+        self.assertEqual(camera.close_count, 0)
+
+    def test_basler_image_stack_skips_transient_failed_grab_result(self):
+        failed = np.full((2, 3), 99, dtype=np.uint16)
+        raw0 = np.arange(6, dtype=np.uint16).reshape(2, 3)
+        raw1 = raw0 + 10
+        camera = FakeBaslerCamera(
+            [failed, raw0, raw1],
+            grab_succeeded=[False, True, True],
+        )
+
+        with (
+            patch.object(constants, "IS_DAQ_PC", True),
+            patch.object(constants, "IMAGE_HEIGHT_CAM1", 2),
+            patch.object(constants, "IMAGE_WIDTH_CAM1", 3),
+            patch(
+                "merlin_track_position.instruments.basler.genicam.IsWritable",
+                lambda node: node.writable,
+            ),
+            patch.object(basler, "_get_camera_by_serial_number", return_value=camera),
+        ):
+            stack = get_basler_image_stack(2)
+
+        np.testing.assert_array_equal(stack, np.stack([raw0, raw1]))
+        self.assertEqual(camera.retrieve_result_count, 3)
         self.assertEqual(camera.close_count, 0)
 
     def test_close_basler_camera_stops_closes_and_allows_reopen(self):

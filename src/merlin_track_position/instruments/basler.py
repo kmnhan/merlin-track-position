@@ -21,12 +21,17 @@ from merlin_track_position.instruments.camera_config import (
 from merlin_track_position.instruments.simulated_hardware import simulator
 
 logger = logging.getLogger("merlin_track_position.instruments.basler")
+BASLER_FAILED_GRAB_RETRY_COUNT = 3
 BAYER_TO_RGB_CONVERSIONS = {
     "bayerbg": cv2.COLOR_BayerBGGR2RGB,
     "bayergb": cv2.COLOR_BayerGBRG2RGB,
     "bayergr": cv2.COLOR_BayerGRBG2RGB,
     "bayerrg": cv2.COLOR_BayerRGGB2RGB,
 }
+
+
+class _BaslerGrabFailed(RuntimeError):
+    pass
 
 
 @dataclass(frozen=True)
@@ -462,11 +467,27 @@ class _BaslerCameraSession:
         frame_count = _validate_frame_count(frame_count)
         with self._lock:
             camera = self._ensure_camera()
+            images = []
+            failed_grabs = 0
             try:
-                images = [
-                    self._retrieve_image(camera, timeout_ms)
-                    for _frame_index in range(frame_count)
-                ]
+                while len(images) < frame_count:
+                    try:
+                        images.append(self._retrieve_image(camera, timeout_ms))
+                    except _BaslerGrabFailed as exc:
+                        failed_grabs += 1
+                        if failed_grabs > BASLER_FAILED_GRAB_RETRY_COUNT:
+                            raise RuntimeError(
+                                f"{exc} after {failed_grabs} failed grab results "
+                                f"while capturing {frame_count} Basler frame(s)"
+                            ) from exc
+                        logger.warning(
+                            "Discarding failed Basler grab result %d/%d while "
+                            "capturing %d frame(s): %s",
+                            failed_grabs,
+                            BASLER_FAILED_GRAB_RETRY_COUNT,
+                            frame_count,
+                            exc,
+                        )
             except Exception:
                 self.close()
                 raise
@@ -510,7 +531,7 @@ class _BaslerCameraSession:
         )
         try:
             if not grab_result.GrabSucceeded():
-                raise RuntimeError(
+                raise _BaslerGrabFailed(
                     "Image grab failed: "
                     f"{grab_result.GetErrorCode()} {grab_result.GetErrorDescription()}"
                 )
