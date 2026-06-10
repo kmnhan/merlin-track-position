@@ -25,13 +25,21 @@ RESIDUAL_PROJECTIONS: tuple[tuple[str, str, int, int], ...] = (
     ("x", "z", 0, 2),
     ("y", "z", 1, 2),
 )
-CORRECTION_STEP_HEADERS: tuple[str, ...] = (
+CAMERA_CORRECTION_STEP_HEADERS: tuple[str, ...] = (
     "move",
     "x_um",
     "y_um",
     "z_um",
     "pre_residual_px",
     "post_residual_px",
+)
+BEAM_CORRECTION_STEP_HEADERS: tuple[str, ...] = (
+    "move",
+    "x_um",
+    "y_um",
+    "z_um",
+    "pre_criterion",
+    "post_criterion",
 )
 
 
@@ -235,19 +243,50 @@ def _correction_move_delta_mm(result: xr.Dataset) -> np.ndarray:
 def _correction_move_residuals(
     result: xr.Dataset,
     name: str,
-    move_count: int,
+    count: int,
 ) -> np.ndarray:
     if name not in result:
-        return np.full(move_count, math.nan, dtype=float)
+        return np.full(count, math.nan, dtype=float)
     values = np.asarray(result[name].values, dtype=float).reshape(-1)
-    if values.size < move_count:
+    if values.size < count:
         return np.pad(
             values,
-            (0, move_count - values.size),
+            (0, count - values.size),
             mode="constant",
             constant_values=math.nan,
         )
-    return values[:move_count]
+    return values[:count]
+
+
+def _correction_step_headers(mode: str | None) -> tuple[str, ...]:
+    if mode == "beam":
+        return BEAM_CORRECTION_STEP_HEADERS
+    return CAMERA_CORRECTION_STEP_HEADERS
+
+
+def _correction_step_residuals(
+    result: xr.Dataset,
+    move_count: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    if result.attrs.get("correction_mode") == "beam":
+        criterion = _correction_move_residuals(
+            result,
+            "iteration_correction_criterion_residual",
+            move_count + 1,
+        )
+        return criterion[:move_count], criterion[1 : move_count + 1]
+
+    pre_residual = _correction_move_residuals(
+        result,
+        "move_pre_weighted_residual_px",
+        move_count,
+    )
+    post_residual = _correction_move_residuals(
+        result,
+        "move_post_weighted_residual_px",
+        move_count,
+    )
+    return pre_residual, post_residual
 
 
 def _correction_status_residual(result: xr.Dataset) -> tuple[float, str, str]:
@@ -593,10 +632,12 @@ class CalibrationPanel(QtWidgets.QWidget):
 
         self.correction_steps_table = QtWidgets.QTableWidget(
             0,
-            len(CORRECTION_STEP_HEADERS),
+            len(CAMERA_CORRECTION_STEP_HEADERS),
         )
         self.correction_steps_table.setObjectName("correction_steps_table")
-        self.correction_steps_table.setHorizontalHeaderLabels(CORRECTION_STEP_HEADERS)
+        self.correction_steps_table.setHorizontalHeaderLabels(
+            CAMERA_CORRECTION_STEP_HEADERS
+        )
         self.correction_steps_table.setEditTriggers(
             QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers
         )
@@ -791,6 +832,9 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.correction_steps_group.setVisible(False)
 
     def _show_pending_correction_steps(self) -> None:
+        headers = _correction_step_headers(self.correction_mode())
+        self.correction_steps_table.setColumnCount(len(headers))
+        self.correction_steps_table.setHorizontalHeaderLabels(headers)
         self.correction_steps_summary_label.setText(
             "Capturing initial correction measurement before first move."
         )
@@ -804,17 +848,14 @@ class CalibrationPanel(QtWidgets.QWidget):
         in_progress: bool = False,
     ) -> None:
         move_delta = _correction_move_delta_mm(result)
-        pre_residual = _correction_move_residuals(
+        headers = _correction_step_headers(result.attrs.get("correction_mode"))
+        pre_residual, post_residual = _correction_step_residuals(
             result,
-            "move_pre_weighted_residual_px",
-            move_delta.shape[0],
-        )
-        post_residual = _correction_move_residuals(
-            result,
-            "move_post_weighted_residual_px",
             move_delta.shape[0],
         )
 
+        self.correction_steps_table.setColumnCount(len(headers))
+        self.correction_steps_table.setHorizontalHeaderLabels(headers)
         self.correction_steps_table.setRowCount(move_delta.shape[0])
         for row, delta_mm in enumerate(move_delta):
             values = (
