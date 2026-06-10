@@ -231,6 +231,35 @@ class FakeDetectShiftThread(QtCore.QObject):
         pass
 
 
+class FakeStoredAxisMoveThread(QtCore.QObject):
+    sigStoredAxisMoveReady = QtCore.Signal(str, float, float)
+    sigStoredAxisMoveFailed = QtCore.Signal(str, str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.axis_alias = None
+        self.target_value = None
+        self.started = False
+        self.running = False
+
+    def configure(self, axis_alias, target_value):
+        self.axis_alias = axis_alias
+        self.target_value = float(target_value)
+
+    def start(self):
+        self.started = True
+        self.running = True
+
+    def isRunning(self):
+        return self.running
+
+    def stop(self):
+        self.running = False
+
+    def wait(self):
+        pass
+
+
 @contextmanager
 def patched_main_window_runtime(settings=None):
     settings = settings or FakeSettings()
@@ -254,6 +283,10 @@ def patched_main_window_runtime(settings=None):
         patch(
             "merlin_track_position.interface.main_window.DetectShiftThread",
             FakeDetectShiftThread,
+        ),
+        patch(
+            "merlin_track_position.interface.main_window._StoredAxisMoveThread",
+            FakeStoredAxisMoveThread,
         ),
         patch("merlin_track_position.interface.main_window.close_basler_camera"),
     ):
@@ -1092,11 +1125,96 @@ class CalibrationPanelTests(unittest.TestCase):
             panel.correction_steps_summary_label.text(),
         )
 
+    def test_stored_orientation_row_shows_calibration_attrs(self):
+        get_qapp()
+        calibration = build_sample_calibration_dataset().assign_attrs(
+            polar=12.34567,
+            tilt=-3.2,
+            azi=47.5,
+        )
+        panel = CalibrationPanel()
+        try:
+            panel.show_loaded_calibration(calibration, "test.h5")
+
+            layout = panel.layout()
+            self.assertIs(layout.itemAt(1).widget(), panel.stored_orientation_widget)
+            self.assertIs(layout.itemAt(2).widget(), panel.calibration_status_label)
+            self.assertFalse(panel.stored_orientation_widget.isHidden())
+            self.assertEqual(
+                panel.stored_orientation_prefix_label.text(), "Calibrated at"
+            )
+            self.assertEqual(
+                panel.stored_orientation_value_labels["polar"].text(),
+                "12.3457",
+            )
+            self.assertEqual(
+                panel.stored_orientation_value_labels["tilt"].text(),
+                "-3.2000",
+            )
+            self.assertEqual(
+                panel.stored_orientation_value_labels["azi"].text(),
+                "47.5000",
+            )
+            self.assertEqual(
+                panel.stored_orientation_axis_widgets["polar"].layout().spacing(),
+                6,
+            )
+            self.assertEqual(
+                panel.stored_orientation_axis_widgets["polar"]
+                .parentWidget()
+                .layout()
+                .spacing(),
+                24,
+            )
+
+            requested = []
+            panel.sigStoredAxisMoveRequested.connect(
+                lambda axis, value: requested.append((axis, value))
+            )
+            panel.stored_orientation_go_buttons["polar"].click()
+
+            self.assertEqual(len(requested), 1)
+            self.assertEqual(requested[0][0], "p")
+            self.assertAlmostEqual(requested[0][1], 12.34567)
+        finally:
+            panel.close()
+
+    def test_stored_orientation_row_skips_missing_axes(self):
+        get_qapp()
+        calibration = build_sample_calibration_dataset().assign_attrs(
+            polar=1.25,
+            tilt=-2.5,
+        )
+        calibration.attrs.pop("azi", None)
+        panel = CalibrationPanel()
+        try:
+            panel.show_loaded_calibration(calibration, "test.h5")
+
+            self.assertFalse(panel.stored_orientation_widget.isHidden())
+            self.assertFalse(panel.stored_orientation_axis_widgets["polar"].isHidden())
+            self.assertFalse(panel.stored_orientation_axis_widgets["tilt"].isHidden())
+            self.assertTrue(panel.stored_orientation_axis_widgets["azi"].isHidden())
+        finally:
+            panel.close()
+
+    def test_stored_orientation_row_hides_without_finite_axes(self):
+        get_qapp()
+        calibration = build_sample_calibration_dataset()
+        for key in ("polar", "tilt", "azi"):
+            calibration.attrs.pop(key, None)
+        panel = CalibrationPanel()
+        try:
+            panel.show_loaded_calibration(calibration, "test.h5")
+
+            self.assertTrue(panel.stored_orientation_widget.isHidden())
+        finally:
+            panel.close()
+
     def test_calibration_review_layout_groups_diagnostics(self):
         get_qapp()
         panel = CalibrationPanel()
 
-        review_widget = panel.layout().itemAt(3).widget()
+        review_widget = panel.layout().itemAt(4).widget()
         content_layout = review_widget.layout().itemAt(0).layout()
         left_column = content_layout.itemAt(0).layout()
         right_column = content_layout.itemAt(1).layout()
@@ -1104,7 +1222,7 @@ class CalibrationPanelTests(unittest.TestCase):
         self.assertIs(left_column.itemAt(0).widget(), panel.metrics_group)
         self.assertIs(left_column.itemAt(1).widget(), panel.repeatability_group)
         self.assertIs(right_column.itemAt(0).widget(), panel.warnings_group)
-        self.assertIs(panel.layout().itemAt(4).widget(), panel.correction_steps_group)
+        self.assertIs(panel.layout().itemAt(5).widget(), panel.correction_steps_group)
 
     def test_correction_progress_before_first_move_shows_plan(self):
         get_qapp()
@@ -2581,6 +2699,146 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                     for refresh_thread in window._image_refresh_threads.values():
                         self.assertFalse(refresh_thread.enabled)
                         self.assertEqual(refresh_thread.wait_until_idle_calls, 1)
+                finally:
+                    window.close()
+
+    def test_stored_axis_move_cancel_does_not_start_thread(self):
+        get_qapp()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "calibration.h5"
+            calibration = write_sample_calibration(path).assign_attrs(polar=12.34567)
+            with patched_main_window_runtime():
+                window = MainWindow()
+                try:
+                    window._on_new_calibration_ready(calibration)
+                    with patch(
+                        "merlin_track_position.interface.main_window.QtWidgets.QMessageBox.warning",
+                        return_value=QtWidgets.QMessageBox.StandardButton.Cancel,
+                    ):
+                        window.calibration_panel.stored_orientation_go_buttons[
+                            "polar"
+                        ].click()
+
+                    self.assertFalse(window._stored_axis_move_thread.started)
+                finally:
+                    window.close()
+
+    def test_stored_axis_move_confirmation_starts_thread_and_disables_actions(self):
+        get_qapp()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "calibration.h5"
+            calibration = write_sample_calibration(path).assign_attrs(tilt=-3.2)
+            with patched_main_window_runtime():
+                window = MainWindow()
+                try:
+                    window._on_new_calibration_ready(calibration)
+                    with patch(
+                        "merlin_track_position.interface.main_window.QtWidgets.QMessageBox.warning",
+                        return_value=QtWidgets.QMessageBox.StandardButton.Ok,
+                    ):
+                        window.calibration_panel.stored_orientation_go_buttons[
+                            "tilt"
+                        ].click()
+
+                    thread = window._stored_axis_move_thread
+                    self.assertTrue(thread.started)
+                    self.assertEqual(thread.axis_alias, "t")
+                    self.assertAlmostEqual(thread.target_value, -3.2)
+                    self.assertFalse(
+                        window.calibration_panel.correct_sample_button.isEnabled()
+                    )
+                    self.assertFalse(
+                        window.calibration_panel.stored_orientation_go_buttons[
+                            "tilt"
+                        ].isEnabled()
+                    )
+                    for refresh_thread in window._image_refresh_threads.values():
+                        self.assertFalse(refresh_thread.enabled)
+                        self.assertEqual(refresh_thread.wait_until_idle_calls, 1)
+                    self.assertIn(
+                        "Moving Tilt",
+                        window.calibration_panel.calibration_status_label.text(),
+                    )
+                finally:
+                    window.close()
+
+    def test_stored_axis_move_success_restores_loaded_state(self):
+        get_qapp()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "calibration.h5"
+            calibration = write_sample_calibration(path).assign_attrs(polar=12.34567)
+            with patched_main_window_runtime():
+                window = MainWindow()
+                try:
+                    window._on_new_calibration_ready(calibration)
+                    with patch(
+                        "merlin_track_position.interface.main_window.QtWidgets.QMessageBox.warning",
+                        return_value=QtWidgets.QMessageBox.StandardButton.Ok,
+                    ):
+                        window.calibration_panel.stored_orientation_go_buttons[
+                            "polar"
+                        ].click()
+
+                    window._stored_axis_move_thread.running = False
+                    window._stored_axis_move_thread.sigStoredAxisMoveReady.emit(
+                        "p",
+                        12.34567,
+                        12.34,
+                    )
+
+                    self.assertTrue(
+                        window.calibration_panel.correct_sample_button.isEnabled()
+                    )
+                    self.assertTrue(
+                        window.calibration_panel.stored_orientation_go_buttons[
+                            "polar"
+                        ].isEnabled()
+                    )
+                    self.assertFalse(
+                        window.calibration_panel.stored_orientation_widget.isHidden()
+                    )
+                    status = window.calibration_panel.calibration_status_label.text()
+                    self.assertIn("Moved Polar", status)
+                    self.assertIn("12.3457", status)
+                    self.assertIn("12.3400", status)
+                finally:
+                    window.close()
+
+    def test_stored_axis_move_failure_restores_loaded_state_and_shows_error(self):
+        get_qapp()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "calibration.h5"
+            calibration = write_sample_calibration(path).assign_attrs(azi=47.5)
+            with patched_main_window_runtime():
+                window = MainWindow()
+                try:
+                    window._on_new_calibration_ready(calibration)
+                    with patch(
+                        "merlin_track_position.interface.main_window.QtWidgets.QMessageBox.warning",
+                        return_value=QtWidgets.QMessageBox.StandardButton.Ok,
+                    ):
+                        window.calibration_panel.stored_orientation_go_buttons[
+                            "azi"
+                        ].click()
+
+                    window._stored_axis_move_thread.running = False
+                    with patch(
+                        "merlin_track_position.interface.main_window.QtWidgets.QMessageBox.critical"
+                    ) as critical:
+                        window._stored_axis_move_thread.sigStoredAxisMoveFailed.emit(
+                            "a",
+                            "boom",
+                        )
+
+                    self.assertTrue(
+                        window.calibration_panel.correct_sample_button.isEnabled()
+                    )
+                    self.assertFalse(
+                        window.calibration_panel.stored_orientation_widget.isHidden()
+                    )
+                    critical.assert_called_once()
+                    self.assertIn("Azimuth", critical.call_args.args[2])
+                    self.assertIn("boom", critical.call_args.args[2])
                 finally:
                     window.close()
 

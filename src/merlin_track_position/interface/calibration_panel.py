@@ -41,6 +41,11 @@ BEAM_CORRECTION_STEP_HEADERS: tuple[str, ...] = (
     "pre_criterion",
     "post_criterion",
 )
+STORED_ORIENTATION_AXES: tuple[tuple[str, str, str], ...] = (
+    ("polar", "p", "Polar"),
+    ("tilt", "t", "Tilt"),
+    ("azi", "a", "Azimuth"),
+)
 
 
 def _tooltip_html(
@@ -543,6 +548,21 @@ def _correction_warning_text(result: xr.Dataset) -> str:
     return "\n".join(warning_lines) if warning_lines else "No correction warnings."
 
 
+def _stored_orientation_attr_value(
+    attrs: Mapping[str, object],
+    attr_name: str,
+) -> float | None:
+    if attr_name not in attrs:
+        return None
+    try:
+        value = float(attrs[attr_name])
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(value):
+        return None
+    return value
+
+
 def _add_residual_projection_plots(
     graphics_layout: pg.GraphicsLayoutWidget,
 ) -> dict[str, pg.PlotItem]:
@@ -618,6 +638,8 @@ def _plot_residuals_on(
 
 
 class CalibrationPanel(QtWidgets.QWidget):
+    sigStoredAxisMoveRequested = QtCore.Signal(str, float)
+
     def __init__(self, parent: QtWidgets.QWidget | None = None):
         super().__init__(parent)
 
@@ -658,6 +680,63 @@ class CalibrationPanel(QtWidgets.QWidget):
         calibration_button_layout.addWidget(self.calibration_details_button)
         calibration_button_layout.addWidget(self.new_calibration_button)
         calibration_layout.addLayout(calibration_button_layout)
+
+        self.stored_orientation_widget = QtWidgets.QWidget()
+        self.stored_orientation_widget.setObjectName("stored_orientation_widget")
+        stored_orientation_layout = QtWidgets.QHBoxLayout(
+            self.stored_orientation_widget
+        )
+        stored_orientation_layout.setContentsMargins(0, 0, 0, 0)
+        stored_orientation_layout.setSpacing(12)
+        self.stored_orientation_prefix_label = QtWidgets.QLabel("Calibrated at")
+        self.stored_orientation_prefix_label.setObjectName(
+            "stored_orientation_prefix_label"
+        )
+        stored_orientation_layout.addWidget(self.stored_orientation_prefix_label)
+
+        stored_orientation_axes_widget = QtWidgets.QWidget()
+        stored_orientation_axes_layout = QtWidgets.QHBoxLayout(
+            stored_orientation_axes_widget
+        )
+        stored_orientation_axes_layout.setContentsMargins(0, 0, 0, 0)
+        stored_orientation_axes_layout.setSpacing(24)
+        self.stored_orientation_axis_widgets: dict[str, QtWidgets.QWidget] = {}
+        self.stored_orientation_value_labels: dict[str, QtWidgets.QLabel] = {}
+        self.stored_orientation_go_buttons: dict[str, QtWidgets.QPushButton] = {}
+        for attr_name, axis_alias, display_name in STORED_ORIENTATION_AXES:
+            axis_widget = QtWidgets.QWidget()
+            axis_widget.setObjectName(f"stored_orientation_{attr_name}_widget")
+            axis_layout = QtWidgets.QHBoxLayout(axis_widget)
+            axis_layout.setContentsMargins(0, 0, 0, 0)
+            axis_layout.setSpacing(6)
+
+            axis_label = QtWidgets.QLabel(display_name)
+            axis_label.setObjectName(f"stored_orientation_{attr_name}_label")
+            value_label = QtWidgets.QLabel()
+            value_label.setObjectName(f"stored_orientation_{attr_name}_value")
+            value_label.setTextInteractionFlags(
+                QtCore.Qt.TextInteractionFlag.TextSelectableByMouse
+            )
+            go_button = QtWidgets.QPushButton("Go")
+            go_button.setObjectName(f"stored_orientation_{attr_name}_go_button")
+            go_button.clicked.connect(
+                lambda _checked=False, alias=axis_alias: (
+                    self._emit_stored_axis_move_requested(alias)
+                )
+            )
+
+            axis_layout.addWidget(axis_label)
+            axis_layout.addWidget(value_label)
+            axis_layout.addWidget(go_button)
+            stored_orientation_axes_layout.addWidget(axis_widget)
+
+            self.stored_orientation_axis_widgets[attr_name] = axis_widget
+            self.stored_orientation_value_labels[attr_name] = value_label
+            self.stored_orientation_go_buttons[attr_name] = go_button
+
+        stored_orientation_layout.addWidget(stored_orientation_axes_widget)
+        stored_orientation_layout.addStretch(1)
+        calibration_layout.addWidget(self.stored_orientation_widget)
 
         self.calibration_status_label = QtWidgets.QLabel()
         self.calibration_status_label.setWordWrap(True)
@@ -774,6 +853,7 @@ class CalibrationPanel(QtWidgets.QWidget):
         calibration_layout.addLayout(correction_button_layout)
 
         self._display_mode = "empty"
+        self._stored_orientation_values_by_alias: dict[str, float] = {}
         self.reset()
 
     def correction_mode(self) -> str:
@@ -793,6 +873,7 @@ class CalibrationPanel(QtWidgets.QWidget):
 
     def reset(self) -> None:
         self._set_display_mode("empty")
+        self._clear_stored_orientation()
         self.load_calibration_button.setEnabled(True)
         self.save_calibration_button.setEnabled(False)
         self.calibration_details_button.setEnabled(False)
@@ -821,6 +902,7 @@ class CalibrationPanel(QtWidgets.QWidget):
 
     def show_calibration_in_progress(self, total_steps: int | None = None) -> None:
         self._set_display_mode("empty")
+        self.stored_orientation_widget.setVisible(False)
         self.load_calibration_button.setEnabled(False)
         self.save_calibration_button.setEnabled(False)
         self.calibration_details_button.setEnabled(False)
@@ -894,7 +976,45 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.auto_correction_interval_spinbox.setEnabled(enabled)
         self.detect_shift_button.setEnabled(enabled)
         self.new_calibration_button.setEnabled(enabled)
+        for button in self.stored_orientation_go_buttons.values():
+            button.setEnabled(enabled)
         self.new_calibration_button.setText("Clear calibration")
+
+    def _clear_stored_orientation(self) -> None:
+        self._stored_orientation_values_by_alias = {}
+        for attr_name, _, _ in STORED_ORIENTATION_AXES:
+            self.stored_orientation_value_labels[attr_name].clear()
+            self.stored_orientation_axis_widgets[attr_name].setVisible(False)
+        self.stored_orientation_widget.setVisible(False)
+
+    def _show_stored_orientation(self, calibration: xr.Dataset) -> None:
+        self._stored_orientation_values_by_alias = {}
+        any_visible = False
+        for attr_name, axis_alias, _ in STORED_ORIENTATION_AXES:
+            value = _stored_orientation_attr_value(calibration.attrs, attr_name)
+            axis_widget = self.stored_orientation_axis_widgets[attr_name]
+            if value is None:
+                self.stored_orientation_value_labels[attr_name].clear()
+                axis_widget.setVisible(False)
+                continue
+            self._stored_orientation_values_by_alias[axis_alias] = value
+            self.stored_orientation_value_labels[attr_name].setText(f"{value:.4f}")
+            axis_widget.setVisible(True)
+            any_visible = True
+        self.stored_orientation_widget.setVisible(any_visible)
+
+    def _show_stored_orientation_if_available(self) -> None:
+        self.stored_orientation_widget.setVisible(
+            bool(self._stored_orientation_values_by_alias)
+        )
+
+    def _emit_stored_axis_move_requested(self, axis_alias: str) -> None:
+        if axis_alias not in self._stored_orientation_values_by_alias:
+            return
+        self.sigStoredAxisMoveRequested.emit(
+            axis_alias,
+            self._stored_orientation_values_by_alias[axis_alias],
+        )
 
     def _set_display_mode(self, mode: str) -> None:
         self._display_mode = mode
@@ -928,6 +1048,7 @@ class CalibrationPanel(QtWidgets.QWidget):
         summary = _calibration_summary(calibration)
         self._set_display_mode("calibration")
         self._set_loaded_idle_controls_enabled(True)
+        self._show_stored_orientation(calibration)
         self.calibration_progress_bar.setVisible(False)
         self.calibration_status_label.setText(
             f"Loaded calibration: {display_name} ({summary['probe_count']} probes)"
@@ -1032,6 +1153,7 @@ class CalibrationPanel(QtWidgets.QWidget):
 
     def show_correction_in_progress(self) -> None:
         self._set_display_mode("correction")
+        self.stored_orientation_widget.setVisible(False)
         self.load_calibration_button.setEnabled(False)
         self.save_calibration_button.setEnabled(False)
         self.calibration_details_button.setEnabled(False)
@@ -1071,6 +1193,7 @@ class CalibrationPanel(QtWidgets.QWidget):
     def show_correction_result(self, result: xr.Dataset) -> None:
         self._set_display_mode("correction")
         self._set_loaded_idle_controls_enabled(True)
+        self._show_stored_orientation_if_available()
         self.calibration_progress_bar.setVisible(False)
         converged = bool(result.attrs.get("correction_converged", False))
         moves = int(
@@ -1089,6 +1212,7 @@ class CalibrationPanel(QtWidgets.QWidget):
 
     def show_detection_in_progress(self) -> None:
         self._set_display_mode("calibration")
+        self.stored_orientation_widget.setVisible(False)
         self.load_calibration_button.setEnabled(False)
         self.save_calibration_button.setEnabled(False)
         self.calibration_details_button.setEnabled(False)
@@ -1105,16 +1229,8 @@ class CalibrationPanel(QtWidgets.QWidget):
 
     def show_detection_result(self, result: xr.Dataset) -> None:
         self._set_display_mode("calibration")
-        self.load_calibration_button.setEnabled(True)
-        self.save_calibration_button.setEnabled(True)
-        self.calibration_details_button.setEnabled(True)
-        self.correct_sample_button.setEnabled(True)
-        self.correction_mode_combo.setEnabled(True)
-        self.auto_correction_checkbox.setEnabled(True)
-        self.auto_correction_interval_spinbox.setEnabled(True)
-        self.detect_shift_button.setEnabled(True)
-        self.new_calibration_button.setEnabled(True)
-        self.new_calibration_button.setText("Clear calibration")
+        self._set_loaded_idle_controls_enabled(True)
+        self._show_stored_orientation_if_available()
         self.calibration_progress_bar.setVisible(False)
 
         residual = math.nan
@@ -1143,6 +1259,33 @@ class CalibrationPanel(QtWidgets.QWidget):
         ]
         self.calibration_warnings_text.setPlainText(
             "\n".join(warning_lines) if warning_lines else "No detection warnings."
+        )
+
+    def show_stored_axis_move_in_progress(
+        self,
+        display_name: str,
+        target_value: float,
+    ) -> None:
+        self._set_display_mode("calibration")
+        self._set_loaded_idle_controls_enabled(False)
+        self._show_stored_orientation_if_available()
+        self.calibration_progress_bar.setVisible(True)
+        self.calibration_progress_bar.setRange(0, 0)
+        self.calibration_status_label.setText(
+            f"Moving {display_name} to calibrated value {target_value:.4f}..."
+        )
+
+    def show_stored_axis_move_result(
+        self,
+        display_name: str,
+        target_value: float,
+        final_value: float,
+    ) -> None:
+        self._show_stored_orientation_if_available()
+        self.calibration_progress_bar.setVisible(False)
+        self.calibration_status_label.setText(
+            f"Moved {display_name} to calibrated value {target_value:.4f}; "
+            f"final readback {final_value:.4f}."
         )
 
     def build_details_dialog(

@@ -56,8 +56,12 @@ from merlin_track_position.instruments.basler import (
     validate_basler_config,
 )
 from merlin_track_position.instruments.framegrab import get_framegrabber_image
+from merlin_track_position.instruments.motors import move_motors_and_wait
 from merlin_track_position.instruments.simulated_hardware import simulator
-from merlin_track_position.interface.calibration_panel import CalibrationPanel
+from merlin_track_position.interface.calibration_panel import (
+    STORED_ORIENTATION_AXES,
+    CalibrationPanel,
+)
 from merlin_track_position.interface.calibration_thread import CalibrationThread
 from merlin_track_position.interface.correction_thread import CorrectionThread
 from merlin_track_position.interface.detection_thread import DetectShiftThread
@@ -130,6 +134,67 @@ def _load_calibration_dialog_path(current_path: Path | None) -> Path:
 
 class _CorrectionUnavailable(RuntimeError):
     """Expected state that prevents a correction run from starting."""
+
+
+STORED_ORIENTATION_LABELS_BY_ALIAS = {
+    axis_alias: display_name for _, axis_alias, display_name in STORED_ORIENTATION_AXES
+}
+
+
+class _StoredAxisMoveThread(QtCore.QThread):
+    sigStoredAxisMoveReady = QtCore.Signal(str, float, float)
+    sigStoredAxisMoveFailed = QtCore.Signal(str, str)
+
+    def __init__(self, parent: QtCore.QObject | None = None):
+        super().__init__(parent)
+        self._running = threading.Event()
+        self._axis_alias: str | None = None
+        self._target_value: float | None = None
+
+    def configure(self, axis_alias: str, target_value: float) -> None:
+        if self.isRunning():
+            raise RuntimeError("cannot configure stored-axis move while it is running")
+        if axis_alias not in STORED_ORIENTATION_LABELS_BY_ALIAS:
+            raise ValueError(f"unsupported stored calibration axis {axis_alias!r}")
+        if not math.isfinite(float(target_value)):
+            raise ValueError("stored calibration target must be finite")
+        self._axis_alias = str(axis_alias)
+        self._target_value = float(target_value)
+
+    def run(self) -> None:
+        self._running.set()
+        try:
+            if not self._running.is_set() or self.isInterruptionRequested():
+                return
+            try:
+                if self._axis_alias is None or self._target_value is None:
+                    raise RuntimeError(
+                        "stored-axis move thread has not been configured"
+                    )
+                final_positions = move_motors_and_wait(
+                    (self._axis_alias,),
+                    (self._target_value,),
+                )
+                final_value = float(final_positions[0])
+            except Exception as exc:
+                logger.exception("Stored calibration axis move failed.")
+                if self._running.is_set() and not self.isInterruptionRequested():
+                    axis_alias = "" if self._axis_alias is None else self._axis_alias
+                    self.sigStoredAxisMoveFailed.emit(axis_alias, str(exc))
+                return
+
+            if self._running.is_set() and not self.isInterruptionRequested():
+                self.sigStoredAxisMoveReady.emit(
+                    self._axis_alias,
+                    self._target_value,
+                    final_value,
+                )
+        finally:
+            self._running.clear()
+
+    def stop(self) -> None:
+        self._running.clear()
+        self.requestInterruption()
 
 
 _ACTIVE_CAMERA_CONFIGS: dict[str, CameraConfig] = default_camera_configs()
@@ -1132,6 +1197,7 @@ class MainWindow(_MainWindowGUI):
         self._calibration_thread = CalibrationThread(self)
         self._correction_thread = CorrectionThread(self)
         self._detect_shift_thread = DetectShiftThread(self)
+        self._stored_axis_move_thread = _StoredAxisMoveThread(self)
         self._calibration_total_steps = 0
         self._calibration_started_at: float | None = None
         self._calibration_processing_started_at: float | None = None
@@ -1245,6 +1311,9 @@ class MainWindow(_MainWindowGUI):
         self.calibration_panel.new_calibration_button.clicked.connect(
             self._on_new_calibration_clicked
         )
+        self.calibration_panel.sigStoredAxisMoveRequested.connect(
+            self._on_stored_axis_move_requested
+        )
         self.shift_monitor_action.triggered.connect(self._on_shift_monitor_triggered)
         self.camera_settings_action.triggered.connect(
             self._on_camera_settings_triggered
@@ -1267,6 +1336,12 @@ class MainWindow(_MainWindowGUI):
         self._detect_shift_thread.sigDetectionReady.connect(self._on_detect_shift_ready)
         self._detect_shift_thread.sigDetectionFailed.connect(
             self._on_detect_shift_failed
+        )
+        self._stored_axis_move_thread.sigStoredAxisMoveReady.connect(
+            self._on_stored_axis_move_ready
+        )
+        self._stored_axis_move_thread.sigStoredAxisMoveFailed.connect(
+            self._on_stored_axis_move_failed
         )
         self.image_auto_refresh_checkbox.toggled.connect(
             self._on_image_auto_refresh_toggled
@@ -1561,6 +1636,8 @@ class MainWindow(_MainWindowGUI):
             return "Correction is already in progress."
         if self._detect_shift_thread.isRunning():
             return "Correction is unavailable while shift detection is running."
+        if self._stored_axis_move_thread.isRunning():
+            return "Correction is unavailable while a stored-axis move is running."
         if self._calibration_path is None or not self._calibration_path.exists():
             return "Correction requires a calibration file on disk."
         mismatch_message = self._camera_config_mismatch_message()
@@ -1577,9 +1654,24 @@ class MainWindow(_MainWindowGUI):
             return "Shift detection is unavailable while correction is running."
         if self._detect_shift_thread.isRunning():
             return "Shift detection is already in progress."
+        if self._stored_axis_move_thread.isRunning():
+            return "Shift detection is unavailable while a stored-axis move is running."
         mismatch_message = self._camera_config_mismatch_message()
         if mismatch_message is not None:
             return mismatch_message
+        return None
+
+    def _stored_axis_move_unavailable_message(self) -> str | None:
+        if self._calibration is None:
+            return "Stored-axis move requires a loaded calibration."
+        if self._calibration_thread.isRunning():
+            return "Stored-axis move is unavailable while calibration is running."
+        if self._correction_thread.isRunning():
+            return "Stored-axis move is unavailable while correction is running."
+        if self._detect_shift_thread.isRunning():
+            return "Stored-axis move is unavailable while shift detection is running."
+        if self._stored_axis_move_thread.isRunning():
+            return "Stored-axis move is already in progress."
         return None
 
     def _camera_config_mismatch_message(self) -> str | None:
@@ -1630,6 +1722,105 @@ class MainWindow(_MainWindowGUI):
                 self._restore_calibration_idle_state()
             logger.exception("Failed while starting correction.")
             raise
+
+    @QtCore.Slot(str, float)
+    def _on_stored_axis_move_requested(
+        self,
+        axis_alias: str,
+        target_value: float,
+    ) -> None:
+        unavailable_message = self._stored_axis_move_unavailable_message()
+        display_name = STORED_ORIENTATION_LABELS_BY_ALIAS.get(axis_alias, axis_alias)
+        if unavailable_message is not None:
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Could not move to calibrated position",
+                unavailable_message,
+            )
+            return
+
+        response = QtWidgets.QMessageBox.warning(
+            self,
+            "Move to calibrated orientation?",
+            f"Move {display_name} to calibrated value {target_value:.4f}?",
+            QtWidgets.QMessageBox.StandardButton.Ok
+            | QtWidgets.QMessageBox.StandardButton.Cancel,
+            QtWidgets.QMessageBox.StandardButton.Cancel,
+        )
+        if response != QtWidgets.QMessageBox.StandardButton.Ok:
+            return
+
+        try:
+            self._stored_axis_move_thread.configure(axis_alias, target_value)
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Could not move to calibrated position",
+                str(exc),
+            )
+            return
+
+        ui_marked_busy = False
+        try:
+            self._pause_image_auto_refresh_for_calibration()
+            ui_marked_busy = True
+            self._set_roi_editing_enabled(False)
+            self.calibration_panel.show_stored_axis_move_in_progress(
+                display_name,
+                target_value,
+            )
+            self._stored_axis_move_thread.start()
+        except Exception as exc:
+            if ui_marked_busy:
+                self._restore_image_auto_refresh_after_calibration()
+                self._restore_calibration_idle_state()
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Could not move to calibrated position",
+                str(exc),
+            )
+
+    @QtCore.Slot(str, float, float)
+    def _on_stored_axis_move_ready(
+        self,
+        axis_alias: str,
+        target_value: float,
+        final_value: float,
+    ) -> None:
+        display_name = STORED_ORIENTATION_LABELS_BY_ALIAS.get(axis_alias, axis_alias)
+        self._restore_image_auto_refresh_after_calibration()
+        self._restore_calibration_idle_state()
+        self.calibration_panel.show_stored_axis_move_result(
+            display_name,
+            target_value,
+            final_value,
+        )
+        logger.info(
+            "Stored calibration axis move finished: axis_alias=%s, target=%g, final=%g",
+            axis_alias,
+            target_value,
+            final_value,
+        )
+
+    @QtCore.Slot(str, str)
+    def _on_stored_axis_move_failed(
+        self,
+        axis_alias: str,
+        error_message: str,
+    ) -> None:
+        display_name = STORED_ORIENTATION_LABELS_BY_ALIAS.get(axis_alias, axis_alias)
+        self._restore_image_auto_refresh_after_calibration()
+        self._restore_calibration_idle_state()
+        logger.error(
+            "Stored calibration axis move failed: axis_alias=%s, error=%s",
+            axis_alias,
+            error_message,
+        )
+        QtWidgets.QMessageBox.critical(
+            self,
+            "Could not move to calibrated position",
+            f"{display_name}: {error_message}",
+        )
 
     def _reply_to_pending_server_correction(
         self,
@@ -2178,7 +2369,11 @@ class MainWindow(_MainWindowGUI):
 
     @QtCore.Slot()
     def _on_load_calibration_clicked(self) -> None:
-        if self._correction_thread.isRunning() or self._detect_shift_thread.isRunning():
+        if (
+            self._correction_thread.isRunning()
+            or self._detect_shift_thread.isRunning()
+            or self._stored_axis_move_thread.isRunning()
+        ):
             return
 
         self._flush_pending_persistence()
@@ -2221,6 +2416,7 @@ class MainWindow(_MainWindowGUI):
             self._calibration is None
             or self._correction_thread.isRunning()
             or self._detect_shift_thread.isRunning()
+            or self._stored_axis_move_thread.isRunning()
         ):
             return
 
@@ -2281,6 +2477,7 @@ class MainWindow(_MainWindowGUI):
             self._calibration_thread.isRunning()
             or self._correction_thread.isRunning()
             or self._detect_shift_thread.isRunning()
+            or self._stored_axis_move_thread.isRunning()
         ):
             return
         if self._calibration is not None:
@@ -2632,6 +2829,7 @@ class MainWindow(_MainWindowGUI):
             self._calibration is None
             or self._correction_thread.isRunning()
             or self._detect_shift_thread.isRunning()
+            or self._stored_axis_move_thread.isRunning()
         ):
             return
 
@@ -2805,6 +3003,9 @@ class MainWindow(_MainWindowGUI):
 
         self._detect_shift_thread.stop()
         self._detect_shift_thread.wait()
+
+        self._stored_axis_move_thread.stop()
+        self._stored_axis_move_thread.wait()
 
         close_basler_camera()
 
