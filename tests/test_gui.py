@@ -1024,23 +1024,42 @@ class CalibrationPanelTests(unittest.TestCase):
         calibration = build_sample_calibration_dataset(
             image_shape_cam0=(4, 5),
             image_shape_cam1=(6, 7),
-        )
+        ).assign_attrs({"warnings": "calibration warning"})
         panel = CalibrationPanel()
 
         panel.show_loaded_calibration(calibration, "test.h5")
         dialog = panel.build_details_dialog(calibration)
         tabs = dialog.findChild(QtWidgets.QTabWidget, "calibration_details_tabs")
+        summary_table = dialog.findChild(
+            QtWidgets.QTableWidget,
+            "calibration_details_summary_table",
+        )
+        warnings_text = dialog.findChild(
+            QtWidgets.QPlainTextEdit,
+            "calibration_details_warnings_text",
+        )
+        residuals_layout = dialog.findChild(
+            QtWidgets.QWidget,
+            "calibration_details_residuals_layout",
+        )
         table = dialog.findChild(QtWidgets.QTableWidget, "calibration_samples_table")
         axes_table = dialog.findChild(QtWidgets.QTableWidget, "calibration_axes_table")
 
         self.assertIn("test.h5", panel.calibration_status_label.text())
         self.assertTrue(panel.correct_sample_button.isEnabled())
         self.assertTrue(panel.detect_shift_button.isEnabled())
+        self.assertFalse(panel.calibration_review_widget.isHidden())
+        self.assertTrue(panel.correction_steps_group.isHidden())
         self.assertNotEqual(panel.metric_labels["axis_scale_readback_mm"].text(), "n/a")
-        self.assertEqual(tabs.tabText(0), "Matrices")
-        self.assertEqual(tabs.tabText(1), "Axes")
-        self.assertEqual(tabs.tabText(2), "Probes")
-        self.assertEqual(tabs.count(), 3)
+        self.assertEqual(tabs.tabText(0), "Summary")
+        self.assertEqual(tabs.tabText(1), "Residuals")
+        self.assertEqual(tabs.tabText(2), "Matrices")
+        self.assertEqual(tabs.tabText(3), "Axes")
+        self.assertEqual(tabs.tabText(4), "Probes")
+        self.assertEqual(tabs.count(), 5)
+        self.assertEqual(summary_table.rowCount(), 11)
+        self.assertIn("calibration warning", warnings_text.toPlainText())
+        self.assertIsNotNone(residuals_layout)
         self.assertEqual(axes_table.rowCount(), len(COMMAND_AXES))
         self.assertEqual(table.rowCount(), calibration.sizes["probe"])
         self.assertIn(
@@ -1061,25 +1080,32 @@ class CalibrationPanelTests(unittest.TestCase):
         self.assertFalse(panel.correct_sample_button.isEnabled())
         self.assertFalse(panel.detect_shift_button.isEnabled())
         self.assertFalse(panel.new_calibration_button.isEnabled())
+        self.assertTrue(panel.calibration_review_widget.isHidden())
+        self.assertTrue(panel.metrics_group.isHidden())
+        self.assertTrue(panel.warnings_group.isHidden())
+        self.assertTrue(panel.residual_graphics_layout.isHidden())
         self.assertFalse(panel.correction_steps_group.isHidden())
+        self.assertGreater(panel.correction_steps_table.maximumHeight(), 180)
+        self.assertGreaterEqual(panel.correction_steps_table.minimumHeight(), 260)
         self.assertEqual(panel.correction_steps_table.rowCount(), 0)
         self.assertIn(
             "initial correction measurement",
             panel.correction_steps_summary_label.text(),
         )
 
-    def test_repeatability_section_is_below_metrics(self):
+    def test_calibration_review_layout_groups_diagnostics(self):
         get_qapp()
         panel = CalibrationPanel()
 
-        content_layout = panel.layout().itemAt(3).layout()
+        review_widget = panel.layout().itemAt(3).widget()
+        content_layout = review_widget.layout().itemAt(0).layout()
         left_column = content_layout.itemAt(0).layout()
         right_column = content_layout.itemAt(1).layout()
 
         self.assertIs(left_column.itemAt(0).widget(), panel.metrics_group)
         self.assertIs(left_column.itemAt(1).widget(), panel.repeatability_group)
         self.assertIs(right_column.itemAt(0).widget(), panel.warnings_group)
-        self.assertIs(right_column.itemAt(1).widget(), panel.correction_steps_group)
+        self.assertIs(panel.layout().itemAt(4).widget(), panel.correction_steps_group)
 
     def test_correction_progress_before_first_move_shows_plan(self):
         get_qapp()
@@ -1107,11 +1133,25 @@ class CalibrationPanelTests(unittest.TestCase):
     def test_correction_result_displays_move_steps_in_microns(self):
         get_qapp()
         panel = CalibrationPanel()
+        calibration = build_sample_calibration_dataset(
+            image_shape_cam0=(4, 5),
+            image_shape_cam1=(6, 7),
+        )
         result = correction_result_with_moves()
 
+        panel.show_loaded_calibration(calibration, "test.h5")
         panel.show_correction_result(result)
 
         table = panel.correction_steps_table
+        self.assertTrue(panel.calibration_review_widget.isHidden())
+        self.assertTrue(panel.metrics_group.isHidden())
+        self.assertTrue(panel.warnings_group.isHidden())
+        self.assertTrue(panel.residual_graphics_layout.isHidden())
+        self.assertEqual(panel.calibration_warnings_text.toPlainText(), "")
+        self.assertEqual(
+            panel.correction_warnings_text.toPlainText(),
+            "No correction warnings.",
+        )
         self.assertFalse(panel.correction_steps_group.isHidden())
         self.assertEqual(table.rowCount(), 2)
         self.assertEqual(table.item(0, 1).text(), "1.5")
@@ -2896,8 +2936,15 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                         window.calibration_panel.calibration_status_label.text(),
                     )
                     self.assertEqual(
-                        window.calibration_panel.calibration_warnings_text.toPlainText(),
+                        window.calibration_panel.correction_warnings_text.toPlainText(),
                         "No correction warnings.",
+                    )
+                    self.assertTrue(
+                        window.calibration_panel.calibration_review_widget.isHidden()
+                    )
+                    self.assertTrue(window.calibration_panel.metrics_group.isHidden())
+                    self.assertFalse(
+                        window.calibration_panel.correction_steps_group.isHidden()
                     )
                 finally:
                     window.close()
@@ -3016,6 +3063,44 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
             finally:
                 window.close()
 
+    def test_loading_calibration_without_history_shows_calibration_review(self):
+        get_qapp()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "calibration.h5"
+            write_sample_calibration(path)
+
+            with patched_main_window_runtime():
+                window = MainWindow()
+                try:
+                    with patch(
+                        "merlin_track_position.interface.main_window."
+                        "QtWidgets.QFileDialog.getOpenFileName",
+                        return_value=(str(path), ""),
+                    ):
+                        window._on_load_calibration_clicked()
+
+                    self.assertIsNone(window._last_correction_result)
+                    self.assertIn(
+                        "Loaded calibration",
+                        window.calibration_panel.calibration_status_label.text(),
+                    )
+                    self.assertFalse(
+                        window.calibration_panel.calibration_review_widget.isHidden()
+                    )
+                    self.assertFalse(window.calibration_panel.metrics_group.isHidden())
+                    self.assertFalse(window.calibration_panel.warnings_group.isHidden())
+                    self.assertTrue(
+                        window.calibration_panel.correction_steps_group.isHidden()
+                    )
+                    self.assertNotEqual(
+                        window.calibration_panel.metric_labels[
+                            "axis_scale_readback_mm"
+                        ].text(),
+                        "n/a",
+                    )
+                finally:
+                    window.close()
+
     def test_loading_calibration_restores_latest_correction_result(self):
         get_qapp()
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -3058,8 +3143,16 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                         window.calibration_panel.calibration_status_label.text(),
                     )
                     self.assertEqual(
-                        window.calibration_panel.calibration_warnings_text.toPlainText(),
+                        window.calibration_panel.correction_warnings_text.toPlainText(),
                         "residual increased",
+                    )
+                    self.assertTrue(
+                        window.calibration_panel.calibration_review_widget.isHidden()
+                    )
+                    self.assertTrue(window.calibration_panel.metrics_group.isHidden())
+                    self.assertTrue(window.calibration_panel.warnings_group.isHidden())
+                    self.assertFalse(
+                        window.calibration_panel.correction_steps_group.isHidden()
                     )
                 finally:
                     window.close()
@@ -3104,7 +3197,7 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
 
             self.assertIn(
                 "Correction history file write pending: locked",
-                panel.calibration_warnings_text.toPlainText(),
+                panel.correction_warnings_text.toPlainText(),
             )
         finally:
             panel.close()

@@ -525,6 +525,99 @@ def _persistence_warning_lines(attrs: Mapping[str, object]) -> tuple[str, ...]:
     return tuple(lines)
 
 
+def _calibration_warning_text(
+    summary: Mapping[str, object],
+    attrs: Mapping[str, object],
+) -> str:
+    warnings = tuple(summary["warnings"])
+    warnings += _persistence_warning_lines(attrs)
+    return "\n".join(warnings) if warnings else "No calibration warnings."
+
+
+def _correction_warning_text(result: xr.Dataset) -> str:
+    warning_lines = [
+        line.strip()
+        for line in str(result.attrs.get("warnings", "")).splitlines()
+        if line.strip()
+    ]
+    warning_lines.extend(_persistence_warning_lines(result.attrs))
+    return "\n".join(warning_lines) if warning_lines else "No correction warnings."
+
+
+def _add_residual_projection_plots(
+    graphics_layout: pg.GraphicsLayoutWidget,
+) -> dict[str, pg.PlotItem]:
+    plots: dict[str, pg.PlotItem] = {}
+    for column, (x_label, y_label, _, _) in enumerate(RESIDUAL_PROJECTIONS):
+        residual_plot = graphics_layout.addPlot(row=0, col=column)
+        residual_plot.setTitle(f"{x_label}-{y_label}")
+        residual_plot.setLabel(
+            "bottom", x_label, units="readback mm", siPrefixEnableRanges=()
+        )
+        residual_plot.setLabel(
+            "left", y_label, units="readback mm", siPrefixEnableRanges=()
+        )
+        residual_plot.showGrid(x=True, y=True, alpha=0.25)
+        residual_plot.setAspectLocked(True)
+        plots[f"{x_label}{y_label}"] = residual_plot
+    return plots
+
+
+def _plot_residuals_on(
+    calibration: xr.Dataset,
+    residual_plots: Mapping[str, pg.PlotItem],
+) -> None:
+    for residual_plot in residual_plots.values():
+        residual_plot.clear()
+    arrays = _calibration_arrays(calibration)
+    readback_delta = arrays["readback_delta"]
+    residual = arrays["residual_readback"]
+
+    for x_label, y_label, x_index, y_index in RESIDUAL_PROJECTIONS:
+        residual_plot = residual_plots[f"{x_label}{y_label}"]
+        residual_plot.plot(
+            readback_delta[:, x_index],
+            readback_delta[:, y_index],
+            pen=None,
+            symbol="o",
+            symbolBrush=pg.mkBrush("#1f77b4"),
+            symbolPen=pg.mkPen("#1f77b4"),
+        )
+
+        x_values: list[float] = []
+        y_values: list[float] = []
+        residual_x_values: list[float] = []
+        residual_y_values: list[float] = []
+        for readback_row, residual_row in zip(readback_delta, residual, strict=True):
+            x0 = readback_row[x_index]
+            y0 = readback_row[y_index]
+            dx = residual_row[x_index]
+            dy = residual_row[y_index]
+            if not np.isfinite((x0, y0, dx, dy)).all():
+                continue
+            x1 = x0 + dx
+            y1 = y0 + dy
+            x_values.extend([float(x0), float(x1), math.nan])
+            y_values.extend([float(y0), float(y1), math.nan])
+            residual_x_values.append(float(x1))
+            residual_y_values.append(float(y1))
+
+        if x_values:
+            residual_plot.plot(
+                x_values,
+                y_values,
+                pen=pg.mkPen("#d62728", width=2),
+            )
+            residual_plot.plot(
+                residual_x_values,
+                residual_y_values,
+                pen=None,
+                symbol="o",
+                symbolBrush=pg.mkBrush("#d62728"),
+                symbolPen=pg.mkPen("#d62728"),
+            )
+
+
 class CalibrationPanel(QtWidgets.QWidget):
     def __init__(self, parent: QtWidgets.QWidget | None = None):
         super().__init__(parent)
@@ -576,12 +669,18 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.calibration_progress_bar.setTextVisible(True)
         calibration_layout.addWidget(self.calibration_progress_bar)
 
+        self.calibration_review_widget = QtWidgets.QWidget()
+        calibration_review_layout = QtWidgets.QVBoxLayout(
+            self.calibration_review_widget
+        )
+        calibration_review_layout.setContentsMargins(0, 0, 0, 0)
+
         content_layout = QtWidgets.QHBoxLayout()
         left_column = QtWidgets.QVBoxLayout()
         right_column = QtWidgets.QVBoxLayout()
         content_layout.addLayout(left_column, stretch=1)
         content_layout.addLayout(right_column, stretch=1)
-        calibration_layout.addLayout(content_layout)
+        calibration_review_layout.addLayout(content_layout)
 
         self.warnings_group = QtWidgets.QGroupBox("Warnings")
         warnings_layout = QtWidgets.QVBoxLayout(self.warnings_group)
@@ -621,6 +720,15 @@ class CalibrationPanel(QtWidgets.QWidget):
         left_column.addWidget(self.repeatability_group)
         right_column.addWidget(self.warnings_group)
 
+        self.residual_graphics_layout = pg.GraphicsLayoutWidget()
+        self.residual_graphics_layout.setObjectName("residual_projections_layout")
+        self.residual_graphics_layout.setMinimumHeight(240)
+        self.residual_plots = _add_residual_projection_plots(
+            self.residual_graphics_layout
+        )
+        calibration_review_layout.addWidget(self.residual_graphics_layout, stretch=1)
+        calibration_layout.addWidget(self.calibration_review_widget, stretch=1)
+
         self.correction_steps_group = QtWidgets.QGroupBox("Correction Steps")
         correction_steps_layout = QtWidgets.QVBoxLayout(self.correction_steps_group)
         self.correction_steps_summary_label = QtWidgets.QLabel()
@@ -629,6 +737,12 @@ class CalibrationPanel(QtWidgets.QWidget):
             QtCore.Qt.TextInteractionFlag.TextSelectableByMouse
         )
         correction_steps_layout.addWidget(self.correction_steps_summary_label)
+
+        self.correction_warnings_text = QtWidgets.QPlainTextEdit()
+        self.correction_warnings_text.setObjectName("correction_warnings_text")
+        self.correction_warnings_text.setReadOnly(True)
+        self.correction_warnings_text.setMaximumHeight(90)
+        correction_steps_layout.addWidget(self.correction_warnings_text)
 
         self.correction_steps_table = QtWidgets.QTableWidget(
             0,
@@ -648,27 +762,9 @@ class CalibrationPanel(QtWidgets.QWidget):
             QtWidgets.QHeaderView.ResizeMode.ResizeToContents
         )
         self.correction_steps_table.verticalHeader().setVisible(False)
-        self.correction_steps_table.setMaximumHeight(180)
-        correction_steps_layout.addWidget(self.correction_steps_table)
-        right_column.addWidget(self.correction_steps_group)
-
-        self.residual_graphics_layout = pg.GraphicsLayoutWidget()
-        self.residual_graphics_layout.setObjectName("residual_projections_layout")
-        self.residual_graphics_layout.setMinimumHeight(240)
-        self.residual_plots: dict[str, pg.PlotItem] = {}
-        for column, (x_label, y_label, _, _) in enumerate(RESIDUAL_PROJECTIONS):
-            residual_plot = self.residual_graphics_layout.addPlot(row=0, col=column)
-            residual_plot.setTitle(f"{x_label}-{y_label}")
-            residual_plot.setLabel(
-                "bottom", x_label, units="readback mm", siPrefixEnableRanges=()
-            )
-            residual_plot.setLabel(
-                "left", y_label, units="readback mm", siPrefixEnableRanges=()
-            )
-            residual_plot.showGrid(x=True, y=True, alpha=0.25)
-            residual_plot.setAspectLocked(True)
-            self.residual_plots[f"{x_label}{y_label}"] = residual_plot
-        calibration_layout.addWidget(self.residual_graphics_layout, stretch=1)
+        self.correction_steps_table.setMinimumHeight(260)
+        correction_steps_layout.addWidget(self.correction_steps_table, stretch=1)
+        calibration_layout.addWidget(self.correction_steps_group, stretch=1)
 
         correction_button_layout = QtWidgets.QHBoxLayout()
         correction_button_layout.addWidget(self.detect_shift_button)
@@ -679,6 +775,7 @@ class CalibrationPanel(QtWidgets.QWidget):
         correction_button_layout.addStretch(1)
         calibration_layout.addLayout(correction_button_layout)
 
+        self._display_mode = "empty"
         self.reset()
 
     def correction_mode(self) -> str:
@@ -697,6 +794,7 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.correction_mode_combo.setCurrentIndex(max(index, 0))
 
     def reset(self) -> None:
+        self._set_display_mode("empty")
         self.load_calibration_button.setEnabled(True)
         self.save_calibration_button.setEnabled(False)
         self.calibration_details_button.setEnabled(False)
@@ -713,6 +811,7 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.calibration_progress_bar.setRange(0, 1)
         self.calibration_progress_bar.setValue(0)
         self.calibration_warnings_text.setPlainText("No calibration loaded.")
+        self.correction_warnings_text.setPlainText("No correction result loaded.")
         for label in self.metric_labels.values():
             label.setText("n/a")
         for label in self.repeatability_labels.values():
@@ -723,6 +822,7 @@ class CalibrationPanel(QtWidgets.QWidget):
             residual_plot.clear()
 
     def show_calibration_in_progress(self, total_steps: int | None = None) -> None:
+        self._set_display_mode("empty")
         self.load_calibration_button.setEnabled(False)
         self.save_calibration_button.setEnabled(False)
         self.calibration_details_button.setEnabled(False)
@@ -786,31 +886,58 @@ class CalibrationPanel(QtWidgets.QWidget):
             f"Elapsed {_format_duration(elapsed_s)}, ETA {_format_duration(eta_s)}."
         )
 
+    def _set_loaded_idle_controls_enabled(self, enabled: bool) -> None:
+        self.load_calibration_button.setEnabled(enabled)
+        self.save_calibration_button.setEnabled(enabled)
+        self.calibration_details_button.setEnabled(enabled)
+        self.correct_sample_button.setEnabled(enabled)
+        self.correction_mode_combo.setEnabled(enabled)
+        self.auto_correction_checkbox.setEnabled(enabled)
+        self.auto_correction_interval_spinbox.setEnabled(enabled)
+        self.detect_shift_button.setEnabled(enabled)
+        self.new_calibration_button.setEnabled(enabled)
+        self.new_calibration_button.setText("Clear calibration")
+
+    def _set_display_mode(self, mode: str) -> None:
+        self._display_mode = mode
+        correction_mode = mode == "correction"
+        self.calibration_review_widget.setVisible(not correction_mode)
+        self.metrics_group.setVisible(not correction_mode)
+        if not correction_mode:
+            self.warnings_group.setVisible(True)
+            self.residual_graphics_layout.setVisible(True)
+        self.correction_steps_group.setVisible(correction_mode)
+        if correction_mode:
+            self._clear_calibration_diagnostics()
+
+    def _clear_calibration_diagnostics(self) -> None:
+        self.calibration_warnings_text.clear()
+        for label in self.metric_labels.values():
+            label.setText("n/a")
+        for label in self.repeatability_labels.values():
+            label.setText("n/a")
+        self.repeatability_group.setVisible(False)
+        self.warnings_group.setVisible(False)
+        self.residual_graphics_layout.setVisible(False)
+        for residual_plot in self.residual_plots.values():
+            residual_plot.clear()
+
     def show_loaded_calibration(
         self,
         calibration: xr.Dataset,
         display_name: str,
     ) -> None:
         summary = _calibration_summary(calibration)
-        self.load_calibration_button.setEnabled(True)
-        self.save_calibration_button.setEnabled(True)
-        self.calibration_details_button.setEnabled(True)
-        self.correct_sample_button.setEnabled(True)
-        self.correction_mode_combo.setEnabled(True)
-        self.auto_correction_checkbox.setEnabled(True)
-        self.auto_correction_interval_spinbox.setEnabled(True)
-        self.detect_shift_button.setEnabled(True)
-        self.new_calibration_button.setEnabled(True)
-        self.new_calibration_button.setText("Clear calibration")
+        self._set_display_mode("calibration")
+        self._set_loaded_idle_controls_enabled(True)
         self.calibration_progress_bar.setVisible(False)
         self.calibration_status_label.setText(
             f"Loaded calibration: {display_name} ({summary['probe_count']} probes)"
         )
 
-        warnings = summary["warnings"]
-        warnings += _persistence_warning_lines(calibration.attrs)
-        warnings_text = "\n".join(warnings) if warnings else "No calibration warnings."
-        self.calibration_warnings_text.setPlainText(warnings_text)
+        self.calibration_warnings_text.setPlainText(
+            _calibration_warning_text(summary, calibration.attrs)
+        )
 
         for key, _, _ in METRIC_ROWS:
             self.metric_labels[key].setText(_format_metric_value(summary[key]))
@@ -828,6 +955,7 @@ class CalibrationPanel(QtWidgets.QWidget):
 
     def _clear_correction_steps(self) -> None:
         self.correction_steps_summary_label.setText("No correction result loaded.")
+        self.correction_warnings_text.setPlainText("No correction result loaded.")
         self.correction_steps_table.setRowCount(0)
         self.correction_steps_group.setVisible(False)
 
@@ -838,6 +966,7 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.correction_steps_summary_label.setText(
             "Capturing initial correction measurement before first move."
         )
+        self.correction_warnings_text.setPlainText("No correction warnings.")
         self.correction_steps_table.setRowCount(0)
         self.correction_steps_group.setVisible(True)
 
@@ -904,6 +1033,7 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.calibration_status_label.setText(f"Saved calibration: {display_name}")
 
     def show_correction_in_progress(self) -> None:
+        self._set_display_mode("correction")
         self.load_calibration_button.setEnabled(False)
         self.save_calibration_button.setEnabled(False)
         self.calibration_details_button.setEnabled(False)
@@ -920,6 +1050,7 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.calibration_status_label.setText("Correction in progress...")
 
     def show_correction_progress(self, result: xr.Dataset) -> None:
+        self._set_display_mode("correction")
         moves = int(
             result.attrs.get("correction_iterations", result.sizes.get("move", 0))
         )
@@ -936,18 +1067,13 @@ class CalibrationPanel(QtWidgets.QWidget):
                 f"{moves} move(s); current {residual_label} "
                 f"{_format_number(residual)}{residual_suffix}."
             )
-        warning_lines = [
-            line.strip()
-            for line in str(result.attrs.get("warnings", "")).splitlines()
-            if line.strip()
-        ]
-        warning_lines.extend(_persistence_warning_lines(result.attrs))
-        self.calibration_warnings_text.setPlainText(
-            "\n".join(warning_lines) if warning_lines else "No correction warnings."
-        )
+        self.correction_warnings_text.setPlainText(_correction_warning_text(result))
         self._show_correction_steps(result, in_progress=True)
 
     def show_correction_result(self, result: xr.Dataset) -> None:
+        self._set_display_mode("correction")
+        self._set_loaded_idle_controls_enabled(True)
+        self.calibration_progress_bar.setVisible(False)
         converged = bool(result.attrs.get("correction_converged", False))
         moves = int(
             result.attrs.get("correction_iterations", result.sizes.get("move", 0))
@@ -960,18 +1086,11 @@ class CalibrationPanel(QtWidgets.QWidget):
             f"{status} after {moves} move(s); final {residual_label} "
             f"{_format_number(residual)}{residual_suffix}."
         )
-        warning_lines = [
-            line.strip()
-            for line in str(result.attrs.get("warnings", "")).splitlines()
-            if line.strip()
-        ]
-        warning_lines.extend(_persistence_warning_lines(result.attrs))
-        self.calibration_warnings_text.setPlainText(
-            "\n".join(warning_lines) if warning_lines else "No correction warnings."
-        )
+        self.correction_warnings_text.setPlainText(_correction_warning_text(result))
         self._show_correction_steps(result)
 
     def show_detection_in_progress(self) -> None:
+        self._set_display_mode("calibration")
         self.load_calibration_button.setEnabled(False)
         self.save_calibration_button.setEnabled(False)
         self.calibration_details_button.setEnabled(False)
@@ -987,6 +1106,7 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.calibration_status_label.setText("Detecting shift...")
 
     def show_detection_result(self, result: xr.Dataset) -> None:
+        self._set_display_mode("calibration")
         self.load_calibration_button.setEnabled(True)
         self.save_calibration_button.setEnabled(True)
         self.calibration_details_button.setEnabled(True)
@@ -1039,6 +1159,87 @@ class CalibrationPanel(QtWidgets.QWidget):
 
         tabs = QtWidgets.QTabWidget()
         tabs.setObjectName("calibration_details_tabs")
+
+        summary_tab = QtWidgets.QWidget()
+        summary_layout = QtWidgets.QVBoxLayout(summary_tab)
+        summary_table = QtWidgets.QTableWidget(len(METRIC_ROWS), 2)
+        summary_table.setObjectName("calibration_details_summary_table")
+        summary_table.setHorizontalHeaderLabels(("metric", "value"))
+        summary_table.setEditTriggers(
+            QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers
+        )
+        summary_table.setSelectionMode(
+            QtWidgets.QAbstractItemView.SelectionMode.NoSelection
+        )
+        summary_table.horizontalHeader().setSectionResizeMode(
+            QtWidgets.QHeaderView.ResizeMode.ResizeToContents
+        )
+        for row, (key, label, tooltip) in enumerate(METRIC_ROWS):
+            label_item = QtWidgets.QTableWidgetItem(label)
+            value_item = QtWidgets.QTableWidgetItem(_format_metric_value(summary[key]))
+            label_item.setToolTip(tooltip)
+            value_item.setToolTip(tooltip)
+            value_item.setTextAlignment(
+                QtCore.Qt.AlignmentFlag.AlignRight
+                | QtCore.Qt.AlignmentFlag.AlignVCenter
+            )
+            summary_table.setItem(row, 0, label_item)
+            summary_table.setItem(row, 1, value_item)
+        summary_layout.addWidget(QtWidgets.QLabel("Metrics"))
+        summary_layout.addWidget(summary_table)
+
+        repeatability_table = QtWidgets.QTableWidget(len(REPEATABILITY_ROWS), 2)
+        repeatability_table.setObjectName("calibration_details_repeatability_table")
+        repeatability_table.setHorizontalHeaderLabels(("metric", "value"))
+        repeatability_table.setEditTriggers(
+            QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers
+        )
+        repeatability_table.setSelectionMode(
+            QtWidgets.QAbstractItemView.SelectionMode.NoSelection
+        )
+        repeatability_table.horizontalHeader().setSectionResizeMode(
+            QtWidgets.QHeaderView.ResizeMode.ResizeToContents
+        )
+        repeatability = summary["repeatability"]
+        for row, (key, label, tooltip) in enumerate(REPEATABILITY_ROWS):
+            label_item = QtWidgets.QTableWidgetItem(label)
+            if repeatability is None:
+                value = "n/a"
+            else:
+                value = _format_number(repeatability[key])
+            value_item = QtWidgets.QTableWidgetItem(value)
+            label_item.setToolTip(tooltip)
+            value_item.setToolTip(tooltip)
+            value_item.setTextAlignment(
+                QtCore.Qt.AlignmentFlag.AlignRight
+                | QtCore.Qt.AlignmentFlag.AlignVCenter
+            )
+            repeatability_table.setItem(row, 0, label_item)
+            repeatability_table.setItem(row, 1, value_item)
+        summary_layout.addWidget(QtWidgets.QLabel("Repeatability"))
+        summary_layout.addWidget(repeatability_table)
+
+        warnings_text = QtWidgets.QPlainTextEdit()
+        warnings_text.setObjectName("calibration_details_warnings_text")
+        warnings_text.setReadOnly(True)
+        warnings_text.setPlainText(
+            _calibration_warning_text(summary, calibration.attrs)
+        )
+        summary_layout.addWidget(QtWidgets.QLabel("Warnings"))
+        summary_layout.addWidget(warnings_text)
+        tabs.addTab(summary_tab, "Summary")
+
+        residuals_tab = QtWidgets.QWidget()
+        residuals_layout = QtWidgets.QVBoxLayout(residuals_tab)
+        residuals_graphics = pg.GraphicsLayoutWidget()
+        residuals_graphics.setObjectName("calibration_details_residuals_layout")
+        residuals_graphics.setMinimumHeight(360)
+        _plot_residuals_on(
+            calibration,
+            _add_residual_projection_plots(residuals_graphics),
+        )
+        residuals_layout.addWidget(residuals_graphics)
+        tabs.addTab(residuals_tab, "Residuals")
 
         matrices_tab = QtWidgets.QWidget()
         matrices_layout = QtWidgets.QVBoxLayout(matrices_tab)
@@ -1261,54 +1462,4 @@ class CalibrationPanel(QtWidgets.QWidget):
         return dialog
 
     def _plot_residuals(self, calibration: xr.Dataset) -> None:
-        for residual_plot in self.residual_plots.values():
-            residual_plot.clear()
-        arrays = _calibration_arrays(calibration)
-        readback_delta = arrays["readback_delta"]
-        residual = arrays["residual_readback"]
-
-        for x_label, y_label, x_index, y_index in RESIDUAL_PROJECTIONS:
-            residual_plot = self.residual_plots[f"{x_label}{y_label}"]
-            residual_plot.plot(
-                readback_delta[:, x_index],
-                readback_delta[:, y_index],
-                pen=None,
-                symbol="o",
-                symbolBrush=pg.mkBrush("#1f77b4"),
-                symbolPen=pg.mkPen("#1f77b4"),
-            )
-
-            x_values: list[float] = []
-            y_values: list[float] = []
-            residual_x_values: list[float] = []
-            residual_y_values: list[float] = []
-            for readback_row, residual_row in zip(
-                readback_delta, residual, strict=True
-            ):
-                x0 = readback_row[x_index]
-                y0 = readback_row[y_index]
-                dx = residual_row[x_index]
-                dy = residual_row[y_index]
-                if not np.isfinite((x0, y0, dx, dy)).all():
-                    continue
-                x1 = x0 + dx
-                y1 = y0 + dy
-                x_values.extend([float(x0), float(x1), math.nan])
-                y_values.extend([float(y0), float(y1), math.nan])
-                residual_x_values.append(float(x1))
-                residual_y_values.append(float(y1))
-
-            if x_values:
-                residual_plot.plot(
-                    x_values,
-                    y_values,
-                    pen=pg.mkPen("#d62728", width=2),
-                )
-                residual_plot.plot(
-                    residual_x_values,
-                    residual_y_values,
-                    pen=None,
-                    symbol="o",
-                    symbolBrush=pg.mkBrush("#d62728"),
-                    symbolPen=pg.mkPen("#d62728"),
-                )
+        _plot_residuals_on(calibration, self.residual_plots)

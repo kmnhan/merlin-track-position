@@ -113,18 +113,20 @@ def estimate_shift(
     )
 
     if dynamic_range <= 1e-12 or standard_deviation <= 1e-12:
-        shift_px = np.array([np.nan, np.nan], dtype=np.float64)
+        phase_shift_px = np.array([np.nan, np.nan], dtype=np.float64)
         diagnostic_warnings.append(
             "registration skipped because reference image has little or no intensity contrast"
         )
     else:
-        shift_px = _estimate_translation(
+        phase_shift_px = _estimate_translation(
             reference_norm,
             current_norm,
             use_window=use_window,
         )
 
-    if not np.isfinite(shift_px).all():
+    shift_px = phase_shift_px.copy()
+    if not np.isfinite(phase_shift_px).all():
+        phase_shift_px = np.array([np.nan, np.nan], dtype=np.float64)
         shift_px = np.array([np.nan, np.nan], dtype=np.float64)
         diagnostic_warnings.append(
             "registration shift is not finite; shift estimate is unreliable"
@@ -144,7 +146,7 @@ def estimate_shift(
         ecc_initial_shift = (
             explicit_ecc_initial_shift
             if explicit_ecc_initial_shift is not None
-            else shift_px
+            else phase_shift_px
         )
         try:
             shift_px = _estimate_ecc_shift(
@@ -160,11 +162,11 @@ def estimate_shift(
             if not ecc_fallback_to_phase_shift:
                 shift_px = np.array([np.nan, np.nan], dtype=np.float64)
 
-    if check_tiles and np.isfinite(shift_px).all():
+    if check_tiles and np.isfinite(phase_shift_px).all():
         tile_warning = _tile_consistency(
             reference_norm,
             current_norm,
-            shift_px,
+            phase_shift_px,
             use_window=use_window,
         )
         if tile_warning is not None:
@@ -225,14 +227,14 @@ def _as_registration_image(name: str, image: Any) -> np.ndarray:
         raise ValueError(f"{name} color images must have exactly 3 channels")
     if image_array.size == 0:
         raise ValueError(f"{name} must not be empty")
-    if (
-        not np.issubdtype(image_array.dtype, np.number)
-        or np.issubdtype(image_array.dtype, np.complexfloating)
+    if not np.issubdtype(image_array.dtype, np.number) or np.issubdtype(
+        image_array.dtype, np.complexfloating
     ):
         raise ValueError(f"{name} must have a real numeric dtype")
-    if np.issubdtype(image_array.dtype, np.floating) and not np.isfinite(
-        image_array
-    ).all():
+    if (
+        np.issubdtype(image_array.dtype, np.floating)
+        and not np.isfinite(image_array).all()
+    ):
         raise ValueError(f"{name} must contain only finite values")
     return image_array
 

@@ -124,7 +124,9 @@ def main() -> None:
                 motion_model,
             )
         )
-        results.extend(run_adjacent_history_cases(records, reference_points, motion_model))
+        results.extend(
+            run_adjacent_history_cases(records, reference_points, motion_model)
+        )
         results.extend(
             run_synthetic_cases(
                 reference_crops,
@@ -391,19 +393,27 @@ def synthetic_transforms(
         [
             (
                 "small_rotation",
-                affine_about_center(center, angle_deg=0.25, scale=1.0, shift=(0.4, -0.2)),
+                affine_about_center(
+                    center, angle_deg=0.25, scale=1.0, shift=(0.4, -0.2)
+                ),
             ),
             (
                 "moderate_rotation",
-                affine_about_center(center, angle_deg=1.25, scale=1.0, shift=(-1.2, 0.9)),
+                affine_about_center(
+                    center, angle_deg=1.25, scale=1.0, shift=(-1.2, 0.9)
+                ),
             ),
             (
                 "small_scale",
-                affine_about_center(center, angle_deg=0.0, scale=1.01, shift=(0.6, -0.3)),
+                affine_about_center(
+                    center, angle_deg=0.0, scale=1.01, shift=(0.6, -0.3)
+                ),
             ),
             (
                 "scale_rotation",
-                affine_about_center(center, angle_deg=-1.0, scale=0.985, shift=(-1.0, 1.3)),
+                affine_about_center(
+                    center, angle_deg=-1.0, scale=0.985, shift=(-1.0, 1.3)
+                ),
             ),
             (
                 "mild_shear",
@@ -776,7 +786,9 @@ def write_summary(results: list[Result], output_dir: Path) -> None:
     rows = []
     for key, group in sorted(groups.items()):
         successes = [result for result in group if result.success]
-        errors = [result.error_px for result in successes if np.isfinite(result.error_px)]
+        errors = [
+            result.error_px for result in successes if np.isfinite(result.error_px)
+        ]
         elapsed = [result.elapsed_ms for result in successes]
         correlations = [
             result.correlation
@@ -823,7 +835,9 @@ def write_summary(results: list[Result], output_dir: Path) -> None:
 
     with (output_dir / "summary.md").open("w") as file:
         file.write(f"# ECC multiscale benchmark\n\nOpenCV: `{cv2.__version__}`\n\n")
-        file.write("| family | camera | model | algorithm | seed | n | success | median error px | p95 error px | median ms | median corr |\n")
+        file.write(
+            "| family | camera | model | algorithm | seed | n | success | median error px | p95 error px | median ms | median corr |\n"
+        )
         file.write("|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|\n")
         for row in rows:
             file.write(

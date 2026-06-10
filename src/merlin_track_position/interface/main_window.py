@@ -2547,12 +2547,6 @@ class MainWindow(_MainWindowGUI):
 
             self._calibration = calibration
             self._set_roi_editing_enabled(False)
-            display_name = (
-                self._calibration_path.name
-                if self._calibration_path is not None
-                else "current calibration"
-            )
-            self.calibration_panel.show_loaded_calibration(calibration, display_name)
             self.calibration_panel.show_correction_result(result)
             self._set_reference_preview_button_enabled(True)
             self._set_shift_monitor_calibration()

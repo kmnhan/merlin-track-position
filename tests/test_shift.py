@@ -103,6 +103,34 @@ class ShiftTests(unittest.TestCase):
             "tile shift estimates are inconsistent", result.attrs["warnings"]
         )
 
+    def test_ecc_tile_consistency_uses_phase_baseline(self):
+        reference = textured_image(seed=18)
+        current = ndimage.shift(reference, shift=(1.25, -1.75), order=3, mode="wrap")
+        ecc_shift = np.asarray(
+            [
+                [1.0, 0.0, 25.0],
+                [0.0, 1.0, -20.0],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=np.float32,
+        )
+
+        with patch(
+            "merlin_track_position.tracking.shift.cv2.findTransformECC",
+            return_value=(0.99, ecc_shift),
+        ):
+            result = estimate_shift(
+                reference,
+                current,
+                check_tiles=True,
+                use_ecc_refinement=True,
+            )
+
+        np.testing.assert_allclose(result["shift_px"].values, [25.0, -20.0])
+        self.assertNotIn(
+            "tile shift estimates are inconsistent", result.attrs["warnings"]
+        )
+
     def test_ecc_refinement_keeps_translation_sign_convention(self):
         reference = textured_image(seed=6)
         current = ndimage.shift(reference, shift=(2.75, -4.25), order=3, mode="wrap")
