@@ -106,6 +106,7 @@ class FakeImageCaptureThread(QtCore.QObject):
         self.image_capture = image_capture
         self.interval_ms = interval_ms
         self.enabled = False
+        self.wait_until_idle_calls = 0
 
     def start(self):
         pass
@@ -115,6 +116,9 @@ class FakeImageCaptureThread(QtCore.QObject):
 
     def stop(self):
         pass
+
+    def wait_until_idle(self):
+        self.wait_until_idle_calls += 1
 
     def wait(self):
         pass
@@ -2535,6 +2539,9 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                     self.assertFalse(
                         window.calibration_panel.new_calibration_button.isEnabled()
                     )
+                    for refresh_thread in window._image_refresh_threads.values():
+                        self.assertFalse(refresh_thread.enabled)
+                        self.assertEqual(refresh_thread.wait_until_idle_calls, 1)
                 finally:
                     window.close()
 

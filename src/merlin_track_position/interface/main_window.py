@@ -904,6 +904,7 @@ class _ImageCaptureThread(QtCore.QThread):
         self._running = threading.Event()
         self._enabled = threading.Event()
         self._wake = threading.Event()
+        self._capture_lock = threading.Lock()
 
     def set_enabled(self, enabled: bool) -> None:
         if enabled:
@@ -925,11 +926,19 @@ class _ImageCaptureThread(QtCore.QThread):
                     continue
 
                 self._wake.clear()
-                try:
-                    image = self._image_capture()
-                except Exception as exc:
-                    self.sigImageCaptureFailed.emit(self.camera, str(exc))
-                else:
+                image: np.ndarray | None = None
+                error_message: str | None = None
+                with self._capture_lock:
+                    if not self._enabled.is_set():
+                        continue
+                    try:
+                        image = self._image_capture()
+                    except Exception as exc:
+                        error_message = str(exc)
+
+                if error_message is not None:
+                    self.sigImageCaptureFailed.emit(self.camera, error_message)
+                elif image is not None:
                     self.sigImageReady.emit(self.camera, image)
 
                 self._wake.wait(self.interval_ms / 1000.0)
@@ -941,6 +950,10 @@ class _ImageCaptureThread(QtCore.QThread):
         self._running.clear()
         self.requestInterruption()
         self._wake.set()
+
+    def wait_until_idle(self) -> None:
+        with self._capture_lock:
+            pass
 
 
 class _BeamTargetItem(pg.TargetItem):
@@ -2008,6 +2021,10 @@ class MainWindow(_MainWindowGUI):
         for thread in self._image_refresh_threads.values():
             thread.set_enabled(enabled)
 
+    def _wait_for_image_refresh_idle(self) -> None:
+        for thread in self._image_refresh_threads.values():
+            thread.wait_until_idle()
+
     def _set_reference_preview_button_enabled(self, enabled: bool) -> None:
         enabled = bool(enabled)
         self.show_reference_images_button.setEnabled(enabled)
@@ -2142,6 +2159,7 @@ class MainWindow(_MainWindowGUI):
             self.image_auto_refresh_checkbox.isChecked()
         )
         self._set_image_refresh_enabled(False)
+        self._wait_for_image_refresh_idle()
         self.image_auto_refresh_checkbox.setEnabled(False)
         self._set_reference_preview_button_enabled(False)
 
