@@ -59,6 +59,7 @@ def estimate_shift(
     ecc_motion_model: str = "homography",
     ecc_reference_point_px: npt.ArrayLike | None = None,
     ecc_initial_shift_px: npt.ArrayLike | None = None,
+    ecc_initial_warp: npt.ArrayLike | None = None,
     ecc_fallback_to_phase_shift: bool = True,
     ecc_use_window: bool = False,
 ) -> xr.Dataset:
@@ -73,8 +74,10 @@ def estimate_shift(
     an OpenCV ECC affine or homography registration and return the displacement
     at ``ecc_reference_point_px``. If no point is supplied, the image center is
     used. ``ecc_initial_shift_px`` overrides the phase-correlation shift used to
-    initialize ECC. Pass ``ecc_fallback_to_phase_shift=False`` when the supplied
-    ECC seed is trusted and a failed refinement should invalidate the estimate.
+    initialize ECC. ``ecc_initial_warp`` overrides translation initialization
+    with a full affine or homography seed. Pass ``ecc_fallback_to_phase_shift=False``
+    when the supplied ECC seed is trusted and a failed refinement should
+    invalidate the estimate.
     Pass ``ecc_use_window=True`` to apply a Hanning taper to ECC inputs.
     """
 
@@ -133,6 +136,7 @@ def estimate_shift(
         )
 
     explicit_ecc_initial_shift = None
+    explicit_ecc_initial_warp = None
     if use_ecc_refinement and ecc_initial_shift_px is not None:
         explicit_ecc_initial_shift = np.asarray(ecc_initial_shift_px, dtype=np.float64)
         if (
@@ -140,8 +144,12 @@ def estimate_shift(
             or not np.isfinite(explicit_ecc_initial_shift).all()
         ):
             raise ValueError("ecc_initial_shift_px must be a finite 2-vector")
+    if use_ecc_refinement and ecc_initial_warp is not None:
+        explicit_ecc_initial_warp = _validate_ecc_initial_warp(ecc_initial_warp)
     if use_ecc_refinement and (
-        explicit_ecc_initial_shift is not None or np.isfinite(shift_px).all()
+        explicit_ecc_initial_warp is not None
+        or explicit_ecc_initial_shift is not None
+        or np.isfinite(shift_px).all()
     ):
         ecc_initial_shift = (
             explicit_ecc_initial_shift
@@ -156,6 +164,7 @@ def estimate_shift(
                 use_window=ecc_use_window,
                 motion_model=ecc_motion_model,
                 reference_point_px=ecc_reference_point_px,
+                initial_warp=explicit_ecc_initial_warp,
             )
         except Exception as exc:
             diagnostic_warnings.append(f"ECC refinement failed: {exc}")
@@ -260,6 +269,7 @@ def _estimate_ecc_shift(
     use_window: bool,
     motion_model: str,
     reference_point_px: npt.ArrayLike | None,
+    initial_warp: np.ndarray | None,
 ) -> np.ndarray:
     reference_work, current_work = _registration_work_images(
         reference_image,
@@ -270,7 +280,11 @@ def _estimate_ecc_shift(
     if initial_shift.shape != (2,) or not np.isfinite(initial_shift).all():
         raise ValueError("initial ECC shift must be a finite 2-vector")
 
-    motion_code, warp = _initial_ecc_warp(motion_model, initial_shift)
+    motion_code, warp = _initial_ecc_warp(
+        motion_model,
+        initial_shift,
+        initial_warp=initial_warp,
+    )
     criteria = (
         cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT,
         50,
@@ -315,9 +329,17 @@ def _estimate_ecc_shift(
 def _initial_ecc_warp(
     motion_model: str,
     initial_shift: np.ndarray,
+    *,
+    initial_warp: np.ndarray | None = None,
 ) -> tuple[int, np.ndarray]:
     normalized_model = str(motion_model).strip().lower()
     if normalized_model == "affine":
+        if initial_warp is not None:
+            if initial_warp.shape != (2, 3):
+                raise ValueError(
+                    "ecc_initial_warp must have shape (2, 3) for affine ECC"
+                )
+            return cv2.MOTION_AFFINE, np.asarray(initial_warp, dtype=np.float32)
         return (
             cv2.MOTION_AFFINE,
             np.asarray(
@@ -329,6 +351,18 @@ def _initial_ecc_warp(
             ),
         )
     if normalized_model == "homography":
+        if initial_warp is not None:
+            if initial_warp.shape == (2, 3):
+                homography = np.eye(3, dtype=np.float64)
+                homography[:2, :] = initial_warp
+            elif initial_warp.shape == (3, 3):
+                homography = initial_warp
+            else:
+                raise ValueError(
+                    "ecc_initial_warp must have shape (2, 3) or (3, 3) "
+                    "for homography ECC"
+                )
+            return cv2.MOTION_HOMOGRAPHY, np.asarray(homography, dtype=np.float32)
         return (
             cv2.MOTION_HOMOGRAPHY,
             np.asarray(
@@ -341,6 +375,15 @@ def _initial_ecc_warp(
             ),
         )
     raise ValueError(f"unsupported ECC motion model: {motion_model!r}")
+
+
+def _validate_ecc_initial_warp(warp: npt.ArrayLike) -> np.ndarray:
+    warp_array = np.asarray(warp, dtype=np.float64)
+    if warp_array.shape not in ((2, 3), (3, 3)):
+        raise ValueError("ecc_initial_warp must have shape (2, 3) or (3, 3)")
+    if not np.isfinite(warp_array).all():
+        raise ValueError("ecc_initial_warp must contain only finite values")
+    return warp_array
 
 
 def _ecc_input_images(

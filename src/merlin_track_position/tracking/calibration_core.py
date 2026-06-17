@@ -1724,7 +1724,7 @@ def _shift_kwargs_for_camera(
     camera: str,
 ) -> dict[str, Any]:
     kwargs = dict(shift_kwargs)
-    for name in ("ecc_reference_point_px", "ecc_initial_shift_px"):
+    for name in ("ecc_reference_point_px", "ecc_initial_shift_px", "ecc_initial_warp"):
         if name not in kwargs or kwargs[name] is None:
             continue
         value = kwargs[name]
@@ -1737,7 +1737,14 @@ def _shift_kwargs_for_camera(
             continue
 
         value_array = np.asarray(value, dtype=np.float64)
-        if value_array.shape == (len(CAMERAS), len(PIXEL_AXES)):
+        if name in {"ecc_reference_point_px", "ecc_initial_shift_px"} and (
+            value_array.shape == (len(CAMERAS), len(PIXEL_AXES))
+        ):
+            kwargs[name] = value_array[CAMERAS.index(camera)]
+        if name == "ecc_initial_warp" and value_array.shape in (
+            (len(CAMERAS), 2, 3),
+            (len(CAMERAS), 3, 3),
+        ):
             kwargs[name] = value_array[CAMERAS.index(camera)]
     return kwargs
 

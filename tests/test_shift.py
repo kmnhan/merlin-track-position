@@ -492,6 +492,81 @@ class ShiftTests(unittest.TestCase):
         np.testing.assert_allclose(initial_warp[:, 2], initial_shift)
         np.testing.assert_allclose(result["shift_px"].values, initial_shift)
 
+    def test_ecc_refinement_uses_explicit_initial_affine_warp(self):
+        reference = corpus_grayscale_image()
+        point = np.asarray([61.25, 70.5], dtype=np.float64)
+        initial_warp = np.asarray(
+            [
+                [0.95, -0.12, 8.0],
+                [0.08, 1.02, -6.0],
+            ],
+            dtype=np.float64,
+        )
+        expected_shift = initial_warp @ np.r_[point, 1.0] - point
+
+        def echo_initial_warp(*args):
+            return 1.0, args[2].copy()
+
+        with patch(
+            "merlin_track_position.tracking.shift.cv2.findTransformECC",
+            side_effect=echo_initial_warp,
+        ) as find_ecc:
+            result = estimate_shift(
+                reference,
+                reference.copy(),
+                check_tiles=False,
+                use_ecc_refinement=True,
+                ecc_motion_model="affine",
+                ecc_reference_point_px=point,
+                ecc_initial_warp=initial_warp,
+            )
+
+        self.assertEqual(find_ecc.call_args.args[3], cv2.MOTION_AFFINE)
+        np.testing.assert_allclose(find_ecc.call_args.args[2], initial_warp)
+        np.testing.assert_allclose(result["shift_px"].values, expected_shift, atol=1e-5)
+
+    def test_ecc_refinement_converts_affine_initial_warp_for_homography(self):
+        reference = corpus_grayscale_image()
+        initial_warp = np.asarray(
+            [
+                [1.0, 0.05, -2.0],
+                [-0.03, 0.98, 4.0],
+            ],
+            dtype=np.float64,
+        )
+
+        def echo_initial_warp(*args):
+            return 1.0, args[2].copy()
+
+        with patch(
+            "merlin_track_position.tracking.shift.cv2.findTransformECC",
+            side_effect=echo_initial_warp,
+        ) as find_ecc:
+            estimate_shift(
+                reference,
+                reference.copy(),
+                check_tiles=False,
+                use_ecc_refinement=True,
+                ecc_initial_warp=initial_warp,
+            )
+
+        expected = np.eye(3, dtype=np.float64)
+        expected[:2, :] = initial_warp
+        self.assertEqual(find_ecc.call_args.args[3], cv2.MOTION_HOMOGRAPHY)
+        np.testing.assert_allclose(find_ecc.call_args.args[2], expected)
+
+    def test_ecc_refinement_rejects_invalid_initial_warp(self):
+        reference = corpus_grayscale_image()
+
+        with self.assertRaisesRegex(ValueError, "ecc_initial_warp"):
+            estimate_shift(
+                reference,
+                reference.copy(),
+                check_tiles=False,
+                use_ecc_refinement=True,
+                ecc_initial_warp=np.zeros((2, 2), dtype=float),
+            )
+
     def test_ecc_refinement_failure_falls_back_to_phase_shift(self):
         reference = corpus_grayscale_image()
         current = ndimage.shift(reference, shift=(-1.5, 2.0), order=3, mode="wrap")

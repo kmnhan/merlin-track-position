@@ -47,6 +47,8 @@ from merlin_track_position.tracking.correct import (
 )
 from merlin_track_position.tracking.detect import detect_shift
 from merlin_track_position.tracking.persistence import pending_entry_count
+from merlin_track_position.tracking.roi import roi_geometry_from_attrs
+from merlin_track_position.tracking.shift import estimate_shift
 
 TEST_CORRECTION_GAIN = 0.6
 TEST_CORRECTION_MAX_NORMALIZED_STEP = 0.5
@@ -54,6 +56,8 @@ TEST_CORRECTION_WEIGHTS = (1.0, 1.0, 1.0, 1.0)
 TEST_LQR_IMAGE_SCALE_PX = 0.1
 TEST_LQR_MOTOR_PENALTY = 100.0
 TEST_LQR_SVD_RELATIVE_TOLERANCE = 1e-6
+AZIMUTH_47P5_CALIBRATION_PATH = Path("/Users/khan/Downloads/calib_azim47p5.h5")
+AZIMUTH_75P8_CALIBRATION_PATH = Path("/Users/khan/Downloads/calib_azim75p8_re.h5")
 
 
 def px_per_readback_mm():
@@ -206,6 +210,14 @@ def calibration_dataset(jacobian=None):
     )
     validate_visual_calibration_dataset(dataset)
     return dataset
+
+
+def cropped_reference_image(dataset: xr.Dataset, camera: str) -> np.ndarray:
+    image = np.asarray(dataset[f"reference_{camera}"].values)
+    roi_geometry = roi_geometry_from_attrs(dataset.attrs, camera)
+    if roi_geometry is None:
+        return image
+    return crop_image_to_roi(image, roi_geometry)
 
 
 def legacy_command_space_calibration_dataset():
@@ -378,6 +390,270 @@ class ShiftDetectionTests(unittest.TestCase):
                 kwargs["ecc_initial_shift_px"][camera],
                 expected_seed[index],
             )
+
+    def test_orientation_ecc_seed_uses_jacobian_basis_and_azimuth_deadband(self):
+        jacobian = np.asarray(
+            [
+                [[1.0, 0.0, 0.25], [0.0, 1.0, -0.15]],
+                [[2.0, 0.0, -0.2], [0.0, 2.0, 0.35]],
+            ],
+            dtype=float,
+        )
+        calibration = calibration_dataset(jacobian).assign_attrs(
+            polar=0.0,
+            tilt=0.0,
+            azi=10.0,
+        )
+        polar_attrs = correct_module._runtime_polar_attrs(calibration, 0.0)
+        orientation_attrs = correct_module._runtime_orientation_attrs(
+            calibration,
+            polar_attrs=polar_attrs,
+            current_tilt_deg=0.0,
+            current_azi_deg=11.5,
+        )
+
+        kwargs = correct_module._orientation_ecc_seed_shift_kwargs(
+            {
+                "use_ecc_refinement": True,
+                "ecc_motion_model": "affine",
+            },
+            calibration=calibration,
+            jacobian=jacobian,
+            polar_attrs=polar_attrs,
+            orientation_attrs=orientation_attrs,
+            readback_position_mm=np.zeros(len(COMMAND_AXES), dtype=float),
+        )
+
+        self.assertTrue(orientation_attrs["orientation_seed_applied"])
+        self.assertFalse(orientation_attrs["azi_deadband_active"])
+        self.assertAlmostEqual(orientation_attrs["azi_applied_delta_deg"], 1.5)
+        angle = np.deg2rad(-1.5)
+        expected_affine = np.asarray(
+            [
+                [np.cos(angle), -np.sin(angle)],
+                [np.sin(angle), np.cos(angle)],
+            ],
+            dtype=float,
+        )
+        for camera in CAMERAS:
+            point = kwargs["ecc_reference_point_px"][camera]
+            expected_warp = correct_module._affine_warp_about_point(
+                expected_affine,
+                point,
+                np.zeros(len(PIXEL_AXES), dtype=float),
+            )
+            np.testing.assert_allclose(
+                kwargs["ecc_initial_warp"][camera],
+                expected_warp,
+                atol=1e-12,
+            )
+
+        deadband_attrs = correct_module._runtime_orientation_attrs(
+            calibration,
+            polar_attrs=polar_attrs,
+            current_tilt_deg=0.0,
+            current_azi_deg=11.499,
+        )
+        deadband_kwargs = correct_module._orientation_ecc_seed_shift_kwargs(
+            {"use_ecc_refinement": True},
+            calibration=calibration,
+            jacobian=jacobian,
+            polar_attrs=polar_attrs,
+            orientation_attrs=deadband_attrs,
+            readback_position_mm=np.zeros(len(COMMAND_AXES), dtype=float),
+        )
+        self.assertTrue(deadband_attrs["azi_deadband_active"])
+        self.assertAlmostEqual(deadband_attrs["azi_applied_delta_deg"], 0.0)
+        for camera in CAMERAS:
+            np.testing.assert_allclose(
+                deadband_kwargs["ecc_initial_warp"][camera],
+                np.asarray([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=float),
+                atol=1e-12,
+            )
+
+    def test_orientation_ecc_seed_skips_missing_azimuth(self):
+        calibration = calibration_dataset()
+        polar_attrs = correct_module._runtime_polar_attrs(calibration, 90.0)
+        orientation_attrs = correct_module._runtime_orientation_attrs(
+            calibration,
+            polar_attrs=polar_attrs,
+            current_tilt_deg=0.0,
+            current_azi_deg=0.0,
+        )
+        runtime_jacobian = correct_module._rotate_px_per_readback_mm_for_polar_delta(
+            calibration["px_per_readback_mm"].values,
+            90.0,
+        )
+
+        kwargs = correct_module._orientation_ecc_seed_shift_kwargs(
+            {"use_ecc_refinement": True},
+            calibration=calibration,
+            jacobian=runtime_jacobian,
+            polar_attrs=polar_attrs,
+            orientation_attrs=orientation_attrs,
+            readback_position_mm=np.zeros(len(COMMAND_AXES), dtype=float),
+        )
+
+        self.assertIn("calibration attr 'tilt' missing", orientation_attrs["orientation_seed_warning"])
+        self.assertIn("ecc_initial_shift_px", kwargs)
+        self.assertNotIn("ecc_initial_warp", kwargs)
+
+    def test_shift_kwargs_for_camera_routes_initial_warp(self):
+        warps = np.asarray(
+            [
+                [[1.0, 0.0, 2.0], [0.0, 1.0, 3.0]],
+                [[0.9, 0.1, -4.0], [-0.2, 1.1, 5.0]],
+            ],
+            dtype=float,
+        )
+
+        kwargs = calibration_core._shift_kwargs_for_camera(
+            {"ecc_initial_warp": warps},
+            "cam1",
+        )
+
+        np.testing.assert_allclose(kwargs["ecc_initial_warp"], warps[1])
+
+    @unittest.skipUnless(
+        AZIMUTH_47P5_CALIBRATION_PATH.exists()
+        and AZIMUTH_75P8_CALIBRATION_PATH.exists(),
+        "large-azimuth calibration benchmark files are not available",
+    )
+    def test_orientation_ecc_seed_benchmarks_large_azimuth_references(self):
+        calibrations = {
+            "azim47p5": load_calibration_dataset(
+                AZIMUTH_47P5_CALIBRATION_PATH
+            ).assign_attrs(azi=-47.5),
+            "azim75p8": load_calibration_dataset(
+                AZIMUTH_75P8_CALIBRATION_PATH
+            ).assign_attrs(azi=-75.8),
+        }
+        expected_seeded_shift = {
+            ("azim47p5", "azim75p8", "cam0"): np.asarray([0.832, 4.765]),
+            ("azim47p5", "azim75p8", "cam1"): np.asarray([15.249, -11.401]),
+            ("azim75p8", "azim47p5", "cam0"): np.asarray([0.239, -5.553]),
+            ("azim75p8", "azim47p5", "cam1"): np.asarray([-24.060, 7.298]),
+        }
+        try:
+            for reference_name, current_name in (
+                ("azim47p5", "azim75p8"),
+                ("azim75p8", "azim47p5"),
+            ):
+                reference_calibration = calibrations[reference_name]
+                current_calibration = calibrations[current_name]
+                current_polar = float(current_calibration.attrs["polar"])
+                polar_attrs = correct_module._runtime_polar_attrs(
+                    reference_calibration,
+                    current_polar,
+                )
+                runtime_jacobian = (
+                    correct_module._rotate_px_per_readback_mm_for_polar_delta(
+                        reference_calibration["px_per_readback_mm"].values,
+                        float(polar_attrs["polar_applied_delta_deg"]),
+                    )
+                )
+                orientation_attrs = correct_module._runtime_orientation_attrs(
+                    reference_calibration,
+                    polar_attrs=polar_attrs,
+                    current_tilt_deg=float(current_calibration.attrs["tilt"]),
+                    current_azi_deg=float(current_calibration.attrs["azi"]),
+                )
+                seed_kwargs = correct_module._orientation_ecc_seed_shift_kwargs(
+                    {
+                        "use_ecc_refinement": True,
+                        "ecc_motion_model": "affine",
+                        "clip_percentiles": None,
+                    },
+                    calibration=reference_calibration,
+                    jacobian=runtime_jacobian,
+                    polar_attrs=polar_attrs,
+                    orientation_attrs=orientation_attrs,
+                    readback_position_mm=np.asarray(
+                        current_calibration["initial_readback_position_mm"].values,
+                        dtype=float,
+                    ),
+                )
+                for camera in CAMERAS:
+                    reference_image = cropped_reference_image(
+                        reference_calibration,
+                        camera,
+                    )
+                    current_image = cropped_reference_image(current_calibration, camera)
+                    per_camera_seed_kwargs = calibration_core._shift_kwargs_for_camera(
+                        seed_kwargs,
+                        camera,
+                    )
+                    seeded = estimate_shift(
+                        reference_image,
+                        current_image,
+                        check_tiles=False,
+                        **per_camera_seed_kwargs,
+                    )
+                    phase_seeded = estimate_shift(
+                        reference_image,
+                        current_image,
+                        check_tiles=False,
+                        clip_percentiles=None,
+                        use_ecc_refinement=True,
+                        ecc_motion_model="affine",
+                        ecc_reference_point_px=per_camera_seed_kwargs[
+                            "ecc_reference_point_px"
+                        ],
+                    )
+                    expected = expected_seeded_shift[
+                        (reference_name, current_name, camera)
+                    ]
+                    seeded_shift = np.asarray(seeded["shift_px"].values, dtype=float)
+                    phase_shift = np.asarray(
+                        phase_seeded["shift_px"].values,
+                        dtype=float,
+                    )
+                    np.testing.assert_allclose(seeded_shift, expected, atol=1.5)
+                    self.assertGreater(
+                        float(np.linalg.norm(phase_shift - expected)),
+                        8.0,
+                    )
+        finally:
+            for calibration in calibrations.values():
+                calibration.close()
+
+    def test_detect_shift_seeds_ecc_from_orientation_geometry(self):
+        calibration = calibration_dataset().assign_attrs(
+            polar=0.0,
+            tilt=0.0,
+            azi=-47.5,
+        )
+
+        with (
+            patch(
+                "merlin_track_position.tracking.detect.get_positions",
+                return_value=(0.0, 0.0, 0.0, -4.85, 0.0, -75.8),
+            ),
+            patch(
+                "merlin_track_position.tracking.correct.capture_image_stack",
+                return_value=(
+                    np.zeros((1, 4, 5), dtype=float),
+                    np.zeros((1, 6, 7), dtype=float),
+                ),
+            ),
+            patch(
+                "merlin_track_position.tracking.correct.measure_image_error",
+                return_value=shift_dataset(np.zeros((2, 2), dtype=float)),
+            ) as measure,
+        ):
+            result = detect_shift(
+                calibration,
+                object(),
+                capture_count=1,
+                use_ecc_refinement=True,
+                ecc_motion_model="affine",
+            )
+
+        kwargs = measure.call_args.kwargs
+        self.assertIn("ecc_initial_warp", kwargs)
+        self.assertFalse(kwargs["ecc_fallback_to_phase_shift"])
+        self.assertTrue(result.attrs["detection_orientation_seed_applied"])
+        self.assertAlmostEqual(result.attrs["detection_azi_applied_delta_deg"], -28.3)
 
     def test_detect_shift_uses_calibration_beam_targets_as_roi_local_ecc_points(self):
         calibration = calibration_dataset().assign_attrs(
@@ -2314,6 +2590,57 @@ class CorrectionTests(unittest.TestCase):
                 kwargs["ecc_initial_shift_px"][camera],
                 expected_seed[index],
             )
+
+    def test_correction_initial_measurement_seeds_ecc_from_orientation_geometry(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "calibration.h5"
+            calibration = calibration_dataset().assign_attrs(
+                polar=0.0,
+                tilt=0.0,
+                azi=-47.5,
+            )
+            save_calibration_dataset(calibration, path)
+
+            def fake_get_positions(aliases):
+                position_map = dict(
+                    zip(
+                        (*COMMAND_AXES, "p", "t", "a"),
+                        (0.0, 0.0, 0.0, -4.85, 0.0, -75.8),
+                        strict=True,
+                    )
+                )
+                return tuple(position_map[str(alias)] for alias in aliases)
+
+            with (
+                patch(
+                    "merlin_track_position.tracking.correct.get_positions",
+                    side_effect=fake_get_positions,
+                ),
+                patch(
+                    "merlin_track_position.tracking.correct.capture_image_stack",
+                    return_value=(
+                        np.zeros((1, 4, 5), dtype=float),
+                        np.zeros((1, 6, 7), dtype=float),
+                    ),
+                ),
+                patch(
+                    "merlin_track_position.tracking.correct.measure_image_error",
+                    return_value=shift_dataset(np.zeros((2, 2), dtype=float)),
+                ) as measure,
+            ):
+                result = do_correction(
+                    path,
+                    capture_count=1,
+                    correction_mode="camera",
+                    use_ecc_refinement=True,
+                    ecc_motion_model="affine",
+                )
+
+        kwargs = measure.call_args.kwargs
+        self.assertIn("ecc_initial_warp", kwargs)
+        self.assertFalse(kwargs["ecc_fallback_to_phase_shift"])
+        self.assertTrue(result.attrs["correction_orientation_seed_applied"])
+        self.assertAlmostEqual(result.attrs["correction_azi_applied_delta_deg"], -28.3)
 
     def test_correction_post_move_measurement_seeds_ecc_from_prediction(self):
         with tempfile.TemporaryDirectory() as tmpdir:

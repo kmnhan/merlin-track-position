@@ -93,6 +93,10 @@ DEFAULT_BEAM_TRANSVERSE_TOLERANCE_UM: float = 3.0
 DEFAULT_BEAM_ANALYZER_TRANSVERSE_TOLERANCE_UM: float = 3.0
 DEFAULT_BEAM_VERTICAL_TOLERANCE_UM: float = 3.0
 
+# Backlash deadband used when seeding ECC from azimuth orientation changes.
+# Smaller azimuth readback differences are treated as no rotation.
+DEFAULT_ORIENTATION_ECC_AZIMUTH_DEADBAND_DEG: float = 1.5
+
 # LQR solver weights and numerical tolerance.
 DEFAULT_LQR_CORRECTION_GAIN: float = 0.50
 DEFAULT_LQR_CORRECTION_MAX_NORMALIZED_STEP: float = 0.25

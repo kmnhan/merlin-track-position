@@ -23,9 +23,11 @@ from merlin_track_position.tracking.calibration_core import (
 )
 from merlin_track_position.tracking.correct import (
     _capture_measurement,
-    _polar_ecc_seed_shift_kwargs,
+    _orientation_ecc_seed_shift_kwargs,
     _position_values,
     _prefixed_polar_attrs,
+    _prefixed_orientation_attrs,
+    _runtime_orientation_attrs,
     _runtime_px_per_readback_mm_for_polar,
 )
 
@@ -52,23 +54,26 @@ def detect_shift(
 
     reference_cam0 = np.asarray(calibration["reference_cam0"].values)
     reference_cam1 = np.asarray(calibration["reference_cam1"].values)
-    current_position = _position_values(
-        get_positions((*COMMAND_AXES, "p")),
-        len(COMMAND_AXES) + 1,
-        "current x/y/z/p readback",
-    )
-    current_readback_position_mm = current_position[: len(COMMAND_AXES)].copy()
-    current_polar_deg = float(current_position[-1])
+    current_position, current_orientation = _read_current_detection_position()
+    current_readback_position_mm = current_position.copy()
+    current_polar_deg = float(current_orientation["polar"])
     jacobian, polar_attrs = _runtime_px_per_readback_mm_for_polar(
         calibration,
         current_polar_deg,
     )
+    orientation_attrs = _runtime_orientation_attrs(
+        calibration,
+        polar_attrs=polar_attrs,
+        current_tilt_deg=current_orientation["tilt"],
+        current_azi_deg=current_orientation["azi"],
+    )
     logger.info("Detecting shift without motor correction.")
-    measurement_shift_kwargs = _polar_ecc_seed_shift_kwargs(
+    measurement_shift_kwargs = _orientation_ecc_seed_shift_kwargs(
         shift_kwargs,
         calibration=calibration,
         jacobian=jacobian,
         polar_attrs=polar_attrs,
+        orientation_attrs=orientation_attrs,
         readback_position_mm=current_readback_position_mm,
     )
     measurement = _capture_measurement(
@@ -112,5 +117,44 @@ def detect_shift(
             }
         )
         .assign_coords(command_axis=list(COMMAND_AXES))
-        .assign_attrs(_prefixed_polar_attrs("detection", polar_attrs))
+        .assign_attrs(
+            _prefixed_polar_attrs("detection", polar_attrs)
+            | _prefixed_orientation_attrs("detection", orientation_attrs)
+        )
+    )
+
+
+def _read_current_detection_position() -> tuple[np.ndarray, dict[str, float]]:
+    try:
+        values = _position_values(
+            get_positions((*COMMAND_AXES, "p", "t", "a")),
+            len(COMMAND_AXES) + 3,
+            "current x/y/z/p/t/a readback",
+        )
+        return (
+            values[: len(COMMAND_AXES)].copy(),
+            {
+                "polar": float(values[len(COMMAND_AXES)]),
+                "tilt": float(values[len(COMMAND_AXES) + 1]),
+                "azi": float(values[len(COMMAND_AXES) + 2]),
+            },
+        )
+    except Exception as exc:
+        logger.info(
+            "Could not read current x/y/z/p/t/a for detection (%s); "
+            "falling back to x/y/z/p only.",
+            exc,
+        )
+    values = _position_values(
+        get_positions((*COMMAND_AXES, "p")),
+        len(COMMAND_AXES) + 1,
+        "current x/y/z/p readback",
+    )
+    return (
+        values[: len(COMMAND_AXES)].copy(),
+        {
+            "polar": float(values[-1]),
+            "tilt": np.nan,
+            "azi": np.nan,
+        },
     )

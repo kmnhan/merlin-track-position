@@ -74,6 +74,15 @@ BEAM_OBSERVATION_AXES = ("beam_transverse", "analyzer_transverse", "vertical")
 _USE_DEFAULT = object()
 _CORRECTION_HISTORY_FORMAT = "merlin_track_position_correction_history"
 _CORRECTION_HISTORY_RESIZABLE_DIMS = ("move", "iteration")
+_ORIENTATION_ECC_MAX_BASIS_CONDITION = 1.0e6
+_SAMPLE_PLANE_BASIS = np.asarray(
+    [
+        [1.0, 0.0],
+        [0.0, 1.0],
+        [0.0, 0.0],
+    ],
+    dtype=np.float64,
+)
 
 
 class CorrectionFeedback(NamedTuple):
@@ -201,14 +210,20 @@ def do_correction(
         raise ValueError("min_command_norm_mm must be finite and non-negative")
     if max_moves < 0:
         raise ValueError("max_moves must be >= 0")
-    logger.info("Reading initial readback x/y/z and polar positions.")
-    readback_position_mm, current_polar_deg = (
-        _read_initial_readback_position_and_polar_deg(motor_backend)
+    logger.info("Reading initial readback x/y/z and orientation positions.")
+    readback_position_mm, current_orientation_deg = (
+        _read_initial_readback_position_and_orientation_deg(motor_backend)
     )
     logger.info("Initial readback positions: %s", readback_position_mm.tolist())
     jacobian, polar_attrs = _runtime_px_per_readback_mm_for_polar(
         calibration,
-        current_polar_deg,
+        float(current_orientation_deg["polar"]),
+    )
+    orientation_attrs = _runtime_orientation_attrs(
+        calibration,
+        polar_attrs=polar_attrs,
+        current_tilt_deg=current_orientation_deg["tilt"],
+        current_azi_deg=current_orientation_deg["azi"],
     )
     logger.info(
         "Correction polar geometry: calibration=%g deg, current=%g deg, "
@@ -312,11 +327,12 @@ def do_correction(
     correction_move_finished_at: str | None = None
 
     logger.info("Capturing initial correction measurement.")
-    initial_shift_kwargs = _polar_ecc_seed_shift_kwargs(
+    initial_shift_kwargs = _orientation_ecc_seed_shift_kwargs(
         shift_kwargs,
         calibration=calibration,
         jacobian=jacobian,
         polar_attrs=polar_attrs,
+        orientation_attrs=orientation_attrs,
         readback_position_mm=readback_position_mm,
     )
     measurement = _capture_measurement(
@@ -497,6 +513,7 @@ def do_correction(
             correction_mode=correction_mode,
             beam_xz_angle_from_analyzer_deg=beam_xz_angle_from_analyzer_deg,
             polar_attrs=polar_attrs,
+            orientation_attrs=orientation_attrs,
             beam_polar_deg=(
                 None if beam_geometry is None else float(beam_geometry["polar_deg"])
             ),
@@ -709,9 +726,12 @@ def do_correction(
             )
 
         logger.info("Capturing post-move correction measurement.")
-        after_shift_kwargs = _polar_ecc_seed_shift_kwargs(
+        after_shift_kwargs = _orientation_ecc_seed_shift_kwargs(
             shift_kwargs,
+            calibration=calibration,
+            jacobian=jacobian,
             polar_attrs=polar_attrs,
+            orientation_attrs=orientation_attrs,
             seed_shift_px=(
                 np.asarray(measurement["shift_px"].values, dtype=np.float64)
                 + predicted_delta_px
@@ -1765,32 +1785,82 @@ def _calibration_polar_deg(calibration: xr.Dataset) -> float:
 def _read_initial_readback_position_and_polar_deg(
     motor_backend: CorrectionMotorBackend,
 ) -> tuple[np.ndarray, float]:
-    aliases = (*COMMAND_AXES, "p")
+    readback_position_mm, orientation = _read_initial_readback_position_and_orientation_deg(
+        motor_backend
+    )
+    return readback_position_mm, float(orientation["polar"])
+
+
+def _read_initial_readback_position_and_orientation_deg(
+    motor_backend: CorrectionMotorBackend,
+) -> tuple[np.ndarray, dict[str, float]]:
+    backend_has_orientation = True
     try:
         values = _position_values(
-            motor_backend.get_positions(aliases),
+            motor_backend.get_positions((*COMMAND_AXES, "p")),
             len(COMMAND_AXES) + 1,
             "initial x/y/z/p readback",
         )
-        return values[: len(COMMAND_AXES)].copy(), float(values[-1])
+        readback_position_mm = values[: len(COMMAND_AXES)].copy()
+        current_polar_deg = float(values[-1])
     except Exception as exc:
         if isinstance(motor_backend, DirectBCSMotorBackend):
             raise
         logger.info(
-            "Motor backend did not provide combined x/y/z/p readback (%s); "
+            "Motor backend did not provide x/y/z/p readback (%s); "
             "falling back to delegated x/y/z plus direct BCS polar read.",
             exc,
         )
-    readback_position_mm = _position_values(
-        motor_backend.get_positions(COMMAND_AXES),
-        len(COMMAND_AXES),
-        "initial x/y/z readback",
+        backend_has_orientation = False
+        readback_position_mm = _position_values(
+            motor_backend.get_positions(COMMAND_AXES),
+            len(COMMAND_AXES),
+            "initial x/y/z readback",
+        )
+        current_polar_deg = _single_position_value(
+            get_positions(("p",)),
+            "current polar",
+        )
+
+    current_tilt_deg = np.nan
+    current_azi_deg = np.nan
+    try:
+        if not backend_has_orientation:
+            raise ValueError("motor backend did not provide polar readback")
+        orientation_values = _position_values(
+            motor_backend.get_positions(("t", "a")),
+            2,
+            "current t/a readback",
+        )
+        current_tilt_deg = float(orientation_values[0])
+        current_azi_deg = float(orientation_values[1])
+    except Exception as exc:
+        logger.info(
+            "Motor backend did not provide t/a readback (%s); "
+            "trying direct BCS t/a read.",
+            exc,
+        )
+        try:
+            orientation_values = _position_values(
+                get_positions(("t", "a")),
+                2,
+                "current t/a readback",
+            )
+            current_tilt_deg = float(orientation_values[0])
+            current_azi_deg = float(orientation_values[1])
+        except Exception as direct_exc:
+            logger.info(
+                "Direct t/a readback failed (%s); orientation ECC seed will be skipped.",
+                direct_exc,
+            )
+    return (
+        readback_position_mm,
+        {
+            "polar": current_polar_deg,
+            "tilt": current_tilt_deg,
+            "azi": current_azi_deg,
+        },
     )
-    current_polar_deg = _single_position_value(
-        get_positions(("p",)),
-        "current polar readback",
-    )
-    return readback_position_mm, current_polar_deg
 
 
 def _position_values(values: Sequence[float], count: int, name: str) -> np.ndarray:
@@ -1857,6 +1927,81 @@ def _prefixed_polar_attrs(
     return {f"{prefix}_{key}": value for key, value in polar_attrs.items()}
 
 
+def _runtime_orientation_attrs(
+    calibration: xr.Dataset,
+    *,
+    polar_attrs: Mapping[str, float | bool],
+    current_tilt_deg: float,
+    current_azi_deg: float,
+) -> dict[str, float | bool | str]:
+    attrs: dict[str, float | bool | str] = {
+        "orientation_seed_inputs_valid": False,
+        "orientation_seed_applied": False,
+        "orientation_seed_warning": "",
+        "orientation_seed_basis_condition": np.nan,
+    }
+    try:
+        calibration_tilt_deg = _calibration_orientation_attr_deg(calibration, "tilt")
+        calibration_azi_deg = _calibration_orientation_attr_deg(calibration, "azi")
+        current_tilt_value = float(current_tilt_deg)
+        current_azi_value = float(current_azi_deg)
+        if not np.isfinite(current_tilt_value):
+            raise ValueError("current tilt readback must be finite")
+        if not np.isfinite(current_azi_value):
+            raise ValueError("current azimuth readback must be finite")
+    except ValueError as exc:
+        attrs["orientation_seed_warning"] = (
+            f"orientation ECC seed skipped: {exc}"
+        )
+        return attrs
+
+    azi_deadband_deg = float(constants.DEFAULT_ORIENTATION_ECC_AZIMUTH_DEADBAND_DEG)
+    if not np.isfinite(azi_deadband_deg) or azi_deadband_deg < 0.0:
+        raise ValueError("azimuth deadband must be finite and non-negative")
+
+    tilt_delta_deg = current_tilt_value - calibration_tilt_deg
+    azi_delta_deg = current_azi_value - calibration_azi_deg
+    azi_deadband_active = bool(abs(azi_delta_deg) < azi_deadband_deg)
+    azi_applied_delta_deg = 0.0 if azi_deadband_active else azi_delta_deg
+    attrs |= {
+        "orientation_seed_inputs_valid": True,
+        "calibration_tilt_deg": float(calibration_tilt_deg),
+        "current_tilt_deg": float(current_tilt_value),
+        "tilt_delta_deg": float(tilt_delta_deg),
+        "tilt_applied_delta_deg": float(tilt_delta_deg),
+        "calibration_azi_deg": float(calibration_azi_deg),
+        "current_azi_deg": float(current_azi_value),
+        "azi_delta_deg": float(azi_delta_deg),
+        "azi_applied_delta_deg": float(azi_applied_delta_deg),
+        "azi_deadband_deg": float(azi_deadband_deg),
+        "azi_deadband_active": azi_deadband_active,
+        "effective_current_azi_deg": float(calibration_azi_deg + azi_applied_delta_deg),
+        "calibration_polar_deg": float(polar_attrs["calibration_polar_deg"]),
+        "current_polar_deg": float(polar_attrs["current_polar_deg"]),
+    }
+    return attrs
+
+
+def _calibration_orientation_attr_deg(calibration: xr.Dataset, name: str) -> float:
+    if name not in calibration.attrs:
+        raise ValueError(f"calibration attr {name!r} missing")
+    value = float(calibration.attrs[name])
+    if not np.isfinite(value):
+        raise ValueError(f"calibration attr {name!r} must be finite")
+    return value
+
+
+def _prefixed_orientation_attrs(
+    prefix: str,
+    orientation_attrs: Mapping[str, float | bool | str],
+) -> dict[str, float | bool | str]:
+    return {
+        f"{prefix}_{key}": value
+        for key, value in orientation_attrs.items()
+        if value != ""
+    }
+
+
 def _polar_ecc_seed_shift_kwargs(
     shift_kwargs: Mapping[str, Any],
     *,
@@ -1866,10 +2011,40 @@ def _polar_ecc_seed_shift_kwargs(
     readback_position_mm: np.ndarray | None = None,
     seed_shift_px: np.ndarray | None = None,
 ) -> dict[str, Any]:
+    orientation_attrs = {
+        "orientation_seed_inputs_valid": False,
+        "orientation_seed_applied": False,
+        "orientation_seed_warning": "orientation ECC seed not requested",
+        "orientation_seed_basis_condition": np.nan,
+    }
+    return _orientation_ecc_seed_shift_kwargs(
+        shift_kwargs,
+        polar_attrs=polar_attrs,
+        orientation_attrs=orientation_attrs,
+        calibration=calibration,
+        jacobian=jacobian,
+        readback_position_mm=readback_position_mm,
+        seed_shift_px=seed_shift_px,
+    )
+
+
+def _orientation_ecc_seed_shift_kwargs(
+    shift_kwargs: Mapping[str, Any],
+    *,
+    polar_attrs: Mapping[str, float | bool],
+    orientation_attrs: Mapping[str, float | bool | str],
+    calibration: xr.Dataset | None = None,
+    jacobian: np.ndarray | None = None,
+    readback_position_mm: np.ndarray | None = None,
+    seed_shift_px: np.ndarray | None = None,
+) -> dict[str, Any]:
     kwargs = dict(shift_kwargs)
-    if not kwargs.get("use_ecc_refinement") or not bool(
-        polar_attrs["polar_rotation_applied"]
-    ):
+    if not kwargs.get("use_ecc_refinement"):
+        return kwargs
+
+    use_orientation_seed = bool(orientation_attrs.get("orientation_seed_inputs_valid"))
+    use_translation_seed = bool(polar_attrs["polar_rotation_applied"]) or use_orientation_seed
+    if not use_translation_seed and seed_shift_px is None:
         return kwargs
 
     if seed_shift_px is None:
@@ -1920,8 +2095,174 @@ def _polar_ecc_seed_shift_kwargs(
     kwargs["ecc_initial_shift_px"] = {
         camera: seed_shift[index].copy() for index, camera in enumerate(CAMERAS)
     }
+    if use_orientation_seed:
+        if calibration is None:
+            raise ValueError("calibration is required for orientation ECC seed")
+        try:
+            kwargs = _shift_kwargs_with_calibration_ecc_points(calibration, kwargs)
+            seed_warps, basis_condition = _orientation_ecc_initial_warps(
+                calibration,
+                orientation_attrs=orientation_attrs,
+                seed_shift_px=seed_shift,
+                reference_points=kwargs["ecc_reference_point_px"],
+            )
+        except ValueError as exc:
+            logger.info("Orientation ECC seed skipped: %s", exc)
+            if isinstance(orientation_attrs, dict):
+                orientation_attrs["orientation_seed_warning"] = (
+                    f"orientation ECC seed skipped: {exc}"
+                )
+                orientation_attrs["orientation_seed_applied"] = False
+            kwargs["ecc_fallback_to_phase_shift"] = False
+            return kwargs
+        kwargs["ecc_initial_warp"] = seed_warps
+        if isinstance(orientation_attrs, dict):
+            orientation_attrs["orientation_seed_applied"] = True
+            orientation_attrs["orientation_seed_basis_condition"] = float(
+                basis_condition
+            )
     kwargs["ecc_fallback_to_phase_shift"] = False
     return kwargs
+
+
+def _orientation_ecc_initial_warps(
+    calibration: xr.Dataset,
+    *,
+    orientation_attrs: Mapping[str, float | bool | str],
+    seed_shift_px: np.ndarray,
+    reference_points: Mapping[str, Any],
+) -> tuple[dict[str, np.ndarray], float]:
+    jacobian = np.asarray(calibration["px_per_readback_mm"].values, dtype=np.float64)
+    if jacobian.shape != (len(CAMERAS), len(PIXEL_AXES), len(COMMAND_AXES)):
+        raise ValueError("calibration Jacobian has unexpected shape")
+    if not np.isfinite(jacobian).all():
+        raise ValueError("calibration Jacobian must contain only finite values")
+
+    calibration_basis = _sample_plane_basis(
+        polar_deg=float(orientation_attrs["calibration_polar_deg"]),
+        tilt_deg=float(orientation_attrs["calibration_tilt_deg"]),
+        azi_deg=float(orientation_attrs["calibration_azi_deg"]),
+    )
+    current_basis = _sample_plane_basis(
+        polar_deg=float(orientation_attrs["current_polar_deg"]),
+        tilt_deg=float(orientation_attrs["current_tilt_deg"]),
+        azi_deg=float(orientation_attrs["effective_current_azi_deg"]),
+    )
+
+    seed_shift = np.asarray(seed_shift_px, dtype=np.float64)
+    if seed_shift.shape != (len(CAMERAS), len(PIXEL_AXES)):
+        raise ValueError("seed_shift_px must have shape (camera, pixel_axis)")
+    if not np.isfinite(seed_shift).all():
+        raise ValueError("seed_shift_px must contain only finite values")
+
+    warps: dict[str, np.ndarray] = {}
+    condition_values: list[float] = []
+    for camera_index, camera in enumerate(CAMERAS):
+        point = np.asarray(reference_points[camera], dtype=np.float64)
+        if point.shape != (len(PIXEL_AXES),) or not np.isfinite(point).all():
+            raise ValueError(f"ECC reference point for {camera} must be finite")
+        projection_calibration = jacobian[camera_index] @ calibration_basis
+        projection_current = jacobian[camera_index] @ current_basis
+        condition = float(np.linalg.cond(projection_calibration))
+        if (
+            not np.isfinite(condition)
+            or condition > _ORIENTATION_ECC_MAX_BASIS_CONDITION
+        ):
+            raise ValueError(
+                f"projected sample basis for {camera} is ill-conditioned "
+                f"({condition:.4g})"
+            )
+        try:
+            affine = projection_current @ np.linalg.inv(projection_calibration)
+        except np.linalg.LinAlgError as exc:
+            raise ValueError(
+                f"projected sample basis for {camera} is singular"
+            ) from exc
+        if not np.isfinite(affine).all():
+            raise ValueError(f"orientation affine for {camera} is not finite")
+        warps[camera] = _affine_warp_about_point(
+            affine,
+            point,
+            seed_shift[camera_index],
+        )
+        condition_values.append(condition)
+    return warps, max(condition_values)
+
+
+def _sample_plane_basis(
+    *,
+    polar_deg: float,
+    tilt_deg: float,
+    azi_deg: float,
+) -> np.ndarray:
+    return (
+        _rotation_y_deg(polar_deg)
+        @ _rotation_x_deg(-tilt_deg)
+        @ _rotation_z_deg(-azi_deg)
+        @ _SAMPLE_PLANE_BASIS
+    )
+
+
+def _rotation_x_deg(angle_deg: float) -> np.ndarray:
+    angle_rad = np.deg2rad(float(angle_deg))
+    cosine = float(np.cos(angle_rad))
+    sine = float(np.sin(angle_rad))
+    return np.asarray(
+        [
+            [1.0, 0.0, 0.0],
+            [0.0, cosine, -sine],
+            [0.0, sine, cosine],
+        ],
+        dtype=np.float64,
+    )
+
+
+def _rotation_y_deg(angle_deg: float) -> np.ndarray:
+    angle_rad = np.deg2rad(float(angle_deg))
+    cosine = float(np.cos(angle_rad))
+    sine = float(np.sin(angle_rad))
+    return np.asarray(
+        [
+            [cosine, 0.0, sine],
+            [0.0, 1.0, 0.0],
+            [-sine, 0.0, cosine],
+        ],
+        dtype=np.float64,
+    )
+
+
+def _rotation_z_deg(angle_deg: float) -> np.ndarray:
+    angle_rad = np.deg2rad(float(angle_deg))
+    cosine = float(np.cos(angle_rad))
+    sine = float(np.sin(angle_rad))
+    return np.asarray(
+        [
+            [cosine, -sine, 0.0],
+            [sine, cosine, 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+
+
+def _affine_warp_about_point(
+    affine: np.ndarray,
+    point: np.ndarray,
+    translation: np.ndarray,
+) -> np.ndarray:
+    affine_array = np.asarray(affine, dtype=np.float64)
+    if affine_array.shape != (len(PIXEL_AXES), len(PIXEL_AXES)):
+        raise ValueError("orientation affine must have shape (pixel_axis, pixel_axis)")
+    point_array = np.asarray(point, dtype=np.float64)
+    translation_array = np.asarray(translation, dtype=np.float64)
+    offset = point_array + translation_array - affine_array @ point_array
+    return np.asarray(
+        [
+            [affine_array[0, 0], affine_array[0, 1], offset[0]],
+            [affine_array[1, 0], affine_array[1, 1], offset[1]],
+        ],
+        dtype=np.float64,
+    )
 
 
 def _rotate_px_per_readback_mm_for_polar_delta(
@@ -2264,6 +2605,7 @@ def _build_correction_result(
     correction_mode: str,
     beam_xz_angle_from_analyzer_deg: float,
     polar_attrs: Mapping[str, float | bool],
+    orientation_attrs: Mapping[str, float | bool | str],
     beam_polar_deg: float | None,
     beam_runtime_xz_angle_deg: float | None,
     analyzer_runtime_xz_angle_deg: float | None,
@@ -2492,6 +2834,7 @@ def _build_correction_result(
         "correction_criterion": correction_criterion,
         "correction_tolerance": float(correction_tolerance),
         **_prefixed_polar_attrs("correction", polar_attrs),
+        **_prefixed_orientation_attrs("correction", orientation_attrs),
         "correction_gain": float(gain),
         "correction_final_gain": float(current_gain),
         "correction_max_normalized_step": max_normalized_attr,
