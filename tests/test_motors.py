@@ -8,10 +8,14 @@ from merlin_track_position import constants
 from merlin_track_position.constants import MOTOR_NAMES
 from merlin_track_position.instruments.motors import (
     _bcs_server_context,
+    _clear_motor_position_cache,
     _move_motors_and_wait,
+    cached_motor_positions,
     get_positions,
     get_temperatures,
     move_motors_and_wait,
+    refresh_motor_positions,
+    update_motor_position_cache,
 )
 from merlin_track_position.instruments.simulated_hardware import simulator
 
@@ -940,9 +944,59 @@ class MoveMotorsAndWaitTests(unittest.TestCase):
             )
 
 
+class MotorPositionCacheTests(unittest.TestCase):
+    def setUp(self):
+        simulator.reset()
+        _clear_motor_position_cache()
+
+    def tearDown(self):
+        _clear_motor_position_cache()
+
+    def test_update_and_cached_motor_positions_are_explicit(self):
+        with patch("merlin_track_position.instruments.motors.time.monotonic", return_value=10.0):
+            updated = update_motor_position_cache(
+                {"x": 1.25, "p": -4.5},
+                source="test",
+            )
+
+        self.assertEqual(updated, {"x": 1.25, "p": -4.5})
+        with patch("merlin_track_position.instruments.motors.time.monotonic", return_value=12.0):
+            self.assertEqual(
+                cached_motor_positions(("p", "x"), max_age_s=3.0),
+                (-4.5, 1.25),
+            )
+            with self.assertRaisesRegex(RuntimeError, "stale"):
+                cached_motor_positions(("x",), max_age_s=1.0)
+
+    def test_cached_motor_positions_reject_missing_and_nonfinite_values(self):
+        with self.assertRaisesRegex(RuntimeError, "missing"):
+            cached_motor_positions(("x",))
+        with self.assertRaisesRegex(ValueError, "finite"):
+            update_motor_position_cache({"x": float("nan")})
+        with self.assertRaisesRegex(ValueError, "max_age_s"):
+            cached_motor_positions(("x",), max_age_s=-1.0)
+
+    def test_live_get_positions_updates_cache(self):
+        with patch.object(constants, "IS_DAQ_PC", False):
+            self.assertEqual(get_positions(("x", "cam")), (0.0, 5.0))
+
+        self.assertEqual(cached_motor_positions(("cam", "x")), (5.0, 0.0))
+
+    def test_refresh_motor_positions_live_reads_and_updates_cache(self):
+        with patch.object(constants, "IS_DAQ_PC", False):
+            positions = refresh_motor_positions(("x", "y"))
+
+        self.assertEqual(positions, (0.0, 0.0))
+        self.assertEqual(cached_motor_positions(("x", "y")), (0.0, 0.0))
+
+
 class DevelopmentModeMotorTests(unittest.TestCase):
     def setUp(self):
         simulator.reset()
+        _clear_motor_position_cache()
+
+    def tearDown(self):
+        _clear_motor_position_cache()
 
     def test_get_positions_uses_simulator_without_bcs_context(self):
         with (
@@ -972,6 +1026,7 @@ class DevelopmentModeMotorTests(unittest.TestCase):
 
         self.assertEqual(positions, (0.03, -0.015))
         self.assertEqual(saved_positions, (0.03, -0.015))
+        self.assertEqual(cached_motor_positions(("x", "y")), (0.03, -0.015))
         sleep.assert_called_once()
         self.assertLessEqual(sleep.call_args.args[0], 0.5)
 

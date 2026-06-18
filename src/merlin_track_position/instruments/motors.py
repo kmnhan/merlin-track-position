@@ -1,5 +1,6 @@
 import contextlib
 import logging
+import threading
 import time
 from collections.abc import Iterable, Mapping
 
@@ -11,10 +12,82 @@ from merlin_track_position.instruments.simulated_hardware import simulator
 
 logger = logging.getLogger("merlin_track_position.instruments.motors")
 DEFAULT_MOVE_TIMEOUT_S = 60.0
+_MOTOR_POSITION_CACHE_LOCK = threading.RLock()
+_MOTOR_POSITION_CACHE: dict[str, tuple[float, float, str]] = {}
 
 
 class _MotorMoveDidNotStartError(TimeoutError):
     pass
+
+
+def update_motor_position_cache(
+    axis_positions: Mapping[str, float],
+    *,
+    source: str = "",
+) -> dict[str, float]:
+    """Update the process-local motor readback cache with finite positions."""
+    updated: dict[str, float] = {}
+    timestamp = time.monotonic()
+    for axis, value in axis_positions.items():
+        axis_name = str(axis)
+        position = float(value)
+        if not np.isfinite(position):
+            raise ValueError(f"cached motor position for {axis_name!r} must be finite")
+        updated[axis_name] = position
+
+    source_text = str(source)
+    with _MOTOR_POSITION_CACHE_LOCK:
+        for axis_name, position in updated.items():
+            _MOTOR_POSITION_CACHE[axis_name] = (position, timestamp, source_text)
+    return dict(updated)
+
+
+def cached_motor_positions(
+    motor_aliases: Iterable[str],
+    *,
+    max_age_s: float | None = None,
+) -> tuple[float, ...]:
+    """Return explicitly cached motor positions for aliases in order."""
+    aliases = tuple(str(alias) for alias in motor_aliases)
+    if max_age_s is not None:
+        max_age_s = float(max_age_s)
+        if not np.isfinite(max_age_s) or max_age_s < 0.0:
+            raise ValueError("max_age_s must be finite and non-negative")
+    now = time.monotonic()
+    positions: list[float] = []
+    with _MOTOR_POSITION_CACHE_LOCK:
+        for alias in aliases:
+            entry = _MOTOR_POSITION_CACHE.get(alias)
+            if entry is None:
+                raise RuntimeError(f"cached motor position is missing for {alias!r}")
+            position, timestamp, _source = entry
+            if max_age_s is not None and now - timestamp > max_age_s:
+                raise RuntimeError(f"cached motor position for {alias!r} is stale")
+            positions.append(float(position))
+    return tuple(positions)
+
+
+def refresh_motor_positions(motor_aliases: Iterable[str]) -> tuple[float, ...]:
+    """Live-read motor positions and update the process-local cache."""
+    return get_positions(motor_aliases)
+
+
+def _update_motor_position_cache_from_sequence(
+    motor_aliases: Iterable[str],
+    positions: Iterable[float],
+    *,
+    source: str,
+) -> None:
+    aliases = tuple(str(alias) for alias in motor_aliases)
+    values = tuple(float(position) for position in positions)
+    if len(aliases) != len(values):
+        raise ValueError("motor_aliases and positions must have the same length")
+    update_motor_position_cache(dict(zip(aliases, values, strict=True)), source=source)
+
+
+def _clear_motor_position_cache() -> None:
+    with _MOTOR_POSITION_CACHE_LOCK:
+        _MOTOR_POSITION_CACHE.clear()
 
 
 @contextlib.contextmanager
@@ -695,11 +768,21 @@ def get_positions(motor_aliases: Iterable[str]) -> tuple[float, ...]:
     logger.info("Reading motor positions: motor_aliases=%s", motor_aliases)
     if not constants.IS_DAQ_PC:
         positions = simulator.get_positions(motor_aliases)
+        _update_motor_position_cache_from_sequence(
+            motor_aliases,
+            positions,
+            source="simulator_get_positions",
+        )
         logger.info("Read simulated motor positions: positions=%s", positions)
         return positions
 
     with _bcs_server_context() as server:
         positions = _get_positions(server, motor_aliases)
+        _update_motor_position_cache_from_sequence(
+            motor_aliases,
+            positions,
+            source="bcs_get_positions",
+        )
         logger.info("Read motor positions: positions=%s", positions)
         return positions
 
@@ -759,6 +842,11 @@ def move_motors_and_wait(
             goals,
             max_retries=max_retries,
         )
+        _update_motor_position_cache_from_sequence(
+            motor_aliases,
+            positions,
+            source="simulator_move_motors_and_wait",
+        )
         logger.info("Simulated motor move returned: positions=%s", positions)
         return positions
 
@@ -773,6 +861,11 @@ def move_motors_and_wait(
             max_retries=max_retries,
             move_timeout_s=move_timeout_s,
             backlash_correction=backlash_correction,
+        )
+        _update_motor_position_cache_from_sequence(
+            motor_aliases,
+            positions,
+            source="bcs_move_motors_and_wait",
         )
         logger.info("Motor move returned: positions=%s", positions)
         return positions

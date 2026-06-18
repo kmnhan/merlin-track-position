@@ -1698,6 +1698,11 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                     window.calibration_panel.detect_shift_button.isEnabled()
                 )
                 self.assertFalse(window.show_reference_images_button.isEnabled())
+                self.assertFalse(window.initial_transform_preview_checkbox.isEnabled())
+                self.assertEqual(
+                    window.initial_transform_preview_checkbox.text(),
+                    "Transform",
+                )
                 self.assertFalse(window.reset_beam_target_button.isEnabled())
                 self.assertIs(
                     window.image_controls_layout.itemAt(1).widget(),
@@ -1705,6 +1710,10 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                 )
                 self.assertIs(
                     window.image_controls_layout.itemAt(2).widget(),
+                    window.initial_transform_preview_checkbox,
+                )
+                self.assertIs(
+                    window.image_controls_layout.itemAt(3).widget(),
                     window.reset_beam_target_button,
                 )
                 self.assertTrue(roi_handles_visible(window))
@@ -2311,6 +2320,195 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                     image_parent_rect(window, "cam1"),
                     (0.0, 0.0, float(image_height), float(image_width)),
                 )
+            finally:
+                window.close()
+
+    def test_transform_preview_warps_roi_only_and_reference_release_restores_it(self):
+        get_qapp()
+        roi = (2.0, 3.0, 4.0, 5.0)
+        metadata = _roi_metadata_from_geometries(
+            {
+                "cam0": roi,
+                "cam1": (0.0, 0.0, 6.0, 7.0),
+            }
+        )
+        image_width, image_height = main_window.CAMERA_IMAGE_SIZES["cam0"]
+        cam1_width, cam1_height = main_window.CAMERA_IMAGE_SIZES["cam1"]
+        calibration = build_sample_calibration_dataset(
+            image_shape_cam0=(image_height, image_width),
+            image_shape_cam1=(cam1_height, cam1_width),
+        ).assign_attrs({"calibration_path": "/tmp/calibration.h5"} | metadata)
+        current_cam0 = np.arange(image_height * image_width, dtype=np.float32).reshape(
+            image_height,
+            image_width,
+        )
+        refreshed_cam0 = current_cam0 + 1000.0
+        warp = np.asarray([[1.0, 0.0, 1.0], [0.0, 1.0, 0.0]], dtype=np.float32)
+
+        def fake_preview_warps(_calibration, readbacks, reference_points):
+            self.assertEqual(tuple(readbacks), ("x", "y", "z", "p", "t", "a"))
+            self.assertIn("cam0", reference_points)
+            return {
+                "cam0": warp,
+                "cam1": np.asarray(
+                    [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+                    dtype=np.float32,
+                ),
+            }, {"orientation_seed_applied": True}
+
+        with (
+            patched_main_window_runtime(),
+            patch(
+                "merlin_track_position.interface.main_window.refresh_motor_positions",
+                return_value=(1.0, 2.0, 3.0, 0.0, 0.0, 0.0),
+            ) as refresh,
+            patch(
+                "merlin_track_position.interface.main_window.orientation_ecc_initial_warps_for_readbacks",
+                side_effect=fake_preview_warps,
+            ),
+        ):
+            window = MainWindow()
+            try:
+                window._on_image_capture_ready("cam0", current_cam0)
+                window._on_new_calibration_ready(calibration)
+
+                window.initial_transform_preview_checkbox.setChecked(True)
+
+                refresh.assert_called_once_with(main_window.ORIENTATION_READBACK_AXES)
+                reference_crop = main_window.crop_image_to_roi(
+                    calibration["reference_cam0"].values,
+                    roi,
+                )
+                self.assertEqual(reference_crop.shape, (5, 4))
+                expected_crop = main_window.crop_image_to_roi(current_cam0, roi)
+                expected = cv2.warpAffine(
+                    expected_crop,
+                    warp,
+                    (reference_crop.shape[1], reference_crop.shape[0]),
+                    flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
+                    borderMode=cv2.BORDER_CONSTANT,
+                    borderValue=0,
+                )
+                np.testing.assert_allclose(window.image_items["cam0"].image, expected)
+                self.assertEqual(window.image_items["cam0"].image.shape, (5, 4))
+                assert_rect_close(self, image_parent_rect(window, "cam0"), roi)
+
+                window.show_reference_images_button.pressed.emit()
+                np.testing.assert_array_equal(
+                    window.image_items["cam0"].image,
+                    calibration["reference_cam0"].values,
+                )
+
+                window._on_image_capture_ready("cam0", refreshed_cam0)
+                np.testing.assert_array_equal(
+                    window.image_items["cam0"].image,
+                    calibration["reference_cam0"].values,
+                )
+                window.show_reference_images_button.released.emit()
+
+                expected_refreshed = cv2.warpAffine(
+                    main_window.crop_image_to_roi(refreshed_cam0, roi),
+                    warp,
+                    (reference_crop.shape[1], reference_crop.shape[0]),
+                    flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
+                    borderMode=cv2.BORDER_CONSTANT,
+                    borderValue=0,
+                )
+                np.testing.assert_allclose(
+                    window.image_items["cam0"].image,
+                    expected_refreshed,
+                )
+                self.assertEqual(refresh.call_count, 1)
+            finally:
+                window.close()
+
+    def test_transform_preview_failure_restores_normal_live_display(self):
+        get_qapp()
+        calibration = build_sample_calibration_dataset(
+            image_shape_cam0=(5, 4),
+            image_shape_cam1=(7, 6),
+        ).assign_attrs({"calibration_path": "/tmp/calibration.h5"})
+        current_cam0 = full_camera_image("cam0", 3.0)
+
+        with (
+            patched_main_window_runtime(),
+            patch(
+                "merlin_track_position.interface.main_window.refresh_motor_positions",
+                return_value=(1.0, 2.0, 3.0, 0.0, 0.0, 0.0),
+            ),
+            patch(
+                "merlin_track_position.interface.main_window.orientation_ecc_initial_warps_for_readbacks",
+                side_effect=ValueError("missing orientation"),
+            ),
+        ):
+            window = MainWindow()
+            try:
+                window._on_image_capture_ready("cam0", current_cam0)
+                window._on_new_calibration_ready(calibration)
+
+                window.initial_transform_preview_checkbox.setChecked(True)
+
+                self.assertFalse(window.initial_transform_preview_checkbox.isChecked())
+                np.testing.assert_array_equal(
+                    window.image_items["cam0"].image,
+                    current_cam0,
+                )
+                self.assertIn("missing orientation", window.statusBar().currentMessage())
+                image_width, image_height = main_window.CAMERA_IMAGE_SIZES["cam0"]
+                assert_rect_close(
+                    self,
+                    image_parent_rect(window, "cam0"),
+                    (0.0, 0.0, float(image_width), float(image_height)),
+                )
+            finally:
+                window.close()
+
+    def test_transform_preview_known_move_refreshes_from_motor_cache(self):
+        get_qapp()
+        calibration = build_sample_calibration_dataset(
+            image_shape_cam0=(5, 4),
+            image_shape_cam1=(7, 6),
+        ).assign_attrs({"calibration_path": "/tmp/calibration.h5"})
+        current_cam0 = full_camera_image("cam0", 3.0)
+        helper_readbacks = []
+
+        def fake_preview_warps(_calibration, readbacks, _reference_points):
+            helper_readbacks.append(dict(readbacks))
+            return {
+                camera: np.asarray(
+                    [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+                    dtype=np.float32,
+                )
+                for camera in main_window.CAMERA_IMAGE_SIZES
+            }, {"orientation_seed_applied": True}
+
+        with (
+            patched_main_window_runtime(),
+            patch(
+                "merlin_track_position.interface.main_window.refresh_motor_positions",
+                return_value=(1.0, 2.0, 3.0, 0.0, 0.0, 0.0),
+            ) as refresh,
+            patch(
+                "merlin_track_position.interface.main_window.cached_motor_positions",
+                return_value=(1.0, 2.0, 3.0, 5.0, 0.0, 0.0),
+            ) as cached,
+            patch(
+                "merlin_track_position.interface.main_window.orientation_ecc_initial_warps_for_readbacks",
+                side_effect=fake_preview_warps,
+            ),
+        ):
+            window = MainWindow()
+            try:
+                window._on_image_capture_ready("cam0", current_cam0)
+                window._on_new_calibration_ready(calibration)
+                window.initial_transform_preview_checkbox.setChecked(True)
+
+                window._on_stored_axis_move_ready("p", 5.0, 5.0)
+
+                refresh.assert_called_once_with(main_window.ORIENTATION_READBACK_AXES)
+                cached.assert_called_with(main_window.ORIENTATION_READBACK_AXES)
+                self.assertEqual(helper_readbacks[0]["p"], 0.0)
+                self.assertEqual(helper_readbacks[-1]["p"], 5.0)
             finally:
                 window.close()
 

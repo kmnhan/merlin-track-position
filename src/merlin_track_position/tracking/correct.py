@@ -71,6 +71,7 @@ ANALYZER_AXES = (
     "analyzer_longitudinal",
 )
 BEAM_OBSERVATION_AXES = ("beam_transverse", "analyzer_transverse", "vertical")
+ORIENTATION_READBACK_AXES = (*COMMAND_AXES, "p", "t", "a")
 _USE_DEFAULT = object()
 _CORRECTION_HISTORY_FORMAT = "merlin_track_position_correction_history"
 _CORRECTION_HISTORY_RESIZABLE_DIMS = ("move", "iteration")
@@ -2026,6 +2027,67 @@ def _polar_ecc_seed_shift_kwargs(
         readback_position_mm=readback_position_mm,
         seed_shift_px=seed_shift_px,
     )
+
+
+def orientation_ecc_initial_warps_for_readbacks(
+    calibration: xr.Dataset,
+    readbacks: Mapping[str, Any],
+    reference_points: Mapping[str, Any],
+) -> tuple[dict[str, np.ndarray], dict[str, float | bool | str]]:
+    """Return per-camera ROI-local affine ECC seeds for current motor readbacks."""
+    values = _orientation_readback_values(readbacks)
+    current_position = np.asarray(
+        [values[axis] for axis in COMMAND_AXES],
+        dtype=np.float64,
+    )
+    polar_attrs = _runtime_polar_attrs(calibration, values["p"])
+    runtime_jacobian = _rotate_px_per_readback_mm_for_polar_delta(
+        calibration["px_per_readback_mm"].values,
+        float(polar_attrs["polar_applied_delta_deg"]),
+    )
+    orientation_attrs = _runtime_orientation_attrs(
+        calibration,
+        polar_attrs=polar_attrs,
+        current_tilt_deg=values["t"],
+        current_azi_deg=values["a"],
+    )
+    seed_kwargs = _orientation_ecc_seed_shift_kwargs(
+        {
+            "use_ecc_refinement": True,
+            "ecc_motion_model": "affine",
+            "ecc_reference_point_px": {
+                camera: np.asarray(reference_points[camera], dtype=np.float64)
+                for camera in CAMERAS
+            },
+        },
+        calibration=calibration,
+        jacobian=runtime_jacobian,
+        polar_attrs=polar_attrs,
+        orientation_attrs=orientation_attrs,
+        readback_position_mm=current_position,
+    )
+    if "ecc_initial_warp" not in seed_kwargs:
+        warning = str(orientation_attrs.get("orientation_seed_warning", "")).strip()
+        raise ValueError(warning or "orientation ECC seed did not produce a warp")
+    warps = {
+        camera: np.asarray(seed_kwargs["ecc_initial_warp"][camera], dtype=np.float64)
+        for camera in CAMERAS
+    }
+    attrs = dict(polar_attrs)
+    attrs.update(orientation_attrs)
+    return warps, attrs
+
+
+def _orientation_readback_values(readbacks: Mapping[str, Any]) -> dict[str, float]:
+    values: dict[str, float] = {}
+    for axis in ORIENTATION_READBACK_AXES:
+        if axis not in readbacks:
+            raise ValueError(f"current motor readbacks missing {axis!r}")
+        value = float(readbacks[axis])
+        if not np.isfinite(value):
+            raise ValueError(f"current motor readback for {axis!r} must be finite")
+        values[axis] = value
+    return values
 
 
 def _orientation_ecc_seed_shift_kwargs(

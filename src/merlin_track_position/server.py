@@ -17,6 +17,7 @@ from merlin_track_position.constants import (
     MOTOR_SERVER_PORT,
     MOTOR_SERVER_USE_BCS_API_BACKEND,
 )
+from merlin_track_position.instruments.motors import update_motor_position_cache
 
 logger = logging.getLogger("merlin_track_position.server")
 _UNSET = object()
@@ -96,6 +97,10 @@ class TrackShiftMotorBackend:
             initial_positions_mm,
             required_axes=_XYZ_AXES,
         )
+        update_motor_position_cache(
+            self._positions_mm,
+            source="track_shift_initial_positions",
+        )
         self._send_move_request = send_move_request
         self._default_move_timeout_ms = int(default_move_timeout_ms)
         self._condition = threading.Condition()
@@ -116,6 +121,10 @@ class TrackShiftMotorBackend:
             if axis not in self._positions_mm:
                 raise RuntimeError(f"missing readback for correction axis {axis!r}")
             positions.append(self._positions_mm[axis])
+        update_motor_position_cache(
+            dict(zip((str(axis) for axis in motor_aliases), positions, strict=True)),
+            source="track_shift_get_positions",
+        )
         return tuple(positions)
 
     def move_motors_and_wait(
@@ -248,6 +257,10 @@ class TrackShiftMotorBackend:
 
             if positions:
                 self._positions_mm.update(positions)
+                update_motor_position_cache(
+                    dict(self._positions_mm),
+                    source="track_shift_move_result",
+                )
             self._pending_result = _MoveResult(
                 ok=ok,
                 positions_mm=dict(self._positions_mm),

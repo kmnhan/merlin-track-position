@@ -56,7 +56,11 @@ from merlin_track_position.instruments.basler import (
     validate_basler_config,
 )
 from merlin_track_position.instruments.framegrab import get_framegrabber_image
-from merlin_track_position.instruments.motors import move_motors_and_wait
+from merlin_track_position.instruments.motors import (
+    cached_motor_positions,
+    move_motors_and_wait,
+    refresh_motor_positions,
+)
 from merlin_track_position.instruments.simulated_hardware import simulator
 from merlin_track_position.interface.calibration_panel import (
     STORED_ORIENTATION_AXES,
@@ -80,8 +84,10 @@ from merlin_track_position.tracking.calibration_core import (
     validate_visual_calibration_dataset,
 )
 from merlin_track_position.tracking.correct import (
+    ORIENTATION_READBACK_AXES,
     flush_pending_correction_history_datasets,
     load_latest_correction_history_dataset,
+    orientation_ecc_initial_warps_for_readbacks,
 )
 from merlin_track_position.tracking.persistence import (
     pending_entry_count,
@@ -1067,6 +1073,12 @@ class _MainWindowGUI(QtWidgets.QMainWindow):
         self.show_reference_images_button.setObjectName("show_reference_images_button")
         self.show_reference_images_button.setEnabled(False)
         self.image_controls_layout.addWidget(self.show_reference_images_button)
+        self.initial_transform_preview_checkbox = QtWidgets.QCheckBox("Transform")
+        self.initial_transform_preview_checkbox.setObjectName(
+            "initial_transform_preview_checkbox"
+        )
+        self.initial_transform_preview_checkbox.setEnabled(False)
+        self.image_controls_layout.addWidget(self.initial_transform_preview_checkbox)
         self.reset_beam_target_button = QtWidgets.QPushButton("Reset target")
         self.reset_beam_target_button.setObjectName("reset_beam_target_button")
         self.reset_beam_target_button.setEnabled(False)
@@ -1215,6 +1227,8 @@ class MainWindow(_MainWindowGUI):
             str,
             tuple[np.ndarray, QtCore.QRectF],
         ] = {}
+        self._initial_transform_preview_warps: dict[str, np.ndarray] = {}
+        self._initial_transform_preview_attrs: dict[str, object] = {}
         self._image_capture_locks = {
             "cam0": threading.Lock(),
             "cam1": threading.Lock(),
@@ -1352,6 +1366,9 @@ class MainWindow(_MainWindowGUI):
         )
         self.show_reference_images_button.released.connect(
             self._on_show_reference_images_released
+        )
+        self.initial_transform_preview_checkbox.toggled.connect(
+            self._on_initial_transform_preview_toggled
         )
         self.reset_beam_target_button.clicked.connect(
             self._on_reset_beam_targets_clicked
@@ -1800,6 +1817,7 @@ class MainWindow(_MainWindowGUI):
             target_value,
             final_value,
         )
+        self._refresh_initial_transform_preview_after_known_state_change()
         logger.info(
             "Stored calibration axis move finished: axis_alias=%s, target=%g, final=%g",
             axis_alias,
@@ -1929,6 +1947,7 @@ class MainWindow(_MainWindowGUI):
     def _on_beam_target_position_change_finished(self, camera: str) -> None:
         self._on_beam_target_position_changed(camera)
         self._persist_beam_target_point(camera)
+        self._refresh_initial_transform_preview_after_known_state_change()
         self._end_beam_target_reference_preview()
 
     def _beam_target_point(self, camera: str) -> tuple[float, float]:
@@ -2048,6 +2067,7 @@ class MainWindow(_MainWindowGUI):
                 self._persist_beam_target_point(camera)
         self._set_shift_monitor_beam_targets()
         self._update_reset_beam_target_button()
+        self._refresh_initial_transform_preview_after_known_state_change()
 
     def _calibration_beam_target_point(
         self,
@@ -2116,6 +2136,7 @@ class MainWindow(_MainWindowGUI):
             self._persist_beam_target_point(camera)
         self._set_shift_monitor_beam_targets()
         self._update_reset_beam_target_button()
+        self._refresh_initial_transform_preview_after_known_state_change()
 
     def _capture_camera_image(self, camera: str) -> np.ndarray:
         with self._image_capture_locks[camera]:
@@ -2162,6 +2183,23 @@ class MainWindow(_MainWindowGUI):
     @QtCore.Slot(bool)
     def _on_image_auto_refresh_toggled(self, enabled: bool) -> None:
         self._set_image_refresh_enabled(enabled)
+
+    @QtCore.Slot(bool)
+    def _on_initial_transform_preview_toggled(self, enabled: bool) -> None:
+        if not enabled:
+            self._initial_transform_preview_warps = {}
+            self._initial_transform_preview_attrs = {}
+            if not self._reference_preview_active:
+                self._restore_latest_current_images()
+            return
+
+        try:
+            self._refresh_initial_transform_preview_warps(live_read=True)
+        except Exception as exc:
+            self._disable_initial_transform_preview(str(exc))
+            return
+        if not self._reference_preview_active:
+            self._restore_latest_current_images()
 
     @QtCore.Slot()
     def _on_show_reference_images_pressed(self) -> None:
@@ -2238,9 +2276,74 @@ class MainWindow(_MainWindowGUI):
         for thread in self._image_refresh_threads.values():
             thread.wait_until_idle()
 
+    def _set_initial_transform_preview_checked(self, checked: bool) -> None:
+        was_blocked = self.initial_transform_preview_checkbox.blockSignals(True)
+        try:
+            self.initial_transform_preview_checkbox.setChecked(bool(checked))
+        finally:
+            self.initial_transform_preview_checkbox.blockSignals(was_blocked)
+
+    def _refresh_initial_transform_preview_warps(self, *, live_read: bool) -> None:
+        if self._calibration is None:
+            raise RuntimeError("Transform preview requires a loaded calibration.")
+        positions = (
+            refresh_motor_positions(ORIENTATION_READBACK_AXES)
+            if live_read
+            else cached_motor_positions(ORIENTATION_READBACK_AXES)
+        )
+        readbacks = {
+            axis: float(position)
+            for axis, position in zip(
+                ORIENTATION_READBACK_AXES,
+                positions,
+                strict=True,
+            )
+        }
+        warps, attrs = orientation_ecc_initial_warps_for_readbacks(
+            self._calibration,
+            readbacks,
+            self._current_ecc_reference_points_px(),
+        )
+        self._initial_transform_preview_warps = warps
+        self._initial_transform_preview_attrs = dict(attrs)
+
+    def _refresh_initial_transform_preview_after_known_state_change(self) -> None:
+        if (
+            not self.initial_transform_preview_checkbox.isChecked()
+            or self._calibration is None
+        ):
+            return
+        try:
+            self._refresh_initial_transform_preview_warps(live_read=False)
+        except Exception as exc:
+            self._disable_initial_transform_preview(str(exc))
+            return
+        if not self._reference_preview_active:
+            self._restore_latest_current_images()
+
+    def _disable_initial_transform_preview(self, message: str) -> None:
+        self._set_initial_transform_preview_checked(False)
+        self._initial_transform_preview_warps = {}
+        self._initial_transform_preview_attrs = {}
+        if not self._reference_preview_active:
+            self._restore_latest_current_images()
+        text = f"Transform preview unavailable: {message}"
+        logger.warning(text)
+        self.statusBar().showMessage(text, 5000)
+
     def _set_reference_preview_button_enabled(self, enabled: bool) -> None:
         enabled = bool(enabled)
+        transform_was_checked = self.initial_transform_preview_checkbox.isChecked()
         self.show_reference_images_button.setEnabled(enabled)
+        self.initial_transform_preview_checkbox.setEnabled(
+            enabled and self._calibration is not None
+        )
+        if self._calibration is None:
+            self._set_initial_transform_preview_checked(False)
+            self._initial_transform_preview_warps = {}
+            self._initial_transform_preview_attrs = {}
+            if transform_was_checked and not self._reference_preview_active:
+                self._restore_latest_current_images()
         if not enabled and self._reference_preview_active:
             self._beam_target_reference_preview_active = False
             self._reference_preview_active = False
@@ -2267,7 +2370,70 @@ class MainWindow(_MainWindowGUI):
         self._reference_preview_restore_state = {}
 
     def _show_current_image(self, camera: str, image: object) -> None:
+        if self.initial_transform_preview_checkbox.isChecked():
+            try:
+                self._show_initial_transform_preview_image(camera, image)
+                return
+            except Exception as exc:
+                logger.info(
+                    "Initial transform preview disabled for %s: %s",
+                    camera,
+                    exc,
+                )
+                self._disable_initial_transform_preview(str(exc))
         self._set_camera_image(camera, image, self._full_image_rect(camera))
+
+    def _show_initial_transform_preview_image(
+        self,
+        camera: str,
+        image: object,
+    ) -> None:
+        if self._calibration is None:
+            raise RuntimeError("Transform preview requires a loaded calibration.")
+        if camera not in self._initial_transform_preview_warps:
+            raise RuntimeError(f"Transform preview seed is missing for {camera}.")
+        reference_name = f"reference_{camera}"
+        if reference_name not in self._calibration:
+            raise RuntimeError(f"Calibration is missing {reference_name}.")
+
+        reference_image = np.asarray(self._calibration[reference_name].values)
+        reference_display = np.asarray(
+            _display_image_for_camera(reference_image, self._camera_configs[camera])
+        )
+        current_display = np.asarray(
+            _display_image_for_camera(image, self._camera_configs[camera])
+        )
+        roi_geometries = _roi_geometries_from_calibration_metadata(self._calibration)
+        if roi_geometries is not None and camera in roi_geometries:
+            roi_geometry = roi_geometries[camera]
+            x0, y0, x1, y1 = roi_crop_bounds(
+                roi_geometry,
+                reference_display.shape[:2],
+            )
+            roi_shape = (y1 - y0, x1 - x0)
+            if reference_display.shape[:2] != roi_shape:
+                reference_display = crop_image_to_roi(reference_display, roi_geometry)
+            if current_display.shape[:2] != reference_display.shape[:2]:
+                current_display = crop_image_to_roi(current_display, roi_geometry)
+
+        height, width = reference_display.shape[:2]
+        warp = np.asarray(
+            self._initial_transform_preview_warps[camera],
+            dtype=np.float32,
+        )
+        warped = cv2.warpAffine(
+            np.ascontiguousarray(current_display),
+            warp,
+            (int(width), int(height)),
+            flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0,
+        )
+        self._set_camera_image(
+            camera,
+            warped,
+            self._reference_image_rect(camera, reference_display),
+        )
 
     def _show_reference_image(self, camera: str) -> None:
         if self._calibration is None:
@@ -2430,6 +2596,7 @@ class MainWindow(_MainWindowGUI):
         self._set_reference_preview_button_enabled(True)
         self._set_shift_monitor_calibration()
         self._update_reset_beam_target_button()
+        self._refresh_initial_transform_preview_after_known_state_change()
         self._schedule_persistence_flush_if_needed()
 
     @QtCore.Slot()
@@ -2731,6 +2898,7 @@ class MainWindow(_MainWindowGUI):
         self._set_reference_preview_button_enabled(True)
         self._set_shift_monitor_calibration()
         self._update_reset_beam_target_button()
+        self._refresh_initial_transform_preview_after_known_state_change()
         self._schedule_persistence_flush_if_needed()
 
     @QtCore.Slot(str)
@@ -2770,6 +2938,7 @@ class MainWindow(_MainWindowGUI):
             self._set_reference_preview_button_enabled(True)
             self._set_shift_monitor_calibration()
             self._update_reset_beam_target_button()
+            self._refresh_initial_transform_preview_after_known_state_change()
             self._flush_pending_persistence()
         except Exception as exc:
             self._restore_calibration_idle_state()

@@ -3,10 +3,20 @@ import threading
 import time
 import unittest
 
+from merlin_track_position.instruments.motors import (
+    _clear_motor_position_cache,
+    cached_motor_positions,
+)
 from merlin_track_position.server import MotorServer, TrackShiftMotorBackend
 
 
 class TrackShiftMotorBackendTests(unittest.TestCase):
+    def setUp(self):
+        _clear_motor_position_cache()
+
+    def tearDown(self):
+        _clear_motor_position_cache()
+
     def test_move_request_payload_and_result_update_positions(self):
         requests = []
         backend = None
@@ -53,6 +63,22 @@ class TrackShiftMotorBackendTests(unittest.TestCase):
         self.assertEqual(requests[0]["timeout_ms"], 60_000)
         self.assertEqual(requests[0]["max_retries"], 2)
         self.assertEqual(backend.get_positions(("x", "y", "z")), (0.5, 2.0, -1.25))
+        self.assertEqual(
+            cached_motor_positions(("x", "y", "z")),
+            (0.5, 2.0, -1.25),
+        )
+
+    def test_initial_positions_update_shared_motor_cache(self):
+        TrackShiftMotorBackend(
+            session_id="session-1",
+            initial_positions_mm={"x": 0.1, "y": 2.0, "z": -0.3},
+            send_move_request=lambda _payload: None,
+        )
+
+        self.assertEqual(
+            cached_motor_positions(("x", "y", "z")),
+            (0.1, 2.0, -0.3),
+        )
 
     def test_failed_move_result_raises(self):
         backend = None

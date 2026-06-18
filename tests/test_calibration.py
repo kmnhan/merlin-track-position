@@ -514,6 +514,67 @@ class ShiftDetectionTests(unittest.TestCase):
 
         np.testing.assert_allclose(kwargs["ecc_initial_warp"], warps[1])
 
+    def test_orientation_preview_helper_matches_registration_seed_warps(self):
+        jacobian = px_per_readback_mm()
+        calibration = calibration_dataset(jacobian).assign_attrs(
+            polar=0.0,
+            tilt=0.0,
+            azi=10.0,
+        )
+        reference_points = {
+            "cam0": np.asarray([2.0, 1.0], dtype=float),
+            "cam1": np.asarray([3.0, 4.0], dtype=float),
+        }
+        readbacks = {
+            "x": 0.01,
+            "y": -0.02,
+            "z": 0.03,
+            "p": 4.0,
+            "t": 2.0,
+            "a": 15.0,
+        }
+        polar_attrs = correct_module._runtime_polar_attrs(calibration, readbacks["p"])
+        runtime_jacobian = correct_module._rotate_px_per_readback_mm_for_polar_delta(
+            calibration["px_per_readback_mm"].values,
+            float(polar_attrs["polar_applied_delta_deg"]),
+        )
+        orientation_attrs = correct_module._runtime_orientation_attrs(
+            calibration,
+            polar_attrs=polar_attrs,
+            current_tilt_deg=readbacks["t"],
+            current_azi_deg=readbacks["a"],
+        )
+        seed_kwargs = correct_module._orientation_ecc_seed_shift_kwargs(
+            {
+                "use_ecc_refinement": True,
+                "ecc_motion_model": "affine",
+                "ecc_reference_point_px": reference_points,
+            },
+            calibration=calibration,
+            jacobian=runtime_jacobian,
+            polar_attrs=polar_attrs,
+            orientation_attrs=orientation_attrs,
+            readback_position_mm=np.asarray(
+                [readbacks[axis] for axis in COMMAND_AXES],
+                dtype=float,
+            ),
+        )
+
+        preview_warps, preview_attrs = (
+            correct_module.orientation_ecc_initial_warps_for_readbacks(
+                calibration,
+                readbacks,
+                reference_points,
+            )
+        )
+
+        self.assertTrue(preview_attrs["orientation_seed_applied"])
+        for camera in CAMERAS:
+            np.testing.assert_allclose(
+                preview_warps[camera],
+                seed_kwargs["ecc_initial_warp"][camera],
+            )
+
     @unittest.skipUnless(
         AZIMUTH_47P5_CALIBRATION_PATH.exists()
         and AZIMUTH_75P8_CALIBRATION_PATH.exists(),
