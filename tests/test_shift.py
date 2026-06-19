@@ -6,6 +6,7 @@ import cv2
 import numpy as np
 from scipy import ndimage
 
+import merlin_track_position.tracking.shift as shift_module
 from merlin_track_position.tracking.shift import estimate_shift, normalize_intensity
 
 
@@ -589,6 +590,14 @@ class ShiftTests(unittest.TestCase):
             borderMode=cv2.BORDER_CONSTANT,
             borderValue=0.0,
         )
+        expected_phase_window = cv2.warpAffine(
+            np.ones(reference_norm.shape, dtype=np.float32),
+            initial_warp.astype(np.float32),
+            (width, height),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0.0,
+        )
 
         def echo_initial_warp(*args):
             return 1.0, args[2].copy()
@@ -627,8 +636,51 @@ class ShiftTests(unittest.TestCase):
             reference_norm,
             atol=1e-6,
         )
+        np.testing.assert_allclose(
+            estimate_translation.call_args_list[1].kwargs["phase_window"],
+            expected_phase_window,
+            atol=1e-6,
+        )
         np.testing.assert_allclose(find_ecc.call_args.args[2], expected_warp)
         np.testing.assert_allclose(result["shift_px"].values, expected_shift, atol=1e-5)
+
+    def test_phase_translation_applies_phase_window_to_both_images(self):
+        reference = np.arange(25, dtype=np.float32).reshape(5, 5)
+        current = reference + 100.0
+        phase_window = np.zeros_like(reference, dtype=np.float32)
+        phase_window[1:4, 2:5] = 0.5
+
+        with patch(
+            "merlin_track_position.tracking.shift.cv2.phaseCorrelate",
+            side_effect=(
+                ((2.0, -1.0), 0.95),
+                ((-2.0, 1.0), 0.95),
+            ),
+        ) as phase_correlate:
+            result = shift_module._estimate_translation(
+                reference,
+                current,
+                use_window=False,
+                phase_window=phase_window,
+            )
+
+        np.testing.assert_allclose(result, [2.0, -1.0])
+        np.testing.assert_allclose(
+            phase_correlate.call_args_list[0].args[0],
+            reference * phase_window,
+        )
+        np.testing.assert_allclose(
+            phase_correlate.call_args_list[0].args[1],
+            current * phase_window,
+        )
+        np.testing.assert_allclose(
+            phase_correlate.call_args_list[1].args[0],
+            current * phase_window,
+        )
+        np.testing.assert_allclose(
+            phase_correlate.call_args_list[1].args[1],
+            reference * phase_window,
+        )
 
     def test_ecc_refinement_converts_affine_initial_warp_for_homography(self):
         reference = corpus_grayscale_image()

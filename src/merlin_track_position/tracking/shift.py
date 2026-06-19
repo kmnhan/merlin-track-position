@@ -77,9 +77,11 @@ def estimate_shift(
     used. ``ecc_initial_shift_px`` overrides the phase-correlation translation
     used to initialize ECC. When ``ecc_initial_warp`` is supplied, the reference
     image is prewarped with that model before phase correlation estimates the
-    residual translation, and ECC starts from the combined model+translation
-    warp. Pass ``ecc_fallback_to_phase_shift=False`` when the supplied ECC seed
-    is trusted and a failed refinement should invalidate the estimate.
+    residual translation; invalid pixels exposed by the prewarp are masked out
+    of both phase-correlation inputs, and ECC starts from the combined
+    model+translation warp. Pass ``ecc_fallback_to_phase_shift=False`` when the
+    supplied ECC seed is trusted and a failed refinement should invalidate the
+    estimate.
     Pass ``ecc_use_window=True`` to apply a Hanning taper to ECC inputs.
     ``ecc_gauss_filter_size`` controls OpenCV ECC's Gaussian prefilter; it must
     be a positive odd integer.
@@ -163,20 +165,28 @@ def estimate_shift(
         and explicit_ecc_initial_warp is not None
         and np.isfinite(phase_shift_px).all()
     ):
-        model_reference_norm = _prewarp_reference_for_phase_seed(
-            reference_norm,
-            explicit_ecc_initial_warp,
-        )
-        ecc_phase_shift_px = _estimate_translation(
-            model_reference_norm,
-            current_norm,
-            use_window=use_window,
-        )
-        if not np.isfinite(ecc_phase_shift_px).all():
+        try:
+            model_reference_norm, model_phase_window = _prewarp_reference_for_phase_seed(
+                reference_norm,
+                explicit_ecc_initial_warp,
+            )
+            ecc_phase_shift_px = _estimate_translation(
+                model_reference_norm,
+                current_norm,
+                use_window=use_window,
+                phase_window=model_phase_window,
+            )
+        except Exception as exc:
             ecc_phase_shift_px = np.array([np.nan, np.nan], dtype=np.float64)
             diagnostic_warnings.append(
-                "model-prewarped ECC phase seed is not finite; shift estimate is unreliable"
+                f"model-prewarped ECC phase seed failed: {exc}"
             )
+        else:
+            if not np.isfinite(ecc_phase_shift_px).all():
+                ecc_phase_shift_px = np.array([np.nan, np.nan], dtype=np.float64)
+                diagnostic_warnings.append(
+                    "model-prewarped ECC phase seed is not finite; shift estimate is unreliable"
+                )
 
     if use_ecc_refinement and (
         explicit_ecc_initial_warp is not None
@@ -188,7 +198,6 @@ def estimate_shift(
             if explicit_ecc_initial_shift is not None
             else ecc_phase_shift_px
         )
-        shift_px = ecc_initial_shift.copy()
         try:
             shift_px = _estimate_ecc_shift(
                 reference_image,
@@ -229,6 +238,7 @@ def _estimate_translation(
     current_norm: np.ndarray,
     *,
     use_window: bool,
+    phase_window: np.ndarray | None = None,
 ) -> np.ndarray:
     if reference_norm.shape != current_norm.shape:
         raise ValueError("images must have identical shapes")
@@ -239,6 +249,7 @@ def _estimate_translation(
         reference_norm,
         current_norm,
         use_window=use_window,
+        phase_window=phase_window,
     )
 
     reference_phase = np.ascontiguousarray(reference_work, dtype=np.float32)
@@ -263,27 +274,49 @@ def _estimate_translation(
 def _prewarp_reference_for_phase_seed(
     reference_norm: np.ndarray,
     initial_warp: np.ndarray,
-) -> np.ndarray:
+) -> tuple[np.ndarray, np.ndarray]:
     height, width = reference_norm.shape
+    source = np.asarray(reference_norm, dtype=np.float32)
+    source_valid = np.ones((height, width), dtype=np.float32)
     if initial_warp.shape == (2, 3):
-        return cv2.warpAffine(
-            np.asarray(reference_norm, dtype=np.float32),
-            np.asarray(initial_warp, dtype=np.float32),
+        warp = np.asarray(initial_warp, dtype=np.float32)
+        warped_reference = cv2.warpAffine(
+            source,
+            warp,
             (width, height),
             flags=cv2.INTER_LINEAR,
             borderMode=cv2.BORDER_CONSTANT,
             borderValue=0.0,
         )
-    if initial_warp.shape == (3, 3):
-        return cv2.warpPerspective(
-            np.asarray(reference_norm, dtype=np.float32),
-            np.asarray(initial_warp, dtype=np.float32),
+        phase_window = cv2.warpAffine(
+            source_valid,
+            warp,
             (width, height),
             flags=cv2.INTER_LINEAR,
             borderMode=cv2.BORDER_CONSTANT,
             borderValue=0.0,
         )
-    raise ValueError("ecc_initial_warp must have shape (2, 3) or (3, 3)")
+    elif initial_warp.shape == (3, 3):
+        warp = np.asarray(initial_warp, dtype=np.float32)
+        warped_reference = cv2.warpPerspective(
+            source,
+            warp,
+            (width, height),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0.0,
+        )
+        phase_window = cv2.warpPerspective(
+            source_valid,
+            warp,
+            (width, height),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0.0,
+        )
+    else:
+        raise ValueError("ecc_initial_warp must have shape (2, 3) or (3, 3)")
+    return warped_reference, np.clip(phase_window, 0.0, 1.0)
 
 
 def _as_registration_image(name: str, image: Any) -> np.ndarray:
@@ -504,21 +537,42 @@ def _registration_work_images(
     current_image: np.ndarray,
     *,
     use_window: bool,
+    phase_window: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     reference_work = reference_image
     current_work = current_image
+    window: np.ndarray | None = None
+    if phase_window is not None:
+        window = _validate_phase_window(phase_window, reference_work.shape[:2])
     if use_window:
         reference_work = np.asarray(reference_work, dtype=np.float32)
         current_work = np.asarray(current_work, dtype=np.float32)
-        window = np.outer(
+        hanning_window = np.outer(
             np.hanning(reference_work.shape[0]).astype(np.float32),
             np.hanning(reference_work.shape[1]).astype(np.float32),
         )
+        window = hanning_window if window is None else window * hanning_window
+    if window is not None:
+        reference_work = np.asarray(reference_work, dtype=np.float32)
+        current_work = np.asarray(current_work, dtype=np.float32)
+        work_window = window
         if reference_work.ndim == 3:
-            window = window[..., np.newaxis]
-        reference_work = reference_work * window
-        current_work = current_work * window
+            work_window = work_window[..., np.newaxis]
+        reference_work = reference_work * work_window
+        current_work = current_work * work_window
     return reference_work, current_work
+
+
+def _validate_phase_window(window: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
+    phase_window = np.asarray(window, dtype=np.float32)
+    if phase_window.shape != shape:
+        raise ValueError("phase window must match image shape")
+    if not np.isfinite(phase_window).all():
+        raise ValueError("phase window must contain only finite values")
+    phase_window = np.clip(phase_window, 0.0, 1.0)
+    if float(np.sum(phase_window > 1.0e-3)) < 9.0:
+        raise ValueError("phase window has too few valid pixels")
+    return phase_window
 
 
 def _tile_consistency(
