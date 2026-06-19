@@ -75,10 +75,11 @@ def estimate_shift(
     an OpenCV ECC affine or homography registration and return the displacement
     at ``ecc_reference_point_px``. If no point is supplied, the image center is
     used. ``ecc_initial_shift_px`` overrides the phase-correlation translation
-    used to initialize ECC. ``ecc_initial_warp`` supplies the non-translation
-    affine or homography seed that is composed with that translation. Pass
-    ``ecc_fallback_to_phase_shift=False`` when the supplied ECC seed is trusted
-    and a failed refinement should invalidate the estimate.
+    used to initialize ECC. When ``ecc_initial_warp`` is supplied, the reference
+    image is prewarped with that model before phase correlation estimates the
+    residual translation, and ECC starts from the combined model+translation
+    warp. Pass ``ecc_fallback_to_phase_shift=False`` when the supplied ECC seed
+    is trusted and a failed refinement should invalidate the estimate.
     Pass ``ecc_use_window=True`` to apply a Hanning taper to ECC inputs.
     ``ecc_gauss_filter_size`` controls OpenCV ECC's Gaussian prefilter; it must
     be a positive odd integer.
@@ -118,26 +119,6 @@ def estimate_shift(
         clip_percentiles=clip_percentiles,
     )
 
-    if dynamic_range <= 1e-12 or standard_deviation <= 1e-12:
-        phase_shift_px = np.array([np.nan, np.nan], dtype=np.float64)
-        diagnostic_warnings.append(
-            "registration skipped because reference image has little or no intensity contrast"
-        )
-    else:
-        phase_shift_px = _estimate_translation(
-            reference_norm,
-            current_norm,
-            use_window=use_window,
-        )
-
-    shift_px = phase_shift_px.copy()
-    if not np.isfinite(phase_shift_px).all():
-        phase_shift_px = np.array([np.nan, np.nan], dtype=np.float64)
-        shift_px = np.array([np.nan, np.nan], dtype=np.float64)
-        diagnostic_warnings.append(
-            "registration shift is not finite; shift estimate is unreliable"
-        )
-
     explicit_ecc_initial_shift = None
     explicit_ecc_initial_warp = None
     if use_ecc_refinement and ecc_initial_shift_px is not None:
@@ -153,6 +134,50 @@ def estimate_shift(
         ecc_gauss_filter_size = _validate_ecc_gauss_filter_size(
             ecc_gauss_filter_size
         )
+
+    if dynamic_range <= 1e-12 or standard_deviation <= 1e-12:
+        phase_shift_px = np.array([np.nan, np.nan], dtype=np.float64)
+        diagnostic_warnings.append(
+            "registration skipped because reference image has little or no intensity contrast"
+        )
+    else:
+        phase_shift_px = _estimate_translation(
+            reference_norm,
+            current_norm,
+            use_window=use_window,
+        )
+
+    shift_px = phase_shift_px.copy()
+    ecc_phase_shift_px = phase_shift_px.copy()
+    if not np.isfinite(phase_shift_px).all():
+        phase_shift_px = np.array([np.nan, np.nan], dtype=np.float64)
+        shift_px = np.array([np.nan, np.nan], dtype=np.float64)
+        ecc_phase_shift_px = np.array([np.nan, np.nan], dtype=np.float64)
+        diagnostic_warnings.append(
+            "registration shift is not finite; shift estimate is unreliable"
+        )
+
+    if (
+        use_ecc_refinement
+        and explicit_ecc_initial_shift is None
+        and explicit_ecc_initial_warp is not None
+        and np.isfinite(phase_shift_px).all()
+    ):
+        model_reference_norm = _prewarp_reference_for_phase_seed(
+            reference_norm,
+            explicit_ecc_initial_warp,
+        )
+        ecc_phase_shift_px = _estimate_translation(
+            model_reference_norm,
+            current_norm,
+            use_window=use_window,
+        )
+        if not np.isfinite(ecc_phase_shift_px).all():
+            ecc_phase_shift_px = np.array([np.nan, np.nan], dtype=np.float64)
+            diagnostic_warnings.append(
+                "model-prewarped ECC phase seed is not finite; shift estimate is unreliable"
+            )
+
     if use_ecc_refinement and (
         explicit_ecc_initial_warp is not None
         or explicit_ecc_initial_shift is not None
@@ -161,8 +186,9 @@ def estimate_shift(
         ecc_initial_shift = (
             explicit_ecc_initial_shift
             if explicit_ecc_initial_shift is not None
-            else phase_shift_px
+            else ecc_phase_shift_px
         )
+        shift_px = ecc_initial_shift.copy()
         try:
             shift_px = _estimate_ecc_shift(
                 reference_image,
@@ -232,6 +258,32 @@ def _estimate_translation(
     if shift_px.shape != (2,):
         raise ValueError("phaseCorrelate returned an unexpected shift shape")
     return shift_px
+
+
+def _prewarp_reference_for_phase_seed(
+    reference_norm: np.ndarray,
+    initial_warp: np.ndarray,
+) -> np.ndarray:
+    height, width = reference_norm.shape
+    if initial_warp.shape == (2, 3):
+        return cv2.warpAffine(
+            np.asarray(reference_norm, dtype=np.float32),
+            np.asarray(initial_warp, dtype=np.float32),
+            (width, height),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0.0,
+        )
+    if initial_warp.shape == (3, 3):
+        return cv2.warpPerspective(
+            np.asarray(reference_norm, dtype=np.float32),
+            np.asarray(initial_warp, dtype=np.float32),
+            (width, height),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0.0,
+        )
+    raise ValueError("ecc_initial_warp must have shape (2, 3) or (3, 3)")
 
 
 def _as_registration_image(name: str, image: Any) -> np.ndarray:

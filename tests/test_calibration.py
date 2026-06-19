@@ -548,7 +548,7 @@ class ShiftDetectionTests(unittest.TestCase):
         and AZIMUTH_75P8_CALIBRATION_PATH.exists(),
         "large-azimuth calibration benchmark files are not available",
     )
-    def test_orientation_ecc_seed_large_azimuth_translation_comes_from_phase(self):
+    def test_orientation_ecc_seed_large_azimuth_translation_comes_from_model_phase(self):
         calibrations = {
             "azim47p5": load_calibration_dataset(
                 AZIMUTH_47P5_CALIBRATION_PATH
@@ -618,8 +618,7 @@ class ShiftDetectionTests(unittest.TestCase):
                         )
 
                     seeded_shift = np.asarray(seeded["shift_px"].values, dtype=float)
-                    phase_shift = np.asarray(phase["shift_px"].values, dtype=float)
-                    np.testing.assert_allclose(seeded_shift, phase_shift, atol=1e-5)
+                    raw_phase_shift = np.asarray(phase["shift_px"].values, dtype=float)
                     self.assertEqual(len(captured_initial_warps), 1)
                     point = np.asarray(
                         per_camera_seed_kwargs["ecc_reference_point_px"],
@@ -629,8 +628,12 @@ class ShiftDetectionTests(unittest.TestCase):
                     initial_displacement = initial_warp @ np.r_[point, 1.0] - point
                     np.testing.assert_allclose(
                         initial_displacement,
-                        phase_shift,
+                        seeded_shift,
                         atol=1e-5,
+                    )
+                    self.assertGreater(
+                        float(np.linalg.norm(seeded_shift - raw_phase_shift)),
+                        1.0,
                     )
         finally:
             for calibration in calibrations.values():

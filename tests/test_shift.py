@@ -558,10 +558,76 @@ class ShiftTests(unittest.TestCase):
                 ecc_motion_model="affine",
                 ecc_reference_point_px=point,
                 ecc_initial_warp=initial_warp,
+                ecc_initial_shift_px=(0.0, 0.0),
             )
 
         self.assertEqual(find_ecc.call_args.args[3], cv2.MOTION_AFFINE)
         np.testing.assert_allclose(find_ecc.call_args.args[2], initial_warp)
+        np.testing.assert_allclose(result["shift_px"].values, expected_shift, atol=1e-5)
+
+    def test_ecc_refinement_combines_phase_translation_with_initial_affine_warp(self):
+        reference = corpus_grayscale_image()
+        point = np.asarray([61.25, 70.5], dtype=np.float64)
+        phase_shift = np.asarray([4.5, -3.25], dtype=np.float64)
+        initial_warp = np.asarray(
+            [
+                [0.95, -0.12, 8.0],
+                [0.08, 1.02, -6.0],
+            ],
+            dtype=np.float64,
+        )
+        expected_warp = initial_warp.copy()
+        expected_warp[:, 2] += phase_shift
+        expected_shift = expected_warp @ np.r_[point, 1.0] - point
+        reference_norm = normalize_intensity(reference)
+        height, width = reference_norm.shape
+        expected_phase_reference = cv2.warpAffine(
+            reference_norm,
+            initial_warp.astype(np.float32),
+            (width, height),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0.0,
+        )
+
+        def echo_initial_warp(*args):
+            return 1.0, args[2].copy()
+
+        with (
+            patch(
+                "merlin_track_position.tracking.shift._estimate_translation",
+                side_effect=(
+                    np.asarray([99.0, 99.0], dtype=np.float64),
+                    phase_shift,
+                ),
+            ) as estimate_translation,
+            patch(
+                "merlin_track_position.tracking.shift.cv2.findTransformECC",
+                side_effect=echo_initial_warp,
+            ) as find_ecc,
+        ):
+            result = estimate_shift(
+                reference,
+                reference.copy(),
+                check_tiles=False,
+                use_ecc_refinement=True,
+                ecc_motion_model="affine",
+                ecc_reference_point_px=point,
+                ecc_initial_warp=initial_warp,
+            )
+
+        self.assertEqual(estimate_translation.call_count, 2)
+        np.testing.assert_allclose(
+            estimate_translation.call_args_list[1].args[0],
+            expected_phase_reference,
+            atol=1e-6,
+        )
+        np.testing.assert_allclose(
+            estimate_translation.call_args_list[1].args[1],
+            reference_norm,
+            atol=1e-6,
+        )
+        np.testing.assert_allclose(find_ecc.call_args.args[2], expected_warp)
         np.testing.assert_allclose(result["shift_px"].values, expected_shift, atol=1e-5)
 
     def test_ecc_refinement_converts_affine_initial_warp_for_homography(self):
@@ -577,10 +643,16 @@ class ShiftTests(unittest.TestCase):
         def echo_initial_warp(*args):
             return 1.0, args[2].copy()
 
-        with patch(
-            "merlin_track_position.tracking.shift.cv2.findTransformECC",
-            side_effect=echo_initial_warp,
-        ) as find_ecc:
+        with (
+            patch(
+                "merlin_track_position.tracking.shift._estimate_translation",
+                return_value=np.zeros(2, dtype=np.float64),
+            ),
+            patch(
+                "merlin_track_position.tracking.shift.cv2.findTransformECC",
+                side_effect=echo_initial_warp,
+            ) as find_ecc,
+        ):
             estimate_shift(
                 reference,
                 reference.copy(),
