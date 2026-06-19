@@ -492,6 +492,45 @@ class ShiftTests(unittest.TestCase):
         np.testing.assert_allclose(initial_warp[:, 2], initial_shift)
         np.testing.assert_allclose(result["shift_px"].values, initial_shift)
 
+    def test_ecc_refinement_passes_gauss_filter_size_to_opencv(self):
+        reference = corpus_grayscale_image()
+        initial_shift = np.asarray([-6.5, 3.75], dtype=np.float64)
+
+        def echo_initial_warp(*args):
+            return 1.0, args[2].copy()
+
+        with patch(
+            "merlin_track_position.tracking.shift.cv2.findTransformECC",
+            side_effect=echo_initial_warp,
+        ) as find_ecc:
+            result = estimate_shift(
+                reference,
+                reference.copy(),
+                check_tiles=False,
+                use_ecc_refinement=True,
+                ecc_motion_model="affine",
+                ecc_initial_shift_px=initial_shift,
+                ecc_gauss_filter_size=3,
+            )
+
+        self.assertEqual(find_ecc.call_args.args[6], 3)
+        np.testing.assert_allclose(result["shift_px"].values, initial_shift)
+
+    def test_ecc_refinement_rejects_even_gauss_filter_size(self):
+        reference = corpus_grayscale_image()
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "ecc_gauss_filter_size must be a positive odd integer",
+        ):
+            estimate_shift(
+                reference,
+                reference.copy(),
+                check_tiles=False,
+                use_ecc_refinement=True,
+                ecc_gauss_filter_size=4,
+            )
+
     def test_ecc_refinement_uses_explicit_initial_affine_warp(self):
         reference = corpus_grayscale_image()
         point = np.asarray([61.25, 70.5], dtype=np.float64)

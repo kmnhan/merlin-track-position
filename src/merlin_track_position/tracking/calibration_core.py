@@ -1724,7 +1724,12 @@ def _shift_kwargs_for_camera(
     camera: str,
 ) -> dict[str, Any]:
     kwargs = dict(shift_kwargs)
-    for name in ("ecc_reference_point_px", "ecc_initial_shift_px", "ecc_initial_warp"):
+    for name in (
+        "ecc_reference_point_px",
+        "ecc_initial_shift_px",
+        "ecc_initial_warp",
+        "ecc_gauss_filter_size",
+    ):
         if name not in kwargs or kwargs[name] is None:
             continue
         value = kwargs[name]

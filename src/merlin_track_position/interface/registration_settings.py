@@ -21,8 +21,11 @@ __all__ = (
     "REGISTRATION_USE_ECC_REFINEMENT_SETTINGS_KEY",
     "REGISTRATION_ECC_USE_WINDOW_SETTINGS_KEY",
     "REGISTRATION_ECC_MOTION_MODEL_SETTINGS_KEY",
+    "REGISTRATION_ECC_GAUSS_FILTER_SIZE_CAM0_SETTINGS_KEY",
+    "REGISTRATION_ECC_GAUSS_FILTER_SIZE_CAM1_SETTINGS_KEY",
     "normalized_registration_config",
     "registration_config_from_settings",
+    "registration_config_to_camera_shift_kwargs",
     "registration_config_to_measurement_kwargs",
     "registration_config_to_shift_kwargs",
     "save_registration_config",
@@ -38,8 +41,15 @@ CAPTURE_AGGREGATIONS = (
 ECC_MOTION_MODEL_AFFINE = "affine"
 ECC_MOTION_MODEL_HOMOGRAPHY = "homography"
 ECC_MOTION_MODELS = (ECC_MOTION_MODEL_AFFINE, ECC_MOTION_MODEL_HOMOGRAPHY)
+CAMERAS = ("cam0", "cam1")
 REGISTRATION_CAPTURE_COUNT_MIN = 1
 REGISTRATION_CAPTURE_COUNT_MAX = 100
+REGISTRATION_ECC_GAUSS_FILTER_SIZE_MIN = 1
+REGISTRATION_ECC_GAUSS_FILTER_SIZE_MAX = 31
+DEFAULT_ECC_GAUSS_FILTER_SIZE_BY_CAMERA: dict[str, int] = {
+    "cam0": 1,
+    "cam1": 5,
+}
 
 REGISTRATION_CLIP_ENABLED_SETTINGS_KEY = "registration/clip_enabled"
 REGISTRATION_CLIP_LOW_SETTINGS_KEY = "registration/clip_low"
@@ -48,6 +58,12 @@ REGISTRATION_USE_WINDOW_SETTINGS_KEY = "registration/use_window"
 REGISTRATION_USE_ECC_REFINEMENT_SETTINGS_KEY = "registration/use_ecc_refinement"
 REGISTRATION_ECC_USE_WINDOW_SETTINGS_KEY = "registration/ecc_use_window"
 REGISTRATION_ECC_MOTION_MODEL_SETTINGS_KEY = "registration/ecc_motion_model"
+REGISTRATION_ECC_GAUSS_FILTER_SIZE_CAM0_SETTINGS_KEY = (
+    "registration/ecc_gauss_filter_size_cam0"
+)
+REGISTRATION_ECC_GAUSS_FILTER_SIZE_CAM1_SETTINGS_KEY = (
+    "registration/ecc_gauss_filter_size_cam1"
+)
 REGISTRATION_CAPTURE_COUNT_SETTINGS_KEY = "registration/capture_count"
 REGISTRATION_CAPTURE_AGGREGATION_SETTINGS_KEY = "registration/capture_aggregation"
 
@@ -59,6 +75,7 @@ DEFAULT_REGISTRATION_CONFIG: dict[str, object] = {
     "use_ecc_refinement": False,
     "ecc_use_window": False,
     "ecc_motion_model": ECC_MOTION_MODEL_HOMOGRAPHY,
+    "ecc_gauss_filter_size": DEFAULT_ECC_GAUSS_FILTER_SIZE_BY_CAMERA.copy(),
     "capture_count": constants.DEFAULT_CORRECTION_CAPTURE_COUNT,
     "capture_aggregation": CAPTURE_AGGREGATION_MEDIAN_SHIFTS,
 }
@@ -109,6 +126,9 @@ def normalized_registration_config(
             bool(DEFAULT_REGISTRATION_CONFIG["ecc_use_window"]),
         ),
         "ecc_motion_model": _ecc_motion_model_value(values["ecc_motion_model"]),
+        "ecc_gauss_filter_size": _ecc_gauss_filter_size_by_camera(
+            values["ecc_gauss_filter_size"]
+        ),
         "capture_count": int(capture_count),
         "capture_aggregation": _capture_aggregation_value(
             values["capture_aggregation"]
@@ -147,6 +167,16 @@ def registration_config_from_settings(settings: Any) -> dict[str, object]:
                 REGISTRATION_ECC_MOTION_MODEL_SETTINGS_KEY,
                 DEFAULT_REGISTRATION_CONFIG["ecc_motion_model"],
             ),
+            "ecc_gauss_filter_size": {
+                "cam0": settings.value(
+                    REGISTRATION_ECC_GAUSS_FILTER_SIZE_CAM0_SETTINGS_KEY,
+                    DEFAULT_ECC_GAUSS_FILTER_SIZE_BY_CAMERA["cam0"],
+                ),
+                "cam1": settings.value(
+                    REGISTRATION_ECC_GAUSS_FILTER_SIZE_CAM1_SETTINGS_KEY,
+                    DEFAULT_ECC_GAUSS_FILTER_SIZE_BY_CAMERA["cam1"],
+                ),
+            },
             "capture_count": settings.value(
                 REGISTRATION_CAPTURE_COUNT_SETTINGS_KEY,
                 DEFAULT_REGISTRATION_CONFIG["capture_count"],
@@ -182,6 +212,16 @@ def save_registration_config(
     settings.setValue(
         REGISTRATION_ECC_MOTION_MODEL_SETTINGS_KEY,
         normalized["ecc_motion_model"],
+    )
+    gauss_filter_size = normalized["ecc_gauss_filter_size"]
+    assert isinstance(gauss_filter_size, dict)
+    settings.setValue(
+        REGISTRATION_ECC_GAUSS_FILTER_SIZE_CAM0_SETTINGS_KEY,
+        gauss_filter_size["cam0"],
+    )
+    settings.setValue(
+        REGISTRATION_ECC_GAUSS_FILTER_SIZE_CAM1_SETTINGS_KEY,
+        gauss_filter_size["cam1"],
     )
     settings.setValue(
         REGISTRATION_CAPTURE_COUNT_SETTINGS_KEY,
@@ -221,9 +261,33 @@ def registration_config_to_shift_kwargs(
         "use_ecc_refinement": normalized["use_ecc_refinement"],
         "ecc_use_window": normalized["ecc_use_window"],
         "ecc_motion_model": normalized["ecc_motion_model"],
+        "ecc_gauss_filter_size": normalized["ecc_gauss_filter_size"],
     }
     if config is not None and "ecc_reference_point_px" in config:
         shift_kwargs["ecc_reference_point_px"] = config["ecc_reference_point_px"]
+    return shift_kwargs
+
+
+def registration_config_to_camera_shift_kwargs(
+    config: Mapping[str, Any],
+    camera: str,
+) -> dict[str, object]:
+    camera_name = str(camera)
+    shift_kwargs = registration_config_to_shift_kwargs(config)
+    for name in (
+        "ecc_reference_point_px",
+        "ecc_initial_shift_px",
+        "ecc_initial_warp",
+        "ecc_gauss_filter_size",
+    ):
+        value = shift_kwargs.get(name)
+        if not isinstance(value, Mapping):
+            continue
+        camera_value = value.get(camera_name)
+        if camera_value is None:
+            shift_kwargs.pop(name)
+        else:
+            shift_kwargs[name] = camera_value
     return shift_kwargs
 
 
@@ -258,6 +322,28 @@ def _as_int(value: Any, fallback: object) -> int:
     except (TypeError, ValueError):
         return int(fallback)
     return numeric
+
+
+def _as_odd_int(value: Any, fallback: object) -> int:
+    numeric = _as_int(value, fallback)
+    if (
+        numeric < REGISTRATION_ECC_GAUSS_FILTER_SIZE_MIN
+        or numeric > REGISTRATION_ECC_GAUSS_FILTER_SIZE_MAX
+        or numeric % 2 != 1
+    ):
+        return int(fallback)
+    return numeric
+
+
+def _ecc_gauss_filter_size_by_camera(value: Any) -> dict[str, int]:
+    defaults = DEFAULT_ECC_GAUSS_FILTER_SIZE_BY_CAMERA
+    if isinstance(value, Mapping):
+        return {
+            camera: _as_odd_int(value.get(camera), defaults[camera])
+            for camera in CAMERAS
+        }
+    fallback = _as_odd_int(value, defaults["cam1"])
+    return {camera: fallback for camera in CAMERAS}
 
 
 def _capture_aggregation_value(value: Any) -> str:

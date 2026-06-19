@@ -16,8 +16,10 @@ from qtpy import QtCore, QtWidgets
 from merlin_track_position.interface.registration_settings import (
     ECC_MOTION_MODEL_AFFINE,
     ECC_MOTION_MODEL_HOMOGRAPHY,
+    REGISTRATION_ECC_GAUSS_FILTER_SIZE_MAX,
+    REGISTRATION_ECC_GAUSS_FILTER_SIZE_MIN,
     normalized_registration_config,
-    registration_config_to_shift_kwargs,
+    registration_config_to_camera_shift_kwargs,
     save_registration_config,
 )
 from merlin_track_position.tracking.calibration_core import estimate_capture_stack_shift
@@ -105,7 +107,10 @@ class _ShiftRegistrationThread(QtCore.QThread):
                             reference,
                             current,
                             capture_aggregation=str(config["capture_aggregation"]),
-                            **registration_config_to_shift_kwargs(config),
+                            **registration_config_to_camera_shift_kwargs(
+                                config,
+                                camera,
+                            ),
                         )
                         shift_px = np.asarray(shift_px, dtype=np.float64)
                         warning_text = "\n".join(warnings)
@@ -225,11 +230,35 @@ class ShiftMonitorWindow(QtWidgets.QWidget):
         controls_layout.addWidget(QtWidgets.QLabel("ECC model"), 6, 0)
         controls_layout.addWidget(self.ecc_motion_model_combo, 6, 1)
 
+        self.ecc_gauss_filter_size_cam0_spin = QtWidgets.QSpinBox()
+        self.ecc_gauss_filter_size_cam0_spin.setObjectName(
+            "shift_monitor_ecc_gauss_filter_size_cam0_spin"
+        )
+        self.ecc_gauss_filter_size_cam0_spin.setRange(
+            REGISTRATION_ECC_GAUSS_FILTER_SIZE_MIN,
+            REGISTRATION_ECC_GAUSS_FILTER_SIZE_MAX,
+        )
+        self.ecc_gauss_filter_size_cam0_spin.setSingleStep(2)
+        controls_layout.addWidget(QtWidgets.QLabel("ECC blur cam0"), 7, 0)
+        controls_layout.addWidget(self.ecc_gauss_filter_size_cam0_spin, 7, 1)
+
+        self.ecc_gauss_filter_size_cam1_spin = QtWidgets.QSpinBox()
+        self.ecc_gauss_filter_size_cam1_spin.setObjectName(
+            "shift_monitor_ecc_gauss_filter_size_cam1_spin"
+        )
+        self.ecc_gauss_filter_size_cam1_spin.setRange(
+            REGISTRATION_ECC_GAUSS_FILTER_SIZE_MIN,
+            REGISTRATION_ECC_GAUSS_FILTER_SIZE_MAX,
+        )
+        self.ecc_gauss_filter_size_cam1_spin.setSingleStep(2)
+        controls_layout.addWidget(QtWidgets.QLabel("ECC blur cam1"), 8, 0)
+        controls_layout.addWidget(self.ecc_gauss_filter_size_cam1_spin, 8, 1)
+
         self.capture_count_spin = QtWidgets.QSpinBox()
         self.capture_count_spin.setObjectName("shift_monitor_capture_count_spin")
         self.capture_count_spin.setRange(1, 100)
-        controls_layout.addWidget(QtWidgets.QLabel("Images"), 7, 0)
-        controls_layout.addWidget(self.capture_count_spin, 7, 1)
+        controls_layout.addWidget(QtWidgets.QLabel("Images"), 9, 0)
+        controls_layout.addWidget(self.capture_count_spin, 9, 1)
 
         self.capture_aggregation_combo = QtWidgets.QComboBox()
         self.capture_aggregation_combo.setObjectName(
@@ -237,24 +266,24 @@ class ShiftMonitorWindow(QtWidgets.QWidget):
         )
         self.capture_aggregation_combo.addItem("Median shifts", "median_shifts")
         self.capture_aggregation_combo.addItem("Mean image", "mean_image")
-        controls_layout.addWidget(QtWidgets.QLabel("Aggregation"), 8, 0)
-        controls_layout.addWidget(self.capture_aggregation_combo, 8, 1)
+        controls_layout.addWidget(QtWidgets.QLabel("Aggregation"), 10, 0)
+        controls_layout.addWidget(self.capture_aggregation_combo, 10, 1)
 
         self.save_button = QtWidgets.QPushButton("Save")
         self.save_button.setObjectName("shift_monitor_save_button")
         self.reset_button = QtWidgets.QPushButton("Reset")
         self.reset_button.setObjectName("shift_monitor_reset_button")
-        controls_layout.addWidget(self.save_button, 11, 0)
-        controls_layout.addWidget(self.reset_button, 11, 1)
+        controls_layout.addWidget(self.save_button, 13, 0)
+        controls_layout.addWidget(self.reset_button, 13, 1)
 
         self.export_button = QtWidgets.QPushButton("Export HDF5")
         self.export_button.setObjectName("shift_monitor_export_button")
-        controls_layout.addWidget(self.export_button, 12, 0, 1, 2)
+        controls_layout.addWidget(self.export_button, 14, 0, 1, 2)
 
         self.live_checkbox = QtWidgets.QCheckBox("Live")
         self.live_checkbox.setObjectName("shift_monitor_live_checkbox")
         self.live_checkbox.setChecked(True)
-        controls_layout.addWidget(self.live_checkbox, 9, 0, 1, 2)
+        controls_layout.addWidget(self.live_checkbox, 11, 0, 1, 2)
 
         self.sample_period_spin = QtWidgets.QDoubleSpinBox()
         self.sample_period_spin.setObjectName("shift_monitor_sample_period_spin")
@@ -263,8 +292,8 @@ class ShiftMonitorWindow(QtWidgets.QWidget):
         self.sample_period_spin.setSingleStep(0.5)
         self.sample_period_spin.setSuffix(" s")
         self.sample_period_spin.setValue(DEFAULT_MONITOR_SAMPLE_PERIOD_S)
-        controls_layout.addWidget(QtWidgets.QLabel("Monitor period"), 10, 0)
-        controls_layout.addWidget(self.sample_period_spin, 10, 1)
+        controls_layout.addWidget(QtWidgets.QLabel("Monitor period"), 12, 0)
+        controls_layout.addWidget(self.sample_period_spin, 12, 1)
         controls_layout.setColumnStretch(1, 1)
         side_layout.addWidget(controls_group)
 
@@ -345,6 +374,8 @@ class ShiftMonitorWindow(QtWidgets.QWidget):
             self.ecc_refinement_checkbox,
             self.ecc_window_checkbox,
             self.ecc_motion_model_combo,
+            self.ecc_gauss_filter_size_cam0_spin,
+            self.ecc_gauss_filter_size_cam1_spin,
             self.capture_count_spin,
             self.capture_aggregation_combo,
         ):
@@ -374,6 +405,8 @@ class ShiftMonitorWindow(QtWidgets.QWidget):
             self.ecc_refinement_checkbox,
             self.ecc_window_checkbox,
             self.ecc_motion_model_combo,
+            self.ecc_gauss_filter_size_cam0_spin,
+            self.ecc_gauss_filter_size_cam1_spin,
             self.capture_count_spin,
             self.capture_aggregation_combo,
         )
@@ -391,6 +424,14 @@ class ShiftMonitorWindow(QtWidgets.QWidget):
                 normalized["ecc_motion_model"]
             )
             self.ecc_motion_model_combo.setCurrentIndex(max(index, 0))
+            gauss_filter_size = normalized["ecc_gauss_filter_size"]
+            assert isinstance(gauss_filter_size, Mapping)
+            self.ecc_gauss_filter_size_cam0_spin.setValue(
+                int(gauss_filter_size["cam0"])
+            )
+            self.ecc_gauss_filter_size_cam1_spin.setValue(
+                int(gauss_filter_size["cam1"])
+            )
             self.capture_count_spin.setValue(int(normalized["capture_count"]))
             index = self.capture_aggregation_combo.findData(
                 normalized["capture_aggregation"]
@@ -418,6 +459,10 @@ class ShiftMonitorWindow(QtWidgets.QWidget):
                 "use_ecc_refinement": self.ecc_refinement_checkbox.isChecked(),
                 "ecc_use_window": self.ecc_window_checkbox.isChecked(),
                 "ecc_motion_model": self.ecc_motion_model_combo.currentData(),
+                "ecc_gauss_filter_size": {
+                    "cam0": self.ecc_gauss_filter_size_cam0_spin.value(),
+                    "cam1": self.ecc_gauss_filter_size_cam1_spin.value(),
+                },
                 "capture_count": self.capture_count_spin.value(),
                 "capture_aggregation": self.capture_aggregation_combo.currentData(),
             }
@@ -632,6 +677,13 @@ class ShiftMonitorWindow(QtWidgets.QWidget):
             file.attrs["sample_period_s"] = float(self.sample_period_spin.value())
             file.attrs["live_enabled"] = bool(self.live_checkbox.isChecked())
             for key, value in config.items():
+                if key == "ecc_gauss_filter_size":
+                    assert isinstance(value, Mapping)
+                    for camera, camera_value in value.items():
+                        file.attrs[
+                            f"registration_{key}_{camera}"
+                        ] = camera_value
+                    continue
                 file.attrs[f"registration_{key}"] = value
 
             pixel_axis = np.asarray(["du_px", "dv_px"], dtype=object)

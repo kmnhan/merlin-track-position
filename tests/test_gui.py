@@ -46,9 +46,12 @@ from merlin_track_position.interface.registration_settings import (  # noqa: E40
     REGISTRATION_CAPTURE_COUNT_SETTINGS_KEY,
     REGISTRATION_CLIP_HIGH_SETTINGS_KEY,
     REGISTRATION_CLIP_LOW_SETTINGS_KEY,
+    REGISTRATION_ECC_GAUSS_FILTER_SIZE_CAM0_SETTINGS_KEY,
+    REGISTRATION_ECC_GAUSS_FILTER_SIZE_CAM1_SETTINGS_KEY,
     REGISTRATION_ECC_USE_WINDOW_SETTINGS_KEY,
     REGISTRATION_ECC_MOTION_MODEL_SETTINGS_KEY,
     REGISTRATION_USE_ECC_REFINEMENT_SETTINGS_KEY,
+    registration_config_to_camera_shift_kwargs,
     registration_config_to_measurement_kwargs,
     registration_config_to_shift_kwargs,
 )
@@ -647,6 +650,36 @@ class ShiftMonitorWindowTests(unittest.TestCase):
             finally:
                 window.close()
 
+    def test_monitor_defaults_to_per_camera_ecc_gauss_filter_sizes(self):
+        get_qapp()
+        with patched_shift_monitor_worker():
+            window = ShiftMonitorWindow(FakeSettings())
+            try:
+                self.assertEqual(window.ecc_gauss_filter_size_cam0_spin.value(), 1)
+                self.assertEqual(window.ecc_gauss_filter_size_cam1_spin.value(), 5)
+
+                kwargs = registration_config_to_shift_kwargs(window._config)
+                self.assertEqual(
+                    kwargs["ecc_gauss_filter_size"],
+                    {"cam0": 1, "cam1": 5},
+                )
+                self.assertEqual(
+                    registration_config_to_camera_shift_kwargs(
+                        window._config,
+                        "cam0",
+                    )["ecc_gauss_filter_size"],
+                    1,
+                )
+                self.assertEqual(
+                    registration_config_to_camera_shift_kwargs(
+                        window._config,
+                        "cam1",
+                    )["ecc_gauss_filter_size"],
+                    5,
+                )
+            finally:
+                window.close()
+
     def test_monitor_plot_x_axes_are_linked(self):
         get_qapp()
         with patched_shift_monitor_worker():
@@ -853,6 +886,8 @@ class ShiftMonitorWindowTests(unittest.TestCase):
                 window.ecc_motion_model_combo.setCurrentIndex(
                     window.ecc_motion_model_combo.findData("affine")
                 )
+                window.ecc_gauss_filter_size_cam0_spin.setValue(3)
+                window.ecc_gauss_filter_size_cam1_spin.setValue(9)
                 window.capture_count_spin.setValue(7)
                 window.capture_aggregation_combo.setCurrentIndex(
                     window.capture_aggregation_combo.findData("mean_image")
@@ -879,6 +914,18 @@ class ShiftMonitorWindowTests(unittest.TestCase):
                 self.assertEqual(
                     settings.values[REGISTRATION_ECC_MOTION_MODEL_SETTINGS_KEY],
                     "affine",
+                )
+                self.assertEqual(
+                    settings.values[
+                        REGISTRATION_ECC_GAUSS_FILTER_SIZE_CAM0_SETTINGS_KEY
+                    ],
+                    3,
+                )
+                self.assertEqual(
+                    settings.values[
+                        REGISTRATION_ECC_GAUSS_FILTER_SIZE_CAM1_SETTINGS_KEY
+                    ],
+                    9,
                 )
                 self.assertEqual(
                     settings.values[REGISTRATION_CAPTURE_COUNT_SETTINGS_KEY],
@@ -913,6 +960,26 @@ class ShiftMonitorWindowTests(unittest.TestCase):
                     "affine",
                 )
                 self.assertEqual(
+                    registration_config_to_shift_kwargs(saved_configs[-1])[
+                        "ecc_gauss_filter_size"
+                    ],
+                    {"cam0": 3, "cam1": 9},
+                )
+                self.assertEqual(
+                    registration_config_to_camera_shift_kwargs(
+                        saved_configs[-1],
+                        "cam0",
+                    )["ecc_gauss_filter_size"],
+                    3,
+                )
+                self.assertEqual(
+                    registration_config_to_camera_shift_kwargs(
+                        saved_configs[-1],
+                        "cam1",
+                    )["ecc_gauss_filter_size"],
+                    9,
+                )
+                self.assertEqual(
                     registration_config_to_measurement_kwargs(saved_configs[-1])[
                         "capture_count"
                     ],
@@ -933,6 +1000,8 @@ class ShiftMonitorWindowTests(unittest.TestCase):
                 window.ecc_motion_model_combo.setCurrentIndex(
                     window.ecc_motion_model_combo.findData("affine")
                 )
+                window.ecc_gauss_filter_size_cam0_spin.setValue(3)
+                window.ecc_gauss_filter_size_cam1_spin.setValue(9)
                 window.capture_count_spin.setValue(5)
                 window.capture_aggregation_combo.setCurrentIndex(
                     window.capture_aggregation_combo.findData("mean_image")
@@ -970,6 +1039,14 @@ class ShiftMonitorWindowTests(unittest.TestCase):
                     self.assertEqual(
                         exported.attrs["registration_ecc_motion_model"],
                         "affine",
+                    )
+                    self.assertEqual(
+                        exported.attrs["registration_ecc_gauss_filter_size_cam0"],
+                        3,
+                    )
+                    self.assertEqual(
+                        exported.attrs["registration_ecc_gauss_filter_size_cam1"],
+                        9,
                     )
                     self.assertEqual(exported.attrs["registration_capture_count"], 5)
                     self.assertEqual(
@@ -3245,6 +3322,7 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                             "use_window": True,
                             "use_ecc_refinement": True,
                             "ecc_use_window": True,
+                            "ecc_gauss_filter_size": {"cam0": 3, "cam1": 9},
                             "capture_count": 7,
                             "capture_aggregation": "mean_image",
                         }
@@ -3263,6 +3341,7 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                             "use_ecc_refinement": True,
                             "ecc_use_window": True,
                             "ecc_motion_model": "homography",
+                            "ecc_gauss_filter_size": {"cam0": 3, "cam1": 9},
                             "capture_count": 7,
                             "capture_aggregation": "mean_image",
                         },

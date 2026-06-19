@@ -62,6 +62,7 @@ def estimate_shift(
     ecc_initial_warp: npt.ArrayLike | None = None,
     ecc_fallback_to_phase_shift: bool = True,
     ecc_use_window: bool = False,
+    ecc_gauss_filter_size: int = 5,
 ) -> xr.Dataset:
     """Estimate subpixel translation between two grayscale or RGB images.
 
@@ -79,6 +80,8 @@ def estimate_shift(
     when the supplied ECC seed is trusted and a failed refinement should
     invalidate the estimate.
     Pass ``ecc_use_window=True`` to apply a Hanning taper to ECC inputs.
+    ``ecc_gauss_filter_size`` controls OpenCV ECC's Gaussian prefilter; it must
+    be a positive odd integer.
     """
 
     reference_image = _as_registration_image("reference image", reference)
@@ -146,6 +149,10 @@ def estimate_shift(
             raise ValueError("ecc_initial_shift_px must be a finite 2-vector")
     if use_ecc_refinement and ecc_initial_warp is not None:
         explicit_ecc_initial_warp = _validate_ecc_initial_warp(ecc_initial_warp)
+    if use_ecc_refinement:
+        ecc_gauss_filter_size = _validate_ecc_gauss_filter_size(
+            ecc_gauss_filter_size
+        )
     if use_ecc_refinement and (
         explicit_ecc_initial_warp is not None
         or explicit_ecc_initial_shift is not None
@@ -165,6 +172,7 @@ def estimate_shift(
                 motion_model=ecc_motion_model,
                 reference_point_px=ecc_reference_point_px,
                 initial_warp=explicit_ecc_initial_warp,
+                gauss_filter_size=ecc_gauss_filter_size,
             )
         except Exception as exc:
             diagnostic_warnings.append(f"ECC refinement failed: {exc}")
@@ -270,6 +278,7 @@ def _estimate_ecc_shift(
     motion_model: str,
     reference_point_px: npt.ArrayLike | None,
     initial_warp: np.ndarray | None,
+    gauss_filter_size: int,
 ) -> np.ndarray:
     reference_work, current_work = _registration_work_images(
         reference_image,
@@ -298,7 +307,7 @@ def _estimate_ecc_shift(
         motion_code,
         criteria,
         None,
-        5,
+        int(gauss_filter_size),
     )
     refined = np.asarray(refined_warp, dtype=np.float64)
     if refined.shape != warp.shape or not np.isfinite(refined).all():
@@ -384,6 +393,16 @@ def _validate_ecc_initial_warp(warp: npt.ArrayLike) -> np.ndarray:
     if not np.isfinite(warp_array).all():
         raise ValueError("ecc_initial_warp must contain only finite values")
     return warp_array
+
+
+def _validate_ecc_gauss_filter_size(value: int) -> int:
+    try:
+        size = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("ecc_gauss_filter_size must be a positive odd integer") from exc
+    if size < 1 or size % 2 != 1:
+        raise ValueError("ecc_gauss_filter_size must be a positive odd integer")
+    return size
 
 
 def _ecc_input_images(
