@@ -2260,7 +2260,7 @@ def _sample_plane_basis(
     return (
         _rotation_y_deg(polar_deg)
         @ _rotation_x_deg(-tilt_deg)
-        @ _rotation_z_deg(-azi_deg)
+        @ _rotation_z_deg(azi_deg)
         @ _SAMPLE_PLANE_BASIS
     )
 
