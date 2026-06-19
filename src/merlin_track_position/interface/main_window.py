@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import logging
+import logging.handlers
 import math
 import multiprocessing
+import os
 import sys
 import threading
 import time
@@ -104,6 +106,11 @@ from merlin_track_position.tracking.roi import (
 __all__ = ("CalibrationStartDialog", "CameraSettingsDialog", "MainWindow")
 
 logger = logging.getLogger("merlin_track_position.interface.main_window")
+LOG_FILE_NAME = "track-position.log"
+LOG_FILE_MAX_BYTES = 1_000_000
+LOG_FILE_BACKUP_COUNT = 5
+LOG_FORMAT = "%(asctime)s %(levelname)s [%(name)s] %(message)s"
+_FILE_LOG_HANDLER_MARKER = "_merlin_track_position_file_log_handler"
 DEFAULT_CALIBRATION_FILE_NAME = "calibration.h5"
 _CV2_WARP_AFFINE_DTYPES = frozenset(
     np.dtype(dtype)
@@ -115,6 +122,84 @@ _CV2_WARP_AFFINE_DTYPES = frozenset(
         np.float64,
     )
 )
+
+
+def configure_application_logging(
+    log_path: str | Path | None = None,
+    *,
+    console_level: int = logging.INFO,
+    file_level: int = logging.WARNING,
+    max_bytes: int = LOG_FILE_MAX_BYTES,
+    backup_count: int = LOG_FILE_BACKUP_COUNT,
+) -> Path | None:
+    """Configure console logging plus a bounded warning/error log file."""
+
+    logging.basicConfig(
+        level=console_level,
+        format=LOG_FORMAT,
+    )
+    root_logger = logging.getLogger()
+    root_logger.setLevel(console_level)
+    resolved_log_path = (
+        _default_application_log_path() if log_path is None else Path(log_path)
+    ).expanduser()
+
+    try:
+        max_bytes = max(1, int(max_bytes))
+        backup_count = max(1, int(backup_count))
+        resolved_log_path.parent.mkdir(parents=True, exist_ok=True)
+        handler = logging.handlers.RotatingFileHandler(
+            resolved_log_path,
+            maxBytes=max_bytes,
+            backupCount=backup_count,
+            encoding="utf-8",
+            delay=True,
+        )
+    except Exception:
+        logger.warning(
+            "Could not configure application log file at %s",
+            resolved_log_path,
+            exc_info=True,
+        )
+        return None
+
+    _remove_application_file_log_handlers(root_logger)
+    setattr(handler, _FILE_LOG_HANDLER_MARKER, True)
+    handler.setLevel(file_level)
+    handler.setFormatter(logging.Formatter(LOG_FORMAT))
+    root_logger.addHandler(handler)
+    logger.info(
+        "Writing warning/error log to %s (max_bytes=%d, backup_count=%d).",
+        resolved_log_path,
+        max_bytes,
+        backup_count,
+    )
+    return resolved_log_path
+
+
+def _default_application_log_path() -> Path:
+    return _default_application_log_directory() / LOG_FILE_NAME
+
+
+def _default_application_log_directory() -> Path:
+    if sys.platform == "win32":
+        root = Path(
+            os.environ.get("LOCALAPPDATA")
+            or os.environ.get("APPDATA")
+            or Path.home() / "AppData" / "Local"
+        )
+        return root / "merlin-track-position" / "logs"
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Logs" / "merlin-track-position"
+    root = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state"))
+    return root / "merlin-track-position" / "logs"
+
+
+def _remove_application_file_log_handlers(root_logger: logging.Logger) -> None:
+    for handler in list(root_logger.handlers):
+        if getattr(handler, _FILE_LOG_HANDLER_MARKER, False):
+            root_logger.removeHandler(handler)
+            handler.close()
 
 
 def _default_calibration_directory() -> Path:
@@ -3225,11 +3310,8 @@ class MainWindow(_MainWindowGUI):
 
 if __name__ == "__main__":
     multiprocessing.freeze_support()
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
-    )
-    logger.info("Starting Track Positions GUI.")
+    log_file = configure_application_logging()
+    logger.info("Starting Track Positions GUI. log_file=%s", log_file)
 
     qapp = QtWidgets.QApplication(sys.argv)
     qapp.setStyle("Fusion")

@@ -1,3 +1,5 @@
+import logging
+import logging.handlers
 import os
 import tempfile
 import unittest
@@ -94,6 +96,65 @@ class FakeSettings:
 
     def sync(self):
         pass
+
+
+class ApplicationLoggingTests(unittest.TestCase):
+    def setUp(self):
+        self.root_logger = logging.getLogger()
+        self.original_level = self.root_logger.level
+        self._remove_managed_file_handlers()
+
+    def tearDown(self):
+        self._remove_managed_file_handlers()
+        self.root_logger.setLevel(self.original_level)
+
+    def _managed_file_handlers(self):
+        return [
+            handler
+            for handler in self.root_logger.handlers
+            if getattr(handler, main_window._FILE_LOG_HANDLER_MARKER, False)
+        ]
+
+    def _remove_managed_file_handlers(self):
+        for handler in self._managed_file_handlers():
+            self.root_logger.removeHandler(handler)
+            handler.close()
+
+    def test_application_file_logger_is_bounded_and_warning_only(self):
+        self.root_logger.setLevel(logging.DEBUG)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_path = Path(tmpdir) / "track-position.log"
+
+            configured_path = main_window.configure_application_logging(
+                log_path,
+                max_bytes=256,
+                backup_count=2,
+            )
+            configured_again = main_window.configure_application_logging(
+                log_path,
+                max_bytes=256,
+                backup_count=2,
+            )
+
+            self.assertEqual(configured_path, log_path)
+            self.assertEqual(configured_again, log_path)
+            handlers = self._managed_file_handlers()
+            self.assertEqual(len(handlers), 1)
+            handler = handlers[0]
+            self.assertIsInstance(handler, logging.handlers.RotatingFileHandler)
+            self.assertEqual(Path(handler.baseFilename), log_path)
+            self.assertEqual(handler.level, logging.WARNING)
+            self.assertEqual(handler.maxBytes, 256)
+            self.assertEqual(handler.backupCount, 2)
+
+            test_logger = logging.getLogger("merlin_track_position.tests.logging")
+            test_logger.info("quiet progress message")
+            test_logger.warning("visible failure warning")
+            handler.flush()
+
+            contents = log_path.read_text(encoding="utf-8")
+            self.assertNotIn("quiet progress message", contents)
+            self.assertIn("visible failure warning", contents)
 
 
 class FakeImageCaptureThread(QtCore.QObject):
