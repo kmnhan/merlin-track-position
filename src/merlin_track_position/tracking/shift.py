@@ -74,11 +74,11 @@ def estimate_shift(
     Pass ``use_ecc_refinement=True`` to refine the phase-correlation result with
     an OpenCV ECC affine or homography registration and return the displacement
     at ``ecc_reference_point_px``. If no point is supplied, the image center is
-    used. ``ecc_initial_shift_px`` overrides the phase-correlation shift used to
-    initialize ECC. ``ecc_initial_warp`` overrides translation initialization
-    with a full affine or homography seed. Pass ``ecc_fallback_to_phase_shift=False``
-    when the supplied ECC seed is trusted and a failed refinement should
-    invalidate the estimate.
+    used. ``ecc_initial_shift_px`` overrides the phase-correlation translation
+    used to initialize ECC. ``ecc_initial_warp`` supplies the non-translation
+    affine or homography seed that is composed with that translation. Pass
+    ``ecc_fallback_to_phase_shift=False`` when the supplied ECC seed is trusted
+    and a failed refinement should invalidate the estimate.
     Pass ``ecc_use_window=True`` to apply a Hanning taper to ECC inputs.
     ``ecc_gauss_filter_size`` controls OpenCV ECC's Gaussian prefilter; it must
     be a positive odd integer.
@@ -348,7 +348,9 @@ def _initial_ecc_warp(
                 raise ValueError(
                     "ecc_initial_warp must have shape (2, 3) for affine ECC"
                 )
-            return cv2.MOTION_AFFINE, np.asarray(initial_warp, dtype=np.float32)
+            warp = np.asarray(initial_warp, dtype=np.float64).copy()
+            warp[:, 2] += initial_shift
+            return cv2.MOTION_AFFINE, np.asarray(warp, dtype=np.float32)
         return (
             cv2.MOTION_AFFINE,
             np.asarray(
@@ -365,12 +367,15 @@ def _initial_ecc_warp(
                 homography = np.eye(3, dtype=np.float64)
                 homography[:2, :] = initial_warp
             elif initial_warp.shape == (3, 3):
-                homography = initial_warp
+                homography = np.asarray(initial_warp, dtype=np.float64)
             else:
                 raise ValueError(
                     "ecc_initial_warp must have shape (2, 3) or (3, 3) "
                     "for homography ECC"
                 )
+            translation = np.eye(3, dtype=np.float64)
+            translation[:2, 2] = initial_shift
+            homography = translation @ homography
             return cv2.MOTION_HOMOGRAPHY, np.asarray(homography, dtype=np.float32)
         return (
             cv2.MOTION_HOMOGRAPHY,

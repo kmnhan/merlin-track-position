@@ -54,8 +54,7 @@ def detect_shift(
 
     reference_cam0 = np.asarray(calibration["reference_cam0"].values)
     reference_cam1 = np.asarray(calibration["reference_cam1"].values)
-    current_position, current_orientation = _read_current_detection_position()
-    current_readback_position_mm = current_position.copy()
+    current_orientation = _read_current_detection_orientation()
     current_polar_deg = float(current_orientation["polar"])
     jacobian, polar_attrs = _runtime_px_per_readback_mm_for_polar(
         calibration,
@@ -71,10 +70,7 @@ def detect_shift(
     measurement_shift_kwargs = _orientation_ecc_seed_shift_kwargs(
         shift_kwargs,
         calibration=calibration,
-        jacobian=jacobian,
-        polar_attrs=polar_attrs,
         orientation_attrs=orientation_attrs,
-        readback_position_mm=current_readback_position_mm,
     )
     measurement = _capture_measurement(
         calibration,
@@ -124,37 +120,31 @@ def detect_shift(
     )
 
 
-def _read_current_detection_position() -> tuple[np.ndarray, dict[str, float]]:
+def _read_current_detection_orientation() -> dict[str, float]:
     try:
         values = _position_values(
-            get_positions((*COMMAND_AXES, "p", "t", "a")),
-            len(COMMAND_AXES) + 3,
-            "current x/y/z/p/t/a readback",
+            get_positions(("p", "t", "a")),
+            3,
+            "current p/t/a readback",
         )
-        return (
-            values[: len(COMMAND_AXES)].copy(),
-            {
-                "polar": float(values[len(COMMAND_AXES)]),
-                "tilt": float(values[len(COMMAND_AXES) + 1]),
-                "azi": float(values[len(COMMAND_AXES) + 2]),
-            },
-        )
+        return {
+            "polar": float(values[0]),
+            "tilt": float(values[1]),
+            "azi": float(values[2]),
+        }
     except Exception as exc:
         logger.info(
-            "Could not read current x/y/z/p/t/a for detection (%s); "
-            "falling back to x/y/z/p only.",
+            "Could not read current p/t/a for detection (%s); "
+            "falling back to polar only.",
             exc,
         )
     values = _position_values(
-        get_positions((*COMMAND_AXES, "p")),
-        len(COMMAND_AXES) + 1,
-        "current x/y/z/p readback",
+        get_positions(("p",)),
+        1,
+        "current polar readback",
     )
-    return (
-        values[: len(COMMAND_AXES)].copy(),
-        {
-            "polar": float(values[-1]),
-            "tilt": np.nan,
-            "azi": np.nan,
-        },
-    )
+    return {
+        "polar": float(values[0]),
+        "tilt": np.nan,
+        "azi": np.nan,
+    }

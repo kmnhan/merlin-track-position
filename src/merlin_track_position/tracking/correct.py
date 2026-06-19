@@ -38,7 +38,6 @@ from merlin_track_position.tracking.calibration_core import (
     update_lqr_kalman_state,
     validate_visual_calibration_dataset,
     weighted_pixel_residual,
-    _initial_readback_position_from_attrs,
 )
 from merlin_track_position.tracking.persistence import (
     PendingEntry,
@@ -71,7 +70,7 @@ ANALYZER_AXES = (
     "analyzer_longitudinal",
 )
 BEAM_OBSERVATION_AXES = ("beam_transverse", "analyzer_transverse", "vertical")
-ORIENTATION_READBACK_AXES = (*COMMAND_AXES, "p", "t", "a")
+ORIENTATION_READBACK_AXES = ("p", "t", "a")
 _USE_DEFAULT = object()
 _CORRECTION_HISTORY_FORMAT = "merlin_track_position_correction_history"
 _CORRECTION_HISTORY_RESIZABLE_DIMS = ("move", "iteration")
@@ -331,10 +330,7 @@ def do_correction(
     initial_shift_kwargs = _orientation_ecc_seed_shift_kwargs(
         shift_kwargs,
         calibration=calibration,
-        jacobian=jacobian,
-        polar_attrs=polar_attrs,
         orientation_attrs=orientation_attrs,
-        readback_position_mm=readback_position_mm,
     )
     measurement = _capture_measurement(
         calibration,
@@ -730,13 +726,7 @@ def do_correction(
         after_shift_kwargs = _orientation_ecc_seed_shift_kwargs(
             shift_kwargs,
             calibration=calibration,
-            jacobian=jacobian,
-            polar_attrs=polar_attrs,
             orientation_attrs=orientation_attrs,
-            seed_shift_px=(
-                np.asarray(measurement["shift_px"].values, dtype=np.float64)
-                + predicted_delta_px
-            ),
         )
         after_measurement = _capture_measurement(
             calibration,
@@ -2003,48 +1993,14 @@ def _prefixed_orientation_attrs(
     }
 
 
-def _polar_ecc_seed_shift_kwargs(
-    shift_kwargs: Mapping[str, Any],
-    *,
-    polar_attrs: Mapping[str, float | bool],
-    calibration: xr.Dataset | None = None,
-    jacobian: np.ndarray | None = None,
-    readback_position_mm: np.ndarray | None = None,
-    seed_shift_px: np.ndarray | None = None,
-) -> dict[str, Any]:
-    orientation_attrs = {
-        "orientation_seed_inputs_valid": False,
-        "orientation_seed_applied": False,
-        "orientation_seed_warning": "orientation ECC seed not requested",
-        "orientation_seed_basis_condition": np.nan,
-    }
-    return _orientation_ecc_seed_shift_kwargs(
-        shift_kwargs,
-        polar_attrs=polar_attrs,
-        orientation_attrs=orientation_attrs,
-        calibration=calibration,
-        jacobian=jacobian,
-        readback_position_mm=readback_position_mm,
-        seed_shift_px=seed_shift_px,
-    )
-
-
 def orientation_ecc_initial_warps_for_readbacks(
     calibration: xr.Dataset,
     readbacks: Mapping[str, Any],
     reference_points: Mapping[str, Any],
 ) -> tuple[dict[str, np.ndarray], dict[str, float | bool | str]]:
-    """Return per-camera ROI-local affine ECC seeds for current motor readbacks."""
+    """Return per-camera ROI-local affine ECC seeds for current p/t/a readbacks."""
     values = _orientation_readback_values(readbacks)
-    current_position = np.asarray(
-        [values[axis] for axis in COMMAND_AXES],
-        dtype=np.float64,
-    )
     polar_attrs = _runtime_polar_attrs(calibration, values["p"])
-    runtime_jacobian = _rotate_px_per_readback_mm_for_polar_delta(
-        calibration["px_per_readback_mm"].values,
-        float(polar_attrs["polar_applied_delta_deg"]),
-    )
     orientation_attrs = _runtime_orientation_attrs(
         calibration,
         polar_attrs=polar_attrs,
@@ -2061,10 +2017,7 @@ def orientation_ecc_initial_warps_for_readbacks(
             },
         },
         calibration=calibration,
-        jacobian=runtime_jacobian,
-        polar_attrs=polar_attrs,
         orientation_attrs=orientation_attrs,
-        readback_position_mm=current_position,
     )
     if "ecc_initial_warp" not in seed_kwargs:
         warning = str(orientation_attrs.get("orientation_seed_warning", "")).strip()
@@ -2093,97 +2046,38 @@ def _orientation_readback_values(readbacks: Mapping[str, Any]) -> dict[str, floa
 def _orientation_ecc_seed_shift_kwargs(
     shift_kwargs: Mapping[str, Any],
     *,
-    polar_attrs: Mapping[str, float | bool],
     orientation_attrs: Mapping[str, float | bool | str],
     calibration: xr.Dataset | None = None,
-    jacobian: np.ndarray | None = None,
-    readback_position_mm: np.ndarray | None = None,
-    seed_shift_px: np.ndarray | None = None,
 ) -> dict[str, Any]:
     kwargs = dict(shift_kwargs)
     if not kwargs.get("use_ecc_refinement"):
         return kwargs
 
     use_orientation_seed = bool(orientation_attrs.get("orientation_seed_inputs_valid"))
-    use_translation_seed = bool(polar_attrs["polar_rotation_applied"]) or use_orientation_seed
-    if not use_translation_seed and seed_shift_px is None:
+    if not use_orientation_seed:
         return kwargs
 
-    if seed_shift_px is None:
-        if calibration is None or jacobian is None or readback_position_mm is None:
-            raise ValueError(
-                "calibration, jacobian, and readback_position_mm are required"
-            )
-        calibration_position = _initial_readback_position_from_attrs(calibration.attrs)
-        if calibration_position is None:
-            seed_shift = np.zeros((len(CAMERAS), len(PIXEL_AXES)), dtype=np.float64)
-        else:
-            readback_delta = np.asarray(readback_position_mm, dtype=np.float64)
-            if (
-                readback_delta.shape != (len(COMMAND_AXES),)
-                or not np.isfinite(readback_delta).all()
-            ):
-                raise ValueError(
-                    "readback_position_mm must be a finite command-axis vector"
-                )
-            jacobian_array = np.asarray(jacobian, dtype=np.float64)
-            if jacobian_array.shape != (
-                len(CAMERAS),
-                len(PIXEL_AXES),
-                len(COMMAND_AXES),
-            ):
-                raise ValueError(
-                    "jacobian must have shape (camera, pixel_axis, command_axis)"
-                )
-            if not np.isfinite(jacobian_array).all():
-                raise ValueError("jacobian must contain only finite values")
-            readback_delta = readback_delta - calibration_position
-            seed_shift = (
-                jacobian_array.reshape(
-                    len(CAMERAS) * len(PIXEL_AXES),
-                    len(COMMAND_AXES),
-                )
-                @ readback_delta
-            ).reshape(len(CAMERAS), len(PIXEL_AXES))
-    else:
-        seed_shift = np.asarray(seed_shift_px, dtype=np.float64)
-
-    if (
-        seed_shift.shape != (len(CAMERAS), len(PIXEL_AXES))
-        or not np.isfinite(seed_shift).all()
-    ):
-        raise ValueError("seed_shift_px must have shape (camera, pixel_axis)")
-
-    kwargs["ecc_initial_shift_px"] = {
-        camera: seed_shift[index].copy() for index, camera in enumerate(CAMERAS)
-    }
-    if use_orientation_seed:
-        if calibration is None:
-            raise ValueError("calibration is required for orientation ECC seed")
-        try:
-            kwargs = _shift_kwargs_with_calibration_ecc_points(calibration, kwargs)
-            seed_warps, basis_condition = _orientation_ecc_initial_warps(
-                calibration,
-                orientation_attrs=orientation_attrs,
-                seed_shift_px=seed_shift,
-                reference_points=kwargs["ecc_reference_point_px"],
-            )
-        except ValueError as exc:
-            logger.info("Orientation ECC seed skipped: %s", exc)
-            if isinstance(orientation_attrs, dict):
-                orientation_attrs["orientation_seed_warning"] = (
-                    f"orientation ECC seed skipped: {exc}"
-                )
-                orientation_attrs["orientation_seed_applied"] = False
-            kwargs["ecc_fallback_to_phase_shift"] = False
-            return kwargs
-        kwargs["ecc_initial_warp"] = seed_warps
+    if calibration is None:
+        raise ValueError("calibration is required for orientation ECC seed")
+    try:
+        kwargs = _shift_kwargs_with_calibration_ecc_points(calibration, kwargs)
+        seed_warps, basis_condition = _orientation_ecc_initial_warps(
+            calibration,
+            orientation_attrs=orientation_attrs,
+            reference_points=kwargs["ecc_reference_point_px"],
+        )
+    except ValueError as exc:
+        logger.info("Orientation ECC seed skipped: %s", exc)
         if isinstance(orientation_attrs, dict):
-            orientation_attrs["orientation_seed_applied"] = True
-            orientation_attrs["orientation_seed_basis_condition"] = float(
-                basis_condition
+            orientation_attrs["orientation_seed_warning"] = (
+                f"orientation ECC seed skipped: {exc}"
             )
-    kwargs["ecc_fallback_to_phase_shift"] = False
+            orientation_attrs["orientation_seed_applied"] = False
+        return kwargs
+    kwargs["ecc_initial_warp"] = seed_warps
+    if isinstance(orientation_attrs, dict):
+        orientation_attrs["orientation_seed_applied"] = True
+        orientation_attrs["orientation_seed_basis_condition"] = float(basis_condition)
     return kwargs
 
 
@@ -2191,7 +2085,6 @@ def _orientation_ecc_initial_warps(
     calibration: xr.Dataset,
     *,
     orientation_attrs: Mapping[str, float | bool | str],
-    seed_shift_px: np.ndarray,
     reference_points: Mapping[str, Any],
 ) -> tuple[dict[str, np.ndarray], float]:
     jacobian = np.asarray(calibration["px_per_readback_mm"].values, dtype=np.float64)
@@ -2210,12 +2103,6 @@ def _orientation_ecc_initial_warps(
         tilt_deg=float(orientation_attrs["current_tilt_deg"]),
         azi_deg=float(orientation_attrs["effective_current_azi_deg"]),
     )
-
-    seed_shift = np.asarray(seed_shift_px, dtype=np.float64)
-    if seed_shift.shape != (len(CAMERAS), len(PIXEL_AXES)):
-        raise ValueError("seed_shift_px must have shape (camera, pixel_axis)")
-    if not np.isfinite(seed_shift).all():
-        raise ValueError("seed_shift_px must contain only finite values")
 
     warps: dict[str, np.ndarray] = {}
     condition_values: list[float] = []
@@ -2245,7 +2132,7 @@ def _orientation_ecc_initial_warps(
         warps[camera] = _affine_warp_about_point(
             affine,
             point,
-            seed_shift[camera_index],
+            np.zeros(len(PIXEL_AXES), dtype=np.float64),
         )
         condition_values.append(condition)
     return warps, max(condition_values)

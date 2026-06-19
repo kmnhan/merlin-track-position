@@ -2484,7 +2484,7 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
         warp = np.asarray([[1.0, 0.0, 1.0], [0.0, 1.0, 0.0]], dtype=np.float32)
 
         def fake_preview_warps(_calibration, readbacks, reference_points):
-            self.assertEqual(tuple(readbacks), ("x", "y", "z", "p", "t", "a"))
+            self.assertEqual(tuple(readbacks), ("p", "t", "a"))
             self.assertIn("cam0", reference_points)
             return {
                 "cam0": warp,
@@ -2498,7 +2498,7 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
             patched_main_window_runtime(),
             patch(
                 "merlin_track_position.interface.main_window.refresh_motor_positions",
-                return_value=(1.0, 2.0, 3.0, 0.0, 0.0, 0.0),
+                return_value=(0.0, 0.0, 0.0),
             ) as refresh,
             patch(
                 "merlin_track_position.interface.main_window.orientation_ecc_initial_warps_for_readbacks",
@@ -2576,7 +2576,7 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
             patched_main_window_runtime(),
             patch(
                 "merlin_track_position.interface.main_window.refresh_motor_positions",
-                return_value=(1.0, 2.0, 3.0, 0.0, 0.0, 0.0),
+                return_value=(0.0, 0.0, 0.0),
             ),
             patch(
                 "merlin_track_position.interface.main_window.orientation_ecc_initial_warps_for_readbacks",
@@ -2628,11 +2628,11 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
             patched_main_window_runtime(),
             patch(
                 "merlin_track_position.interface.main_window.refresh_motor_positions",
-                return_value=(1.0, 2.0, 3.0, 0.0, 0.0, 0.0),
+                return_value=(0.0, 0.0, 0.0),
             ) as refresh,
             patch(
                 "merlin_track_position.interface.main_window.cached_motor_positions",
-                return_value=(1.0, 2.0, 3.0, 5.0, 0.0, 0.0),
+                return_value=(5.0, 0.0, 0.0),
             ) as cached,
             patch(
                 "merlin_track_position.interface.main_window.orientation_ecc_initial_warps_for_readbacks",
