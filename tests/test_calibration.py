@@ -427,7 +427,7 @@ class ShiftDetectionTests(unittest.TestCase):
         self.assertTrue(orientation_attrs["orientation_seed_applied"])
         self.assertFalse(orientation_attrs["azi_deadband_active"])
         self.assertAlmostEqual(orientation_attrs["azi_applied_delta_deg"], 1.5)
-        angle = np.deg2rad(1.5)
+        angle = np.deg2rad(-1.5)
         expected_affine = np.asarray(
             [
                 [np.cos(angle), -np.sin(angle)],
