@@ -105,6 +105,16 @@ __all__ = ("CalibrationStartDialog", "CameraSettingsDialog", "MainWindow")
 
 logger = logging.getLogger("merlin_track_position.interface.main_window")
 DEFAULT_CALIBRATION_FILE_NAME = "calibration.h5"
+_CV2_WARP_AFFINE_DTYPES = frozenset(
+    np.dtype(dtype)
+    for dtype in (
+        np.uint8,
+        np.uint16,
+        np.int16,
+        np.float32,
+        np.float64,
+    )
+)
 
 
 def _default_calibration_directory() -> Path:
@@ -439,6 +449,13 @@ def _display_image_for_camera(image: object, config: CameraConfig) -> object:
     if conversion is None or min(image_array.shape) < 2:
         return image
     return cv2.cvtColor(np.ascontiguousarray(image_array), conversion)
+
+
+def _cv2_warp_affine_input(image: np.ndarray) -> np.ndarray:
+    image_array = np.asarray(image)
+    if image_array.dtype not in _CV2_WARP_AFFINE_DTYPES:
+        image_array = image_array.astype(np.float32, copy=False)
+    return np.ascontiguousarray(image_array)
 
 
 def _roi_metadata_from_geometries(
@@ -2422,7 +2439,7 @@ class MainWindow(_MainWindowGUI):
             dtype=np.float32,
         )
         warped = cv2.warpAffine(
-            np.ascontiguousarray(current_display),
+            _cv2_warp_affine_input(current_display),
             warp,
             (int(width), int(height)),
             flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,

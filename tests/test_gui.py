@@ -2338,7 +2338,7 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
             image_shape_cam0=(image_height, image_width),
             image_shape_cam1=(cam1_height, cam1_width),
         ).assign_attrs({"calibration_path": "/tmp/calibration.h5"} | metadata)
-        current_cam0 = np.arange(image_height * image_width, dtype=np.float32).reshape(
+        current_cam0 = np.arange(image_height * image_width, dtype=np.int32).reshape(
             image_height,
             image_width,
         )
@@ -2380,7 +2380,9 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                     roi,
                 )
                 self.assertEqual(reference_crop.shape, (5, 4))
-                expected_crop = main_window.crop_image_to_roi(current_cam0, roi)
+                expected_crop = main_window.crop_image_to_roi(current_cam0, roi).astype(
+                    np.float32
+                )
                 expected = cv2.warpAffine(
                     expected_crop,
                     warp,
@@ -2407,7 +2409,9 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                 window.show_reference_images_button.released.emit()
 
                 expected_refreshed = cv2.warpAffine(
-                    main_window.crop_image_to_roi(refreshed_cam0, roi),
+                    main_window.crop_image_to_roi(refreshed_cam0, roi).astype(
+                        np.float32
+                    ),
                     warp,
                     (reference_crop.shape[1], reference_crop.shape[0]),
                     flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
