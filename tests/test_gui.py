@@ -1600,7 +1600,11 @@ class CalibrationPanelTests(unittest.TestCase):
 class MainWindowCalibrationStateTests(unittest.TestCase):
     def test_polar_compensation_dialog_empty_state_enables_calculation(self):
         get_qapp()
-        dialog = main_window.PolarCompensationDialog(None, start_enabled=True)
+        dialog = main_window.PolarCompensationDialog(
+            None,
+            anchor_polar=1.85,
+            start_enabled=True,
+        )
         try:
             details = dialog.findChild(
                 QtWidgets.QGroupBox,
@@ -1610,18 +1614,67 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                 QtWidgets.QPushButton,
                 "polar_compensation_start_button",
             )
+            table = dialog.findChild(
+                QtWidgets.QTableWidget,
+                "polar_compensation_probe_table",
+            )
 
             self.assertIsNotNone(details)
             self.assertIsNotNone(start_button)
+            self.assertIsNotNone(table)
             assert details is not None
             assert start_button is not None
+            assert table is not None
             self.assertFalse(details.isEnabled())
             self.assertFalse(start_button.isHidden())
             self.assertTrue(start_button.isEnabled())
+            self.assertEqual(table.rowCount(), 4)
+            self.assertEqual(
+                dialog.probe_angles(),
+                (1.85, -5.0, -12.5, -20.0),
+            )
 
             start_button.click()
 
             self.assertTrue(dialog.start_requested())
+        finally:
+            dialog.close()
+
+    def test_polar_compensation_dialog_allows_probe_angle_edits(self):
+        get_qapp()
+        dialog = main_window.PolarCompensationDialog(
+            None,
+            anchor_polar=1.85,
+            start_enabled=True,
+        )
+        try:
+            table = dialog.findChild(
+                QtWidgets.QTableWidget,
+                "polar_compensation_probe_table",
+            )
+            add_button = dialog.findChild(
+                QtWidgets.QPushButton,
+                "polar_compensation_add_probe_button",
+            )
+            remove_button = dialog.findChild(
+                QtWidgets.QPushButton,
+                "polar_compensation_remove_probe_button",
+            )
+            self.assertIsNotNone(table)
+            self.assertIsNotNone(add_button)
+            self.assertIsNotNone(remove_button)
+            assert table is not None
+            assert add_button is not None
+            assert remove_button is not None
+
+            table.item(1, 0).setText("-6")
+            table.selectRow(2)
+            remove_button.click()
+            add_button.click()
+            table.item(table.rowCount() - 1, 0).setText("-2")
+
+            self.assertEqual(table.rowCount(), 4)
+            self.assertEqual(dialog.probe_angles(), (1.85, -2.0, -6.0, -20.0))
         finally:
             dialog.close()
 
@@ -1666,11 +1719,15 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                 self,
                 model,
                 *,
+                anchor_polar=None,
+                probe_angles=None,
                 start_enabled=False,
                 start_unavailable_message="",
                 parent=None,
             ):
                 self.model = model
+                self.anchor_polar = anchor_polar
+                self.initial_probe_angles = probe_angles
                 self.start_enabled = start_enabled
                 self.start_unavailable_message = start_unavailable_message
                 self.parent = parent
@@ -1681,6 +1738,9 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
 
             def start_requested(self):
                 return True
+
+            def probe_angles(self):
+                return (0.0, -2.5, -7.5)
 
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "calibration.h5"
@@ -1704,8 +1764,12 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
 
                     self.assertEqual(len(instances), 1)
                     self.assertIsNone(instances[0].model)
+                    self.assertEqual(
+                        instances[0].anchor_polar,
+                        float(calibration.attrs["polar"]),
+                    )
                     self.assertTrue(instances[0].start_enabled)
-                    start_workflow.assert_called_once()
+                    start_workflow.assert_called_once_with(instances[0].probe_angles())
                 finally:
                     window.close()
 
@@ -1720,11 +1784,15 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                 self,
                 model,
                 *,
+                anchor_polar=None,
+                probe_angles=None,
                 start_enabled=False,
                 start_unavailable_message="",
                 parent=None,
             ):
                 self.model = model
+                self.anchor_polar = anchor_polar
+                self.initial_probe_angles = probe_angles
                 self.start_enabled = start_enabled
                 self.start_unavailable_message = start_unavailable_message
                 self.parent = parent
@@ -1735,6 +1803,9 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
 
             def start_requested(self):
                 return False
+
+            def probe_angles(self):
+                return (0.0, -5.0, -12.5)
 
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "calibration.h5"
@@ -1775,11 +1846,15 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                 self,
                 model,
                 *,
+                anchor_polar=None,
+                probe_angles=None,
                 start_enabled=False,
                 start_unavailable_message="",
                 parent=None,
             ):
                 self.model = model
+                self.anchor_polar = anchor_polar
+                self.initial_probe_angles = probe_angles
                 self.start_enabled = start_enabled
                 self.start_unavailable_message = start_unavailable_message
                 self.parent = parent
@@ -1790,6 +1865,9 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
 
             def start_requested(self):
                 return True
+
+            def probe_angles(self):
+                return (0.0, -4.0, -9.0)
 
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "calibration.h5"
@@ -1817,7 +1895,7 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                     self.assertEqual(len(instances), 1)
                     self.assertIs(instances[0].model, calibration)
                     self.assertTrue(instances[0].start_enabled)
-                    start_workflow.assert_called_once()
+                    start_workflow.assert_called_once_with(instances[0].probe_angles())
                 finally:
                     window.close()
 
@@ -1834,6 +1912,35 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
             main_window._polar_compensation_probe_angles(-5.0),
             (-5.0, -10.0, -12.5, -20.0),
         )
+
+    def test_polar_compensation_start_uses_custom_probe_angles(self):
+        get_qapp()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "calibration.h5"
+            calibration = write_sample_calibration(path)
+            with patched_main_window_runtime():
+                window = MainWindow()
+                try:
+                    window._on_new_calibration_ready(calibration)
+                    with (
+                        patch(
+                            "merlin_track_position.interface.main_window."
+                            "QtWidgets.QMessageBox.warning",
+                            return_value=QtWidgets.QMessageBox.StandardButton.Ok,
+                        ),
+                        patch.object(
+                            window,
+                            "_start_polar_compensation_polar_move",
+                        ) as start_move,
+                    ):
+                        window._on_calculate_polar_compensate_clicked((0.0, -8.0, -2.0))
+
+                    self.assertEqual(
+                        window._polar_compensation_angles, (0.0, -2.0, -8.0)
+                    )
+                    start_move.assert_called_once()
+                finally:
+                    window.close()
 
     def test_polar_compensation_finishes_in_place_when_anchor_is_last_probe(self):
         get_qapp()

@@ -251,10 +251,62 @@ def _polar_compensation_probe_angles(anchor_polar: float) -> tuple[float, ...]:
             unique.append(angle)
     if len(unique) < len(POLAR_COMPENSATION_PROBE_ANGLES_DEG) + 1:
         raise ValueError("polar compensation probe angles must be unique")
+    return _polar_compensation_anchor_first_nearest_angles(anchor, unique)
+
+
+def _custom_polar_compensation_probe_angles(
+    anchor_polar: float,
+    probe_angles: Sequence[float],
+) -> tuple[float, ...]:
+    anchor = float(anchor_polar)
+    if not math.isfinite(anchor):
+        raise ValueError("anchor polar must be finite")
+
+    values: list[float] = []
+    for index, angle in enumerate(probe_angles):
+        value = float(angle)
+        if not math.isfinite(value):
+            raise ValueError(
+                f"polar compensation probe angle {index + 1} must be finite"
+            )
+        if any(
+            math.isclose(
+                value,
+                existing,
+                rel_tol=0.0,
+                abs_tol=POLAR_COMPENSATION_PROBE_TOLERANCE_DEG,
+            )
+            for existing in values
+        ):
+            raise ValueError("polar compensation probe angles must be unique")
+        values.append(value)
+
+    if not any(
+        math.isclose(
+            angle,
+            anchor,
+            rel_tol=0.0,
+            abs_tol=POLAR_COMPENSATION_PROBE_TOLERANCE_DEG,
+        )
+        for angle in values
+    ):
+        values.append(anchor)
+    if len(values) < 3:
+        raise ValueError(
+            "polar compensation requires at least three probe angles, "
+            "including the anchor"
+        )
+    return _polar_compensation_anchor_first_nearest_angles(anchor, values)
+
+
+def _polar_compensation_anchor_first_nearest_angles(
+    anchor: float,
+    angles: Sequence[float],
+) -> tuple[float, ...]:
     ordered = [anchor]
     remaining = [
         angle
-        for angle in unique
+        for angle in angles
         if not math.isclose(
             angle,
             anchor,
@@ -1339,6 +1391,8 @@ class PolarCompensationDialog(QtWidgets.QDialog):
         self,
         model: xr.Dataset | None,
         *,
+        anchor_polar: float | None = None,
+        probe_angles: Sequence[float] | None = None,
         start_enabled: bool = False,
         start_unavailable_message: str = "",
         parent: QtWidgets.QWidget | None = None,
@@ -1348,6 +1402,8 @@ class PolarCompensationDialog(QtWidgets.QDialog):
         self.setWindowTitle("Polar Compensation")
         self._model = model
         self._start_requested = False
+        self._anchor_polar = None if anchor_polar is None else float(anchor_polar)
+        self.probe_table: QtWidgets.QTableWidget | None = None
 
         layout = QtWidgets.QVBoxLayout(self)
         self.details_group = QtWidgets.QGroupBox("Stored compensation")
@@ -1359,6 +1415,16 @@ class PolarCompensationDialog(QtWidgets.QDialog):
         else:
             self._populate_model_details(details_layout, model)
         layout.addWidget(self.details_group, stretch=1)
+
+        if self._anchor_polar is not None:
+            if probe_angles is None:
+                probe_angles = _polar_compensation_probe_angles(self._anchor_polar)
+            self._populate_probe_angle_editor(
+                layout,
+                self._anchor_polar,
+                probe_angles,
+                enabled=bool(start_enabled),
+            )
 
         if start_unavailable_message:
             unavailable_label = QtWidgets.QLabel(start_unavailable_message)
@@ -1384,9 +1450,188 @@ class PolarCompensationDialog(QtWidgets.QDialog):
     def start_requested(self) -> bool:
         return self._start_requested
 
+    def probe_angles(self) -> tuple[float, ...]:
+        if self._anchor_polar is None or self.probe_table is None:
+            return ()
+        return _custom_polar_compensation_probe_angles(
+            self._anchor_polar,
+            self._probe_angle_values(),
+        )
+
     def _request_start(self) -> None:
+        if self.probe_table is not None:
+            try:
+                self.probe_angles()
+            except Exception as exc:
+                QtWidgets.QMessageBox.critical(
+                    self,
+                    "Invalid polar probe angles",
+                    str(exc),
+                )
+                return
         self._start_requested = True
         self.accept()
+
+    def _populate_probe_angle_editor(
+        self,
+        layout: QtWidgets.QVBoxLayout,
+        anchor_polar: float,
+        probe_angles: Sequence[float],
+        *,
+        enabled: bool,
+    ) -> None:
+        group = QtWidgets.QGroupBox("Probe angles")
+        group.setObjectName("polar_compensation_probe_group")
+        group.setEnabled(enabled)
+        group_layout = QtWidgets.QVBoxLayout(group)
+
+        table = QtWidgets.QTableWidget(0, 2)
+        table.setObjectName("polar_compensation_probe_table")
+        table.setHorizontalHeaderLabels(("Polar (deg)", "Role"))
+        table.horizontalHeader().setStretchLastSection(True)
+        table.verticalHeader().setVisible(False)
+        table.setSelectionBehavior(
+            QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows
+        )
+        table.setSelectionMode(
+            QtWidgets.QAbstractItemView.SelectionMode.SingleSelection
+        )
+        table.itemSelectionChanged.connect(self._update_probe_button_state)
+        self.probe_table = table
+        for angle in probe_angles:
+            self._append_probe_angle_row(
+                float(angle),
+                is_anchor=math.isclose(
+                    float(angle),
+                    anchor_polar,
+                    rel_tol=0.0,
+                    abs_tol=POLAR_COMPENSATION_PROBE_TOLERANCE_DEG,
+                ),
+            )
+        group_layout.addWidget(table)
+
+        button_layout = QtWidgets.QHBoxLayout()
+        self.add_probe_button = QtWidgets.QPushButton("Add")
+        self.add_probe_button.setObjectName("polar_compensation_add_probe_button")
+        self.add_probe_button.clicked.connect(self._add_probe_angle_row)
+        button_layout.addWidget(self.add_probe_button)
+
+        self.remove_probe_button = QtWidgets.QPushButton("Remove")
+        self.remove_probe_button.setObjectName("polar_compensation_remove_probe_button")
+        self.remove_probe_button.clicked.connect(self._remove_selected_probe_angle_rows)
+        button_layout.addWidget(self.remove_probe_button)
+        button_layout.addStretch(1)
+        group_layout.addLayout(button_layout)
+        layout.addWidget(group)
+        self._update_probe_button_state()
+
+    def _append_probe_angle_row(self, angle: float, *, is_anchor: bool) -> None:
+        if self.probe_table is None:
+            return
+        row = self.probe_table.rowCount()
+        self.probe_table.insertRow(row)
+
+        angle_item = QtWidgets.QTableWidgetItem(f"{float(angle):.6g}")
+        flags = QtCore.Qt.ItemFlag.ItemIsEnabled | QtCore.Qt.ItemFlag.ItemIsSelectable
+        if not is_anchor:
+            flags |= QtCore.Qt.ItemFlag.ItemIsEditable
+        angle_item.setFlags(flags)
+        angle_item.setData(QtCore.Qt.ItemDataRole.UserRole, bool(is_anchor))
+        self.probe_table.setItem(row, 0, angle_item)
+
+        role_item = QtWidgets.QTableWidgetItem("anchor" if is_anchor else "probe")
+        role_item.setFlags(
+            QtCore.Qt.ItemFlag.ItemIsEnabled | QtCore.Qt.ItemFlag.ItemIsSelectable
+        )
+        role_item.setData(QtCore.Qt.ItemDataRole.UserRole, bool(is_anchor))
+        self.probe_table.setItem(row, 1, role_item)
+
+    def _probe_angle_values(self) -> list[float]:
+        if self.probe_table is None:
+            return []
+        values: list[float] = []
+        for row in range(self.probe_table.rowCount()):
+            item = self.probe_table.item(row, 0)
+            text = "" if item is None else item.text().strip()
+            try:
+                value = float(text)
+            except ValueError as exc:
+                raise ValueError(
+                    f"polar compensation probe angle {row + 1} must be numeric"
+                ) from exc
+            values.append(value)
+        return values
+
+    def _add_probe_angle_row(self) -> None:
+        if self.probe_table is None:
+            return
+        finite_values = [
+            value
+            for value in self._probe_angle_values_or_empty()
+            if math.isfinite(value)
+        ]
+        candidate = (
+            finite_values[-1] - 5.0
+            if finite_values
+            else float(self._anchor_polar or 0.0) - 5.0
+        )
+        while any(
+            math.isclose(
+                candidate,
+                existing,
+                rel_tol=0.0,
+                abs_tol=POLAR_COMPENSATION_PROBE_TOLERANCE_DEG,
+            )
+            for existing in finite_values
+        ):
+            candidate -= 5.0
+        self._append_probe_angle_row(candidate, is_anchor=False)
+        self.probe_table.selectRow(self.probe_table.rowCount() - 1)
+
+    def _probe_angle_values_or_empty(self) -> list[float]:
+        try:
+            return self._probe_angle_values()
+        except ValueError:
+            return []
+
+    def _remove_selected_probe_angle_rows(self) -> None:
+        if self.probe_table is None:
+            return
+        rows = sorted(
+            {index.row() for index in self.probe_table.selectedIndexes()},
+            reverse=True,
+        )
+        if not rows:
+            rows = [
+                row
+                for row in range(self.probe_table.rowCount() - 1, -1, -1)
+                if not self._probe_angle_row_is_anchor(row)
+            ][:1]
+        for row in rows:
+            if not self._probe_angle_row_is_anchor(row):
+                self.probe_table.removeRow(row)
+        self._update_probe_button_state()
+
+    def _probe_angle_row_is_anchor(self, row: int) -> bool:
+        if self.probe_table is None:
+            return False
+        item = self.probe_table.item(row, 0)
+        return bool(item is not None and item.data(QtCore.Qt.ItemDataRole.UserRole))
+
+    def _update_probe_button_state(self) -> None:
+        table = self.probe_table
+        remove_button = getattr(self, "remove_probe_button", None)
+        if table is None or remove_button is None:
+            return
+        rows = {index.row() for index in table.selectedIndexes()}
+        if rows:
+            removable = any(not self._probe_angle_row_is_anchor(row) for row in rows)
+        else:
+            removable = any(
+                not self._probe_angle_row_is_anchor(row)
+                for row in range(table.rowCount())
+            )
+        remove_button.setEnabled(removable)
 
     def _populate_empty_details(self, layout: QtWidgets.QVBoxLayout) -> None:
         summary = QtWidgets.QLabel(
@@ -2468,8 +2713,13 @@ class MainWindow(_MainWindowGUI):
 
         unavailable_message = self._polar_compensation_unavailable_message()
         model = _stored_polar_compensation_model(self._calibration)
+        try:
+            anchor_polar = float(self._calibration.attrs["polar"])
+        except Exception:
+            anchor_polar = None
         dialog = PolarCompensationDialog(
             model,
+            anchor_polar=anchor_polar,
             start_enabled=unavailable_message is None,
             start_unavailable_message=(
                 "" if unavailable_message is None else unavailable_message
@@ -2478,10 +2728,13 @@ class MainWindow(_MainWindowGUI):
         )
         if dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted:
             if dialog.start_requested():
-                self._on_calculate_polar_compensate_clicked()
+                self._on_calculate_polar_compensate_clicked(dialog.probe_angles())
 
     @QtCore.Slot()
-    def _on_calculate_polar_compensate_clicked(self) -> None:
+    def _on_calculate_polar_compensate_clicked(
+        self,
+        probe_angles: Sequence[float] | None = None,
+    ) -> None:
         unavailable_message = self._polar_compensation_unavailable_message()
         if unavailable_message is not None:
             QtWidgets.QMessageBox.critical(
@@ -2506,7 +2759,13 @@ class MainWindow(_MainWindowGUI):
             return
 
         try:
-            probe_angles = _polar_compensation_probe_angles(anchor_polar)
+            if probe_angles is None:
+                resolved_probe_angles = _polar_compensation_probe_angles(anchor_polar)
+            else:
+                resolved_probe_angles = _custom_polar_compensation_probe_angles(
+                    anchor_polar,
+                    probe_angles,
+                )
         except Exception as exc:
             QtWidgets.QMessageBox.critical(
                 self,
@@ -2514,7 +2773,7 @@ class MainWindow(_MainWindowGUI):
                 str(exc),
             )
             return
-        angle_text = ", ".join(f"{angle:g}°" for angle in probe_angles)
+        angle_text = ", ".join(f"{angle:g}°" for angle in resolved_probe_angles)
         response = QtWidgets.QMessageBox.warning(
             self,
             "Calculate polar compensation?",
@@ -2530,7 +2789,9 @@ class MainWindow(_MainWindowGUI):
             return
 
         self._polar_compensation_active = True
-        self._polar_compensation_angles = tuple(float(angle) for angle in probe_angles)
+        self._polar_compensation_angles = tuple(
+            float(angle) for angle in resolved_probe_angles
+        )
         self._polar_compensation_index = 0
         self._polar_compensation_points = []
         self._polar_compensation_current_polar = None
