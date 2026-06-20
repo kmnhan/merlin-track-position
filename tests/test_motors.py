@@ -10,6 +10,7 @@ from merlin_track_position.instruments.motors import (
     _bcs_server_context,
     _bcs_motor_names,
     _clear_motor_position_cache,
+    _wait_until_motors_idle,
     _move_motors_and_wait,
     cached_motor_positions,
     get_positions,
@@ -17,6 +18,7 @@ from merlin_track_position.instruments.motors import (
     move_motors_and_wait,
     refresh_motor_positions,
     update_motor_position_cache,
+    wait_until_motors_idle,
 )
 from merlin_track_position.instruments.simulated_hardware import simulator
 
@@ -275,6 +277,50 @@ class MoveMotorsAndWaitTests(unittest.TestCase):
             sleep.call_args_list,
             [call(0.25), call(0.25), call(0.25)],
         )
+
+    def test_wait_until_motors_idle_polls_until_move_complete(self):
+        server = FakeBCSServer(
+            [],
+            get_motor_responses=[
+                _get_motor_response((1.0,), status=0, goals=(2.0,)),
+                _get_motor_response((2.0,), goals=(2.0,)),
+                _get_motor_response((2.0,), goals=(2.0,)),
+            ],
+        )
+
+        with (
+            patch("merlin_track_position.instruments.motors.time.sleep") as sleep,
+            patch(
+                "merlin_track_position.instruments.motors.time.monotonic",
+                side_effect=[0.0, 0.0, 0.1, 0.2],
+            ),
+        ):
+            positions = _wait_until_motors_idle(server, ("p",))
+
+        self.assertEqual(positions, (2.0,))
+        self.assertEqual(server.move_calls, [])
+        self.assertEqual(sleep.call_args_list, [call(0.25), call(0.25)])
+
+    def test_wait_until_motors_idle_updates_cache(self):
+        server = FakeBCSServer(
+            [],
+            initial_positions=(4.5,),
+            status=BCSz.MotorStatus.MOVE_COMPLETE.value,
+        )
+
+        with (
+            patch.object(constants, "IS_DAQ_PC", True),
+            patch(
+                "merlin_track_position.instruments.motors._bcs_server_context",
+                return_value=contextlib.nullcontext(server),
+            ),
+            patch("merlin_track_position.instruments.motors.time.sleep"),
+        ):
+            positions = wait_until_motors_idle(("p",))
+            cached = cached_motor_positions(("p",))
+
+        self.assertEqual(positions, (4.5,))
+        self.assertEqual(cached, (4.5,))
 
     def test_motor_timing_matches_bcs_example(self):
         server = FakeBCSServer(

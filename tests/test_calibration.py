@@ -2202,6 +2202,65 @@ class CorrectionTests(unittest.TestCase):
         )
         self.assertTrue(result.attrs["correction_orientation_seed_applied"])
 
+    def test_correction_waits_for_polar_idle_before_initial_capture(self):
+        order: list[str] = []
+
+        class FakeMotorBackend:
+            def wait_until_motors_idle(self, aliases):
+                self.assertEqual(tuple(aliases), ("p",))
+                order.append("wait")
+                return (4.0,)
+
+            def get_positions(self, aliases):
+                self.assertIn("wait", order)
+                order.append(f"get:{' '.join(str(alias) for alias in aliases)}")
+                values = {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "p": 4.0,
+                    "t": 0.0,
+                    "a": 0.0,
+                }
+                return tuple(values[str(alias)] for alias in aliases)
+
+            def move_motors_and_wait(self, *args, **kwargs):
+                raise AssertionError("correction should converge before moving")
+
+        def fake_capture(*args, **kwargs):
+            del args, kwargs
+            self.assertIn("wait", order)
+            order.append("capture")
+            return (
+                np.zeros((1, 4, 5), dtype=float),
+                np.zeros((1, 6, 7), dtype=float),
+            )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "calibration.h5"
+            calibration = calibration_dataset().assign_attrs(tilt=0.0, azi=0.0)
+            save_calibration_dataset(calibration, path)
+            with (
+                patch(
+                    "merlin_track_position.tracking.correct.capture_image_stack",
+                    side_effect=fake_capture,
+                ),
+                patch(
+                    "merlin_track_position.tracking.correct.measure_image_error",
+                    return_value=shift_dataset(np.zeros((2, 2), dtype=float)),
+                ),
+            ):
+                result = do_correction(
+                    path,
+                    object(),
+                    capture_count=1,
+                    motor_backend=FakeMotorBackend(),
+                )
+
+        self.assertTrue(result.attrs["correction_converged"])
+        self.assertEqual(order[0], "wait")
+        self.assertGreater(order.index("capture"), order.index("wait"))
+
     def test_correction_uses_closest_stored_polar_reference(self):
         positions = {
             "x": 0.0,

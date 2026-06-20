@@ -220,6 +220,70 @@ def _wait_until_move_complete(
         time.sleep(0.25)  # don't hit the api server constantly
 
 
+def _wait_until_motors_idle(
+    bcs_server: BCSz.BCSServer,
+    motor_aliases: Iterable[str],
+    *,
+    timeout_s: float = DEFAULT_MOVE_TIMEOUT_S,
+) -> tuple[float, ...]:
+    motor_aliases = tuple(motor_aliases)
+    if not motor_aliases:
+        return ()
+    timeout_s = _validate_move_timeout(timeout_s)
+    started_at = time.monotonic()
+    next_log_elapsed_s = 5.0
+    logger.info(
+        "Waiting for motors to become idle: motor_aliases=%s, timeout_s=%g",
+        motor_aliases,
+        timeout_s,
+    )
+    while True:
+        positions, status, goal_readbacks, readback_times = _get_motor_info(
+            bcs_server,
+            motor_aliases,
+            ("position", "status", "goal", "time"),
+        )
+        positions = tuple(float(position) for position in positions)
+        status = tuple(int(motor_status) for motor_status in status)
+        goal_readbacks = tuple(float(goal) for goal in goal_readbacks)
+        elapsed_s = time.monotonic() - started_at
+        if _motor_statuses_all_set(status, BCSz.MotorStatus.MOVE_COMPLETE):
+            time.sleep(0.25)
+            positions = _get_positions(bcs_server, motor_aliases)
+            logger.info(
+                "Motors idle by BCS status: motor_aliases=%s, positions=%s, "
+                "goal_readbacks=%s, readback_times=%s, status=%s, elapsed_s=%.1f",
+                motor_aliases,
+                positions,
+                goal_readbacks,
+                readback_times,
+                status,
+                time.monotonic() - started_at,
+            )
+            return positions
+        if elapsed_s >= timeout_s:
+            raise TimeoutError(
+                "Timed out waiting for motors to become idle: "
+                f"motor_aliases={motor_aliases}, goal_readbacks={goal_readbacks}, "
+                f"positions={positions}, readback_times={readback_times}, "
+                f"status={status}, elapsed_s={elapsed_s:.1f}"
+            )
+        if elapsed_s >= next_log_elapsed_s:
+            logger.info(
+                "Still waiting for motors to become idle: motor_aliases=%s, "
+                "positions=%s, goal_readbacks=%s, readback_times=%s, status=%s, "
+                "elapsed_s=%.1f",
+                motor_aliases,
+                positions,
+                goal_readbacks,
+                readback_times,
+                status,
+                elapsed_s,
+            )
+            next_log_elapsed_s = elapsed_s + 5.0
+        time.sleep(0.25)
+
+
 def _move_motors_and_wait(
     bcs_server: BCSz.BCSServer,
     motor_aliases: Iterable[str],
@@ -662,4 +726,42 @@ def move_motors_and_wait(
             source="bcs_move_motors_and_wait",
         )
         logger.info("Motor move returned: positions=%s", positions)
+        return positions
+
+
+def wait_until_motors_idle(
+    motor_aliases: Iterable[str],
+    *,
+    move_timeout_s: float = DEFAULT_MOVE_TIMEOUT_S,
+) -> tuple[float, ...]:
+    """Wait until the specified motors report BCS ``MOVE_COMPLETE``."""
+    motor_aliases = tuple(motor_aliases)
+    move_timeout_s = _validate_move_timeout(move_timeout_s)
+    logger.info(
+        "Waiting for motor idle status: motor_aliases=%s, move_timeout_s=%g",
+        motor_aliases,
+        move_timeout_s,
+    )
+    if not constants.IS_DAQ_PC:
+        positions = simulator.get_positions(motor_aliases)
+        _update_motor_position_cache_from_sequence(
+            motor_aliases,
+            positions,
+            source="simulator_wait_until_motors_idle",
+        )
+        logger.info("Simulated motors treated as idle: positions=%s", positions)
+        return positions
+
+    with _bcs_server_context() as server:
+        positions = _wait_until_motors_idle(
+            server,
+            motor_aliases,
+            timeout_s=move_timeout_s,
+        )
+        _update_motor_position_cache_from_sequence(
+            motor_aliases,
+            positions,
+            source="bcs_wait_until_motors_idle",
+        )
+        logger.info("Motors are idle: positions=%s", positions)
         return positions

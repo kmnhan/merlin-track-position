@@ -17,7 +17,11 @@ from merlin_track_position.instruments.cameras import (
     default_camera_pair,
     normalize_capture_count,
 )
-from merlin_track_position.instruments.motors import get_positions, move_motors_and_wait
+from merlin_track_position.instruments.motors import (
+    get_positions,
+    move_motors_and_wait,
+    wait_until_motors_idle,
+)
 from merlin_track_position.tracking.calibration_core import (
     CAMERAS,
     CAPTURE_AGGREGATION_MEDIAN_SHIFTS,
@@ -102,6 +106,14 @@ class CorrectionMeasurementReference(NamedTuple):
 
 
 class CorrectionMotorBackend(Protocol):
+    def wait_until_motors_idle(
+        self,
+        motor_aliases: Sequence[str],
+        *,
+        move_timeout_s: float = 60.0,
+    ) -> tuple[float, ...]:
+        """Wait until the requested motors are no longer moving."""
+
     def get_positions(self, motor_aliases: Sequence[str]) -> tuple[float, ...]:
         """Return motor readback positions in the order requested."""
 
@@ -117,6 +129,17 @@ class CorrectionMotorBackend(Protocol):
 
 
 class DirectBCSMotorBackend:
+    def wait_until_motors_idle(
+        self,
+        motor_aliases: Sequence[str],
+        *,
+        move_timeout_s: float = 60.0,
+    ) -> tuple[float, ...]:
+        return wait_until_motors_idle(
+            motor_aliases,
+            move_timeout_s=move_timeout_s,
+        )
+
     def get_positions(self, motor_aliases: Sequence[str]) -> tuple[float, ...]:
         return get_positions(motor_aliases)
 
@@ -221,6 +244,7 @@ def do_correction(
         raise ValueError("min_command_norm_mm must be finite and non-negative")
     if max_moves < 0:
         raise ValueError("max_moves must be >= 0")
+    _wait_for_correction_orientation_motors(motor_backend)
     logger.info("Reading initial readback x/y/z and orientation positions.")
     readback_position_mm, current_orientation_deg = (
         _read_initial_readback_position_and_orientation_deg(motor_backend)
@@ -1816,6 +1840,20 @@ def _positive_um_to_mm(value: float, name: str) -> float:
     if not np.isfinite(value_um) or value_um <= 0.0:
         raise ValueError(f"{name} must be finite and positive")
     return value_um / 1000.0
+
+
+def _wait_for_correction_orientation_motors(
+    motor_backend: CorrectionMotorBackend,
+) -> None:
+    wait_until_idle = getattr(motor_backend, "wait_until_motors_idle", None)
+    if not callable(wait_until_idle):
+        logger.info(
+            "Motor backend does not expose idle-status waiting; correction will "
+            "start from the current orientation readback."
+        )
+        return
+    logger.info("Waiting for Polar motor to finish before correction acquisition.")
+    wait_until_idle(("p",))
 
 
 def _calibration_polar_deg(calibration: xr.Dataset) -> float:
