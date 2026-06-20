@@ -310,6 +310,25 @@ def _correction_status_residual(result: xr.Dataset) -> tuple[float, str, str]:
     return residual, label, suffix
 
 
+def _detection_status_residual(result: xr.Dataset) -> tuple[float, str, str]:
+    if (
+        result.attrs.get("detection_correction_mode") == "beam"
+        and "detection_correction_criterion_residual" in result
+    ):
+        name = "detection_correction_criterion_residual"
+        label = "Beam residual"
+        suffix = ""
+    else:
+        name = "weighted_residual_px"
+        label = "Weighted residual"
+        suffix = " px"
+
+    residual = math.nan
+    if name in result:
+        residual = float(result[name].values)
+    return residual, label, suffix
+
+
 def _format_duration(seconds: float | None) -> str:
     if seconds is None or not math.isfinite(seconds) or seconds < 0.0:
         return "n/a"
@@ -1293,9 +1312,7 @@ class CalibrationPanel(QtWidgets.QWidget):
         self._show_stored_orientation_if_available()
         self.calibration_progress_bar.setVisible(False)
 
-        residual = math.nan
-        if "weighted_residual_px" in result:
-            residual = float(result["weighted_residual_px"].values)
+        residual, residual_label, residual_suffix = _detection_status_residual(result)
 
         if "estimated_readback_offset_mm" in result:
             offset_text = _format_axis_triplet_um(
@@ -1309,7 +1326,7 @@ class CalibrationPanel(QtWidgets.QWidget):
 
         self.calibration_status_label.setText(
             f"Detected shift: {offset_text}. "
-            f"Weighted residual {_format_number(residual)} px."
+            f"{residual_label} {_format_number(residual)}{residual_suffix}."
         )
 
         warning_lines = [

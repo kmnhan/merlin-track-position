@@ -340,6 +340,49 @@ class ShiftDetectionTests(unittest.TestCase):
         self.assertEqual(result.attrs["detection_current_polar_deg"], 90.0)
         self.assertEqual(result.attrs["detection_polar_applied_delta_deg"], 90.0)
 
+    def test_detect_shift_reports_beam_mode_criterion_residual(self):
+        calibration = calibration_dataset()
+        offset_mm = np.asarray([0.003, -0.002, 0.001], dtype=float)
+        shift = measured_from_jacobian(
+            offset_mm.reshape(1, len(COMMAND_AXES)),
+            calibration["px_per_readback_mm"].values,
+        )[0]
+        measurement = shift_dataset(shift)
+
+        with (
+            patch(
+                "merlin_track_position.tracking.detect.get_positions",
+                return_value=(0.0,),
+            ),
+            patch(
+                "merlin_track_position.tracking.detect._capture_measurement",
+                return_value=measurement,
+            ),
+        ):
+            result = detect_shift(
+                calibration,
+                object(),
+                capture_count=1,
+                correction_mode="beam",
+            )
+
+        self.assertEqual(result.attrs["detection_correction_mode"], "beam")
+        self.assertEqual(
+            result.attrs["detection_correction_criterion"],
+            correct_module.BEAM_CORRECTION_CRITERION,
+        )
+        self.assertIn("detection_correction_criterion_residual", result)
+        self.assertIn("beam_analyzer_observation_um", result)
+        self.assertGreater(
+            float(result["detection_correction_criterion_residual"].values),
+            0.0,
+        )
+        np.testing.assert_allclose(
+            result["estimated_readback_offset_mm"].values,
+            offset_mm,
+            atol=1e-12,
+        )
+
     def test_detect_shift_does_not_seed_ecc_translation_from_readbacks(self):
         calibration = calibration_dataset().assign_attrs(
             initial_x_mm=1.0,

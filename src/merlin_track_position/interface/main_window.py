@@ -3638,6 +3638,7 @@ class MainWindow(_MainWindowGUI):
             self._detect_shift_thread.configure(
                 self._calibration,
                 camera_pair,
+                correction_mode=self.calibration_panel.correction_mode(),
                 shift_kwargs=self._registration_measurement_kwargs(),
             )
         except Exception as exc:

@@ -8,6 +8,7 @@ from typing import Any
 import xarray as xr
 from qtpy import QtCore
 
+from merlin_track_position import constants
 from merlin_track_position.instruments.cameras import CameraPairPlugin
 from merlin_track_position.tracking.detect import detect_shift
 
@@ -29,12 +30,14 @@ class DetectShiftThread(QtCore.QThread):
         self._calibration: xr.Dataset | None = None
         self._camera_pair: CameraPairPlugin | None = None
         self._shift_kwargs: dict[str, Any] = {}
+        self._correction_mode = constants.DEFAULT_CORRECTION_MODE
 
     def configure(
         self,
         calibration: xr.Dataset,
         camera_pair: CameraPairPlugin,
         *,
+        correction_mode: str = constants.DEFAULT_CORRECTION_MODE,
         shift_kwargs: Mapping[str, Any] | None = None,
     ) -> None:
         """Set the parameters for the next no-move shift detection."""
@@ -42,6 +45,7 @@ class DetectShiftThread(QtCore.QThread):
             raise RuntimeError("cannot configure shift detection while it is running")
         self._calibration = calibration
         self._camera_pair = camera_pair
+        self._correction_mode = str(correction_mode)
         self._shift_kwargs = {} if shift_kwargs is None else dict(shift_kwargs)
 
     def run(self) -> None:
@@ -57,6 +61,7 @@ class DetectShiftThread(QtCore.QThread):
                 result = detect_shift(
                     self._calibration,
                     self._camera_pair,
+                    correction_mode=self._correction_mode,
                     **self._shift_kwargs,
                 )
             except Exception as exc:

@@ -269,6 +269,7 @@ class FakeDetectShiftThread(QtCore.QObject):
         super().__init__(parent)
         self.calibration = None
         self.camera_pair = None
+        self.correction_mode = None
         self.shift_kwargs = None
         self.started = False
         self.running = False
@@ -278,10 +279,12 @@ class FakeDetectShiftThread(QtCore.QObject):
         calibration,
         camera_pair,
         *,
+        correction_mode="beam",
         shift_kwargs=None,
     ):
         self.calibration = calibration
         self.camera_pair = camera_pair
+        self.correction_mode = correction_mode
         self.shift_kwargs = {} if shift_kwargs is None else dict(shift_kwargs)
 
     def start(self):
@@ -556,23 +559,32 @@ def detection_result(
     *,
     offsets_mm=(0.004, -0.005, 0.006),
     residual: float = 1.25,
+    beam_residual: float | None = None,
     warnings: str = "",
 ) -> xr.Dataset:
     offsets = np.asarray(offsets_mm, dtype=float)
+    data_vars = {
+        "estimated_readback_offset_mm": (
+            ("command_axis",),
+            offsets,
+        ),
+        "detected_shift_um": (
+            ("command_axis",),
+            1000.0 * offsets,
+        ),
+        "weighted_residual_px": ((), float(residual)),
+    }
+    attrs = {"warnings": warnings}
+    if beam_residual is not None:
+        data_vars["detection_correction_criterion_residual"] = (
+            (),
+            float(beam_residual),
+        )
+        attrs["detection_correction_mode"] = "beam"
     return xr.Dataset(
-        data_vars={
-            "estimated_readback_offset_mm": (
-                ("command_axis",),
-                offsets,
-            ),
-            "detected_shift_um": (
-                ("command_axis",),
-                1000.0 * offsets,
-            ),
-            "weighted_residual_px": ((), float(residual)),
-        },
+        data_vars=data_vars,
         coords={"command_axis": list(COMMAND_AXES)},
-        attrs={"warnings": warnings},
+        attrs=attrs,
     )
 
 
@@ -1540,6 +1552,17 @@ class CalibrationPanelTests(unittest.TestCase):
             panel.calibration_warnings_text.toPlainText(),
             "registration warning",
         )
+
+    def test_beam_detection_result_displays_beam_residual(self):
+        get_qapp()
+        panel = CalibrationPanel()
+        result = detection_result(residual=25.0, beam_residual=0.75)
+
+        panel.show_detection_result(result)
+
+        status = panel.calibration_status_label.text()
+        self.assertIn("Beam residual 0.75.", status)
+        self.assertNotIn("Weighted residual 25", status)
 
 
 class MainWindowCalibrationStateTests(unittest.TestCase):
@@ -3614,6 +3637,10 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                     thread = window._detect_shift_thread
                     self.assertTrue(thread.started)
                     self.assertIs(thread.calibration, window._calibration)
+                    self.assertEqual(
+                        thread.correction_mode,
+                        window.calibration_panel.correction_mode(),
+                    )
                     self.assertEqual(
                         thread.shift_kwargs,
                         registration_config_to_measurement_kwargs(
