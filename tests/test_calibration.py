@@ -3443,6 +3443,56 @@ class CorrectionTests(unittest.TestCase):
             [[True, False, False]],
         )
 
+    def test_active_command_axes_freezes_y_and_uses_reduced_convergence(self):
+        jacobian = np.array(
+            [
+                [[100.0, 0.0, 0.0], [0.0, 1000.0, 0.0]],
+                [[0.0, 0.0, 100.0], [0.0, 1000.0, 0.0]],
+            ],
+            dtype=float,
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "calibration.h5"
+            calibration = calibration_dataset(jacobian)
+            save_calibration_dataset(calibration, path)
+            initial_shift = np.array([[10.0, 500.0], [10.0, 500.0]], dtype=float)
+            y_residual_only = np.array([[0.0, 500.0], [0.0, 500.0]], dtype=float)
+            hardware_patches = self.patch_hardware(
+                [shift_dataset(initial_shift), shift_dataset(y_residual_only)]
+            )
+            with (
+                hardware_patches[0],
+                hardware_patches[1],
+                hardware_patches[2],
+                patch(
+                    "merlin_track_position.tracking.correct.move_motors_and_wait",
+                    return_value=(9.9, 29.9),
+                ) as move,
+            ):
+                result = do_correction(
+                    path,
+                    capture_count=1,
+                    correction_mode="camera",
+                    max_moves=1,
+                    gain=1.0,
+                    lqr_projected_tolerance=1e-6,
+                    lqr_image_scale_px=TEST_LQR_IMAGE_SCALE_PX,
+                    lqr_motor_penalty=TEST_LQR_MOTOR_PENALTY,
+                    lqr_svd_relative_tolerance=TEST_LQR_SVD_RELATIVE_TOLERANCE,
+                    max_normalized_step=None,
+                    weights=TEST_CORRECTION_WEIGHTS,
+                    active_command_axes=("x", "z"),
+                )
+
+        self.assertEqual(move.call_args.args[0], ("x", "z"))
+        self.assertEqual(result.attrs["correction_active_command_axes"], "x z")
+        self.assertEqual(result.attrs["correction_active_command_axis_mask"], "1 0 1")
+        self.assertTrue(result.attrs["correction_converged"])
+        self.assertEqual(
+            result["move_active_axis_mask"].values.tolist(),
+            [[True, False, True]],
+        )
+
     def test_tiny_correction_components_are_zeroed_before_motor_move(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = self.save_calibration(tmpdir)

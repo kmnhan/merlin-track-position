@@ -929,10 +929,15 @@ def solve_lqr_observation_command_correction(
         observation_model.shape[0],
     )
     axis_scale = np.asarray(axis_scale_readback_mm, dtype=np.float64)
-    if axis_scale.shape != (len(COMMAND_AXES),):
-        raise ValueError("axis_scale_readback_mm must have one value for x/y/z")
+    if axis_scale.ndim != 1 or axis_scale.size < 1:
+        raise ValueError("axis_scale_readback_mm must be a non-empty 1-D vector")
     if not np.isfinite(axis_scale).all() or np.any(axis_scale <= 0.0):
         raise ValueError("axis_scale_readback_mm must contain finite positive values")
+    command_count = int(axis_scale.size)
+    if observation_model.shape[1] != command_count:
+        raise ValueError(
+            "observation_model column count must match axis_scale_readback_mm"
+        )
 
     gain = float(gain)
     if not np.isfinite(gain) or gain <= 0.0:
@@ -958,7 +963,7 @@ def solve_lqr_observation_command_correction(
         max_normalized_step=max_normalized_step,
     )
 
-    if correction_readback_mm.shape != (len(COMMAND_AXES),):
+    if correction_readback_mm.shape != (command_count,):
         raise ValueError("computed correction has unexpected shape")
     if not np.isfinite(correction_readback_mm).all():
         raise ValueError("computed correction contains non-finite values")
@@ -1044,10 +1049,15 @@ def compute_lqr_correction_design(
     observation_count = jacobian.shape[0]
 
     axis_scale = np.asarray(axis_scale_readback_mm, dtype=np.float64)
-    if axis_scale.shape != (len(COMMAND_AXES),):
-        raise ValueError("axis_scale_readback_mm must have one value for x/y/z")
+    if axis_scale.ndim != 1 or axis_scale.size < 1:
+        raise ValueError("axis_scale_readback_mm must be a non-empty 1-D vector")
     if not np.isfinite(axis_scale).all() or np.any(axis_scale <= 0.0):
         raise ValueError("axis_scale_readback_mm must contain finite positive values")
+    command_count = int(axis_scale.size)
+    if jacobian.shape[1] != command_count:
+        raise ValueError(
+            "jacobian_observation column count must match axis_scale_readback_mm"
+        )
 
     motor_penalty = float(motor_penalty)
     svd_relative_tolerance = float(svd_relative_tolerance)
@@ -1083,7 +1093,7 @@ def compute_lqr_correction_design(
     state_matrix = np.eye(rank, dtype=np.float64)
     input_matrix = controllable_basis.T @ normalized_jacobian
     state_cost = np.eye(rank, dtype=np.float64)
-    input_cost = motor_penalty * np.eye(len(COMMAND_AXES), dtype=np.float64)
+    input_cost = motor_penalty * np.eye(command_count, dtype=np.float64)
 
     riccati_solution = solve_discrete_are(
         state_matrix,
@@ -1160,12 +1170,14 @@ def solve_lqr_state_command_correction(
 ) -> np.ndarray:
     """Solve an LQR command from a normalized controllable-subspace state."""
 
+    axis_scale_values = np.asarray(lqr_design["axis_scale"], dtype=np.float64)
+    command_count = int(axis_scale_values.size)
     normalized_feedback_gain = _lqr_design_matrix(
         lqr_design,
         "normalized_feedback_gain",
-        (len(COMMAND_AXES), int(lqr_design["rank"])),
+        (command_count, int(lqr_design["rank"])),
     )
-    axis_scale = _lqr_design_vector(lqr_design, "axis_scale", len(COMMAND_AXES))
+    axis_scale = _lqr_design_vector(lqr_design, "axis_scale", command_count)
     state_values = np.asarray(state, dtype=np.float64)
     if state_values.shape != (int(lqr_design["rank"]),):
         raise ValueError("state must have one value per LQR controllable state")
@@ -1186,7 +1198,7 @@ def solve_lqr_state_command_correction(
         if max_component > max_normalized_step:
             normalized_correction *= max_normalized_step / max_component
     correction_readback_mm = axis_scale * normalized_correction
-    if correction_readback_mm.shape != (len(COMMAND_AXES),):
+    if correction_readback_mm.shape != (command_count,):
         raise ValueError("computed correction has unexpected shape")
     if not np.isfinite(correction_readback_mm).all():
         raise ValueError("computed correction contains non-finite values")
@@ -2334,10 +2346,8 @@ def _as_jacobian(values: np.ndarray) -> np.ndarray:
 
 def _as_observation_model(values: np.ndarray) -> np.ndarray:
     model = np.asarray(values, dtype=np.float64)
-    if model.ndim != 2 or model.shape[1] != len(COMMAND_AXES):
-        raise ValueError(
-            "observation model must have shape (observation, command_axis)"
-        )
+    if model.ndim != 2 or model.shape[1] < 1:
+        raise ValueError("observation model must have at least one command column")
     if model.shape[0] < 1:
         raise ValueError("observation model must include at least one observation")
     if not np.isfinite(model).all():

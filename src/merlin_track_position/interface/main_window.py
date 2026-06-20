@@ -8,8 +8,8 @@ import os
 import sys
 import threading
 import time
-from collections.abc import Callable, Mapping
-from dataclasses import replace
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, cast
 
@@ -94,6 +94,11 @@ from merlin_track_position.tracking.correct import (
 from merlin_track_position.tracking.persistence import (
     pending_entry_count,
     persistence_result_attrs,
+)
+from merlin_track_position.tracking.polar_compensation import (
+    apply_polar_compensation_model,
+    fit_polar_compensation_model,
+    predict_polar_compensation_from_attrs,
 )
 from merlin_track_position.tracking.roi import (
     BEAM_TARGET_ATTR_KEYS,
@@ -219,6 +224,71 @@ def _default_calibration_path() -> Path:
     return _default_calibration_directory() / DEFAULT_CALIBRATION_FILE_NAME
 
 
+def _polar_compensation_probe_angles(anchor_polar: float) -> tuple[float, ...]:
+    anchor = float(anchor_polar)
+    if not math.isfinite(anchor):
+        raise ValueError("anchor polar must be finite")
+    angles = [float(angle) for angle in POLAR_COMPENSATION_PROBE_ANGLES_DEG]
+    angles.append(anchor)
+    if _has_duplicate_polar_probe(angles):
+        angles.append(float(POLAR_COMPENSATION_DUPLICATE_PROBE_DEG))
+
+    unique: list[float] = []
+    for angle in angles:
+        if not any(
+            math.isclose(
+                angle,
+                existing,
+                rel_tol=0.0,
+                abs_tol=POLAR_COMPENSATION_PROBE_TOLERANCE_DEG,
+            )
+            for existing in unique
+        ):
+            unique.append(angle)
+    if len(unique) < len(POLAR_COMPENSATION_PROBE_ANGLES_DEG) + 1:
+        raise ValueError("polar compensation probe angles must be unique")
+    return tuple(sorted(unique))
+
+
+def _has_duplicate_polar_probe(angles: Sequence[float]) -> bool:
+    values = tuple(float(angle) for angle in angles)
+    for left, left_value in enumerate(values):
+        for right_value in values[left + 1 :]:
+            if math.isclose(
+                left_value,
+                right_value,
+                rel_tol=0.0,
+                abs_tol=POLAR_COMPENSATION_PROBE_TOLERANCE_DEG,
+            ):
+                return True
+    return False
+
+
+def _polar_compensation_anchor_xz_from_points(
+    points: Sequence[_PolarCompensationPoint],
+    anchor_polar: float,
+) -> tuple[float, float]:
+    anchor = float(anchor_polar)
+    if not math.isfinite(anchor):
+        raise ValueError("anchor polar must be finite")
+    matches = [
+        point
+        for point in points
+        if math.isclose(
+            float(point.polar_deg),
+            anchor,
+            rel_tol=0.0,
+            abs_tol=POLAR_COMPENSATION_PROBE_TOLERANCE_DEG,
+        )
+    ]
+    if len(matches) != 1:
+        raise ValueError("exactly one polar compensation point must match the anchor")
+    point = matches[0]
+    if not math.isfinite(point.x_mm) or not math.isfinite(point.z_mm):
+        raise ValueError("anchor x/z point must be finite")
+    return (float(point.x_mm), float(point.z_mm))
+
+
 def _load_calibration_dialog_path(current_path: Path | None) -> Path:
     if current_path is not None:
         return current_path
@@ -235,6 +305,14 @@ def _load_calibration_dialog_path(current_path: Path | None) -> Path:
 
 class _CorrectionUnavailable(RuntimeError):
     """Expected state that prevents a correction run from starting."""
+
+
+@dataclass(frozen=True)
+class _PolarCompensationPoint:
+    polar_deg: float
+    x_mm: float
+    y_mm: float
+    z_mm: float
 
 
 STORED_ORIENTATION_LABELS_BY_ALIAS = {
@@ -298,12 +376,71 @@ class _StoredAxisMoveThread(QtCore.QThread):
         self.requestInterruption()
 
 
+class _PolarCompensationXzMoveThread(QtCore.QThread):
+    sigPolarCompensationXzMoveReady = QtCore.Signal(float, float, float, float)
+    sigPolarCompensationXzMoveFailed = QtCore.Signal(str)
+
+    def __init__(self, parent: QtCore.QObject | None = None):
+        super().__init__(parent)
+        self._running = threading.Event()
+        self._target_xz: tuple[float, float] | None = None
+
+    def configure(self, target_x_mm: float, target_z_mm: float) -> None:
+        if self.isRunning():
+            raise RuntimeError("cannot configure x/z move while it is running")
+        target = (float(target_x_mm), float(target_z_mm))
+        if not all(math.isfinite(value) for value in target):
+            raise ValueError("x/z target must be finite")
+        self._target_xz = target
+
+    def run(self) -> None:
+        self._running.set()
+        try:
+            if not self._running.is_set() or self.isInterruptionRequested():
+                return
+            try:
+                if self._target_xz is None:
+                    raise RuntimeError("x/z move thread has not been configured")
+                final_positions = tuple(
+                    float(value)
+                    for value in move_motors_and_wait(
+                        ("x", "z"),
+                        self._target_xz,
+                    )
+                )
+                if len(final_positions) != 2:
+                    raise ValueError("x/z move returned unexpected readback count")
+            except Exception as exc:
+                logger.exception("Polar compensation x/z return move failed.")
+                if self._running.is_set() and not self.isInterruptionRequested():
+                    self.sigPolarCompensationXzMoveFailed.emit(str(exc))
+                return
+
+            if self._running.is_set() and not self.isInterruptionRequested():
+                self.sigPolarCompensationXzMoveReady.emit(
+                    self._target_xz[0],
+                    self._target_xz[1],
+                    final_positions[0],
+                    final_positions[1],
+                )
+        finally:
+            self._running.clear()
+
+    def stop(self) -> None:
+        self._running.clear()
+        self.requestInterruption()
+
+
 _ACTIVE_CAMERA_CONFIGS: dict[str, CameraConfig] = default_camera_configs()
 CAMERA_IMAGE_SIZES: dict[str, tuple[int, int]] = {
     slot: (_ACTIVE_CAMERA_CONFIGS[slot].width, _ACTIVE_CAMERA_CONFIGS[slot].height)
     for slot in CAMERA_SLOTS
 }
 IMAGE_REFRESH_INTERVAL_MS = 400
+POLAR_COMPENSATION_PROBE_ANGLES_DEG = (-20.0, -12.5, -5.0)
+POLAR_COMPENSATION_DUPLICATE_PROBE_DEG = -10.0
+POLAR_COMPENSATION_PROBE_TOLERANCE_DEG = 1.0e-9
+POLAR_COMPENSATION_ACTIVE_AXES = ("x", "z")
 PERSISTENCE_FLUSH_INTERVAL_MS = 5000
 DEFAULT_AUTO_CORRECTION_INTERVAL_SECONDS = 180.0
 AUTO_CORRECTION_INTERVAL_SETTINGS_KEY = "auto_correction/interval_seconds"
@@ -1059,6 +1196,194 @@ class CameraSettingsDialog(QtWidgets.QDialog):
         return configs
 
 
+class PolarCompensationDiagnosticsDialog(QtWidgets.QDialog):
+    def __init__(self, model: xr.Dataset, parent: QtWidgets.QWidget | None = None):
+        super().__init__(parent)
+        self.setWindowTitle("Polar Compensation Diagnostics")
+        self._model = model
+
+        layout = QtWidgets.QVBoxLayout(self)
+        summary = QtWidgets.QLabel(self._summary_text(model))
+        summary.setWordWrap(True)
+        summary.setTextInteractionFlags(
+            QtCore.Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        layout.addWidget(summary)
+
+        graphics = pg.GraphicsLayoutWidget()
+        graphics.setMinimumSize(760, 520)
+        layout.addWidget(graphics, stretch=1)
+        self._populate_plots(graphics)
+
+        query_group = QtWidgets.QGroupBox("Predict x/z")
+        query_layout = QtWidgets.QGridLayout(query_group)
+        self.polar_input = QtWidgets.QDoubleSpinBox()
+        self.polar_input.setDecimals(4)
+        self.polar_input.setRange(-180.0, 180.0)
+        self.polar_input.setSingleStep(0.5)
+        self.polar_input.setValue(
+            float(model.attrs["polar_compensation_anchor_polar_deg"])
+        )
+        self.x_output = self._read_only_line_edit()
+        self.z_output = self._read_only_line_edit()
+        copy_x = QtWidgets.QPushButton("Copy x")
+        copy_z = QtWidgets.QPushButton("Copy z")
+        copy_pair = QtWidgets.QPushButton("Copy x,z")
+
+        query_layout.addWidget(QtWidgets.QLabel("Polar"), 0, 0)
+        query_layout.addWidget(self.polar_input, 0, 1)
+        query_layout.addWidget(QtWidgets.QLabel("x"), 1, 0)
+        query_layout.addWidget(self.x_output, 1, 1)
+        query_layout.addWidget(copy_x, 1, 2)
+        query_layout.addWidget(QtWidgets.QLabel("z"), 2, 0)
+        query_layout.addWidget(self.z_output, 2, 1)
+        query_layout.addWidget(copy_z, 2, 2)
+        query_layout.addWidget(copy_pair, 3, 1, 1, 2)
+        layout.addWidget(query_group)
+
+        close_button = QtWidgets.QPushButton("Close")
+        close_button.clicked.connect(self.accept)
+        layout.addWidget(close_button, alignment=QtCore.Qt.AlignmentFlag.AlignRight)
+
+        self.polar_input.valueChanged.connect(self._update_prediction)
+        copy_x.clicked.connect(lambda: self._copy_text(self.x_output.text()))
+        copy_z.clicked.connect(lambda: self._copy_text(self.z_output.text()))
+        copy_pair.clicked.connect(
+            lambda: self._copy_text(f"{self.x_output.text()}, {self.z_output.text()}")
+        )
+        self._update_prediction()
+
+    @staticmethod
+    def _read_only_line_edit() -> QtWidgets.QLineEdit:
+        line_edit = QtWidgets.QLineEdit()
+        line_edit.setReadOnly(True)
+        line_edit.setMinimumWidth(160)
+        return line_edit
+
+    @staticmethod
+    def _summary_text(model: xr.Dataset) -> str:
+        attrs = model.attrs
+        return (
+            "Polar compensation model fitted. "
+            f"Anchor p={float(attrs['polar_compensation_anchor_polar_deg']):.4f} deg, "
+            f"x={float(attrs['polar_compensation_anchor_x_mm']):.6f} mm, "
+            f"z={float(attrs['polar_compensation_anchor_z_mm']):.6f} mm. "
+            f"Center x={float(attrs['polar_compensation_center_x_mm']):.6f} mm, "
+            f"z={float(attrs['polar_compensation_center_z_mm']):.6f} mm. "
+            f"RMS residual={float(attrs['polar_compensation_residual_rms_um']):.3f} um, "
+            f"max residual={float(attrs['polar_compensation_residual_max_um']):.3f} um."
+        )
+
+    def _populate_plots(self, graphics: pg.GraphicsLayoutWidget) -> None:
+        polar = np.asarray(
+            self._model["polar_compensation_probe_polar_deg"].values,
+            dtype=np.float64,
+        )
+        measured = np.asarray(
+            self._model["polar_compensation_probe_xz_mm"].values,
+            dtype=np.float64,
+        )
+        predicted = np.asarray(
+            self._model["polar_compensation_predicted_xz_mm"].values,
+            dtype=np.float64,
+        )
+        residual_um = np.asarray(
+            self._model["polar_compensation_residual_um"].values,
+            dtype=np.float64,
+        )
+        order = np.argsort(polar)
+        polar_sorted = polar[order]
+        predicted_sorted = predicted[order]
+
+        x_plot = graphics.addPlot(row=0, col=0, title="x(p)")
+        self._format_plot(x_plot, "polar (deg)", "x (mm)")
+        x_plot.plot(
+            polar_sorted,
+            predicted_sorted[:, 0],
+            pen=pg.mkPen("#0072b2", width=2),
+        )
+        x_plot.plot(
+            polar,
+            measured[:, 0],
+            pen=None,
+            symbol="o",
+            symbolBrush="#d55e00",
+        )
+
+        z_plot = graphics.addPlot(row=0, col=1, title="z(p)")
+        self._format_plot(z_plot, "polar (deg)", "z (mm)")
+        z_plot.plot(
+            polar_sorted,
+            predicted_sorted[:, 1],
+            pen=pg.mkPen("#0072b2", width=2),
+        )
+        z_plot.plot(
+            polar,
+            measured[:, 1],
+            pen=None,
+            symbol="o",
+            symbolBrush="#d55e00",
+        )
+
+        residual_plot = graphics.addPlot(row=1, col=0, title="Residuals")
+        self._format_plot(residual_plot, "polar (deg)", "residual (um)")
+        residual_plot.plot(
+            polar,
+            residual_um[:, 0],
+            pen=None,
+            symbol="o",
+            symbolBrush="#009e73",
+            name="dx",
+        )
+        residual_plot.plot(
+            polar,
+            residual_um[:, 1],
+            pen=None,
+            symbol="t",
+            symbolBrush="#cc79a7",
+            name="dz",
+        )
+        residual_plot.addLegend()
+
+        trajectory_plot = graphics.addPlot(row=1, col=1, title="x-z trajectory")
+        self._format_plot(trajectory_plot, "x (mm)", "z (mm)")
+        trajectory_plot.setAspectLocked(True)
+        trajectory_plot.plot(
+            predicted_sorted[:, 0],
+            predicted_sorted[:, 1],
+            pen=pg.mkPen("#0072b2", width=2),
+        )
+        trajectory_plot.plot(
+            measured[:, 0],
+            measured[:, 1],
+            pen=None,
+            symbol="o",
+            symbolBrush="#d55e00",
+        )
+
+    @staticmethod
+    def _format_plot(plot: pg.PlotItem, bottom: str, left: str) -> None:
+        plot.setLabel("bottom", bottom)
+        plot.setLabel("left", left)
+        plot.showGrid(x=True, y=True, alpha=0.25)
+        plot.getAxis("bottom").enableAutoSIPrefix(False)
+        plot.getAxis("left").enableAutoSIPrefix(False)
+
+    def _update_prediction(self) -> None:
+        xz = np.asarray(
+            predict_polar_compensation_from_attrs(
+                self._model,
+                float(self.polar_input.value()),
+            ),
+            dtype=np.float64,
+        )
+        self.x_output.setText(f"{float(xz[0]):.9f}")
+        self.z_output.setText(f"{float(xz[1]):.9f}")
+
+    def _copy_text(self, text: str) -> None:
+        QtWidgets.QApplication.clipboard().setText(text)
+
+
 class _ImageCaptureThread(QtCore.QThread):
     sigImageReady = QtCore.Signal(str, object)
     sigImageCaptureFailed = QtCore.Signal(str, str)
@@ -1312,6 +1637,7 @@ class MainWindow(_MainWindowGUI):
         self._correction_thread = CorrectionThread(self)
         self._detect_shift_thread = DetectShiftThread(self)
         self._stored_axis_move_thread = _StoredAxisMoveThread(self)
+        self._polar_compensation_xz_move_thread = _PolarCompensationXzMoveThread(self)
         self._calibration_total_steps = 0
         self._calibration_started_at: float | None = None
         self._calibration_processing_started_at: float | None = None
@@ -1321,6 +1647,15 @@ class MainWindow(_MainWindowGUI):
         self._stored_axis_move_restore_correction_result = False
         self._server_correction_pending = False
         self._server_correction_target: int | None = None
+        self._polar_compensation_active = False
+        self._polar_compensation_angles: tuple[float, ...] = ()
+        self._polar_compensation_index = 0
+        self._polar_compensation_points: list[_PolarCompensationPoint] = []
+        self._polar_compensation_current_polar: float | None = None
+        self._polar_compensation_anchor_polar: float | None = None
+        self._polar_compensation_anchor_xz: tuple[float, float] | None = None
+        self._polar_compensation_returning_to_anchor = False
+        self._polar_compensation_returning_xz = False
         self._latest_images: tuple[np.ndarray, np.ndarray] | None = None
         self._latest_images_by_camera: dict[str, np.ndarray] = {}
         self._reference_preview_active = False
@@ -1410,6 +1745,9 @@ class MainWindow(_MainWindowGUI):
         self.calibration_panel.calibration_details_button.clicked.connect(
             self._on_calibration_details_clicked
         )
+        self.calibration_panel.calculate_polar_compensate_button.clicked.connect(
+            self._on_calculate_polar_compensate_clicked
+        )
         self.calibration_panel.correct_sample_button.clicked.connect(
             self._on_correct_sample_clicked
         )
@@ -1459,6 +1797,12 @@ class MainWindow(_MainWindowGUI):
         )
         self._stored_axis_move_thread.sigStoredAxisMoveFailed.connect(
             self._on_stored_axis_move_failed
+        )
+        self._polar_compensation_xz_move_thread.sigPolarCompensationXzMoveReady.connect(
+            self._on_polar_compensation_xz_move_ready
+        )
+        self._polar_compensation_xz_move_thread.sigPolarCompensationXzMoveFailed.connect(
+            self._on_polar_compensation_xz_move_failed
         )
         self.image_auto_refresh_checkbox.toggled.connect(
             self._on_image_auto_refresh_toggled
@@ -1758,6 +2102,8 @@ class MainWindow(_MainWindowGUI):
             return "Correction is unavailable while shift detection is running."
         if self._stored_axis_move_thread.isRunning():
             return "Correction is unavailable while a stored-axis move is running."
+        if self._polar_compensation_active:
+            return "Correction is unavailable while polar compensation is running."
         if self._calibration_path is None or not self._calibration_path.exists():
             return "Correction requires a calibration file on disk."
         mismatch_message = self._camera_config_mismatch_message()
@@ -1776,6 +2122,8 @@ class MainWindow(_MainWindowGUI):
             return "Shift detection is already in progress."
         if self._stored_axis_move_thread.isRunning():
             return "Shift detection is unavailable while a stored-axis move is running."
+        if self._polar_compensation_active:
+            return "Shift detection is unavailable while polar compensation is running."
         mismatch_message = self._camera_config_mismatch_message()
         if mismatch_message is not None:
             return mismatch_message
@@ -1792,6 +2140,28 @@ class MainWindow(_MainWindowGUI):
             return "Stored-axis move is unavailable while shift detection is running."
         if self._stored_axis_move_thread.isRunning():
             return "Stored-axis move is already in progress."
+        if self._polar_compensation_active:
+            return "Stored-axis move is unavailable while polar compensation is running."
+        return None
+
+    def _polar_compensation_unavailable_message(self) -> str | None:
+        if self._calibration is None:
+            return "Polar compensation requires a loaded calibration."
+        if self._calibration_thread.isRunning():
+            return "Polar compensation is unavailable while calibration is running."
+        if self._correction_thread.isRunning():
+            return "Polar compensation is unavailable while correction is running."
+        if self._detect_shift_thread.isRunning():
+            return "Polar compensation is unavailable while shift detection is running."
+        if self._stored_axis_move_thread.isRunning():
+            return "Polar compensation is unavailable while a stored-axis move is running."
+        if self._polar_compensation_active:
+            return "Polar compensation is already running."
+        if self._calibration_path is None or not self._calibration_path.exists():
+            return "Polar compensation requires a calibration file on disk."
+        mismatch_message = self._camera_config_mismatch_message()
+        if mismatch_message is not None:
+            return mismatch_message
         return None
 
     def _camera_config_mismatch_message(self) -> str | None:
@@ -1842,6 +2212,380 @@ class MainWindow(_MainWindowGUI):
                 self._restore_calibration_idle_state()
             logger.exception("Failed while starting correction.")
             raise
+
+    @QtCore.Slot()
+    def _on_calculate_polar_compensate_clicked(self) -> None:
+        unavailable_message = self._polar_compensation_unavailable_message()
+        if unavailable_message is not None:
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Could not calculate polar compensation",
+                unavailable_message,
+            )
+            return
+        if self._calibration is None or self._calibration_path is None:
+            return
+
+        try:
+            anchor_polar = float(self._calibration.attrs["polar"])
+            if not math.isfinite(anchor_polar):
+                raise ValueError("calibration polar must be finite")
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Could not calculate polar compensation",
+                f"Loaded calibration does not have a valid polar angle: {exc}",
+            )
+            return
+
+        try:
+            probe_angles = _polar_compensation_probe_angles(anchor_polar)
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Could not calculate polar compensation",
+                str(exc),
+            )
+            return
+        angle_text = ", ".join(f"{angle:g} deg" for angle in probe_angles)
+        if math.isclose(
+            float(probe_angles[-1]),
+            anchor_polar,
+            rel_tol=0.0,
+            abs_tol=POLAR_COMPENSATION_PROBE_TOLERANCE_DEG,
+        ):
+            return_text = (
+                " The final probe is the calibration polar, so no return move "
+                "will be run."
+            )
+        else:
+            return_text = (
+                " After all probes, Polar will return to the calibration angle "
+                f"{anchor_polar:g} deg, then X/Z will return to the acquired "
+                "anchor point."
+            )
+        response = QtWidgets.QMessageBox.warning(
+            self,
+            "Calculate polar compensation?",
+            "This workflow will move Polar to "
+            f"{angle_text}. After each move, you will be asked to manually jog "
+            "only X and Z until the target sample area appears inside the ROI "
+            f"for both cameras.{return_text} Continue?",
+            QtWidgets.QMessageBox.StandardButton.Ok
+            | QtWidgets.QMessageBox.StandardButton.Cancel,
+            QtWidgets.QMessageBox.StandardButton.Cancel,
+        )
+        if response != QtWidgets.QMessageBox.StandardButton.Ok:
+            return
+
+        self._polar_compensation_active = True
+        self._polar_compensation_angles = tuple(float(angle) for angle in probe_angles)
+        self._polar_compensation_index = 0
+        self._polar_compensation_points = []
+        self._polar_compensation_current_polar = None
+        self._polar_compensation_anchor_polar = float(anchor_polar)
+        self._polar_compensation_anchor_xz = None
+        self._polar_compensation_returning_to_anchor = False
+        self._polar_compensation_returning_xz = False
+        self._stop_auto_correction(uncheck=True)
+        self._start_polar_compensation_polar_move()
+
+    def _start_polar_compensation_polar_move(self) -> None:
+        if not self._polar_compensation_active:
+            return
+        if self._polar_compensation_index >= len(self._polar_compensation_angles):
+            self._start_polar_compensation_return_move()
+            return
+        target = float(self._polar_compensation_angles[self._polar_compensation_index])
+        try:
+            self._stored_axis_move_thread.configure("p", target)
+        except Exception as exc:
+            self._abort_polar_compensation(str(exc))
+            return
+
+        try:
+            self._pause_image_auto_refresh_for_calibration()
+            self._set_roi_editing_enabled(False)
+            self.calibration_panel.show_polar_compensation_in_progress(
+                f"Moving Polar to {target:g} deg for polar compensation..."
+            )
+            self._stored_axis_move_thread.start()
+        except Exception as exc:
+            self._restore_image_auto_refresh_after_calibration()
+            self._abort_polar_compensation(str(exc))
+
+    def _start_polar_compensation_return_move(self) -> None:
+        if not self._polar_compensation_active:
+            return
+        if self._polar_compensation_anchor_polar is None:
+            self._abort_polar_compensation("Calibration anchor polar is missing.")
+            return
+        target = float(self._polar_compensation_anchor_polar)
+        if self._polar_compensation_last_probe_is_anchor():
+            self._finish_polar_compensation()
+            return
+        try:
+            self._polar_compensation_anchor_xz = _polar_compensation_anchor_xz_from_points(
+                self._polar_compensation_points,
+                target,
+            )
+        except Exception as exc:
+            self._abort_polar_compensation(str(exc))
+            return
+        if (
+            self._polar_compensation_current_polar is not None
+            and math.isclose(
+                float(self._polar_compensation_current_polar),
+                target,
+                rel_tol=0.0,
+                abs_tol=POLAR_COMPENSATION_PROBE_TOLERANCE_DEG,
+            )
+        ):
+            self._start_polar_compensation_anchor_xz_move()
+            return
+        try:
+            self._polar_compensation_returning_to_anchor = True
+            self._stored_axis_move_thread.configure("p", target)
+        except Exception as exc:
+            self._abort_polar_compensation(str(exc))
+            return
+
+        try:
+            self._pause_image_auto_refresh_for_calibration()
+            self._set_roi_editing_enabled(False)
+            self.calibration_panel.show_polar_compensation_in_progress(
+                f"Returning Polar to calibration angle {target:g} deg..."
+            )
+            self._stored_axis_move_thread.start()
+        except Exception as exc:
+            self._restore_image_auto_refresh_after_calibration()
+            self._abort_polar_compensation(str(exc))
+
+    def _polar_compensation_last_probe_is_anchor(self) -> bool:
+        if not self._polar_compensation_angles:
+            return False
+        if self._polar_compensation_anchor_polar is None:
+            return False
+        return math.isclose(
+            float(self._polar_compensation_angles[-1]),
+            float(self._polar_compensation_anchor_polar),
+            rel_tol=0.0,
+            abs_tol=POLAR_COMPENSATION_PROBE_TOLERANCE_DEG,
+        )
+
+    def _start_polar_compensation_anchor_xz_move(self) -> None:
+        if not self._polar_compensation_active:
+            return
+        if self._polar_compensation_anchor_xz is None:
+            self._abort_polar_compensation("Polar compensation anchor x/z is missing.")
+            return
+        target_x, target_z = self._polar_compensation_anchor_xz
+        try:
+            self._polar_compensation_returning_xz = True
+            self._polar_compensation_xz_move_thread.configure(target_x, target_z)
+        except Exception as exc:
+            self._abort_polar_compensation(str(exc))
+            return
+
+        try:
+            self._pause_image_auto_refresh_for_calibration()
+            self._set_roi_editing_enabled(False)
+            self.calibration_panel.show_polar_compensation_in_progress(
+                "Returning X/Z to the acquired calibration-polar anchor..."
+            )
+            self._polar_compensation_xz_move_thread.start()
+        except Exception as exc:
+            self._restore_image_auto_refresh_after_calibration()
+            self._abort_polar_compensation(str(exc))
+
+    def _on_polar_compensation_polar_move_ready(
+        self,
+        target_value: float,
+        final_value: float,
+    ) -> None:
+        self._restore_image_auto_refresh_after_calibration()
+        self._polar_compensation_current_polar = float(final_value)
+        step = self._polar_compensation_index + 1
+        total = len(self._polar_compensation_angles)
+        response = QtWidgets.QMessageBox.information(
+            self,
+            "Manual x/z jog required",
+            f"Polar is at {final_value:.4f} deg "
+            f"(step {step} of {total}).\n\n"
+            "Manually jog only X and Z until the target sample area is inside "
+            "the ROI for both cameras. Click OK only after this is done.",
+            QtWidgets.QMessageBox.StandardButton.Ok
+            | QtWidgets.QMessageBox.StandardButton.Cancel,
+            QtWidgets.QMessageBox.StandardButton.Ok,
+        )
+        if response != QtWidgets.QMessageBox.StandardButton.Ok:
+            self._abort_polar_compensation("Polar compensation cancelled by user.")
+            return
+        self._start_polar_compensation_correction()
+
+    def _start_polar_compensation_correction(self) -> None:
+        if not self._polar_compensation_active:
+            return
+        if self._calibration is None or self._calibration_path is None:
+            self._abort_polar_compensation("Calibration state changed.")
+            return
+        try:
+            camera_pair = self._camera_pair_for_current_images()
+            self._correction_thread.configure(
+                self._calibration,
+                camera_pair,
+                self._calibration_path,
+                correction_mode=self.calibration_panel.correction_mode(),
+                shift_kwargs=self._registration_measurement_kwargs(),
+                active_command_axes=POLAR_COMPENSATION_ACTIVE_AXES,
+            )
+            self._pause_image_auto_refresh_for_calibration()
+            self._set_roi_editing_enabled(False)
+            self.calibration_panel.show_polar_compensation_in_progress(
+                "Correcting X/Z with Y frozen for polar compensation..."
+            )
+            self._correction_thread.start()
+        except Exception as exc:
+            self._restore_image_auto_refresh_after_calibration()
+            self._abort_polar_compensation(str(exc))
+
+    def _on_polar_compensation_correction_ready(self, result: xr.Dataset) -> None:
+        self._restore_image_auto_refresh_after_calibration()
+        if not bool(result.attrs.get("correction_converged", False)):
+            self._abort_polar_compensation(
+                "X/Z correction did not converge; no polar compensation model saved."
+            )
+            return
+        try:
+            final_xyz = np.asarray(
+                result["final_readback_position_mm"].values,
+                dtype=np.float64,
+            )
+            if final_xyz.shape != (3,) or not np.isfinite(final_xyz).all():
+                raise ValueError("correction result has invalid final readbacks")
+            if self._polar_compensation_current_polar is None:
+                raise RuntimeError("polar readback is missing for current probe")
+            self._polar_compensation_points.append(
+                _PolarCompensationPoint(
+                    polar_deg=float(self._polar_compensation_current_polar),
+                    x_mm=float(final_xyz[0]),
+                    y_mm=float(final_xyz[1]),
+                    z_mm=float(final_xyz[2]),
+                )
+            )
+        except Exception as exc:
+            self._abort_polar_compensation(str(exc))
+            return
+
+        self._polar_compensation_index += 1
+        self._start_polar_compensation_polar_move()
+
+    def _on_polar_compensation_return_ready(
+        self,
+        target_value: float,
+        final_value: float,
+    ) -> None:
+        self._restore_image_auto_refresh_after_calibration()
+        self._polar_compensation_returning_to_anchor = False
+        logger.info(
+            "Polar compensation return move finished: target=%g, final=%g",
+            target_value,
+            final_value,
+        )
+        self._start_polar_compensation_anchor_xz_move()
+
+    def _on_polar_compensation_xz_move_ready(
+        self,
+        target_x: float,
+        target_z: float,
+        final_x: float,
+        final_z: float,
+    ) -> None:
+        self._restore_image_auto_refresh_after_calibration()
+        self._polar_compensation_returning_xz = False
+        logger.info(
+            "Polar compensation x/z return move finished: target=(%g, %g), "
+            "final=(%g, %g)",
+            target_x,
+            target_z,
+            final_x,
+            final_z,
+        )
+        self._finish_polar_compensation()
+
+    def _on_polar_compensation_xz_move_failed(self, error_message: str) -> None:
+        self._restore_image_auto_refresh_after_calibration()
+        self._abort_polar_compensation(
+            f"Could not return X/Z to the acquired anchor point: {error_message}"
+        )
+
+    def _finish_polar_compensation(self) -> None:
+        if self._calibration is None or self._calibration_path is None:
+            self._abort_polar_compensation("Calibration state changed before fitting.")
+            return
+        try:
+            anchor_polar = float(self._calibration.attrs["polar"])
+            points = tuple(self._polar_compensation_points)
+            model = fit_polar_compensation_model(
+                [point.polar_deg for point in points],
+                [point.x_mm for point in points],
+                [point.y_mm for point in points],
+                [point.z_mm for point in points],
+                anchor_polar_deg=anchor_polar,
+            )
+            updated = apply_polar_compensation_model(self._calibration, model)
+            persistence = save_calibration_dataset_deferred(
+                updated,
+                self._calibration_path,
+            )
+            if persistence.flushed:
+                self._calibration = load_calibration_dataset(self._calibration_path)
+            else:
+                self._calibration = updated.load().copy(deep=True)
+                self._calibration.attrs["calibration_path"] = str(
+                    self._calibration_path
+                )
+                self._calibration = self._calibration.assign_attrs(
+                    persistence_result_attrs("calibration", persistence)
+                )
+            self._schedule_persistence_flush_if_needed()
+        except Exception as exc:
+            self._abort_polar_compensation(str(exc))
+            return
+
+        self._polar_compensation_active = False
+        self._polar_compensation_angles = ()
+        self._polar_compensation_index = 0
+        self._polar_compensation_points = []
+        self._polar_compensation_current_polar = None
+        self._polar_compensation_anchor_polar = None
+        self._polar_compensation_anchor_xz = None
+        self._polar_compensation_returning_to_anchor = False
+        self._polar_compensation_returning_xz = False
+        self._set_roi_editing_enabled(False)
+        self._set_shift_monitor_calibration()
+        self._update_reset_beam_target_button()
+        self.calibration_panel.show_polar_compensation_result(model)
+        self._refresh_initial_transform_preview_after_known_state_change()
+        PolarCompensationDiagnosticsDialog(model, self).exec()
+
+    def _abort_polar_compensation(self, message: str) -> None:
+        logger.warning("Polar compensation stopped: %s", message)
+        self._polar_compensation_active = False
+        self._polar_compensation_angles = ()
+        self._polar_compensation_index = 0
+        self._polar_compensation_points = []
+        self._polar_compensation_current_polar = None
+        self._polar_compensation_anchor_polar = None
+        self._polar_compensation_anchor_xz = None
+        self._polar_compensation_returning_to_anchor = False
+        self._polar_compensation_returning_xz = False
+        self._restore_calibration_idle_state()
+        QtWidgets.QMessageBox.warning(
+            self,
+            "Polar compensation stopped",
+            message,
+        )
 
     @QtCore.Slot(str, float)
     def _on_stored_axis_move_requested(
@@ -1911,6 +2655,12 @@ class MainWindow(_MainWindowGUI):
         target_value: float,
         final_value: float,
     ) -> None:
+        if self._polar_compensation_active and axis_alias == "p":
+            if self._polar_compensation_returning_to_anchor:
+                self._on_polar_compensation_return_ready(target_value, final_value)
+                return
+            self._on_polar_compensation_polar_move_ready(target_value, final_value)
+            return
         display_name = STORED_ORIENTATION_LABELS_BY_ALIAS.get(axis_alias, axis_alias)
         self._restore_image_auto_refresh_after_calibration()
         self._restore_stored_axis_move_idle_state()
@@ -1933,6 +2683,15 @@ class MainWindow(_MainWindowGUI):
         axis_alias: str,
         error_message: str,
     ) -> None:
+        if self._polar_compensation_active and axis_alias == "p":
+            self._restore_image_auto_refresh_after_calibration()
+            if self._polar_compensation_returning_to_anchor:
+                self._abort_polar_compensation(
+                    f"Could not return Polar to calibration angle: {error_message}"
+                )
+            else:
+                self._abort_polar_compensation(error_message)
+            return
         display_name = STORED_ORIENTATION_LABELS_BY_ALIAS.get(axis_alias, axis_alias)
         self._restore_image_auto_refresh_after_calibration()
         self._restore_stored_axis_move_idle_state()
@@ -2663,6 +3422,7 @@ class MainWindow(_MainWindowGUI):
             self._correction_thread.isRunning()
             or self._detect_shift_thread.isRunning()
             or self._stored_axis_move_thread.isRunning()
+            or self._polar_compensation_active
         ):
             return
 
@@ -2708,6 +3468,7 @@ class MainWindow(_MainWindowGUI):
             or self._correction_thread.isRunning()
             or self._detect_shift_thread.isRunning()
             or self._stored_axis_move_thread.isRunning()
+            or self._polar_compensation_active
         ):
             return
 
@@ -2769,6 +3530,7 @@ class MainWindow(_MainWindowGUI):
             or self._correction_thread.isRunning()
             or self._detect_shift_thread.isRunning()
             or self._stored_axis_move_thread.isRunning()
+            or self._polar_compensation_active
         ):
             return
         if self._calibration is not None:
@@ -3019,6 +3781,15 @@ class MainWindow(_MainWindowGUI):
     @QtCore.Slot(object)
     def _on_correction_ready(self, result: object) -> None:
         logger.info("Correction ready signal received.")
+        if self._polar_compensation_active:
+            if isinstance(result, xr.Dataset):
+                self._on_polar_compensation_correction_ready(result)
+            else:
+                self._restore_image_auto_refresh_after_calibration()
+                self._abort_polar_compensation(
+                    "correction thread did not return an xarray Dataset"
+                )
+            return
         try:
             self._restore_image_auto_refresh_after_calibration()
             if not isinstance(result, xr.Dataset):
@@ -3068,11 +3839,20 @@ class MainWindow(_MainWindowGUI):
             )
             return
         self._last_correction_result = result
-        self.calibration_panel.show_correction_progress(result)
+        if self._polar_compensation_active:
+            self.calibration_panel.show_polar_compensation_in_progress(
+                "Correcting X/Z with Y frozen for polar compensation..."
+            )
+        else:
+            self.calibration_panel.show_correction_progress(result)
 
     @QtCore.Slot(str)
     def _on_correction_failed(self, error_message: str) -> None:
         logger.error("Correction failed signal received: %s", error_message)
+        if self._polar_compensation_active:
+            self._restore_image_auto_refresh_after_calibration()
+            self._abort_polar_compensation(error_message)
+            return
         self._reply_to_pending_server_correction(False, error_message)
         self._restore_image_auto_refresh_after_calibration()
         self._restore_calibration_idle_state()
@@ -3123,6 +3903,7 @@ class MainWindow(_MainWindowGUI):
             or self._correction_thread.isRunning()
             or self._detect_shift_thread.isRunning()
             or self._stored_axis_move_thread.isRunning()
+            or self._polar_compensation_active
         ):
             return
 
@@ -3299,6 +4080,9 @@ class MainWindow(_MainWindowGUI):
 
         self._stored_axis_move_thread.stop()
         self._stored_axis_move_thread.wait()
+
+        self._polar_compensation_xz_move_thread.stop()
+        self._polar_compensation_xz_move_thread.wait()
 
         close_basler_camera()
 

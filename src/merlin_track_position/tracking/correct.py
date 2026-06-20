@@ -162,6 +162,7 @@ def do_correction(
     weights: Sequence[float] | np.ndarray | None = None,
     progress_callback: Callable[[xr.Dataset], None] | None = None,
     motor_backend: CorrectionMotorBackend | None = None,
+    active_command_axes: Sequence[str] | None = None,
     **shift_kwargs: Any,
 ) -> xr.Dataset:
     """Run LQR closed-loop visual-servo correction in readback-mm space."""
@@ -177,6 +178,9 @@ def do_correction(
         camera_pair = default_camera_pair()
     if motor_backend is None:
         motor_backend = DirectBCSMotorBackend()
+    active_axis_indices = _active_command_axis_indices(active_command_axes)
+    active_axis_names = tuple(COMMAND_AXES[index] for index in active_axis_indices)
+    active_axis_reduced = len(active_axis_indices) != len(COMMAND_AXES)
     correction_backlash_enabled = (
         isinstance(motor_backend, DirectBCSMotorBackend)
         and constants.CORRECTION_USE_BCS_API_BACKLASH
@@ -249,6 +253,7 @@ def do_correction(
     lqr_kalman_filter_enabled = (
         bool(constants.DEFAULT_LQR_CORRECTION_USE_KALMAN_FILTER)
         and correction_mode == CORRECTION_MODE_CAMERA
+        and not active_axis_reduced
     )
     lqr_kalman_process_noise = constants.DEFAULT_LQR_CORRECTION_KALMAN_PROCESS_NOISE
     lqr_kalman_measurement_noise = (
@@ -272,6 +277,7 @@ def do_correction(
             jacobian,
             np.asarray(calibration["probe_readback_delta_mm"].values, dtype=np.float64),
         )
+    active_axis_scale = axis_scale[list(active_axis_indices)]
     beam_geometry: dict[str, np.ndarray | float] | None = None
     beam_lqr_weights: np.ndarray | None = None
     lqr_image_scale: float | np.ndarray = lqr_image_scale_px
@@ -293,17 +299,17 @@ def do_correction(
         lqr_observation_model = np.asarray(
             beam_geometry["projection_matrix"],
             dtype=np.float64,
-        )
+        )[:, list(active_axis_indices)]
         lqr_image_scale = 1.0
         lqr_weights = beam_lqr_weights
     else:
         lqr_observation_model = jacobian.reshape(
             len(CAMERAS) * len(PIXEL_AXES),
             len(COMMAND_AXES),
-        )
+        )[:, list(active_axis_indices)]
     lqr_design = compute_lqr_correction_design(
         lqr_observation_model,
-        axis_scale,
+        active_axis_scale,
         image_scale_px=lqr_image_scale,
         motor_penalty=lqr_motor_penalty,
         svd_relative_tolerance=lqr_svd_relative_tolerance,
@@ -444,6 +450,7 @@ def do_correction(
                 jacobian=jacobian,
                 measurement=measurement,
                 axis_scale=axis_scale,
+                active_axis_indices=active_axis_indices,
                 correction_mode=correction_mode,
                 beam_observation=beam_observation_mm,
                 beam_projection_matrix=(
@@ -547,6 +554,7 @@ def do_correction(
             initial_readback_position_mm=initial_readback_position_mm,
             readback_position_mm=readback_position_mm,
             warnings=warnings,
+            active_axis_names=active_axis_names,
         )
 
     def save_progress(completed: bool) -> xr.Dataset:
@@ -605,16 +613,22 @@ def do_correction(
         if correction_mode == CORRECTION_MODE_BEAM:
             if beam_geometry is None or beam_observation_mm is None:
                 raise RuntimeError("beam correction geometry was not initialized")
-            raw_correction_readback_delta_mm = solve_lqr_observation_command_correction(
-                np.asarray(beam_geometry["projection_matrix"], dtype=np.float64),
-                beam_observation_mm,
-                axis_scale,
-                gain=gain_used,
-                image_scale=1.0,
-                motor_penalty=lqr_motor_penalty,
-                svd_relative_tolerance=lqr_svd_relative_tolerance,
-                max_normalized_step=max_normalized_step,
-                weights=beam_lqr_weights,
+            raw_correction_readback_delta_mm = _expand_active_command_correction(
+                solve_lqr_observation_command_correction(
+                    np.asarray(
+                        beam_geometry["projection_matrix"],
+                        dtype=np.float64,
+                    )[:, list(active_axis_indices)],
+                    beam_observation_mm,
+                    active_axis_scale,
+                    gain=gain_used,
+                    image_scale=1.0,
+                    motor_penalty=lqr_motor_penalty,
+                    svd_relative_tolerance=lqr_svd_relative_tolerance,
+                    max_normalized_step=max_normalized_step,
+                    weights=beam_lqr_weights,
+                ),
+                active_axis_indices,
             )
         elif lqr_kalman_filter_enabled:
             if lqr_design is None or lqr_kalman_state is None:
@@ -626,17 +640,36 @@ def do_correction(
                 max_normalized_step=max_normalized_step,
             )
         else:
-            raw_correction_readback_delta_mm = solve_lqr_command_correction(
-                jacobian,
-                measurement,
-                axis_scale,
-                gain=gain_used,
-                max_normalized_step=max_normalized_step,
-                image_scale_px=lqr_image_scale_px,
-                motor_penalty=lqr_motor_penalty,
-                svd_relative_tolerance=lqr_svd_relative_tolerance,
-                weights=weights,
-            )
+            if active_axis_reduced:
+                raw_correction_readback_delta_mm = _expand_active_command_correction(
+                    solve_lqr_observation_command_correction(
+                        jacobian.reshape(
+                            len(CAMERAS) * len(PIXEL_AXES),
+                            len(COMMAND_AXES),
+                        )[:, list(active_axis_indices)],
+                        _measurement_observation(measurement),
+                        active_axis_scale,
+                        gain=gain_used,
+                        max_normalized_step=max_normalized_step,
+                        image_scale=lqr_image_scale_px,
+                        motor_penalty=lqr_motor_penalty,
+                        svd_relative_tolerance=lqr_svd_relative_tolerance,
+                        weights=weights,
+                    ),
+                    active_axis_indices,
+                )
+            else:
+                raw_correction_readback_delta_mm = solve_lqr_command_correction(
+                    jacobian,
+                    measurement,
+                    axis_scale,
+                    gain=gain_used,
+                    max_normalized_step=max_normalized_step,
+                    image_scale_px=lqr_image_scale_px,
+                    motor_penalty=lqr_motor_penalty,
+                    svd_relative_tolerance=lqr_svd_relative_tolerance,
+                    weights=weights,
+                )
         correction_readback_delta_mm = _validate_readback_correction(
             raw_correction_readback_delta_mm
         )
@@ -2451,6 +2484,7 @@ def _reported_next_correction(
     jacobian: np.ndarray,
     measurement: xr.Dataset,
     axis_scale: np.ndarray,
+    active_axis_indices: Sequence[int],
     correction_mode: str,
     beam_observation: np.ndarray | None,
     beam_projection_matrix: np.ndarray | None,
@@ -2470,16 +2504,21 @@ def _reported_next_correction(
     if correction_mode == CORRECTION_MODE_BEAM:
         if beam_observation is None or beam_projection_matrix is None:
             raise RuntimeError("beam correction geometry was not initialized")
-        raw_correction = solve_lqr_observation_command_correction(
-            beam_projection_matrix,
-            beam_observation,
-            axis_scale,
-            gain=gain,
-            image_scale=1.0,
-            motor_penalty=lqr_motor_penalty,
-            svd_relative_tolerance=lqr_svd_relative_tolerance,
-            max_normalized_step=max_normalized_step,
-            weights=beam_lqr_weights,
+        raw_correction = _expand_active_command_correction(
+            solve_lqr_observation_command_correction(
+                np.asarray(beam_projection_matrix, dtype=np.float64)[
+                    :, list(active_axis_indices)
+                ],
+                beam_observation,
+                np.asarray(axis_scale, dtype=np.float64)[list(active_axis_indices)],
+                gain=gain,
+                image_scale=1.0,
+                motor_penalty=lqr_motor_penalty,
+                svd_relative_tolerance=lqr_svd_relative_tolerance,
+                max_normalized_step=max_normalized_step,
+                weights=beam_lqr_weights,
+            ),
+            active_axis_indices,
         )
     elif lqr_kalman_filter_enabled:
         if lqr_design is None or lqr_kalman_state is None:
@@ -2491,17 +2530,36 @@ def _reported_next_correction(
             max_normalized_step=max_normalized_step,
         )
     else:
-        raw_correction = solve_lqr_command_correction(
-            jacobian,
-            measurement,
-            axis_scale,
-            gain=gain,
-            max_normalized_step=max_normalized_step,
-            image_scale_px=lqr_image_scale_px,
-            motor_penalty=lqr_motor_penalty,
-            svd_relative_tolerance=lqr_svd_relative_tolerance,
-            weights=weights,
-        )
+        if len(active_axis_indices) != len(COMMAND_AXES):
+            raw_correction = _expand_active_command_correction(
+                solve_lqr_observation_command_correction(
+                    np.asarray(jacobian, dtype=np.float64).reshape(
+                        len(CAMERAS) * len(PIXEL_AXES),
+                        len(COMMAND_AXES),
+                    )[:, list(active_axis_indices)],
+                    _measurement_observation(measurement),
+                    np.asarray(axis_scale, dtype=np.float64)[list(active_axis_indices)],
+                    gain=gain,
+                    max_normalized_step=max_normalized_step,
+                    image_scale=lqr_image_scale_px,
+                    motor_penalty=lqr_motor_penalty,
+                    svd_relative_tolerance=lqr_svd_relative_tolerance,
+                    weights=weights,
+                ),
+                active_axis_indices,
+            )
+        else:
+            raw_correction = solve_lqr_command_correction(
+                jacobian,
+                measurement,
+                axis_scale,
+                gain=gain,
+                max_normalized_step=max_normalized_step,
+                image_scale_px=lqr_image_scale_px,
+                motor_penalty=lqr_motor_penalty,
+                svd_relative_tolerance=lqr_svd_relative_tolerance,
+                weights=weights,
+            )
     return _validate_readback_correction(raw_correction)
 
 
@@ -2579,6 +2637,7 @@ def _build_correction_result(
     initial_readback_position_mm: np.ndarray,
     readback_position_mm: np.ndarray,
     warnings: Sequence[str],
+    active_axis_names: Sequence[str],
 ) -> xr.Dataset:
     result = measurement.assign(
         {
@@ -2780,6 +2839,10 @@ def _build_correction_result(
         "correction_converged": bool(converged),
         "correction_iterations": int(move_count),
         "correction_mode": correction_mode,
+        "correction_active_command_axes": " ".join(active_axis_names),
+        "correction_active_command_axis_mask": " ".join(
+            "1" if axis in active_axis_names else "0" for axis in COMMAND_AXES
+        ),
         "correction_criterion": correction_criterion,
         "correction_tolerance": float(correction_tolerance),
         **_prefixed_polar_attrs("correction", polar_attrs),
@@ -2997,6 +3060,47 @@ def _validate_readback_correction(correction_readback_mm: np.ndarray) -> np.ndar
     if deadband_mm > 0.0:
         correction[np.abs(correction) < deadband_mm] = 0.0
     return correction
+
+
+def _active_command_axis_indices(active_command_axes: Sequence[str] | None) -> tuple[int, ...]:
+    if active_command_axes is None:
+        return tuple(range(len(COMMAND_AXES)))
+    axes = tuple(str(axis) for axis in active_command_axes)
+    if not axes:
+        raise ValueError("active_command_axes must include at least one axis")
+    indices: list[int] = []
+    for axis in axes:
+        if axis not in COMMAND_AXES:
+            raise ValueError(f"unsupported active command axis {axis!r}")
+        index = COMMAND_AXES.index(axis)
+        if index in indices:
+            raise ValueError("active_command_axes must not contain duplicates")
+        indices.append(index)
+    return tuple(indices)
+
+
+def _expand_active_command_correction(
+    active_correction_readback_mm: Sequence[float] | np.ndarray,
+    active_axis_indices: Sequence[int],
+) -> np.ndarray:
+    active = np.asarray(active_correction_readback_mm, dtype=np.float64)
+    indices = tuple(int(index) for index in active_axis_indices)
+    if active.shape != (len(indices),):
+        raise ValueError("active correction must match active command axes")
+    if not np.isfinite(active).all():
+        raise ValueError("active correction must contain finite values")
+    correction = np.zeros(len(COMMAND_AXES), dtype=np.float64)
+    correction[list(indices)] = active
+    return correction
+
+
+def _measurement_observation(measurement: xr.Dataset) -> np.ndarray:
+    values = np.asarray(measurement["shift_px"].values, dtype=np.float64)
+    if values.shape != (len(CAMERAS), len(PIXEL_AXES)):
+        raise ValueError("measurement shift_px has unexpected shape")
+    if not np.isfinite(values).all():
+        raise ValueError("measurement shift_px must contain finite values")
+    return values.reshape(len(CAMERAS) * len(PIXEL_AXES))
 
 
 def _correction_stop_warning(

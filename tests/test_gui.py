@@ -225,6 +225,7 @@ class FakeCorrectionThread(QtCore.QObject):
         self.motor_backend = None
         self.correction_mode = None
         self.shift_kwargs = None
+        self.active_command_axes = None
         self.started = False
         self.running = False
 
@@ -236,6 +237,7 @@ class FakeCorrectionThread(QtCore.QObject):
         motor_backend=None,
         correction_mode="camera",
         shift_kwargs=None,
+        active_command_axes=None,
     ):
         self.calibration = calibration
         self.camera_pair = camera_pair
@@ -243,6 +245,7 @@ class FakeCorrectionThread(QtCore.QObject):
         self.motor_backend = motor_backend
         self.correction_mode = correction_mode
         self.shift_kwargs = {} if shift_kwargs is None else dict(shift_kwargs)
+        self.active_command_axes = active_command_axes
 
     def start(self):
         self.started = True
@@ -324,6 +327,35 @@ class FakeStoredAxisMoveThread(QtCore.QObject):
         pass
 
 
+class FakePolarCompensationXzMoveThread(QtCore.QObject):
+    sigPolarCompensationXzMoveReady = QtCore.Signal(float, float, float, float)
+    sigPolarCompensationXzMoveFailed = QtCore.Signal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.target_x = None
+        self.target_z = None
+        self.started = False
+        self.running = False
+
+    def configure(self, target_x, target_z):
+        self.target_x = float(target_x)
+        self.target_z = float(target_z)
+
+    def start(self):
+        self.started = True
+        self.running = True
+
+    def isRunning(self):
+        return self.running
+
+    def stop(self):
+        self.running = False
+
+    def wait(self):
+        pass
+
+
 @contextmanager
 def patched_main_window_runtime(settings=None):
     settings = settings or FakeSettings()
@@ -351,6 +383,10 @@ def patched_main_window_runtime(settings=None):
         patch(
             "merlin_track_position.interface.main_window._StoredAxisMoveThread",
             FakeStoredAxisMoveThread,
+        ),
+        patch(
+            "merlin_track_position.interface.main_window._PolarCompensationXzMoveThread",
+            FakePolarCompensationXzMoveThread,
         ),
         patch("merlin_track_position.interface.main_window.close_basler_camera"),
     ):
@@ -1222,6 +1258,7 @@ class CalibrationPanelTests(unittest.TestCase):
         self.assertIn("test.h5", panel.calibration_status_label.text())
         self.assertTrue(panel.correct_sample_button.isEnabled())
         self.assertTrue(panel.detect_shift_button.isEnabled())
+        self.assertTrue(panel.calculate_polar_compensate_button.isEnabled())
         self.assertFalse(panel.calibration_review_widget.isHidden())
         self.assertTrue(panel.correction_steps_group.isHidden())
         self.assertNotEqual(panel.metric_labels["axis_scale_readback_mm"].text(), "n/a")
@@ -1245,6 +1282,7 @@ class CalibrationPanelTests(unittest.TestCase):
         self.assertEqual(panel.calibration_file_label.text(), "Calibration file: none")
         self.assertFalse(panel.correct_sample_button.isEnabled())
         self.assertFalse(panel.detect_shift_button.isEnabled())
+        self.assertFalse(panel.calculate_polar_compensate_button.isEnabled())
 
         panel.show_loaded_calibration(calibration, "test.h5")
         panel.show_correction_in_progress()
@@ -1255,6 +1293,7 @@ class CalibrationPanelTests(unittest.TestCase):
         self.assertFalse(panel.load_calibration_button.isEnabled())
         self.assertFalse(panel.save_calibration_button.isEnabled())
         self.assertFalse(panel.calibration_details_button.isEnabled())
+        self.assertFalse(panel.calculate_polar_compensate_button.isEnabled())
         self.assertFalse(panel.correct_sample_button.isEnabled())
         self.assertFalse(panel.detect_shift_button.isEnabled())
         self.assertFalse(panel.new_calibration_button.isEnabled())
@@ -1504,6 +1543,122 @@ class CalibrationPanelTests(unittest.TestCase):
 
 
 class MainWindowCalibrationStateTests(unittest.TestCase):
+    def test_polar_compensation_probe_angles_are_sorted_and_unique(self):
+        self.assertEqual(
+            main_window._polar_compensation_probe_angles(0.0),
+            (-20.0, -12.5, -5.0, 0.0),
+        )
+        self.assertEqual(
+            main_window._polar_compensation_probe_angles(-15.0),
+            (-20.0, -15.0, -12.5, -5.0),
+        )
+        self.assertEqual(
+            main_window._polar_compensation_probe_angles(-5.0),
+            (-20.0, -12.5, -10.0, -5.0),
+        )
+
+    def test_polar_compensation_finishes_in_place_when_anchor_is_last_probe(self):
+        get_qapp()
+        with patched_main_window_runtime():
+            window = MainWindow()
+            try:
+                window._polar_compensation_active = True
+                window._polar_compensation_angles = (-20.0, -12.5, -5.0, 0.0)
+                window._polar_compensation_index = len(
+                    window._polar_compensation_angles
+                )
+                window._polar_compensation_current_polar = 0.0
+                window._polar_compensation_anchor_polar = 0.0
+                with patch.object(window, "_finish_polar_compensation") as finish:
+                    window._start_polar_compensation_polar_move()
+
+                    finish.assert_called_once()
+                    self.assertFalse(window._stored_axis_move_thread.started)
+                    self.assertFalse(window._polar_compensation_xz_move_thread.started)
+            finally:
+                window.close()
+
+    def test_polar_compensation_returns_to_anchor_and_xz_when_anchor_is_not_last(self):
+        get_qapp()
+        with patched_main_window_runtime():
+            window = MainWindow()
+            try:
+                window._polar_compensation_active = True
+                window._polar_compensation_angles = (
+                    -20.0,
+                    -12.5,
+                    -10.0,
+                    -5.0,
+                )
+                window._polar_compensation_index = len(
+                    window._polar_compensation_angles
+                )
+                window._polar_compensation_current_polar = -5.0
+                window._polar_compensation_anchor_polar = -12.5
+                window._polar_compensation_points = [
+                    main_window._PolarCompensationPoint(
+                        polar_deg=-20.0,
+                        x_mm=0.0,
+                        y_mm=0.0,
+                        z_mm=0.0,
+                    ),
+                    main_window._PolarCompensationPoint(
+                        polar_deg=-12.5,
+                        x_mm=1.25,
+                        y_mm=0.5,
+                        z_mm=3.5,
+                    ),
+                    main_window._PolarCompensationPoint(
+                        polar_deg=-10.0,
+                        x_mm=2.0,
+                        y_mm=0.0,
+                        z_mm=4.0,
+                    ),
+                    main_window._PolarCompensationPoint(
+                        polar_deg=-5.0,
+                        x_mm=3.0,
+                        y_mm=0.0,
+                        z_mm=5.0,
+                    ),
+                ]
+                with (
+                    patch.object(window, "_finish_polar_compensation") as finish,
+                    patch(
+                        "merlin_track_position.interface.main_window.QtWidgets.QMessageBox.information"
+                    ) as information,
+                ):
+                    window._start_polar_compensation_polar_move()
+
+                    thread = window._stored_axis_move_thread
+                    self.assertTrue(thread.started)
+                    self.assertEqual(thread.axis_alias, "p")
+                    self.assertEqual(thread.target_value, -12.5)
+                    self.assertTrue(window._polar_compensation_returning_to_anchor)
+                    information.assert_not_called()
+
+                    thread.running = False
+                    thread.sigStoredAxisMoveReady.emit("p", -12.5, -12.5)
+
+                    xz_thread = window._polar_compensation_xz_move_thread
+                    self.assertTrue(xz_thread.started)
+                    self.assertEqual(xz_thread.target_x, 1.25)
+                    self.assertEqual(xz_thread.target_z, 3.5)
+                    finish.assert_not_called()
+
+                    xz_thread.running = False
+                    xz_thread.sigPolarCompensationXzMoveReady.emit(
+                        1.25,
+                        3.5,
+                        1.25,
+                        3.5,
+                    )
+
+                    finish.assert_called_once()
+                    self.assertFalse(window._polar_compensation_returning_to_anchor)
+                    self.assertFalse(window._polar_compensation_returning_xz)
+            finally:
+                window.close()
+
     def test_camera_display_transform_comes_from_settings(self):
         get_qapp()
         settings = FakeSettings()

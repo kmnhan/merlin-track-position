@@ -35,6 +35,7 @@ class CorrectionThread(QtCore.QThread):
         self._motor_backend: Any | None = None
         self._correction_mode = constants.DEFAULT_CORRECTION_MODE
         self._shift_kwargs: dict[str, Any] = {}
+        self._active_command_axes: tuple[str, ...] | None = None
 
     def configure(
         self,
@@ -44,6 +45,7 @@ class CorrectionThread(QtCore.QThread):
         motor_backend: Any | None = None,
         correction_mode: str = constants.DEFAULT_CORRECTION_MODE,
         shift_kwargs: Mapping[str, Any] | None = None,
+        active_command_axes: tuple[str, ...] | None = None,
     ) -> None:
         """Set the parameters for the next correction run."""
         if self.isRunning():
@@ -54,10 +56,13 @@ class CorrectionThread(QtCore.QThread):
         self._motor_backend = motor_backend
         self._correction_mode = str(correction_mode)
         self._shift_kwargs = {} if shift_kwargs is None else dict(shift_kwargs)
+        self._active_command_axes = active_command_axes
         logger.info(
-            "Configured correction thread: calibration_path=%s, correction_mode=%s",
+            "Configured correction thread: calibration_path=%s, correction_mode=%s, "
+            "active_command_axes=%s",
             calibration_path,
             self._correction_mode,
+            self._active_command_axes,
         )
 
     def run(self) -> None:
@@ -85,6 +90,7 @@ class CorrectionThread(QtCore.QThread):
                     progress_callback=self._emit_progress,
                     motor_backend=self._motor_backend,
                     correction_mode=self._correction_mode,
+                    active_command_axes=self._active_command_axes,
                     **self._shift_kwargs,
                 )
             except Exception as exc:
