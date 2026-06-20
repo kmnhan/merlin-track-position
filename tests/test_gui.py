@@ -1643,7 +1643,9 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
             assert start_button is not None
             assert summary is not None
             self.assertTrue(details.isEnabled())
-            self.assertTrue(start_button.isHidden())
+            self.assertFalse(start_button.isHidden())
+            self.assertTrue(start_button.isEnabled())
+            self.assertEqual(start_button.text(), "Calculate Again")
             self.assertIn("Polar compensation model fitted", summary.text())
         finally:
             dialog.close()
@@ -1700,7 +1702,9 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                 finally:
                     window.close()
 
-    def test_polar_compensate_button_shows_existing_model_without_starting(self):
+    def test_polar_compensate_button_shows_existing_model_without_starting_on_close(
+        self,
+    ):
         get_qapp()
         instances = []
 
@@ -1750,8 +1754,63 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
 
                     self.assertEqual(len(instances), 1)
                     self.assertIs(instances[0].model, calibration)
-                    self.assertFalse(instances[0].start_enabled)
+                    self.assertTrue(instances[0].start_enabled)
                     start_workflow.assert_not_called()
+                finally:
+                    window.close()
+
+    def test_polar_compensate_button_can_start_another_existing_model_run(self):
+        get_qapp()
+        instances = []
+
+        class FakePolarCompensationDialog:
+            def __init__(
+                self,
+                model,
+                *,
+                start_enabled=False,
+                start_unavailable_message="",
+                parent=None,
+            ):
+                self.model = model
+                self.start_enabled = start_enabled
+                self.start_unavailable_message = start_unavailable_message
+                self.parent = parent
+                instances.append(self)
+
+            def exec(self):
+                return QtWidgets.QDialog.DialogCode.Accepted
+
+            def start_requested(self):
+                return True
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "calibration.h5"
+            calibration = write_sample_calibration(path)
+            model = synthetic_polar_compensation_model()
+            calibration = apply_polar_compensation_model(calibration, model)
+            calibration.attrs["calibration_path"] = str(path)
+            with patched_main_window_runtime():
+                window = MainWindow()
+                try:
+                    window._on_new_calibration_ready(calibration)
+                    with (
+                        patch(
+                            "merlin_track_position.interface.main_window."
+                            "PolarCompensationDialog",
+                            FakePolarCompensationDialog,
+                        ),
+                        patch.object(
+                            window,
+                            "_on_calculate_polar_compensate_clicked",
+                        ) as start_workflow,
+                    ):
+                        window.calibration_panel.polar_compensate_button.click()
+
+                    self.assertEqual(len(instances), 1)
+                    self.assertIs(instances[0].model, calibration)
+                    self.assertTrue(instances[0].start_enabled)
+                    start_workflow.assert_called_once()
                 finally:
                     window.close()
 

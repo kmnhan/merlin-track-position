@@ -1290,7 +1290,7 @@ class PolarCompensationDialog(QtWidgets.QDialog):
             self._populate_model_details(details_layout, model)
         layout.addWidget(self.details_group, stretch=1)
 
-        if model is None and start_unavailable_message:
+        if start_unavailable_message:
             unavailable_label = QtWidgets.QLabel(start_unavailable_message)
             unavailable_label.setObjectName("polar_compensation_unavailable_label")
             unavailable_label.setWordWrap(True)
@@ -1298,10 +1298,11 @@ class PolarCompensationDialog(QtWidgets.QDialog):
 
         button_layout = QtWidgets.QHBoxLayout()
         button_layout.addStretch(1)
-        self.start_button = QtWidgets.QPushButton("Calculate")
+        self.start_button = QtWidgets.QPushButton(
+            "Calculate" if model is None else "Calculate Again"
+        )
         self.start_button.setObjectName("polar_compensation_start_button")
         self.start_button.setEnabled(bool(start_enabled))
-        self.start_button.setVisible(model is None)
         self.start_button.clicked.connect(self._request_start)
         button_layout.addWidget(self.start_button)
 
@@ -2388,7 +2389,7 @@ class MainWindow(_MainWindowGUI):
         model = _stored_polar_compensation_model(self._calibration)
         dialog = PolarCompensationDialog(
             model,
-            start_enabled=model is None and unavailable_message is None,
+            start_enabled=unavailable_message is None,
             start_unavailable_message=(
                 "" if unavailable_message is None else unavailable_message
             ),
