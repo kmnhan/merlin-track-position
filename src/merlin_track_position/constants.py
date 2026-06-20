@@ -109,7 +109,7 @@ DEFAULT_LQR_CORRECTION_PROJECTED_TOLERANCE: float = 1.0
 # LQR-only Kalman observer. Measurement covariance is in raw pixel units and is
 # ordered as cam0_du, cam0_dv, cam1_du, cam1_dv. The correction code normalizes
 # it by the LQR image scale before updating/gating.
-DEFAULT_LQR_CORRECTION_USE_KALMAN_FILTER: bool = False
+DEFAULT_LQR_CORRECTION_USE_KALMAN_FILTER: bool = True
 DEFAULT_LQR_CORRECTION_KALMAN_PROCESS_NOISE: float = 0.05
 DEFAULT_LQR_CORRECTION_KALMAN_MEASUREMENT_NOISE: float = 1.0
 DEFAULT_LQR_CORRECTION_KALMAN_MEASUREMENT_COVARIANCE: (
