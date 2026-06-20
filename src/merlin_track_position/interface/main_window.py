@@ -30,8 +30,14 @@ from merlin_track_position.instruments.parse_config import get_base_file_dir
 from merlin_track_position.instruments.cameras import (
     CameraPairPlugin,
     RoiGeometry,
+    TimestampedFrame,
+    TimestampedFrameCache,
+    as_timestamped_frame,
     camera_pair_from_configs,
+    cached_camera_pair_from_frame_cache,
+    capture_timestamped_frame_from_config,
     crop_image_to_roi,
+    normalize_capture_count,
 )
 from merlin_track_position.instruments.camera_config import (
     CAMERA_SLOTS,
@@ -51,19 +57,16 @@ from merlin_track_position.instruments.camera_config import (
 from merlin_track_position.instruments.basler import (
     BaslerCameraCapabilities,
     close_basler_camera,
-    get_basler_image,
     list_basler_devices,
     preferred_basler_pixel_format,
     read_basler_capabilities,
     validate_basler_config,
 )
-from merlin_track_position.instruments.framegrab import get_framegrabber_image
 from merlin_track_position.instruments.motors import (
     cached_motor_positions,
     move_motors_and_wait,
     refresh_motor_positions,
 )
-from merlin_track_position.instruments.simulated_hardware import simulator
 from merlin_track_position.interface.calibration_panel import (
     STORED_ORIENTATION_AXES,
     CalibrationPanel,
@@ -505,6 +508,10 @@ CAMERA_IMAGE_SIZES: dict[str, tuple[int, int]] = {
     for slot in CAMERA_SLOTS
 }
 IMAGE_REFRESH_INTERVAL_MS = 400
+MIN_FRAME_CACHE_CAPACITY = 4
+FRAME_CACHE_CAPTURE_COUNT_HEADROOM = 2
+MIN_FRAME_CACHE_WAIT_TIMEOUT_S = 5.0
+FRAME_CACHE_WAIT_TIMEOUT_HEADROOM_S = 1.0
 POLAR_COMPENSATION_PROBE_ANGLES_DEG = (-20.0, -12.5, -5.0)
 POLAR_COMPENSATION_DUPLICATE_PROBE_DEG = -10.0
 POLAR_COMPENSATION_PROBE_TOLERANCE_DEG = 0.1
@@ -525,6 +532,24 @@ BAYER_DISPLAY_CONVERSIONS = {
     "bayergr": cv2.COLOR_BayerGRBG2RGB,
     "bayerrg": cv2.COLOR_BayerRGGB2RGB,
 }
+
+
+def _frame_cache_capacity_for_capture_count(capture_count: int) -> int:
+    return max(
+        MIN_FRAME_CACHE_CAPACITY,
+        normalize_capture_count(capture_count) + FRAME_CACHE_CAPTURE_COUNT_HEADROOM,
+    )
+
+
+def _frame_cache_wait_timeout_for_capture_count(capture_count: int) -> float:
+    count = normalize_capture_count(capture_count)
+    return max(
+        MIN_FRAME_CACHE_WAIT_TIMEOUT_S,
+        (count + 1) * IMAGE_REFRESH_INTERVAL_MS / 1000.0
+        + FRAME_CACHE_WAIT_TIMEOUT_HEADROOM_S,
+    )
+
+
 ROI_SETTINGS_KEYS: dict[str, tuple[str, str, str, str]] = {
     camera: (
         f"roi/{camera}/x",
@@ -1782,6 +1807,11 @@ class MainWindow(_MainWindowGUI):
         self._settings = settings
         self._camera_configs = camera_configs
         self._registration_config = registration_config_from_settings(self._settings)
+        self._frame_cache = TimestampedFrameCache(
+            _frame_cache_capacity_for_capture_count(
+                int(self._registration_config["capture_count"]),
+            )
+        )
         self._shift_monitor_window: ShiftMonitorWindow | None = None
         self.calibration_panel.auto_correction_interval_spinbox.setValue(
             self._stored_auto_correction_interval_seconds()
@@ -2121,6 +2151,11 @@ class MainWindow(_MainWindowGUI):
             self._registration_config = registration_config_from_settings(
                 self._settings
             )
+        self._frame_cache.set_capacity(
+            _frame_cache_capacity_for_capture_count(
+                int(self._registration_config["capture_count"]),
+            )
+        )
         self._update_beam_target_visibility()
         self._set_shift_monitor_beam_targets()
 
@@ -2348,7 +2383,10 @@ class MainWindow(_MainWindowGUI):
             raise RuntimeError("correction state changed before startup")
 
         logger.info("Starting correction: calibration_path=%s", self._calibration_path)
-        camera_pair = self._camera_pair_for_current_images()
+        action_started_ns = time.time_ns()
+        camera_pair = self._camera_pair_for_current_images(
+            cached_after_ns=action_started_ns,
+        )
         self._correction_thread.configure(
             self._calibration,
             camera_pair,
@@ -2360,7 +2398,6 @@ class MainWindow(_MainWindowGUI):
 
         ui_marked_busy = False
         try:
-            self._pause_image_auto_refresh_for_calibration()
             ui_marked_busy = True
             self._set_roi_editing_enabled(False)
             self.calibration_panel.show_correction_in_progress()
@@ -2368,7 +2405,6 @@ class MainWindow(_MainWindowGUI):
             logger.info("Correction thread start requested.")
         except Exception:
             if ui_marked_busy:
-                self._restore_image_auto_refresh_after_calibration()
                 self._restore_calibration_idle_state()
             logger.exception("Failed while starting correction.")
             raise
@@ -2474,14 +2510,12 @@ class MainWindow(_MainWindowGUI):
             return
 
         try:
-            self._pause_image_auto_refresh_for_calibration()
             self._set_roi_editing_enabled(False)
             self.calibration_panel.show_polar_compensation_in_progress(
                 f"Moving Polar to {target:g} deg for polar compensation..."
             )
             self._stored_axis_move_thread.start()
         except Exception as exc:
-            self._restore_image_auto_refresh_after_calibration()
             self._abort_polar_compensation(str(exc))
 
     def _start_polar_compensation_return_move(self) -> None:
@@ -2520,14 +2554,12 @@ class MainWindow(_MainWindowGUI):
             return
 
         try:
-            self._pause_image_auto_refresh_for_calibration()
             self._set_roi_editing_enabled(False)
             self.calibration_panel.show_polar_compensation_in_progress(
                 f"Returning Polar to calibration angle {target:g} deg..."
             )
             self._stored_axis_move_thread.start()
         except Exception as exc:
-            self._restore_image_auto_refresh_after_calibration()
             self._abort_polar_compensation(str(exc))
 
     def _polar_compensation_last_probe_is_anchor(self) -> bool:
@@ -2557,14 +2589,12 @@ class MainWindow(_MainWindowGUI):
             return
 
         try:
-            self._pause_image_auto_refresh_for_calibration()
             self._set_roi_editing_enabled(False)
             self.calibration_panel.show_polar_compensation_in_progress(
                 "Returning X/Z to the acquired calibration-polar anchor..."
             )
             self._polar_compensation_xz_move_thread.start()
         except Exception as exc:
-            self._restore_image_auto_refresh_after_calibration()
             self._abort_polar_compensation(str(exc))
 
     def _on_polar_compensation_polar_move_ready(
@@ -2572,7 +2602,6 @@ class MainWindow(_MainWindowGUI):
         target_value: float,
         final_value: float,
     ) -> None:
-        self._restore_image_auto_refresh_after_calibration()
         self._polar_compensation_current_polar = float(final_value)
         step = self._polar_compensation_index + 1
         total = len(self._polar_compensation_angles)
@@ -2599,7 +2628,10 @@ class MainWindow(_MainWindowGUI):
             self._abort_polar_compensation("Calibration state changed.")
             return
         try:
-            camera_pair = self._camera_pair_for_current_images()
+            action_started_ns = time.time_ns()
+            camera_pair = self._camera_pair_for_current_images(
+                cached_after_ns=action_started_ns,
+            )
             self._correction_thread.configure(
                 self._calibration,
                 camera_pair,
@@ -2608,18 +2640,15 @@ class MainWindow(_MainWindowGUI):
                 shift_kwargs=self._registration_measurement_kwargs(),
                 active_command_axes=POLAR_COMPENSATION_ACTIVE_AXES,
             )
-            self._pause_image_auto_refresh_for_calibration()
             self._set_roi_editing_enabled(False)
             self.calibration_panel.show_polar_compensation_in_progress(
                 "Correcting X/Z with Y frozen for polar compensation..."
             )
             self._correction_thread.start()
         except Exception as exc:
-            self._restore_image_auto_refresh_after_calibration()
             self._abort_polar_compensation(str(exc))
 
     def _on_polar_compensation_correction_ready(self, result: xr.Dataset) -> None:
-        self._restore_image_auto_refresh_after_calibration()
         if not bool(result.attrs.get("correction_converged", False)):
             self._abort_polar_compensation(
                 "X/Z correction did not converge; no polar compensation model saved."
@@ -2659,7 +2688,6 @@ class MainWindow(_MainWindowGUI):
         target_value: float,
         final_value: float,
     ) -> None:
-        self._restore_image_auto_refresh_after_calibration()
         self._polar_compensation_returning_to_anchor = False
         logger.info(
             "Polar compensation return move finished: target=%g, final=%g",
@@ -2675,7 +2703,6 @@ class MainWindow(_MainWindowGUI):
         final_x: float,
         final_z: float,
     ) -> None:
-        self._restore_image_auto_refresh_after_calibration()
         self._polar_compensation_returning_xz = False
         logger.info(
             "Polar compensation x/z return move finished: target=(%g, %g), "
@@ -2688,7 +2715,6 @@ class MainWindow(_MainWindowGUI):
         self._finish_polar_compensation()
 
     def _on_polar_compensation_xz_move_failed(self, error_message: str) -> None:
-        self._restore_image_auto_refresh_after_calibration()
         self._abort_polar_compensation(
             f"Could not return X/Z to the acquired anchor point: {error_message}"
         )
@@ -2809,7 +2835,6 @@ class MainWindow(_MainWindowGUI):
                 self.calibration_panel.display_mode() == "correction"
                 and self._last_correction_result is not None
             )
-            self._pause_image_auto_refresh_for_calibration()
             ui_marked_busy = True
             self._set_roi_editing_enabled(False)
             self.calibration_panel.show_stored_axis_move_in_progress(
@@ -2819,7 +2844,6 @@ class MainWindow(_MainWindowGUI):
             self._stored_axis_move_thread.start()
         except Exception as exc:
             if ui_marked_busy:
-                self._restore_image_auto_refresh_after_calibration()
                 self._restore_stored_axis_move_idle_state()
             QtWidgets.QMessageBox.critical(
                 self,
@@ -2841,7 +2865,6 @@ class MainWindow(_MainWindowGUI):
             self._on_polar_compensation_polar_move_ready(target_value, final_value)
             return
         display_name = STORED_ORIENTATION_LABELS_BY_ALIAS.get(axis_alias, axis_alias)
-        self._restore_image_auto_refresh_after_calibration()
         self._restore_stored_axis_move_idle_state()
         self.calibration_panel.show_stored_axis_move_result(
             display_name,
@@ -2863,7 +2886,6 @@ class MainWindow(_MainWindowGUI):
         error_message: str,
     ) -> None:
         if self._polar_compensation_active and axis_alias == "p":
-            self._restore_image_auto_refresh_after_calibration()
             if self._polar_compensation_returning_to_anchor:
                 self._abort_polar_compensation(
                     f"Could not return Polar to calibration angle: {error_message}"
@@ -2872,7 +2894,6 @@ class MainWindow(_MainWindowGUI):
                 self._abort_polar_compensation(error_message)
             return
         display_name = STORED_ORIENTATION_LABELS_BY_ALIAS.get(axis_alias, axis_alias)
-        self._restore_image_auto_refresh_after_calibration()
         self._restore_stored_axis_move_idle_state()
         logger.error(
             "Stored calibration axis move failed: axis_alias=%s, error=%s",
@@ -3178,26 +3199,10 @@ class MainWindow(_MainWindowGUI):
         self._update_reset_beam_target_button()
         self._refresh_initial_transform_preview_after_known_state_change()
 
-    def _capture_camera_image(self, camera: str) -> np.ndarray:
+    def _capture_camera_image(self, camera: str) -> TimestampedFrame:
         with self._image_capture_locks[camera]:
             config = self._camera_configs[camera]
-            if config.source_type == "framegrabber":
-                return get_framegrabber_image(config=config)
-            elif config.source_type == "basler":
-                return get_basler_image(config)
-            elif camera == "cam0":
-                image = simulator.get_framegrabber_image()
-            else:
-                image = simulator.get_basler_image()
-            return crop_image_to_roi(
-                image,
-                (
-                    float(config.offset_x),
-                    float(config.offset_y),
-                    float(config.width),
-                    float(config.height),
-                ),
-            )
+            return capture_timestamped_frame_from_config(config)
 
     @QtCore.Slot(str, object)
     def _on_image_capture_ready(self, camera: str, image: object) -> None:
@@ -3205,16 +3210,19 @@ class MainWindow(_MainWindowGUI):
             logger.warning("Image refresh returned unknown camera %s", camera)
             return
 
-        self._latest_images_by_camera[camera] = image
+        frame = as_timestamped_frame(cast(TimestampedFrame | np.ndarray, image))
+        image_array = np.asarray(frame.image)
+        self._frame_cache.append(camera, image_array, frame.timestamp_ns)
+        self._latest_images_by_camera[camera] = image_array
         if {"cam0", "cam1"}.issubset(self._latest_images_by_camera):
             self._latest_images = (
                 self._latest_images_by_camera["cam0"],
                 self._latest_images_by_camera["cam1"],
             )
         if not self._reference_preview_active:
-            self._show_current_image(camera, image)
+            self._show_current_image(camera, image_array)
         if self._shift_monitor_window is not None:
-            self._shift_monitor_window.submit_frame(camera, image)
+            self._shift_monitor_window.submit_frame(camera, image_array)
 
     @QtCore.Slot(str, str)
     def _on_image_capture_failed(self, camera: str, error_message: str) -> None:
@@ -3825,7 +3833,10 @@ class MainWindow(_MainWindowGUI):
         if self._calibration is None:
             return
 
-        camera_pair = self._camera_pair_for_current_images()
+        action_started_ns = time.time_ns()
+        camera_pair = self._camera_pair_for_current_images(
+            cached_after_ns=action_started_ns,
+        )
         try:
             self._detect_shift_thread.configure(
                 self._calibration,
@@ -3841,7 +3852,6 @@ class MainWindow(_MainWindowGUI):
             )
             return
 
-        self._pause_image_auto_refresh_for_calibration()
         self._set_roi_editing_enabled(False)
         self.calibration_panel.show_detection_in_progress()
         self._detect_shift_thread.start()
@@ -3965,13 +3975,11 @@ class MainWindow(_MainWindowGUI):
             if isinstance(result, xr.Dataset):
                 self._on_polar_compensation_correction_ready(result)
             else:
-                self._restore_image_auto_refresh_after_calibration()
                 self._abort_polar_compensation(
                     "correction thread did not return an xarray Dataset"
                 )
             return
         try:
-            self._restore_image_auto_refresh_after_calibration()
             if not isinstance(result, xr.Dataset):
                 raise TypeError("correction thread did not return an xarray Dataset")
             self._last_correction_result = result
@@ -4033,11 +4041,9 @@ class MainWindow(_MainWindowGUI):
     def _on_correction_failed(self, error_message: str) -> None:
         logger.error("Correction failed signal received: %s", error_message)
         if self._polar_compensation_active:
-            self._restore_image_auto_refresh_after_calibration()
             self._abort_polar_compensation(error_message)
             return
         self._reply_to_pending_server_correction(False, error_message)
-        self._restore_image_auto_refresh_after_calibration()
         self._restore_calibration_idle_state()
         QtWidgets.QMessageBox.critical(
             self,
@@ -4049,7 +4055,6 @@ class MainWindow(_MainWindowGUI):
     def _on_detect_shift_ready(self, result: object) -> None:
         logger.info("Shift detection ready signal received.")
         try:
-            self._restore_image_auto_refresh_after_calibration()
             if not isinstance(result, xr.Dataset):
                 raise TypeError(
                     "shift detection thread did not return an xarray Dataset"
@@ -4071,7 +4076,6 @@ class MainWindow(_MainWindowGUI):
     @QtCore.Slot(str)
     def _on_detect_shift_failed(self, error_message: str) -> None:
         logger.error("Shift detection failed signal received: %s", error_message)
-        self._restore_image_auto_refresh_after_calibration()
         self._restore_calibration_idle_state()
         QtWidgets.QMessageBox.critical(
             self,
@@ -4162,9 +4166,24 @@ class MainWindow(_MainWindowGUI):
         )
 
     def _current_roi_geometries(self) -> dict[str, RoiGeometry]:
-        return {camera: self._get_roi_geometry(camera) for camera in CAMERA_IMAGE_SIZES}
+        return {
+            camera: self._get_roi_geometry(camera) for camera in CAMERA_IMAGE_SIZES
+        }
 
-    def _camera_pair_for_current_images(self) -> CameraPairPlugin:
+    def _camera_pair_for_current_images(
+        self,
+        *,
+        cached_after_ns: int | None = None,
+    ) -> CameraPairPlugin:
+        if cached_after_ns is not None and self.image_auto_refresh_checkbox.isChecked():
+            capture_count = int(self._registration_config["capture_count"])
+            return cached_camera_pair_from_frame_cache(
+                self._frame_cache,
+                start_after_ns=int(cached_after_ns),
+                fresh_frame_timeout_s=_frame_cache_wait_timeout_for_capture_count(
+                    capture_count,
+                ),
+            )
         return camera_pair_from_configs(self._camera_configs)
 
     def _set_roi_geometry(

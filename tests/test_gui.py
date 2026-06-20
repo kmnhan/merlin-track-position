@@ -36,6 +36,10 @@ from merlin_track_position.instruments.camera_config import (  # noqa: E402
     CameraConfig,
     DisplayTransform,
 )
+from merlin_track_position.instruments.cameras import (  # noqa: E402
+    CachedFrameCameraPlugin,
+    TimestampedFrame,
+)
 from merlin_track_position.instruments.basler import (  # noqa: E402
     BaslerCameraCapabilities,
     BaslerDevice,
@@ -1849,6 +1853,27 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
             finally:
                 window.close()
 
+    def test_polar_compensation_polar_move_keeps_live_images_updating(self):
+        get_qapp()
+        with patched_main_window_runtime():
+            window = MainWindow()
+            try:
+                window._polar_compensation_active = True
+                window._polar_compensation_angles = (-20.0, -12.5, -5.0, 0.0)
+                window._polar_compensation_index = 0
+                window._polar_compensation_anchor_polar = 0.0
+
+                window._start_polar_compensation_polar_move()
+
+                self.assertTrue(window._stored_axis_move_thread.started)
+                self.assertEqual(window._stored_axis_move_thread.axis_alias, "p")
+                self.assertEqual(window._stored_axis_move_thread.target_value, -20.0)
+                for refresh_thread in window._image_refresh_threads.values():
+                    self.assertTrue(refresh_thread.enabled)
+                    self.assertEqual(refresh_thread.wait_until_idle_calls, 0)
+            finally:
+                window.close()
+
     def test_polar_compensation_returns_to_anchor_and_xz_when_anchor_is_not_last(self):
         get_qapp()
         with patched_main_window_runtime():
@@ -1906,6 +1931,9 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                     self.assertEqual(thread.target_value, -12.5)
                     self.assertTrue(window._polar_compensation_returning_to_anchor)
                     information.assert_not_called()
+                    for refresh_thread in window._image_refresh_threads.values():
+                        self.assertTrue(refresh_thread.enabled)
+                        self.assertEqual(refresh_thread.wait_until_idle_calls, 0)
 
                     thread.running = False
                     thread.sigStoredAxisMoveReady.emit("p", -12.5, -12.5)
@@ -1915,6 +1943,9 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                     self.assertEqual(xz_thread.target_x, 1.25)
                     self.assertEqual(xz_thread.target_z, 3.5)
                     finish.assert_not_called()
+                    for refresh_thread in window._image_refresh_threads.values():
+                        self.assertTrue(refresh_thread.enabled)
+                        self.assertEqual(refresh_thread.wait_until_idle_calls, 0)
 
                     xz_thread.running = False
                     xz_thread.sigPolarCompensationXzMoveReady.emit(
@@ -1929,6 +1960,33 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                     self.assertFalse(window._polar_compensation_returning_xz)
             finally:
                 window.close()
+
+    def test_polar_compensation_correction_keeps_live_images_updating(self):
+        get_qapp()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "calibration.h5"
+            calibration = write_sample_calibration(path)
+            with patched_main_window_runtime():
+                window = MainWindow()
+                try:
+                    window._on_new_calibration_ready(calibration)
+                    window._polar_compensation_active = True
+                    window._polar_compensation_angles = (-20.0, -12.5, -5.0, 0.0)
+                    window._polar_compensation_index = 0
+                    window._polar_compensation_current_polar = -20.0
+
+                    window._start_polar_compensation_correction()
+
+                    self.assertTrue(window._correction_thread.started)
+                    self.assertEqual(
+                        window._correction_thread.active_command_axes,
+                        main_window.POLAR_COMPENSATION_ACTIVE_AXES,
+                    )
+                    for refresh_thread in window._image_refresh_threads.values():
+                        self.assertTrue(refresh_thread.enabled)
+                        self.assertEqual(refresh_thread.wait_until_idle_calls, 0)
+                finally:
+                    window.close()
 
     def test_polar_compensation_progress_shows_correction_steps(self):
         get_qapp()
@@ -2791,6 +2849,29 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                 finally:
                     window.close()
 
+    def test_live_image_ready_updates_timestamped_frame_cache(self):
+        get_qapp()
+        with patched_main_window_runtime():
+            window = MainWindow()
+            try:
+                image = np.arange(6, dtype=np.uint16).reshape(2, 3)
+                window._on_image_capture_ready(
+                    "cam0",
+                    TimestampedFrame(image, 1234),
+                )
+
+                frames = window._frame_cache.frames_after("cam0", 1233)
+                self.assertEqual(len(frames), 1)
+                self.assertEqual(frames[0].timestamp_ns, 1234)
+                self.assertEqual(frames[0].image.dtype, np.dtype(np.uint16))
+                np.testing.assert_array_equal(frames[0].image, image)
+                np.testing.assert_array_equal(
+                    window._latest_images_by_camera["cam0"],
+                    image,
+                )
+            finally:
+                window.close()
+
     def test_loaded_calibration_locks_roi_and_button_clears_without_dialog(self):
         get_qapp()
         calibration = build_sample_calibration_dataset(
@@ -3619,7 +3700,8 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                             window._registration_config
                         ),
                     )
-                    self.assertIsNotNone(thread.camera_pair)
+                    self.assertIsInstance(thread.camera_pair.cam0, CachedFrameCameraPlugin)
+                    self.assertIsInstance(thread.camera_pair.cam1, CachedFrameCameraPlugin)
                     self.assertIn(
                         "Correction in progress",
                         window.calibration_panel.calibration_status_label.text(),
@@ -3631,8 +3713,34 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                         window.calibration_panel.new_calibration_button.isEnabled()
                     )
                     for refresh_thread in window._image_refresh_threads.values():
-                        self.assertFalse(refresh_thread.enabled)
-                        self.assertEqual(refresh_thread.wait_until_idle_calls, 1)
+                        self.assertTrue(refresh_thread.enabled)
+                        self.assertEqual(refresh_thread.wait_until_idle_calls, 0)
+                finally:
+                    window.close()
+
+    def test_correction_uses_direct_cameras_when_live_refresh_is_disabled(self):
+        get_qapp()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "calibration.h5"
+            calibration = write_sample_calibration(path)
+            with patched_main_window_runtime():
+                window = MainWindow()
+                try:
+                    window._on_new_calibration_ready(calibration)
+                    window.image_auto_refresh_checkbox.setChecked(False)
+
+                    window._start_correction()
+
+                    thread = window._correction_thread
+                    self.assertTrue(thread.started)
+                    self.assertNotIsInstance(
+                        thread.camera_pair.cam0,
+                        CachedFrameCameraPlugin,
+                    )
+                    self.assertNotIsInstance(
+                        thread.camera_pair.cam1,
+                        CachedFrameCameraPlugin,
+                    )
                 finally:
                     window.close()
 
@@ -3687,8 +3795,8 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                         ].isEnabled()
                     )
                     for refresh_thread in window._image_refresh_threads.values():
-                        self.assertFalse(refresh_thread.enabled)
-                        self.assertEqual(refresh_thread.wait_until_idle_calls, 1)
+                        self.assertTrue(refresh_thread.enabled)
+                        self.assertEqual(refresh_thread.wait_until_idle_calls, 0)
                     self.assertIn(
                         "Moving Tilt",
                         window.calibration_panel.calibration_status_label.text(),
@@ -4002,7 +4110,8 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                             window._registration_config
                         ),
                     )
-                    self.assertIsNotNone(thread.camera_pair)
+                    self.assertIsInstance(thread.camera_pair.cam0, CachedFrameCameraPlugin)
+                    self.assertIsInstance(thread.camera_pair.cam1, CachedFrameCameraPlugin)
                     self.assertIsNone(window._last_correction_result)
                     self.assertFalse(window._server_correction_pending)
                     self.assertIn(
@@ -4018,6 +4127,9 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                     self.assertFalse(
                         window.calibration_panel.new_calibration_button.isEnabled()
                     )
+                    for refresh_thread in window._image_refresh_threads.values():
+                        self.assertTrue(refresh_thread.enabled)
+                        self.assertEqual(refresh_thread.wait_until_idle_calls, 0)
                 finally:
                     window.close()
 
@@ -4082,7 +4194,8 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                             window._registration_config
                         ),
                     )
-                    self.assertIsNotNone(thread.camera_pair)
+                    self.assertIsInstance(thread.camera_pair.cam0, CachedFrameCameraPlugin)
+                    self.assertIsInstance(thread.camera_pair.cam1, CachedFrameCameraPlugin)
                     self.assertEqual(window._server.result_calls, [])
                     self.assertTrue(window._server_correction_pending)
                     self.assertEqual(window._server_correction_target, 7)

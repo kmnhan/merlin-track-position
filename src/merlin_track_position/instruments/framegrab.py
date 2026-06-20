@@ -45,17 +45,33 @@ def get_framegrabber_image_stack(
     config
         Logical camera configuration used to crop raw framegrabber frames.
     """
+    stack, _timestamps_ns = get_framegrabber_image_stack_with_timestamps(
+        frame_count,
+        timeout_ms=timeout_ms,
+        config=config,
+    )
+    return stack
+
+
+def get_framegrabber_image_stack_with_timestamps(
+    frame_count: int,
+    timeout_ms: int = 5000,
+    *,
+    config: CameraConfig | None = None,
+) -> tuple[npt.NDArray, npt.NDArray[np.int64]]:
+    """Request consecutive fresh images and their Unix-epoch timestamps."""
     frame_count = _validate_frame_count(frame_count)
     if config is None:
         config = default_camera_config("cam0")
     if not constants.IS_DAQ_PC:
-        return np.stack(
-            [
+        frames: list[npt.NDArray] = []
+        timestamps: list[int] = []
+        for _ in range(frame_count):
+            frames.append(
                 _crop_frame_to_config(simulator.get_framegrabber_image(), config)
-                for _ in range(frame_count)
-            ],
-            axis=0,
-        )
+            )
+            timestamps.append(time.time_ns())
+        return np.stack(frames, axis=0), np.asarray(timestamps, dtype=np.int64)
 
     request_start_labview_ms = (
         time.time_ns() // 1_000_000 + LABVIEW_UNIX_EPOCH_OFFSET_MS
@@ -72,6 +88,7 @@ def get_framegrabber_image_stack(
         sock.setsockopt_string(zmq.SUBSCRIBE, topic)
         sock.connect(f"tcp://127.0.0.1:{constants.FRAMEGRAB_SERVER_PORT}")
         frames: list[npt.NDArray] = []
+        timestamps: list[int] = []
         last_accepted_dt = request_start_labview_ms
         while len(frames) < frame_count:
             remaining_s = deadline - time.monotonic()
@@ -96,9 +113,14 @@ def get_framegrabber_image_stack(
                 tuple(meta["shape"])
             )
             frames.append(_crop_frame_to_config(raw, config))
+            timestamps.append(_labview_ms_to_unix_ns(frame_dt))
             last_accepted_dt = frame_dt
 
-    return np.stack(frames, axis=0)
+    return np.stack(frames, axis=0), np.asarray(timestamps, dtype=np.int64)
+
+
+def _labview_ms_to_unix_ns(labview_ms: int) -> int:
+    return int(labview_ms - LABVIEW_UNIX_EPOCH_OFFSET_MS) * 1_000_000
 
 
 def _validate_frame_count(frame_count: int) -> int:

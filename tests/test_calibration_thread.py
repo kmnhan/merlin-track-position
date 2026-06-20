@@ -266,7 +266,10 @@ class CorrectionThreadTests(unittest.TestCase):
                     path,
                     None,
                     "beam",
-                    {"clip_percentiles": (1.0, 99.0)},
+                    {
+                        "active_command_axes": None,
+                        "clip_percentiles": (1.0, 99.0),
+                    },
                 )
             ],
         )
@@ -341,7 +344,16 @@ class DetectShiftThreadTests(unittest.TestCase):
         ):
             thread.run()
 
-        self.assertEqual(calls, [(calibration, camera_pair, {"use_window": True})])
+        self.assertEqual(
+            calls,
+            [
+                (
+                    calibration,
+                    camera_pair,
+                    {"correction_mode": "beam", "use_window": True},
+                )
+            ],
+        )
         self.assertEqual(ready, [result])
         self.assertEqual(failed, [])
 

@@ -13,6 +13,7 @@ from merlin_track_position.instruments import simulated_hardware
 from merlin_track_position.instruments.basler import (
     get_basler_image,
     get_basler_image_stack,
+    get_basler_image_stack_with_timestamps,
 )
 from merlin_track_position.instruments.camera_config import (
     SOURCE_BASLER,
@@ -25,9 +26,11 @@ from merlin_track_position.instruments.camera_config import (
 )
 from merlin_track_position.instruments.cameras import (
     BaslerCameraPlugin,
+    CachedFrameCameraPlugin,
     CallableCameraPlugin,
     CameraPairPlugin,
     FramegrabberCameraPlugin,
+    TimestampedFrameCache,
     camera_pair_from_configs,
     capture_image_and_display_stacks,
     capture_image_stack,
@@ -37,6 +40,7 @@ from merlin_track_position.instruments.cameras import (
 from merlin_track_position.instruments.framegrab import (
     get_framegrabber_image,
     get_framegrabber_image_stack,
+    get_framegrabber_image_stack_with_timestamps,
 )
 from merlin_track_position.instruments.motors import move_motors_and_wait
 from merlin_track_position.instruments.simulated_hardware import simulator
@@ -424,6 +428,60 @@ class DevelopmentModeFramegrabTests(unittest.TestCase):
         time_ns.assert_called_once()
         self.assertEqual(socket.recv_count, 4)
         np.testing.assert_array_equal(stack, np.stack([fresh0, fresh1]))
+
+    def test_daq_mode_framegrabber_timestamped_stack_uses_server_timestamps(self):
+        image0 = np.ones((3, 4), dtype=np.uint16)
+        image1 = image0 + 1
+        request_start_ms = framegrab_module.LABVIEW_UNIX_EPOCH_OFFSET_MS + 1000
+        socket = FakeFramegrabberSocket(
+            [
+                framegrabber_message(image0, request_start_ms + 1),
+                framegrabber_message(image1, request_start_ms + 2),
+            ]
+        )
+
+        with (
+            patch.object(constants, "IS_DAQ_PC", True),
+            patch.object(constants, "IMAGE_HEIGHT_CAM0", 3),
+            patch.object(constants, "IMAGE_WIDTH_CAM0", 4),
+            patch(
+                "merlin_track_position.instruments.framegrab.time.time_ns",
+                return_value=1_000_000_000,
+            ),
+            patch(
+                "merlin_track_position.instruments.framegrab.zmq.Context.instance",
+                return_value=FakeFramegrabberContext(socket),
+            ),
+        ):
+            stack, timestamps_ns = get_framegrabber_image_stack_with_timestamps(2)
+
+        np.testing.assert_array_equal(stack, np.stack([image0, image1]))
+        np.testing.assert_array_equal(
+            timestamps_ns,
+            np.asarray([1_001_000_000, 1_002_000_000], dtype=np.int64),
+        )
+
+    def test_development_mode_basler_timestamped_stack_records_grab_timestamps(self):
+        config = CameraConfig(
+            slot="cam1",
+            source_type=SOURCE_BASLER,
+            width=4,
+            height=3,
+        )
+        with (
+            patch.object(constants, "IS_DAQ_PC", False),
+            patch(
+                "merlin_track_position.instruments.basler.time.time_ns",
+                side_effect=[11, 22],
+            ),
+        ):
+            stack, timestamps_ns = get_basler_image_stack_with_timestamps(2, config)
+
+        self.assertEqual(stack.shape[0], 2)
+        np.testing.assert_array_equal(
+            timestamps_ns,
+            np.asarray([11, 22], dtype=np.int64),
+        )
 
     def test_daq_mode_framegrabber_stack_uses_configured_crop(self):
         raw0 = np.arange(4 * 5, dtype=np.uint16).reshape(4, 5)
@@ -1234,6 +1292,50 @@ class DevelopmentModeFramegrabTests(unittest.TestCase):
         self.assertIs(get_stack.call_args.kwargs["config"], config)
         np.testing.assert_array_equal(captured, stack)
         np.testing.assert_array_equal(display, stack)
+
+    def test_timestamped_frame_cache_filters_by_timestamp_and_preserves_dtype(self):
+        cache = TimestampedFrameCache(3)
+        before = np.zeros((2, 3), dtype=np.uint16)
+        first = np.ones((2, 3), dtype=np.uint16)
+        second = np.ones((2, 3), dtype=np.uint16) + 2
+        cache.append("cam0", before, 10)
+        cache.append("cam0", first, 20)
+        cache.append("cam0", second, 30)
+
+        frames = cache.wait_for_frames_after("cam0", 10, 2, timeout_s=0)
+
+        self.assertEqual([frame.timestamp_ns for frame in frames], [20, 30])
+        self.assertEqual(frames[0].image.dtype, np.dtype(np.uint16))
+        np.testing.assert_array_equal(frames[0].image, first)
+        np.testing.assert_array_equal(frames[1].image, second)
+
+    def test_cached_frame_camera_plugin_uses_start_and_request_timestamps(self):
+        cache = TimestampedFrameCache(8)
+        cache.append("cam0", np.full((2, 2), 1, dtype=np.uint16), 100)
+        cache.append("cam0", np.full((2, 2), 2, dtype=np.uint16), 200)
+        cache.append("cam0", np.full((2, 2), 3, dtype=np.uint16), 300)
+        plugin = CachedFrameCameraPlugin(
+            "cam0",
+            cache,
+            start_after_ns=150,
+            fresh_frame_timeout_s=0.0,
+        )
+
+        stack, display = plugin.capture_stack(2)
+
+        self.assertEqual(stack.dtype, np.dtype(np.uint16))
+        np.testing.assert_array_equal(stack[:, 0, 0], np.asarray([2, 3]))
+        np.testing.assert_array_equal(display, stack)
+
+        cache.append("cam0", np.full((2, 2), 4, dtype=np.uint16), 320)
+        cache.append("cam0", np.full((2, 2), 5, dtype=np.uint16), 360)
+        with patch(
+            "merlin_track_position.instruments.cameras.time.time_ns",
+            return_value=350,
+        ):
+            next_stack, _display = plugin.capture_stack(1)
+
+        np.testing.assert_array_equal(next_stack[:, 0, 0], np.asarray([5]))
 
     def test_capture_image_stack_works_with_cropped_camera_callables(self):
         stale_cam0 = np.arange(4 * 5).reshape(4, 5)

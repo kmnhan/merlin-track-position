@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import logging
 import math
+import threading
 import time
 from abc import ABC, abstractmethod
+from collections import deque
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from numbers import Integral
 from typing import Any
 
@@ -17,6 +20,7 @@ import numpy.typing as npt
 from merlin_track_position.instruments.basler import (
     get_basler_image,
     get_basler_image_stack,
+    get_basler_image_stack_with_timestamps,
 )
 from merlin_track_position.instruments.camera_config import (
     SOURCE_BASLER,
@@ -29,12 +33,114 @@ from merlin_track_position.instruments.camera_config import (
 from merlin_track_position.instruments.framegrab import (
     get_framegrabber_image,
     get_framegrabber_image_stack,
+    get_framegrabber_image_stack_with_timestamps,
 )
 from merlin_track_position.instruments.simulated_hardware import simulator
 
 RoiGeometry = tuple[float, float, float, float]
 _NO_FRAME = object()
 logger = logging.getLogger("merlin_track_position.instruments.cameras")
+
+
+@dataclass(frozen=True)
+class TimestampedFrame:
+    image: npt.NDArray
+    timestamp_ns: int
+
+
+def as_timestamped_frame(value: TimestampedFrame | npt.ArrayLike) -> TimestampedFrame:
+    if isinstance(value, TimestampedFrame):
+        return value
+    return TimestampedFrame(np.asarray(value), time.time_ns())
+
+
+class TimestampedFrameCache:
+    """Thread-safe in-memory cache of recent frames by camera name."""
+
+    def __init__(self, capacity: int):
+        self._capacity = _validate_cache_capacity(capacity)
+        self._condition = threading.Condition()
+        self._frames: dict[str, deque[TimestampedFrame]] = {}
+
+    @property
+    def capacity(self) -> int:
+        with self._condition:
+            return self._capacity
+
+    def set_capacity(self, capacity: int) -> None:
+        capacity = _validate_cache_capacity(capacity)
+        with self._condition:
+            if capacity == self._capacity:
+                return
+            self._capacity = capacity
+            self._frames = {
+                camera: deque(list(frames)[-capacity:], maxlen=capacity)
+                for camera, frames in self._frames.items()
+            }
+            self._condition.notify_all()
+
+    def append(
+        self,
+        camera: str,
+        image: npt.ArrayLike,
+        timestamp_ns: int,
+    ) -> None:
+        timestamp = int(timestamp_ns)
+        if timestamp < 0:
+            raise ValueError("timestamp_ns must be non-negative")
+        frame = TimestampedFrame(np.asarray(image).copy(), timestamp)
+        with self._condition:
+            frames = self._frames.setdefault(
+                str(camera),
+                deque(maxlen=self._capacity),
+            )
+            frames.append(frame)
+            self._condition.notify_all()
+
+    def frames_after(
+        self,
+        camera: str,
+        timestamp_ns: int,
+    ) -> tuple[TimestampedFrame, ...]:
+        threshold = int(timestamp_ns)
+        with self._condition:
+            return self._frames_after_locked(str(camera), threshold)
+
+    def wait_for_frames_after(
+        self,
+        camera: str,
+        timestamp_ns: int,
+        count: int,
+        *,
+        timeout_s: float = 5.0,
+    ) -> tuple[TimestampedFrame, ...]:
+        count = normalize_capture_count(count)
+        timeout = _validate_nonnegative_float("timeout_s", timeout_s)
+        threshold = int(timestamp_ns)
+        deadline = time.monotonic() + timeout
+        with self._condition:
+            while True:
+                frames = self._frames_after_locked(str(camera), threshold)
+                if len(frames) >= count:
+                    return frames[:count]
+                remaining_s = deadline - time.monotonic()
+                if remaining_s <= 0.0:
+                    raise TimeoutError(
+                        f"Timed out waiting for {count} cached frame(s) from "
+                        f"{camera} after timestamp {threshold}"
+                    )
+                self._condition.wait(remaining_s)
+
+    def _frames_after_locked(
+        self,
+        camera: str,
+        timestamp_ns: int,
+    ) -> tuple[TimestampedFrame, ...]:
+        return tuple(
+            frame
+            for frame in self._frames.get(str(camera), ())
+            if frame.timestamp_ns > timestamp_ns
+        )
 
 
 class _ImageContentKey:
@@ -220,6 +326,60 @@ class CallableCameraPlugin(CameraPlugin):
         return super()._frame_key(image)
 
 
+class CachedFrameCameraPlugin(CameraPlugin):
+    """Camera plugin that reads frames populated by the live image updater."""
+
+    def __init__(
+        self,
+        name: str,
+        cache: TimestampedFrameCache,
+        *,
+        start_after_ns: int,
+        fresh_frame_timeout_s: float = 5.0,
+        fresh_frame_poll_interval_s: float = 0.05,
+    ):
+        super().__init__(
+            name,
+            fresh_frame_timeout_s=fresh_frame_timeout_s,
+            fresh_frame_poll_interval_s=fresh_frame_poll_interval_s,
+        )
+        self._cache = cache
+        self.start_after_ns = int(start_after_ns)
+        self._last_timestamp_ns = self.start_after_ns
+        self._capture_request_count = 0
+
+    def capture(self) -> npt.NDArray:
+        return self.capture_stack(1)[0][0]
+
+    def capture_stack(self, frame_count: int) -> tuple[npt.NDArray, npt.NDArray]:
+        frame_count = normalize_capture_count(frame_count)
+        threshold_ns = self._next_threshold_ns()
+        frames = self._cache.wait_for_frames_after(
+            self.name,
+            threshold_ns,
+            frame_count,
+            timeout_s=self.fresh_frame_timeout_s,
+        )
+        stack = np.stack(
+            [np.asarray(frame.image).copy() for frame in frames],
+            axis=0,
+        )
+        self._last_timestamp_ns = int(frames[-1].timestamp_ns)
+        self._last_frame_key = self._last_timestamp_ns
+        self._last_image = stack[-1].copy()
+        return stack, stack.copy()
+
+    def _capture_once(self) -> npt.NDArray:
+        return self.capture()
+
+    def _next_threshold_ns(self) -> int:
+        threshold_ns = self._last_timestamp_ns
+        if self._capture_request_count > 0:
+            threshold_ns = max(threshold_ns, time.time_ns())
+        self._capture_request_count += 1
+        return threshold_ns
+
+
 class SimulatedCameraPlugin(CameraPlugin):
     """Camera plugin backed by the development-mode simulator."""
 
@@ -335,6 +495,58 @@ def camera_pair_from_configs(configs: dict[str, CameraConfig]) -> CameraPairPlug
     return CameraPairPlugin(plugins[0], plugins[1])
 
 
+def cached_camera_pair_from_frame_cache(
+    cache: TimestampedFrameCache,
+    *,
+    start_after_ns: int,
+    fresh_frame_timeout_s: float = 5.0,
+) -> CameraPairPlugin:
+    return CameraPairPlugin(
+        CachedFrameCameraPlugin(
+            "cam0",
+            cache,
+            start_after_ns=start_after_ns,
+            fresh_frame_timeout_s=fresh_frame_timeout_s,
+        ),
+        CachedFrameCameraPlugin(
+            "cam1",
+            cache,
+            start_after_ns=start_after_ns,
+            fresh_frame_timeout_s=fresh_frame_timeout_s,
+        ),
+    )
+
+
+def capture_timestamped_frame_from_config(config: CameraConfig) -> TimestampedFrame:
+    if config.source_type == SOURCE_FRAMEGRABBER:
+        stack, timestamps_ns = get_framegrabber_image_stack_with_timestamps(
+            1,
+            config=config,
+        )
+        return TimestampedFrame(stack[0], int(timestamps_ns[0]))
+    if config.source_type == SOURCE_BASLER:
+        stack, timestamps_ns = get_basler_image_stack_with_timestamps(1, config)
+        return TimestampedFrame(stack[0], int(timestamps_ns[0]))
+    if config.source_type == SOURCE_SIMULATED:
+        if config.slot == "cam0":
+            image = simulator.get_framegrabber_image()
+        else:
+            image = simulator.get_basler_image()
+        return TimestampedFrame(
+            crop_image_to_roi(
+                image,
+                (
+                    float(config.offset_x),
+                    float(config.offset_y),
+                    float(config.width),
+                    float(config.height),
+                ),
+            ),
+            time.time_ns(),
+        )
+    raise ValueError(f"unsupported camera source type: {config.source_type!r}")
+
+
 def default_camera_pair() -> CameraPairPlugin:
     """Return the default two-camera hardware plugin pair."""
     return camera_pair_from_configs(default_camera_configs())
@@ -347,6 +559,13 @@ def normalize_capture_count(capture_count: int) -> int:
     value = int(capture_count)
     if value < 1:
         raise ValueError("capture_count must be an integer >= 1")
+    return value
+
+
+def _validate_cache_capacity(capacity: int) -> int:
+    value = int(capacity)
+    if value < 1:
+        raise ValueError("cache capacity must be >= 1")
     return value
 
 

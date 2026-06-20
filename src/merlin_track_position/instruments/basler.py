@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import logging
 import math
 import threading
+import time
 
 import cv2
 import numpy as np
@@ -464,15 +465,28 @@ class _BaslerCameraSession:
         frame_count: int,
         timeout_ms: int = 5000,
     ) -> npt.NDArray:
+        images, _timestamps_ns = self.get_images_with_timestamps(
+            frame_count,
+            timeout_ms=timeout_ms,
+        )
+        return images
+
+    def get_images_with_timestamps(
+        self,
+        frame_count: int,
+        timeout_ms: int = 5000,
+    ) -> tuple[npt.NDArray, npt.NDArray[np.int64]]:
         frame_count = _validate_frame_count(frame_count)
         with self._lock:
             camera = self._ensure_camera()
             images = []
+            timestamps = []
             failed_grabs = 0
             try:
                 while len(images) < frame_count:
                     try:
                         images.append(self._retrieve_image(camera, timeout_ms))
+                        timestamps.append(time.time_ns())
                     except _BaslerGrabFailed as exc:
                         failed_grabs += 1
                         if failed_grabs > BASLER_FAILED_GRAB_RETRY_COUNT:
@@ -493,7 +507,7 @@ class _BaslerCameraSession:
                 raise
             stack = np.stack(images, axis=0)
             self._latest_image = stack[-1].copy()
-            return stack
+            return stack, np.asarray(timestamps, dtype=np.int64)
 
     def close(self) -> None:
         with self._lock:
@@ -584,16 +598,33 @@ def get_basler_image_stack(
     config: CameraConfig | None = None,
 ) -> npt.NDArray:
     """Return consecutive images from a Basler camera."""
+    stack, _timestamps_ns = get_basler_image_stack_with_timestamps(
+        frame_count,
+        config,
+    )
+    return stack
+
+
+def get_basler_image_stack_with_timestamps(
+    frame_count: int,
+    config: CameraConfig | None = None,
+) -> tuple[npt.NDArray, npt.NDArray[np.int64]]:
+    """Return consecutive images and their Unix-epoch timestamps."""
     frame_count = _validate_frame_count(frame_count)
     if config is None:
         config = default_camera_config("cam1")
     if not constants.IS_DAQ_PC:
-        images = np.stack(
-            [_simulated_image(config) for _ in range(frame_count)],
-            axis=0,
-        )
+        raw_images: list[npt.NDArray] = []
+        timestamps: list[int] = []
+        for _ in range(frame_count):
+            raw_images.append(_simulated_image(config))
+            timestamps.append(time.time_ns())
+        images = np.stack(raw_images, axis=0)
     else:
-        images = _session_for_config(config).get_images(frame_count)
+        images, timestamps_array = _session_for_config(
+            config
+        ).get_images_with_timestamps(frame_count)
+        timestamps = [int(value) for value in timestamps_array]
     images = np.asarray(images)
     images = _decode_basler_image_stack(images, config)
     if images.ndim < 3:
@@ -601,7 +632,7 @@ def get_basler_image_stack(
             f"Basler image stack must be at least 3D, got {images.shape!r}"
         )
     _validate_image_shape(images[0], config)
-    return images.copy()
+    return images.copy(), np.asarray(timestamps, dtype=np.int64)
 
 
 def _simulated_image(config: CameraConfig) -> npt.NDArray:
