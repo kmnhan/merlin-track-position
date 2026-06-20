@@ -106,14 +106,6 @@ class CorrectionMeasurementReference(NamedTuple):
 
 
 class CorrectionMotorBackend(Protocol):
-    def wait_until_motors_idle(
-        self,
-        motor_aliases: Sequence[str],
-        *,
-        move_timeout_s: float = 60.0,
-    ) -> tuple[float, ...]:
-        """Wait until the requested motors are no longer moving."""
-
     def get_positions(self, motor_aliases: Sequence[str]) -> tuple[float, ...]:
         """Return motor readback positions in the order requested."""
 

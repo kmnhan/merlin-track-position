@@ -2204,15 +2204,16 @@ class CorrectionTests(unittest.TestCase):
 
     def test_correction_waits_for_polar_idle_before_initial_capture(self):
         order: list[str] = []
+        test_case = self
 
         class FakeMotorBackend:
             def wait_until_motors_idle(self, aliases):
-                self.assertEqual(tuple(aliases), ("p",))
+                test_case.assertEqual(tuple(aliases), ("p",))
                 order.append("wait")
                 return (4.0,)
 
             def get_positions(self, aliases):
-                self.assertIn("wait", order)
+                test_case.assertIn("wait", order)
                 order.append(f"get:{' '.join(str(alias) for alias in aliases)}")
                 values = {
                     "x": 0.0,
