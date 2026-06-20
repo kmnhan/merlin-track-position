@@ -617,6 +617,81 @@ class _PolarCompensationXzMoveThread(QtCore.QThread):
         self.requestInterruption()
 
 
+class _PolarCompensationPredictionMoveThread(QtCore.QThread):
+    sigPolarCompensationPredictionMoveReady = QtCore.Signal(
+        float,
+        float,
+        float,
+        float,
+        float,
+        float,
+    )
+    sigPolarCompensationPredictionMoveFailed = QtCore.Signal(str)
+
+    def __init__(self, parent: QtCore.QObject | None = None):
+        super().__init__(parent)
+        self._running = threading.Event()
+        self._target: tuple[float, float, float] | None = None
+
+    def configure(
+        self,
+        target_polar_deg: float,
+        target_x_mm: float,
+        target_z_mm: float,
+    ) -> None:
+        if self.isRunning():
+            raise RuntimeError(
+                "cannot configure polar compensation prediction move while it is running"
+            )
+        target = (float(target_x_mm), float(target_z_mm), float(target_polar_deg))
+        if not all(math.isfinite(value) for value in target):
+            raise ValueError("predicted x/z/polar target must be finite")
+        self._target = target
+
+    def run(self) -> None:
+        self._running.set()
+        try:
+            if not self._running.is_set() or self.isInterruptionRequested():
+                return
+            try:
+                if self._target is None:
+                    raise RuntimeError(
+                        "polar compensation prediction move thread has not been configured"
+                    )
+                final_positions = tuple(
+                    float(value)
+                    for value in move_motors_and_wait(
+                        ("x", "z", "p"),
+                        self._target,
+                    )
+                )
+                if len(final_positions) != 3:
+                    raise ValueError(
+                        "predicted x/z/polar move returned unexpected readback count"
+                    )
+            except Exception as exc:
+                logger.exception("Polar compensation prediction move failed.")
+                if self._running.is_set() and not self.isInterruptionRequested():
+                    self.sigPolarCompensationPredictionMoveFailed.emit(str(exc))
+                return
+
+            if self._running.is_set() and not self.isInterruptionRequested():
+                self.sigPolarCompensationPredictionMoveReady.emit(
+                    self._target[0],
+                    self._target[1],
+                    self._target[2],
+                    final_positions[0],
+                    final_positions[1],
+                    final_positions[2],
+                )
+        finally:
+            self._running.clear()
+
+    def stop(self) -> None:
+        self._running.clear()
+        self.requestInterruption()
+
+
 _ACTIVE_CAMERA_CONFIGS: dict[str, CameraConfig] = default_camera_configs()
 CAMERA_IMAGE_SIZES: dict[str, tuple[int, int]] = {
     slot: (_ACTIVE_CAMERA_CONFIGS[slot].width, _ACTIVE_CAMERA_CONFIGS[slot].height)
@@ -1880,6 +1955,8 @@ class TrackShiftFileDialog(QtWidgets.QDialog):
 
 
 class PolarCompensationDialog(QtWidgets.QDialog):
+    sigMoveToPredictionRequested = QtCore.Signal(float, float, float)
+
     def __init__(
         self,
         model: xr.Dataset | None,
@@ -1888,6 +1965,8 @@ class PolarCompensationDialog(QtWidgets.QDialog):
         probe_angles: Sequence[float] | None = None,
         start_enabled: bool = False,
         start_unavailable_message: str = "",
+        move_enabled: bool = False,
+        move_unavailable_message: str = "",
         parent: QtWidgets.QWidget | None = None,
     ):
         super().__init__(parent)
@@ -1896,6 +1975,8 @@ class PolarCompensationDialog(QtWidgets.QDialog):
         self._model = model
         self._start_requested = False
         self._anchor_polar = None if anchor_polar is None else float(anchor_polar)
+        self._move_enabled = bool(move_enabled)
+        self._move_unavailable_message = str(move_unavailable_message)
         self.probe_table: QtWidgets.QTableWidget | None = None
 
         layout = QtWidgets.QVBoxLayout(self)
@@ -2190,6 +2271,11 @@ class PolarCompensationDialog(QtWidgets.QDialog):
         copy_x = QtWidgets.QPushButton("Copy x")
         copy_z = QtWidgets.QPushButton("Copy z")
         copy_pair = QtWidgets.QPushButton("Copy x,z")
+        move_button = QtWidgets.QPushButton("Move x/z/p")
+        move_button.setObjectName("polar_compensation_move_button")
+        move_button.setEnabled(self._move_enabled)
+        if self._move_unavailable_message:
+            move_button.setToolTip(self._move_unavailable_message)
 
         query_layout.addWidget(QtWidgets.QLabel("Polar"), 0, 0)
         query_layout.addWidget(self.polar_input, 0, 1)
@@ -2199,7 +2285,8 @@ class PolarCompensationDialog(QtWidgets.QDialog):
         query_layout.addWidget(QtWidgets.QLabel("z"), 2, 0)
         query_layout.addWidget(self.z_output, 2, 1)
         query_layout.addWidget(copy_z, 2, 2)
-        query_layout.addWidget(copy_pair, 3, 1, 1, 2)
+        query_layout.addWidget(copy_pair, 3, 1)
+        query_layout.addWidget(move_button, 3, 2)
         layout.addWidget(query_group)
 
         self.polar_input.valueChanged.connect(self._update_prediction)
@@ -2208,6 +2295,7 @@ class PolarCompensationDialog(QtWidgets.QDialog):
         copy_pair.clicked.connect(
             lambda: self._copy_text(f"{self.x_output.text()}, {self.z_output.text()}")
         )
+        move_button.clicked.connect(self._request_prediction_move)
         self._update_prediction()
 
     @staticmethod
@@ -2327,17 +2415,56 @@ class PolarCompensationDialog(QtWidgets.QDialog):
         plot.getAxis("left").enableAutoSIPrefix(False)
 
     def _update_prediction(self) -> None:
-        if self._model is None:
+        try:
+            _polar, x_mm, z_mm = self._prediction_target()
+        except Exception:
+            if hasattr(self, "x_output"):
+                self.x_output.setText("n/a")
+                self.z_output.setText("n/a")
             return
+        self.x_output.setText(f"{x_mm:.9f}")
+        self.z_output.setText(f"{z_mm:.9f}")
+
+    def _prediction_target(self) -> tuple[float, float, float]:
+        if self._model is None:
+            raise RuntimeError("no polar compensation model is available")
+        polar_deg = float(self.polar_input.value())
         xz = np.asarray(
             predict_polar_compensation_from_attrs(
                 self._model,
-                float(self.polar_input.value()),
+                polar_deg,
             ),
             dtype=np.float64,
         )
-        self.x_output.setText(f"{float(xz[0]):.9f}")
-        self.z_output.setText(f"{float(xz[1]):.9f}")
+        if xz.shape != (2,) or not np.isfinite(xz).all():
+            raise ValueError("polar compensation prediction is not finite")
+        return polar_deg, float(xz[0]), float(xz[1])
+
+    def _request_prediction_move(self) -> None:
+        try:
+            polar_deg, x_mm, z_mm = self._prediction_target()
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Could not move to prediction",
+                str(exc),
+            )
+            return
+
+        response = QtWidgets.QMessageBox.warning(
+            self,
+            "Move to polar compensation prediction?",
+            "Move X/Z/Polar to "
+            f"x={x_mm:.6f} mm, z={z_mm:.6f} mm, p={polar_deg:.4f} deg?",
+            QtWidgets.QMessageBox.StandardButton.Ok
+            | QtWidgets.QMessageBox.StandardButton.Cancel,
+            QtWidgets.QMessageBox.StandardButton.Cancel,
+        )
+        if response != QtWidgets.QMessageBox.StandardButton.Ok:
+            return
+
+        self.sigMoveToPredictionRequested.emit(polar_deg, x_mm, z_mm)
+        self.accept()
 
     def _copy_text(self, text: str) -> None:
         QtWidgets.QApplication.clipboard().setText(text)
@@ -2610,6 +2737,9 @@ class MainWindow(_MainWindowGUI):
         self._detect_shift_thread = DetectShiftThread(self)
         self._stored_axis_move_thread = _StoredAxisMoveThread(self)
         self._polar_compensation_xz_move_thread = _PolarCompensationXzMoveThread(self)
+        self._polar_compensation_prediction_move_thread = (
+            _PolarCompensationPredictionMoveThread(self)
+        )
         self._record_polar_thread = _RecordPolarReferenceThread(self)
         self._calibration_total_steps = 0
         self._calibration_started_at: float | None = None
@@ -2782,6 +2912,12 @@ class MainWindow(_MainWindowGUI):
         )
         self._polar_compensation_xz_move_thread.sigPolarCompensationXzMoveFailed.connect(
             self._on_polar_compensation_xz_move_failed
+        )
+        self._polar_compensation_prediction_move_thread.sigPolarCompensationPredictionMoveReady.connect(
+            self._on_polar_compensation_prediction_move_ready
+        )
+        self._polar_compensation_prediction_move_thread.sigPolarCompensationPredictionMoveFailed.connect(
+            self._on_polar_compensation_prediction_move_failed
         )
         self._record_polar_thread.sigRecordPolarProgress.connect(
             self._on_record_polar_progress
@@ -3113,6 +3249,10 @@ class MainWindow(_MainWindowGUI):
             return "Correction is unavailable while a stored-axis move is running."
         if self._polar_compensation_active:
             return "Correction is unavailable while polar compensation is running."
+        if self._polar_compensation_prediction_move_thread.isRunning():
+            return (
+                "Correction is unavailable while a polar compensation move is running."
+            )
         if self._record_polar_thread.isRunning():
             return "Correction is unavailable while Record Polar is running."
         if self._calibration_path is None or not self._calibration_path.exists():
@@ -3135,6 +3275,11 @@ class MainWindow(_MainWindowGUI):
             return "Shift detection is unavailable while a stored-axis move is running."
         if self._polar_compensation_active:
             return "Shift detection is unavailable while polar compensation is running."
+        if self._polar_compensation_prediction_move_thread.isRunning():
+            return (
+                "Shift detection is unavailable while a polar compensation move is "
+                "running."
+            )
         if self._record_polar_thread.isRunning():
             return "Shift detection is unavailable while Record Polar is running."
         mismatch_message = self._camera_config_mismatch_message()
@@ -3157,8 +3302,41 @@ class MainWindow(_MainWindowGUI):
             return (
                 "Stored-axis move is unavailable while polar compensation is running."
             )
+        if self._polar_compensation_prediction_move_thread.isRunning():
+            return (
+                "Stored-axis move is unavailable while a polar compensation move is "
+                "running."
+            )
         if self._record_polar_thread.isRunning():
             return "Stored-axis move is unavailable while Record Polar is running."
+        return None
+
+    def _polar_compensation_prediction_move_unavailable_message(self) -> str | None:
+        if self._calibration is None:
+            return "Polar compensation move requires a loaded calibration."
+        if self._calibration_thread.isRunning():
+            return (
+                "Polar compensation move is unavailable while calibration is running."
+            )
+        if self._correction_thread.isRunning():
+            return "Polar compensation move is unavailable while correction is running."
+        if self._detect_shift_thread.isRunning():
+            return "Polar compensation move is unavailable while shift detection is running."
+        if self._stored_axis_move_thread.isRunning():
+            return (
+                "Polar compensation move is unavailable while a stored-axis move is "
+                "running."
+            )
+        if self._polar_compensation_active:
+            return (
+                "Polar compensation move is unavailable while calculation is running."
+            )
+        if self._polar_compensation_prediction_move_thread.isRunning():
+            return "Polar compensation move is already in progress."
+        if self._record_polar_thread.isRunning():
+            return (
+                "Polar compensation move is unavailable while Record Polar is running."
+            )
         return None
 
     def _polar_compensation_unavailable_message(self) -> str | None:
@@ -3176,6 +3354,11 @@ class MainWindow(_MainWindowGUI):
             )
         if self._polar_compensation_active:
             return "Polar compensation is already running."
+        if self._polar_compensation_prediction_move_thread.isRunning():
+            return (
+                "Polar compensation is unavailable while a polar compensation move is "
+                "running."
+            )
         if self._record_polar_thread.isRunning():
             return "Polar compensation is unavailable while Record Polar is running."
         if self._calibration_path is None or not self._calibration_path.exists():
@@ -3198,6 +3381,8 @@ class MainWindow(_MainWindowGUI):
             return "Record Polar is unavailable while a stored-axis move is running."
         if self._polar_compensation_active:
             return "Record Polar is unavailable while polar compensation is running."
+        if self._polar_compensation_prediction_move_thread.isRunning():
+            return "Record Polar is unavailable while a polar compensation move is running."
         if self._record_polar_thread.isRunning():
             return "Record Polar is already running."
         if self._calibration_path is None or not self._calibration_path.exists():
@@ -3266,11 +3451,15 @@ class MainWindow(_MainWindowGUI):
             or self._detect_shift_thread.isRunning()
             or self._stored_axis_move_thread.isRunning()
             or self._polar_compensation_active
+            or self._polar_compensation_prediction_move_thread.isRunning()
             or self._record_polar_thread.isRunning()
         ):
             return
 
         unavailable_message = self._polar_compensation_unavailable_message()
+        move_unavailable_message = (
+            self._polar_compensation_prediction_move_unavailable_message()
+        )
         model = _stored_polar_compensation_model(self._calibration)
         try:
             anchor_polar = float(self._calibration.attrs["polar"])
@@ -3283,8 +3472,15 @@ class MainWindow(_MainWindowGUI):
             start_unavailable_message=(
                 "" if unavailable_message is None else unavailable_message
             ),
+            move_enabled=model is not None and move_unavailable_message is None,
+            move_unavailable_message=(
+                "" if move_unavailable_message is None else move_unavailable_message
+            ),
             parent=self,
         )
+        move_signal = getattr(dialog, "sigMoveToPredictionRequested", None)
+        if move_signal is not None:
+            move_signal.connect(self._on_polar_compensation_prediction_move_requested)
         if dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted:
             if dialog.start_requested():
                 self._on_calculate_polar_compensate_clicked(dialog.probe_angles())
@@ -3698,6 +3894,90 @@ class MainWindow(_MainWindowGUI):
     def _on_polar_compensation_xz_move_failed(self, error_message: str) -> None:
         self._abort_polar_compensation(
             f"Could not return X/Z to the acquired anchor point: {error_message}"
+        )
+
+    @QtCore.Slot(float, float, float)
+    def _on_polar_compensation_prediction_move_requested(
+        self,
+        polar_deg: float,
+        x_mm: float,
+        z_mm: float,
+    ) -> None:
+        unavailable_message = (
+            self._polar_compensation_prediction_move_unavailable_message()
+        )
+        if unavailable_message is not None:
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Could not move to polar compensation prediction",
+                unavailable_message,
+            )
+            return
+
+        try:
+            self._polar_compensation_prediction_move_thread.configure(
+                polar_deg,
+                x_mm,
+                z_mm,
+            )
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Could not move to polar compensation prediction",
+                str(exc),
+            )
+            return
+
+        ui_marked_busy = False
+        try:
+            ui_marked_busy = True
+            self._set_roi_editing_enabled(False)
+            self.calibration_panel.show_polar_compensation_prediction_move_in_progress(
+                x_mm,
+                z_mm,
+                polar_deg,
+            )
+            self._polar_compensation_prediction_move_thread.start()
+        except Exception as exc:
+            if ui_marked_busy:
+                self._restore_calibration_idle_state()
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Could not move to polar compensation prediction",
+                str(exc),
+            )
+
+    @QtCore.Slot(float, float, float, float, float, float)
+    def _on_polar_compensation_prediction_move_ready(
+        self,
+        target_x_mm: float,
+        target_z_mm: float,
+        target_polar_deg: float,
+        final_x_mm: float,
+        final_z_mm: float,
+        final_polar_deg: float,
+    ) -> None:
+        self._restore_calibration_idle_state()
+        self.calibration_panel.show_polar_compensation_prediction_move_result(
+            target_x_mm,
+            target_z_mm,
+            target_polar_deg,
+            final_x_mm,
+            final_z_mm,
+            final_polar_deg,
+        )
+        self._refresh_initial_transform_preview_after_known_state_change()
+
+    @QtCore.Slot(str)
+    def _on_polar_compensation_prediction_move_failed(
+        self,
+        error_message: str,
+    ) -> None:
+        self._restore_calibration_idle_state()
+        QtWidgets.QMessageBox.critical(
+            self,
+            "Could not move to polar compensation prediction",
+            error_message,
         )
 
     def _finish_polar_compensation(self) -> None:
@@ -4600,6 +4880,7 @@ class MainWindow(_MainWindowGUI):
             or self._detect_shift_thread.isRunning()
             or self._stored_axis_move_thread.isRunning()
             or self._polar_compensation_active
+            or self._polar_compensation_prediction_move_thread.isRunning()
             or self._record_polar_thread.isRunning()
         ):
             return
@@ -4647,6 +4928,7 @@ class MainWindow(_MainWindowGUI):
             or self._detect_shift_thread.isRunning()
             or self._stored_axis_move_thread.isRunning()
             or self._polar_compensation_active
+            or self._polar_compensation_prediction_move_thread.isRunning()
             or self._record_polar_thread.isRunning()
         ):
             return
@@ -4710,6 +4992,7 @@ class MainWindow(_MainWindowGUI):
             or self._detect_shift_thread.isRunning()
             or self._stored_axis_move_thread.isRunning()
             or self._polar_compensation_active
+            or self._polar_compensation_prediction_move_thread.isRunning()
             or self._record_polar_thread.isRunning()
         ):
             return
@@ -5159,6 +5442,7 @@ class MainWindow(_MainWindowGUI):
             or self._detect_shift_thread.isRunning()
             or self._stored_axis_move_thread.isRunning()
             or self._polar_compensation_active
+            or self._polar_compensation_prediction_move_thread.isRunning()
             or self._record_polar_thread.isRunning()
         ):
             return
@@ -5352,6 +5636,9 @@ class MainWindow(_MainWindowGUI):
 
         self._polar_compensation_xz_move_thread.stop()
         self._polar_compensation_xz_move_thread.wait()
+
+        self._polar_compensation_prediction_move_thread.stop()
+        self._polar_compensation_prediction_move_thread.wait()
 
         self._record_polar_thread.stop()
         self._record_polar_thread.wait()

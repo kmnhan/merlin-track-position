@@ -376,6 +376,44 @@ class FakePolarCompensationXzMoveThread(QtCore.QObject):
         pass
 
 
+class FakePolarCompensationPredictionMoveThread(QtCore.QObject):
+    sigPolarCompensationPredictionMoveReady = QtCore.Signal(
+        float,
+        float,
+        float,
+        float,
+        float,
+        float,
+    )
+    sigPolarCompensationPredictionMoveFailed = QtCore.Signal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.target_polar = None
+        self.target_x = None
+        self.target_z = None
+        self.started = False
+        self.running = False
+
+    def configure(self, target_polar, target_x, target_z):
+        self.target_polar = float(target_polar)
+        self.target_x = float(target_x)
+        self.target_z = float(target_z)
+
+    def start(self):
+        self.started = True
+        self.running = True
+
+    def isRunning(self):
+        return self.running
+
+    def stop(self):
+        self.running = False
+
+    def wait(self):
+        pass
+
+
 class FakeRecordPolarReferenceThread(QtCore.QObject):
     sigRecordPolarProgress = QtCore.Signal(int, int, float, str, object, object)
     sigRecordPolarReady = QtCore.Signal(object)
@@ -468,6 +506,11 @@ def patched_main_window_runtime(settings=None):
         patch(
             "merlin_track_position.interface.main_window._PolarCompensationXzMoveThread",
             FakePolarCompensationXzMoveThread,
+        ),
+        patch(
+            "merlin_track_position.interface.main_window."
+            "_PolarCompensationPredictionMoveThread",
+            FakePolarCompensationPredictionMoveThread,
         ),
         patch(
             "merlin_track_position.interface.main_window._RecordPolarReferenceThread",
@@ -2015,6 +2058,45 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
         finally:
             dialog.close()
 
+    def test_polar_compensation_dialog_move_button_emits_predicted_target(self):
+        get_qapp()
+        model = synthetic_polar_compensation_model()
+        dialog = main_window.PolarCompensationDialog(
+            model,
+            start_enabled=True,
+            move_enabled=True,
+        )
+        try:
+            move_button = dialog.findChild(
+                QtWidgets.QPushButton,
+                "polar_compensation_move_button",
+            )
+            self.assertIsNotNone(move_button)
+            assert move_button is not None
+            requests = []
+            dialog.sigMoveToPredictionRequested.connect(
+                lambda polar, x, z: requests.append((polar, x, z))
+            )
+            dialog.polar_input.setValue(-7.5)
+            expected_xz = np.asarray(
+                main_window.predict_polar_compensation_from_attrs(model, -7.5),
+                dtype=np.float64,
+            )
+
+            with patch(
+                "merlin_track_position.interface.main_window.QtWidgets.QMessageBox.warning",
+                return_value=QtWidgets.QMessageBox.StandardButton.Ok,
+            ):
+                move_button.click()
+
+            self.assertEqual(len(requests), 1)
+            self.assertAlmostEqual(requests[0][0], -7.5)
+            self.assertAlmostEqual(requests[0][1], float(expected_xz[0]))
+            self.assertAlmostEqual(requests[0][2], float(expected_xz[1]))
+            self.assertFalse(dialog.start_requested())
+        finally:
+            dialog.close()
+
     def test_polar_compensate_button_opens_dialog_before_starting_workflow(self):
         get_qapp()
         instances = []
@@ -2028,6 +2110,8 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                 probe_angles=None,
                 start_enabled=False,
                 start_unavailable_message="",
+                move_enabled=False,
+                move_unavailable_message="",
                 parent=None,
             ):
                 self.model = model
@@ -2035,6 +2119,8 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                 self.initial_probe_angles = probe_angles
                 self.start_enabled = start_enabled
                 self.start_unavailable_message = start_unavailable_message
+                self.move_enabled = move_enabled
+                self.move_unavailable_message = move_unavailable_message
                 self.parent = parent
                 instances.append(self)
 
@@ -2093,6 +2179,8 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                 probe_angles=None,
                 start_enabled=False,
                 start_unavailable_message="",
+                move_enabled=False,
+                move_unavailable_message="",
                 parent=None,
             ):
                 self.model = model
@@ -2100,6 +2188,8 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                 self.initial_probe_angles = probe_angles
                 self.start_enabled = start_enabled
                 self.start_unavailable_message = start_unavailable_message
+                self.move_enabled = move_enabled
+                self.move_unavailable_message = move_unavailable_message
                 self.parent = parent
                 instances.append(self)
 
@@ -2155,6 +2245,8 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                 probe_angles=None,
                 start_enabled=False,
                 start_unavailable_message="",
+                move_enabled=False,
+                move_unavailable_message="",
                 parent=None,
             ):
                 self.model = model
@@ -2162,6 +2254,8 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                 self.initial_probe_angles = probe_angles
                 self.start_enabled = start_enabled
                 self.start_unavailable_message = start_unavailable_message
+                self.move_enabled = move_enabled
+                self.move_unavailable_message = move_unavailable_message
                 self.parent = parent
                 instances.append(self)
 
@@ -2403,6 +2497,79 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                         self.assertEqual(refresh_thread.wait_until_idle_calls, 0)
                 finally:
                     window.close()
+
+    def test_polar_compensation_prediction_move_uses_three_axis_thread(self):
+        get_qapp()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "calibration.h5"
+            calibration = write_sample_calibration(path)
+            model = synthetic_polar_compensation_model()
+            calibration = apply_polar_compensation_model(calibration, model)
+            calibration.attrs["calibration_path"] = str(path)
+            with patched_main_window_runtime():
+                window = MainWindow()
+                try:
+                    window._on_new_calibration_ready(calibration)
+
+                    window._on_polar_compensation_prediction_move_requested(
+                        -7.5,
+                        1.125,
+                        3.875,
+                    )
+
+                    thread = window._polar_compensation_prediction_move_thread
+                    self.assertTrue(thread.started)
+                    self.assertEqual(thread.target_polar, -7.5)
+                    self.assertEqual(thread.target_x, 1.125)
+                    self.assertEqual(thread.target_z, 3.875)
+                    self.assertFalse(
+                        window.calibration_panel.correct_sample_button.isEnabled()
+                    )
+                    self.assertIn(
+                        "Moving to polar compensation prediction",
+                        window.calibration_panel.calibration_status_label.text(),
+                    )
+
+                    thread.running = False
+                    window._on_polar_compensation_prediction_move_ready(
+                        1.125,
+                        3.875,
+                        -7.5,
+                        1.126,
+                        3.874,
+                        -7.49,
+                    )
+
+                    self.assertTrue(
+                        window.calibration_panel.correct_sample_button.isEnabled()
+                    )
+                    self.assertIn(
+                        "Moved to polar compensation prediction",
+                        window.calibration_panel.calibration_status_label.text(),
+                    )
+                finally:
+                    window.close()
+
+    def test_polar_compensation_prediction_move_thread_moves_x_z_p(self):
+        get_qapp()
+        thread = main_window._PolarCompensationPredictionMoveThread()
+        ready = []
+        thread.sigPolarCompensationPredictionMoveReady.connect(
+            lambda *values: ready.append(values)
+        )
+
+        with patch(
+            "merlin_track_position.interface.main_window.move_motors_and_wait",
+            return_value=(1.126, 3.874, -7.49),
+        ) as move_motors:
+            thread.configure(-7.5, 1.125, 3.875)
+            thread.run()
+
+        move_motors.assert_called_once_with(
+            ("x", "z", "p"),
+            (1.125, 3.875, -7.5),
+        )
+        self.assertEqual(ready, [(1.125, 3.875, -7.5, 1.126, 3.874, -7.49)])
 
     def test_polar_compensation_anchor_step_skips_manual_jog(self):
         get_qapp()

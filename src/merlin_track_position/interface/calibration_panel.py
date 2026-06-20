@@ -1359,6 +1359,45 @@ class CalibrationPanel(QtWidgets.QWidget):
             f"{_format_number(model.attrs.get('polar_compensation_residual_max_um'))} um."
         )
 
+    def show_polar_compensation_prediction_move_in_progress(
+        self,
+        target_x_mm: float,
+        target_z_mm: float,
+        target_polar_deg: float,
+    ) -> None:
+        self._set_display_mode("calibration")
+        self._set_loaded_idle_controls_enabled(False)
+        self._show_stored_orientation_if_available()
+        self.calibration_progress_bar.setVisible(True)
+        self.calibration_progress_bar.setRange(0, 0)
+        self.calibration_status_label.setText(
+            "Moving to polar compensation prediction: "
+            f"x={float(target_x_mm):.6f} mm, "
+            f"z={float(target_z_mm):.6f} mm, "
+            f"p={float(target_polar_deg):.4f} deg..."
+        )
+
+    def show_polar_compensation_prediction_move_result(
+        self,
+        target_x_mm: float,
+        target_z_mm: float,
+        target_polar_deg: float,
+        final_x_mm: float,
+        final_z_mm: float,
+        final_polar_deg: float,
+    ) -> None:
+        self._show_stored_orientation_if_available()
+        self.calibration_progress_bar.setVisible(False)
+        self.calibration_status_label.setText(
+            "Moved to polar compensation prediction: "
+            f"target x={float(target_x_mm):.6f} mm, "
+            f"z={float(target_z_mm):.6f} mm, "
+            f"p={float(target_polar_deg):.4f} deg; "
+            f"final x={float(final_x_mm):.6f} mm, "
+            f"z={float(final_z_mm):.6f} mm, "
+            f"p={float(final_polar_deg):.4f} deg."
+        )
+
     def show_record_polar_in_progress(
         self,
         *,
