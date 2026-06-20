@@ -2603,7 +2603,7 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                 finally:
                     window.close()
 
-    def test_polar_compensation_uses_previous_point_as_local_reference(self):
+    def test_polar_compensation_uses_acquired_point_as_local_reference(self):
         get_qapp()
         with tempfile.TemporaryDirectory() as tmpdir:
             calibration = write_sample_calibration(Path(tmpdir) / "calibration.h5")
@@ -2651,6 +2651,66 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                     self.assertFalse(
                         window._correction_thread.use_stored_polar_reference
                     )
+                finally:
+                    window.close()
+
+    def test_polar_compensation_uses_closest_acquired_local_reference(self):
+        get_qapp()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            calibration = write_sample_calibration(Path(tmpdir) / "calibration.h5")
+            anchor_cam0 = np.arange(2 * 3, dtype=np.uint16).reshape(2, 3)
+            anchor_cam1 = np.arange(3 * 4 * 3, dtype=np.uint16).reshape(3, 4, 3)
+            previous_cam0 = anchor_cam0 + 100
+            previous_cam1 = anchor_cam1 + 100
+            with patched_main_window_runtime():
+                window = MainWindow()
+                try:
+                    window._on_new_calibration_ready(calibration)
+                    window._polar_compensation_active = True
+                    window._polar_compensation_angles = (0.0, -5.0, -15.0, 5.0)
+                    window._polar_compensation_index = 3
+                    window._polar_compensation_current_polar = 5.0
+                    window._polar_compensation_points = [
+                        main_window._PolarCompensationPoint(
+                            polar_deg=0.0,
+                            x_mm=1.0,
+                            y_mm=2.0,
+                            z_mm=3.0,
+                            tilt_deg=-3.5,
+                            azi_deg=24.5,
+                            current_cam0=anchor_cam0,
+                            current_cam1=anchor_cam1,
+                        ),
+                        main_window._PolarCompensationPoint(
+                            polar_deg=-15.0,
+                            x_mm=4.0,
+                            y_mm=5.0,
+                            z_mm=6.0,
+                            tilt_deg=-1.5,
+                            azi_deg=14.5,
+                            current_cam0=previous_cam0,
+                            current_cam1=previous_cam1,
+                        ),
+                    ]
+
+                    window._start_polar_compensation_correction()
+
+                    measurement_reference = (
+                        window._correction_thread.measurement_reference
+                    )
+                    self.assertIsNotNone(measurement_reference)
+                    assert measurement_reference is not None
+                    np.testing.assert_array_equal(
+                        measurement_reference.cam0,
+                        anchor_cam0,
+                    )
+                    np.testing.assert_array_equal(
+                        measurement_reference.cam1,
+                        anchor_cam1,
+                    )
+                    self.assertEqual(measurement_reference.polar_deg, 0.0)
+                    self.assertEqual(measurement_reference.tilt_deg, -3.5)
+                    self.assertEqual(measurement_reference.azi_deg, 24.5)
                 finally:
                     window.close()
 

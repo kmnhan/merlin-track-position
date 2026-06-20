@@ -3805,7 +3805,15 @@ class MainWindow(_MainWindowGUI):
             return None
         if not self._polar_compensation_points:
             raise RuntimeError("polar compensation local reference is missing")
-        point = self._polar_compensation_points[-1]
+        if self._polar_compensation_current_polar is None:
+            raise RuntimeError("polar compensation current polar is missing")
+        current_polar = float(self._polar_compensation_current_polar)
+        if not math.isfinite(current_polar):
+            raise RuntimeError("polar compensation current polar is not finite")
+        point = min(
+            self._polar_compensation_points,
+            key=lambda candidate: abs(float(candidate.polar_deg) - current_polar),
+        )
         if point.current_cam0 is None or point.current_cam1 is None:
             raise RuntimeError("polar compensation local reference image is missing")
         return CorrectionMeasurementReference(
