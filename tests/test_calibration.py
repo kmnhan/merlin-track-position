@@ -270,6 +270,14 @@ class ShiftDetectionTests(unittest.TestCase):
 
             capture.assert_called_once()
             self.assertEqual(capture.call_args.args[4], 1)
+            np.testing.assert_array_equal(
+                capture.call_args.args[2],
+                calibration["reference_cam0"].values,
+            )
+            np.testing.assert_array_equal(
+                capture.call_args.args[3],
+                calibration["reference_cam1"].values,
+            )
             np.testing.assert_allclose(
                 result["estimated_readback_offset_mm"].values,
                 offset_mm,
@@ -286,6 +294,7 @@ class ShiftDetectionTests(unittest.TestCase):
             )
             self.assertEqual(result.attrs["warnings"], "registration warning")
             self.assertFalse(result.attrs["detection_polar_rotation_applied"])
+            self.assertFalse(result.attrs["detection_measurement_reference_used"])
             self.assertEqual(dict(calibration.attrs), attrs_before)
             self.assertFalse(correction_history_path(path).exists())
 
@@ -387,6 +396,60 @@ class ShiftDetectionTests(unittest.TestCase):
             offset_mm,
             atol=1e-12,
         )
+
+    def test_detect_shift_uses_closest_stored_polar_reference(self):
+        stored_cam0 = np.stack(
+            [np.full((4, 5), value, dtype=float) for value in (10.0, 20.0, 30.0)],
+            axis=0,
+        )
+        stored_cam1 = np.stack(
+            [np.full((6, 7), value, dtype=float) for value in (40.0, 50.0, 60.0)],
+            axis=0,
+        )
+        calibration = apply_polar_reference_stack(
+            calibration_dataset().assign_attrs(tilt=0.0, azi=0.0),
+            polar_deg=[-10.0, -5.0, 0.0],
+            tilt_deg=[1.0, 2.0, 3.0],
+            azi_deg=[4.0, 5.0, 6.0],
+            x_mm=[7.0, 8.0, 9.0],
+            z_mm=[17.0, 18.0, 19.0],
+            cam0=stored_cam0,
+            cam1=stored_cam1,
+            source_motor_name="Polar",
+            minimum_deg=-10.0,
+            maximum_deg=0.0,
+        )
+        measurement = shift_dataset(np.zeros((2, 2), dtype=float))
+
+        with (
+            patch(
+                "merlin_track_position.tracking.detect.get_positions",
+                return_value=(-4.6, 0.25, 0.5),
+            ),
+            patch(
+                "merlin_track_position.tracking.detect._capture_measurement",
+                return_value=measurement,
+            ) as capture,
+        ):
+            result = detect_shift(calibration, object(), capture_count=1)
+
+        args = capture.call_args.args
+        np.testing.assert_array_equal(args[2], stored_cam0[1])
+        np.testing.assert_array_equal(args[3], stored_cam1[1])
+        self.assertTrue(result.attrs["detection_measurement_reference_used"])
+        self.assertEqual(
+            result.attrs["detection_measurement_reference_polar_deg"],
+            -5.0,
+        )
+        self.assertEqual(
+            result.attrs["detection_measurement_reference_tilt_deg"],
+            2.0,
+        )
+        self.assertEqual(
+            result.attrs["detection_measurement_reference_azi_deg"],
+            5.0,
+        )
+        self.assertTrue(result.attrs["detection_orientation_seed_inputs_valid"])
 
     def test_detect_shift_does_not_seed_ecc_translation_from_readbacks(self):
         calibration = calibration_dataset().assign_attrs(

@@ -2794,6 +2794,7 @@ class MainWindow(_MainWindowGUI):
             thread.sigImageCaptureFailed.connect(self._on_image_capture_failed)
             thread.start()
         self._image_auto_refresh_checked_before_calibration: bool | None = None
+        self._image_auto_refresh_toggle_lock_count = 0
         self._auto_correction_timer = QtCore.QTimer(self)
         self._auto_correction_timer.setSingleShot(False)
         self._auto_correction_timer.timeout.connect(self._on_auto_correction_timeout)
@@ -3434,13 +3435,18 @@ class MainWindow(_MainWindowGUI):
         )
 
         ui_marked_busy = False
+        refresh_toggle_locked = False
         try:
             ui_marked_busy = True
+            self._lock_image_auto_refresh_toggle()
+            refresh_toggle_locked = True
             self._set_roi_editing_enabled(False)
             self.calibration_panel.show_correction_in_progress()
             self._correction_thread.start()
             logger.info("Correction thread start requested.")
         except Exception:
+            if refresh_toggle_locked:
+                self._unlock_image_auto_refresh_toggle()
             if ui_marked_busy:
                 self._restore_calibration_idle_state()
             logger.exception("Failed while starting correction.")
@@ -3541,6 +3547,7 @@ class MainWindow(_MainWindowGUI):
 
         try:
             self._stop_auto_correction(uncheck=True)
+            self._lock_image_auto_refresh_toggle()
             self._set_roi_editing_enabled(False)
             targets = self._record_polar_thread.targets
             self.calibration_panel.show_record_polar_in_progress(
@@ -3551,6 +3558,7 @@ class MainWindow(_MainWindowGUI):
             )
             self._record_polar_thread.start()
         except Exception as exc:
+            self._unlock_image_auto_refresh_toggle()
             self._restore_calibration_idle_state()
             QtWidgets.QMessageBox.critical(
                 self,
@@ -3793,6 +3801,7 @@ class MainWindow(_MainWindowGUI):
                 use_stored_polar_reference=False,
             )
             self._set_roi_editing_enabled(False)
+            self._lock_image_auto_refresh_toggle()
             self.calibration_panel.show_polar_compensation_in_progress(
                 "Correcting X/Z with Y frozen for polar compensation..."
             )
@@ -4051,6 +4060,7 @@ class MainWindow(_MainWindowGUI):
 
     def _abort_polar_compensation(self, message: str) -> None:
         logger.warning("Polar compensation stopped: %s", message)
+        self._unlock_image_auto_refresh_toggle()
         self._polar_compensation_active = False
         self._polar_compensation_angles = ()
         self._polar_compensation_index = 0
@@ -4599,6 +4609,24 @@ class MainWindow(_MainWindowGUI):
         for thread in self._image_refresh_threads.values():
             thread.set_enabled(enabled)
 
+    def _set_image_auto_refresh_checkbox_enabled_for_state(self) -> None:
+        enabled = (
+            self._image_auto_refresh_toggle_lock_count <= 0
+            and self._image_auto_refresh_checked_before_calibration is None
+        )
+        self.image_auto_refresh_checkbox.setEnabled(enabled)
+
+    def _lock_image_auto_refresh_toggle(self) -> None:
+        self._image_auto_refresh_toggle_lock_count += 1
+        self._set_image_auto_refresh_checkbox_enabled_for_state()
+
+    def _unlock_image_auto_refresh_toggle(self) -> None:
+        self._image_auto_refresh_toggle_lock_count = max(
+            self._image_auto_refresh_toggle_lock_count - 1,
+            0,
+        )
+        self._set_image_auto_refresh_checkbox_enabled_for_state()
+
     def _wait_for_image_refresh_idle(self) -> None:
         for thread in self._image_refresh_threads.values():
             thread.wait_until_idle()
@@ -4870,7 +4898,7 @@ class MainWindow(_MainWindowGUI):
         )
         self._set_image_refresh_enabled(False)
         self._wait_for_image_refresh_idle()
-        self.image_auto_refresh_checkbox.setEnabled(False)
+        self._set_image_auto_refresh_checkbox_enabled_for_state()
         self._set_reference_preview_button_enabled(False)
 
     def _restore_image_auto_refresh_after_calibration(self) -> None:
@@ -4882,7 +4910,7 @@ class MainWindow(_MainWindowGUI):
         was_blocked = self.image_auto_refresh_checkbox.blockSignals(True)
         self.image_auto_refresh_checkbox.setChecked(restore_checked)
         self.image_auto_refresh_checkbox.blockSignals(was_blocked)
-        self.image_auto_refresh_checkbox.setEnabled(True)
+        self._set_image_auto_refresh_checkbox_enabled_for_state()
 
         self._set_image_refresh_enabled(restore_checked)
 
@@ -5142,8 +5170,13 @@ class MainWindow(_MainWindowGUI):
             return
 
         self._set_roi_editing_enabled(False)
+        self._lock_image_auto_refresh_toggle()
         self.calibration_panel.show_detection_in_progress()
-        self._detect_shift_thread.start()
+        try:
+            self._detect_shift_thread.start()
+        except Exception:
+            self._unlock_image_auto_refresh_toggle()
+            raise
 
     @QtCore.Slot(int, float, float, float, object, object)
     def _on_calibration_step(
@@ -5278,6 +5311,7 @@ class MainWindow(_MainWindowGUI):
                 polar_deg=self._polar_compensation_current_polar,
             )
             return
+        self._unlock_image_auto_refresh_toggle()
         self._reply_to_pending_server_correction(
             True,
             self._correction_server_result_message(result),
@@ -5289,8 +5323,10 @@ class MainWindow(_MainWindowGUI):
         logger.info("Correction ready signal received.")
         if self._polar_compensation_active:
             if isinstance(result, xr.Dataset):
+                self._unlock_image_auto_refresh_toggle()
                 self._on_polar_compensation_correction_ready(result)
             else:
+                self._unlock_image_auto_refresh_toggle()
                 self._abort_polar_compensation(
                     "correction thread did not return an xarray Dataset"
                 )
@@ -5323,6 +5359,7 @@ class MainWindow(_MainWindowGUI):
         except Exception as exc:
             self._restore_calibration_idle_state()
             self._reply_to_pending_server_correction(False, str(exc))
+            self._unlock_image_auto_refresh_toggle()
             self._release_basler_if_live_refresh_disabled()
             QtWidgets.QMessageBox.critical(
                 self,
@@ -5331,6 +5368,7 @@ class MainWindow(_MainWindowGUI):
             )
             return
 
+        self._unlock_image_auto_refresh_toggle()
         logger.info("Correction result applied to GUI.")
         self._release_basler_if_live_refresh_disabled()
 
@@ -5361,6 +5399,7 @@ class MainWindow(_MainWindowGUI):
             self._abort_polar_compensation(error_message)
             return
         self._reply_to_pending_server_correction(False, error_message)
+        self._unlock_image_auto_refresh_toggle()
         self._restore_calibration_idle_state()
         self._release_basler_if_live_refresh_disabled()
         QtWidgets.QMessageBox.critical(
@@ -5372,6 +5411,7 @@ class MainWindow(_MainWindowGUI):
     @QtCore.Slot(object)
     def _on_detect_shift_ready(self, result: object) -> None:
         logger.info("Shift detection ready signal received.")
+        self._unlock_image_auto_refresh_toggle()
         try:
             if not isinstance(result, xr.Dataset):
                 raise TypeError(
@@ -5396,6 +5436,7 @@ class MainWindow(_MainWindowGUI):
     @QtCore.Slot(str)
     def _on_detect_shift_failed(self, error_message: str) -> None:
         logger.error("Shift detection failed signal received: %s", error_message)
+        self._unlock_image_auto_refresh_toggle()
         self._restore_calibration_idle_state()
         self._release_basler_if_live_refresh_disabled()
         QtWidgets.QMessageBox.critical(
@@ -5425,10 +5466,12 @@ class MainWindow(_MainWindowGUI):
 
     @QtCore.Slot(int)
     def _on_record_polar_saving(self, total: int) -> None:
+        self._unlock_image_auto_refresh_toggle()
         self.calibration_panel.show_record_polar_saving(total=total)
 
     @QtCore.Slot(object)
     def _on_record_polar_ready(self, calibration: object) -> None:
+        self._unlock_image_auto_refresh_toggle()
         try:
             if not isinstance(calibration, xr.Dataset):
                 raise TypeError("record-polar thread did not return an xarray Dataset")
@@ -5466,6 +5509,7 @@ class MainWindow(_MainWindowGUI):
     @QtCore.Slot(str)
     def _on_record_polar_failed(self, error_message: str) -> None:
         logger.error("Record Polar failed signal received: %s", error_message)
+        self._unlock_image_auto_refresh_toggle()
         self._restore_calibration_idle_state()
         self._release_basler_if_live_refresh_disabled()
         QtWidgets.QMessageBox.critical(

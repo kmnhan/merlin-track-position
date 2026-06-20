@@ -35,9 +35,12 @@ from merlin_track_position.tracking.correct import (
     _beam_analyzer_observation_from_offsets,
     _beam_geometry_from_calibration,
     _beam_offset_from_estimated_offset,
+    _correction_measurement_reference_inputs,
     _orientation_ecc_seed_shift_kwargs,
+    _orientation_attrs_with_seed_status,
     _position_values,
     _positive_um_to_mm,
+    _prefixed_measurement_reference_attrs,
     _prefixed_polar_attrs,
     _prefixed_orientation_attrs,
     _resolve_correction_mode,
@@ -82,8 +85,6 @@ def detect_shift(
     if camera_pair is None:
         camera_pair = default_camera_pair()
 
-    reference_cam0 = np.asarray(calibration["reference_cam0"].values)
-    reference_cam1 = np.asarray(calibration["reference_cam1"].values)
     current_orientation = _read_current_detection_orientation()
     current_polar_deg = float(current_orientation["polar"])
     jacobian, polar_attrs = _runtime_px_per_readback_mm_for_polar(
@@ -96,11 +97,24 @@ def detect_shift(
         current_tilt_deg=current_orientation["tilt"],
         current_azi_deg=current_orientation["azi"],
     )
+    reference_cam0, reference_cam1, reference_attrs, seed_orientation_attrs = (
+        _correction_measurement_reference_inputs(
+            calibration,
+            None,
+            current_orientation_deg=current_orientation,
+            default_orientation_attrs=orientation_attrs,
+            use_stored_polar_reference=True,
+        )
+    )
     logger.info("Detecting shift without motor correction.")
     measurement_shift_kwargs = _orientation_ecc_seed_shift_kwargs(
         shift_kwargs,
         calibration=calibration,
-        orientation_attrs=orientation_attrs,
+        orientation_attrs=seed_orientation_attrs,
+    )
+    result_orientation_attrs = _orientation_attrs_with_seed_status(
+        orientation_attrs,
+        seed_orientation_attrs,
     )
     measurement = _capture_measurement(
         calibration,
@@ -168,7 +182,11 @@ def detect_shift(
         .assign_attrs(
             attrs
             | _prefixed_polar_attrs("detection", polar_attrs)
-            | _prefixed_orientation_attrs("detection", orientation_attrs)
+            | _prefixed_orientation_attrs("detection", result_orientation_attrs)
+            | _prefixed_measurement_reference_attrs(
+                "detection_measurement_reference",
+                reference_attrs,
+            )
         )
     )
 

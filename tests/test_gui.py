@@ -1870,6 +1870,61 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                 finally:
                     window.close()
 
+    def test_record_polar_locks_live_refresh_toggle_until_saving(self):
+        get_qapp()
+
+        class FakeRecordPolarDialog:
+            def __init__(
+                self,
+                *,
+                default_minimum_deg=0.0,
+                default_maximum_deg=13.0,
+                parent=None,
+            ):
+                del default_minimum_deg, default_maximum_deg, parent
+
+            def exec(self):
+                return QtWidgets.QDialog.DialogCode.Accepted
+
+            def parameters(self):
+                return -2.0, 0.4, "pc", "Polar Compens"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "calibration.h5"
+            calibration = write_sample_calibration(path).assign_attrs(polar=-2.5)
+            with patched_main_window_runtime():
+                window = MainWindow()
+                try:
+                    window._on_new_calibration_ready(calibration)
+                    with patch(
+                        "merlin_track_position.interface.main_window."
+                        "RecordPolarDialog",
+                        FakeRecordPolarDialog,
+                    ):
+                        window.calibration_panel.record_polar_button.click()
+
+                    thread = window._record_polar_thread
+                    self.assertTrue(thread.started)
+                    self.assertIsInstance(
+                        thread.camera_pair.cam0,
+                        CachedFrameCameraPlugin,
+                    )
+                    self.assertIsInstance(
+                        thread.camera_pair.cam1,
+                        CachedFrameCameraPlugin,
+                    )
+                    self.assertFalse(window.image_auto_refresh_checkbox.isEnabled())
+                    self.assertTrue(window.image_auto_refresh_checkbox.isChecked())
+                    for refresh_thread in window._image_refresh_threads.values():
+                        self.assertTrue(refresh_thread.enabled)
+
+                    window._on_record_polar_saving(len(thread.targets))
+
+                    self.assertTrue(window.image_auto_refresh_checkbox.isEnabled())
+                    self.assertTrue(window.image_auto_refresh_checkbox.isChecked())
+                finally:
+                    window.close()
+
     def test_record_polar_ready_updates_loaded_calibration(self):
         get_qapp()
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2552,6 +2607,19 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                     for refresh_thread in window._image_refresh_threads.values():
                         self.assertTrue(refresh_thread.enabled)
                         self.assertEqual(refresh_thread.wait_until_idle_calls, 0)
+                    self.assertFalse(window.image_auto_refresh_checkbox.isEnabled())
+                    self.assertTrue(window.image_auto_refresh_checkbox.isChecked())
+
+                    window._correction_thread.running = False
+                    with patch(
+                        "merlin_track_position.interface.main_window.QtWidgets."
+                        "QMessageBox.warning"
+                    ) as warning:
+                        window._on_correction_failed("boom")
+
+                    warning.assert_called_once()
+                    self.assertTrue(window.image_auto_refresh_checkbox.isEnabled())
+                    self.assertTrue(window.image_auto_refresh_checkbox.isChecked())
                 finally:
                     window.close()
 
@@ -4495,9 +4563,43 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                     self.assertFalse(
                         window.calibration_panel.new_calibration_button.isEnabled()
                     )
+                    self.assertFalse(window.image_auto_refresh_checkbox.isEnabled())
+                    self.assertTrue(window.image_auto_refresh_checkbox.isChecked())
                     for refresh_thread in window._image_refresh_threads.values():
                         self.assertTrue(refresh_thread.enabled)
                         self.assertEqual(refresh_thread.wait_until_idle_calls, 0)
+                finally:
+                    window.close()
+
+    def test_correction_locks_live_refresh_toggle_until_completion(self):
+        get_qapp()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "calibration.h5"
+            calibration = write_sample_calibration(path)
+            result = correction_result(converged=True, moves=1, residual=0.05)
+            with patched_main_window_runtime():
+                window = MainWindow()
+                try:
+                    window._on_new_calibration_ready(calibration)
+
+                    window._start_correction()
+
+                    self.assertIsInstance(
+                        window._correction_thread.camera_pair.cam0,
+                        CachedFrameCameraPlugin,
+                    )
+                    self.assertFalse(window.image_auto_refresh_checkbox.isEnabled())
+                    for refresh_thread in window._image_refresh_threads.values():
+                        self.assertTrue(refresh_thread.enabled)
+                        self.assertEqual(refresh_thread.wait_until_idle_calls, 0)
+
+                    window._correction_thread.running = False
+                    window._on_correction_completed(result)
+
+                    self.assertTrue(window.image_auto_refresh_checkbox.isEnabled())
+                    self.assertTrue(window.image_auto_refresh_checkbox.isChecked())
+                    for refresh_thread in window._image_refresh_threads.values():
+                        self.assertTrue(refresh_thread.enabled)
                 finally:
                     window.close()
 
@@ -4516,6 +4618,8 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
 
                     thread = window._correction_thread
                     self.assertTrue(thread.started)
+                    self.assertFalse(window.image_auto_refresh_checkbox.isEnabled())
+                    self.assertFalse(window.image_auto_refresh_checkbox.isChecked())
                     self.assertNotIsInstance(
                         thread.camera_pair.cam0,
                         CachedFrameCameraPlugin,
@@ -4545,6 +4649,8 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
 
                     window._on_correction_ready(result)
                     main_window.close_basler_camera.assert_called_once_with()
+                    self.assertTrue(window.image_auto_refresh_checkbox.isEnabled())
+                    self.assertFalse(window.image_auto_refresh_checkbox.isChecked())
                 finally:
                     window.close()
 
@@ -4949,9 +5055,16 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                     self.assertFalse(
                         window.calibration_panel.new_calibration_button.isEnabled()
                     )
+                    self.assertFalse(window.image_auto_refresh_checkbox.isEnabled())
+                    self.assertTrue(window.image_auto_refresh_checkbox.isChecked())
                     for refresh_thread in window._image_refresh_threads.values():
                         self.assertTrue(refresh_thread.enabled)
                         self.assertEqual(refresh_thread.wait_until_idle_calls, 0)
+
+                    thread.running = False
+                    window._on_detect_shift_ready(detection_result())
+                    self.assertTrue(window.image_auto_refresh_checkbox.isEnabled())
+                    self.assertTrue(window.image_auto_refresh_checkbox.isChecked())
                 finally:
                     window.close()
 
@@ -5031,6 +5144,8 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                     self.assertFalse(
                         window.calibration_panel.new_calibration_button.isEnabled()
                     )
+                    self.assertFalse(window.image_auto_refresh_checkbox.isEnabled())
+                    self.assertTrue(window.image_auto_refresh_checkbox.isChecked())
                 finally:
                     window.close()
 
@@ -5051,6 +5166,8 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
 
                     self.assertFalse(window._server_correction_pending)
                     self.assertIsNone(window._server_correction_target)
+                    self.assertTrue(window.image_auto_refresh_checkbox.isEnabled())
+                    self.assertTrue(window.image_auto_refresh_checkbox.isChecked())
                     self.assertEqual(len(window._server.result_calls), 1)
                     success, message = window._server.result_calls[0]
                     self.assertTrue(success)
