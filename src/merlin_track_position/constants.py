@@ -33,7 +33,7 @@ CORRECTION_USE_BCS_API_BACKLASH: bool = False
 # Motor readback deadbands used by correction and geometry checks.
 # Values are keyed by motor alias and are in each motor's command units. For
 # x/y/z this is mm; for p/t/a this is degrees.
-MOTOR_STALE_READBACK_DEADBAND: dict[str, float] = {
+MOTOR_READBACK_DEADBAND: dict[str, float] = {
     "x": 0.01,
     "y": 0.1,
     "z": 0.01,

@@ -1896,7 +1896,7 @@ def _single_position_value(values: Sequence[float], name: str) -> float:
 
 
 def _polar_deadband_deg() -> float:
-    deadband = float(constants.MOTOR_STALE_READBACK_DEADBAND["p"])
+    deadband = float(constants.MOTOR_READBACK_DEADBAND["p"])
     if not np.isfinite(deadband) or deadband < 0.0:
         raise ValueError("polar deadband must be finite and non-negative")
     return deadband

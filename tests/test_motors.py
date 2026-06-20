@@ -112,9 +112,9 @@ class FakeBCSServer:
 
 
 class MotorConfigurationTests(unittest.TestCase):
-    def test_all_configured_motor_aliases_have_stale_readback_deadbands(self):
+    def test_all_configured_motor_aliases_have_readback_deadbands(self):
         missing_aliases = sorted(
-            set(MOTOR_NAMES) - set(constants.MOTOR_STALE_READBACK_DEADBAND)
+            set(MOTOR_NAMES) - set(constants.MOTOR_READBACK_DEADBAND)
         )
 
         self.assertEqual(missing_aliases, [])

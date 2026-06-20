@@ -2845,7 +2845,7 @@ class CorrectionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = self.save_calibration(tmpdir)
             calibration = calibration_dataset()
-            deadband = constants.MOTOR_STALE_READBACK_DEADBAND["p"]
+            deadband = constants.MOTOR_READBACK_DEADBAND["p"]
             hardware_patches = self.patch_hardware(
                 [shift_dataset(np.zeros((2, 2)))],
                 positions={"x": 10.0, "y": 20.0, "z": 30.0, "p": deadband / 2.0},
