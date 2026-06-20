@@ -3786,6 +3786,7 @@ class MainWindow(_MainWindowGUI):
                 shift_kwargs=self._registration_measurement_kwargs(),
                 active_command_axes=POLAR_COMPENSATION_ACTIVE_AXES,
                 measurement_reference=measurement_reference,
+                use_stored_polar_reference=False,
             )
             self._set_roi_editing_enabled(False)
             self.calibration_panel.show_polar_compensation_in_progress(

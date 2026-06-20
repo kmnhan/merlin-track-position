@@ -38,6 +38,7 @@ class CorrectionThread(QtCore.QThread):
         self._shift_kwargs: dict[str, Any] = {}
         self._active_command_axes: tuple[str, ...] | None = None
         self._measurement_reference: CorrectionMeasurementReference | None = None
+        self._use_stored_polar_reference = True
 
     def configure(
         self,
@@ -49,6 +50,7 @@ class CorrectionThread(QtCore.QThread):
         shift_kwargs: Mapping[str, Any] | None = None,
         active_command_axes: tuple[str, ...] | None = None,
         measurement_reference: CorrectionMeasurementReference | None = None,
+        use_stored_polar_reference: bool = True,
     ) -> None:
         """Set the parameters for the next correction run."""
         if self.isRunning():
@@ -61,12 +63,14 @@ class CorrectionThread(QtCore.QThread):
         self._shift_kwargs = {} if shift_kwargs is None else dict(shift_kwargs)
         self._active_command_axes = active_command_axes
         self._measurement_reference = measurement_reference
+        self._use_stored_polar_reference = bool(use_stored_polar_reference)
         logger.info(
             "Configured correction thread: calibration_path=%s, correction_mode=%s, "
-            "active_command_axes=%s",
+            "active_command_axes=%s, use_stored_polar_reference=%s",
             calibration_path,
             self._correction_mode,
             self._active_command_axes,
+            self._use_stored_polar_reference,
         )
 
     def run(self) -> None:
@@ -96,6 +100,7 @@ class CorrectionThread(QtCore.QThread):
                     correction_mode=self._correction_mode,
                     active_command_axes=self._active_command_axes,
                     measurement_reference=self._measurement_reference,
+                    use_stored_polar_reference=self._use_stored_polar_reference,
                     **self._shift_kwargs,
                 )
             except Exception as exc:

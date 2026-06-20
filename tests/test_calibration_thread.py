@@ -259,6 +259,7 @@ class CorrectionThreadTests(unittest.TestCase):
                 correction_mode="beam",
                 shift_kwargs={"clip_percentiles": (1.0, 99.0)},
                 measurement_reference=measurement_reference,
+                use_stored_polar_reference=False,
             )
             with patch(
                 "merlin_track_position.interface.correction_thread.do_correction",
@@ -279,6 +280,7 @@ class CorrectionThreadTests(unittest.TestCase):
                         "active_command_axes": None,
                         "clip_percentiles": (1.0, 99.0),
                         "measurement_reference": measurement_reference,
+                        "use_stored_polar_reference": False,
                     },
                 )
             ],

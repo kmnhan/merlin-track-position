@@ -169,6 +169,7 @@ def do_correction(
     motor_backend: CorrectionMotorBackend | None = None,
     active_command_axes: Sequence[str] | None = None,
     measurement_reference: CorrectionMeasurementReference | None = None,
+    use_stored_polar_reference: bool = True,
     **shift_kwargs: Any,
 ) -> xr.Dataset:
     """Run LQR closed-loop visual-servo correction in readback-mm space."""
@@ -245,6 +246,7 @@ def do_correction(
         measurement_reference,
         current_orientation_deg=current_orientation_deg,
         default_orientation_attrs=orientation_attrs,
+        use_stored_polar_reference=use_stored_polar_reference,
     )
     logger.info(
         "Correction polar geometry: calibration=%g deg, current=%g deg, "
@@ -1988,6 +1990,7 @@ def _correction_measurement_reference_inputs(
     *,
     current_orientation_deg: Mapping[str, float],
     default_orientation_attrs: Mapping[str, float | bool | str],
+    use_stored_polar_reference: bool,
 ) -> tuple[
     np.ndarray,
     np.ndarray,
@@ -1995,9 +1998,13 @@ def _correction_measurement_reference_inputs(
     Mapping[str, float | bool | str],
 ]:
     if measurement_reference is None:
-        stored_reference = closest_polar_reference(
-            calibration,
-            float(current_orientation_deg["polar"]),
+        stored_reference = (
+            closest_polar_reference(
+                calibration,
+                float(current_orientation_deg["polar"]),
+            )
+            if use_stored_polar_reference
+            else None
         )
         if stored_reference is None:
             return (

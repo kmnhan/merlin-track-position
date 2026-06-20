@@ -2261,6 +2261,65 @@ class CorrectionTests(unittest.TestCase):
             5.0,
         )
 
+    def test_correction_can_skip_stored_polar_reference(self):
+        positions = {
+            "x": 0.0,
+            "y": 0.0,
+            "z": 0.0,
+            "p": -4.6,
+            "t": 0.25,
+            "a": 0.5,
+        }
+        stored_cam0 = np.stack(
+            [np.full((4, 5), value, dtype=float) for value in (10.0, 20.0)],
+            axis=0,
+        )
+        stored_cam1 = np.stack(
+            [np.full((6, 7), value, dtype=float) for value in (40.0, 50.0)],
+            axis=0,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "calibration.h5"
+            calibration = apply_polar_reference_stack(
+                calibration_dataset().assign_attrs(tilt=0.0, azi=0.0),
+                polar_deg=[-10.0, -5.0],
+                tilt_deg=[1.0, 2.0],
+                azi_deg=[3.0, 4.0],
+                x_mm=[7.0, 8.0],
+                z_mm=[17.0, 18.0],
+                cam0=stored_cam0,
+                cam1=stored_cam1,
+                source_motor_name="Polar",
+                minimum_deg=-10.0,
+                maximum_deg=-5.0,
+            )
+            save_calibration_dataset(calibration, path)
+            current_cam0 = np.full((1, 4, 5), 70.0, dtype=float)
+            current_cam1 = np.full((1, 6, 7), 80.0, dtype=float)
+            with (
+                patch(
+                    "merlin_track_position.tracking.correct.capture_image_stack",
+                    return_value=(current_cam0, current_cam1),
+                ),
+                patch(
+                    "merlin_track_position.tracking.correct.measure_image_error",
+                    return_value=shift_dataset(np.zeros((2, 2), dtype=float)),
+                ) as measure,
+            ):
+                result = do_correction(
+                    path,
+                    object(),
+                    capture_count=1,
+                    motor_backend=self.motor_backend(positions),
+                    use_stored_polar_reference=False,
+                )
+
+        args = measure.call_args.args
+        np.testing.assert_array_equal(args[0], calibration["reference_cam0"].values)
+        np.testing.assert_array_equal(args[2], calibration["reference_cam1"].values)
+        self.assertFalse(result.attrs["correction_measurement_reference_used"])
+
     def test_explicit_measurement_reference_overrides_stored_polar_reference(self):
         positions = {
             "x": 0.0,

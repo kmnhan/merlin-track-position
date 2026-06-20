@@ -241,6 +241,7 @@ class FakeCorrectionThread(QtCore.QObject):
         self.shift_kwargs = None
         self.active_command_axes = None
         self.measurement_reference = None
+        self.use_stored_polar_reference = True
         self.started = False
         self.running = False
 
@@ -254,6 +255,7 @@ class FakeCorrectionThread(QtCore.QObject):
         shift_kwargs=None,
         active_command_axes=None,
         measurement_reference=None,
+        use_stored_polar_reference=True,
     ):
         self.calibration = calibration
         self.camera_pair = camera_pair
@@ -263,6 +265,7 @@ class FakeCorrectionThread(QtCore.QObject):
         self.shift_kwargs = {} if shift_kwargs is None else dict(shift_kwargs)
         self.active_command_axes = active_command_axes
         self.measurement_reference = measurement_reference
+        self.use_stored_polar_reference = bool(use_stored_polar_reference)
 
     def start(self):
         self.started = True
@@ -2492,6 +2495,9 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                         main_window.POLAR_COMPENSATION_ACTIVE_AXES,
                     )
                     self.assertIsNone(window._correction_thread.measurement_reference)
+                    self.assertFalse(
+                        window._correction_thread.use_stored_polar_reference
+                    )
                     for refresh_thread in window._image_refresh_threads.values():
                         self.assertTrue(refresh_thread.enabled)
                         self.assertEqual(refresh_thread.wait_until_idle_calls, 0)
@@ -2591,6 +2597,9 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                     information.assert_not_called()
                     self.assertTrue(window._correction_thread.started)
                     self.assertIsNone(window._correction_thread.measurement_reference)
+                    self.assertFalse(
+                        window._correction_thread.use_stored_polar_reference
+                    )
                 finally:
                     window.close()
 
@@ -2639,6 +2648,9 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                     self.assertEqual(measurement_reference.polar_deg, 0.0)
                     self.assertEqual(measurement_reference.tilt_deg, -3.5)
                     self.assertEqual(measurement_reference.azi_deg, 24.5)
+                    self.assertFalse(
+                        window._correction_thread.use_stored_polar_reference
+                    )
                 finally:
                     window.close()
 
