@@ -669,13 +669,10 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.load_calibration_button = QtWidgets.QPushButton("Load calibration")
         self.save_calibration_button = QtWidgets.QPushButton("Save copy")
         self.calibration_details_button = QtWidgets.QPushButton("Details...")
-        self.calculate_polar_compensate_button = QtWidgets.QPushButton(
-            "Calculate Polar Compensate"
-        )
-        self.calculate_polar_compensate_button.setObjectName(
-            "calculate_polar_compensate_button"
-        )
-        self.calculate_polar_compensate_button.setEnabled(False)
+        self.polar_compensate_button = QtWidgets.QPushButton("Polar Compensate...")
+        self.polar_compensate_button.setObjectName("polar_compensate_button")
+        self.polar_compensate_button.setEnabled(False)
+        self.calculate_polar_compensate_button = self.polar_compensate_button
         self.correct_sample_button = QtWidgets.QPushButton("Correct sample")
         self.correct_sample_button.setEnabled(False)
         self.auto_correction_checkbox = QtWidgets.QCheckBox("Auto correct every:")

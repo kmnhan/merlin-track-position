@@ -71,6 +71,11 @@ from merlin_track_position.tracking.correct import (  # noqa: E402
     correction_history_path,
     save_correction_history_dataset,
 )
+from merlin_track_position.tracking.polar_compensation import (  # noqa: E402
+    apply_polar_compensation_model,
+    fit_polar_compensation_model,
+    predict_polar_compensation_xz,
+)
 from merlin_track_position.tracking.sample_calibration import (  # noqa: E402
     build_sample_calibration_dataset,
 )
@@ -595,6 +600,25 @@ def write_sample_calibration(path: Path) -> xr.Dataset:
     )
     save_calibration_dataset(calibration, path)
     return calibration.assign_attrs({"calibration_path": str(path)})
+
+
+def synthetic_polar_compensation_model() -> xr.Dataset:
+    polar = np.asarray([-20.0, -12.5, -5.0, 0.0], dtype=float)
+    anchor_xz = np.asarray([1.25, 3.5], dtype=float)
+    anchor_to_center = np.asarray([0.4, -0.2], dtype=float)
+    xz = predict_polar_compensation_xz(
+        polar,
+        anchor_polar_deg=0.0,
+        anchor_xz_mm=anchor_xz,
+        anchor_to_center_xz_mm=anchor_to_center,
+    )
+    return fit_polar_compensation_model(
+        polar,
+        xz[:, 0],
+        np.zeros_like(polar),
+        xz[:, 1],
+        anchor_polar_deg=0.0,
+    )
 
 
 class FakeShiftRegistrationThread(QtCore.QObject):
@@ -1268,6 +1292,7 @@ class CalibrationPanelTests(unittest.TestCase):
             panel.calibration_file_label.text(), "Calibration file: test.h5"
         )
         self.assertIn("test.h5", panel.calibration_status_label.text())
+        self.assertEqual(panel.polar_compensate_button.text(), "Polar Compensate...")
         self.assertTrue(panel.correct_sample_button.isEnabled())
         self.assertTrue(panel.detect_shift_button.isEnabled())
         self.assertTrue(panel.calculate_polar_compensate_button.isEnabled())
@@ -1566,6 +1591,170 @@ class CalibrationPanelTests(unittest.TestCase):
 
 
 class MainWindowCalibrationStateTests(unittest.TestCase):
+    def test_polar_compensation_dialog_empty_state_enables_calculation(self):
+        get_qapp()
+        dialog = main_window.PolarCompensationDialog(None, start_enabled=True)
+        try:
+            details = dialog.findChild(
+                QtWidgets.QGroupBox,
+                "polar_compensation_details_group",
+            )
+            start_button = dialog.findChild(
+                QtWidgets.QPushButton,
+                "polar_compensation_start_button",
+            )
+
+            self.assertIsNotNone(details)
+            self.assertIsNotNone(start_button)
+            assert details is not None
+            assert start_button is not None
+            self.assertFalse(details.isEnabled())
+            self.assertFalse(start_button.isHidden())
+            self.assertTrue(start_button.isEnabled())
+
+            start_button.click()
+
+            self.assertTrue(dialog.start_requested())
+        finally:
+            dialog.close()
+
+    def test_polar_compensation_dialog_shows_stored_model_details(self):
+        get_qapp()
+        model = synthetic_polar_compensation_model()
+        dialog = main_window.PolarCompensationDialog(model, start_enabled=True)
+        try:
+            details = dialog.findChild(
+                QtWidgets.QGroupBox,
+                "polar_compensation_details_group",
+            )
+            start_button = dialog.findChild(
+                QtWidgets.QPushButton,
+                "polar_compensation_start_button",
+            )
+            summary = dialog.findChild(
+                QtWidgets.QLabel,
+                "polar_compensation_summary_label",
+            )
+
+            self.assertIsNotNone(details)
+            self.assertIsNotNone(start_button)
+            self.assertIsNotNone(summary)
+            assert details is not None
+            assert start_button is not None
+            assert summary is not None
+            self.assertTrue(details.isEnabled())
+            self.assertTrue(start_button.isHidden())
+            self.assertIn("Polar compensation model fitted", summary.text())
+        finally:
+            dialog.close()
+
+    def test_polar_compensate_button_opens_dialog_before_starting_workflow(self):
+        get_qapp()
+        instances = []
+
+        class FakePolarCompensationDialog:
+            def __init__(
+                self,
+                model,
+                *,
+                start_enabled=False,
+                start_unavailable_message="",
+                parent=None,
+            ):
+                self.model = model
+                self.start_enabled = start_enabled
+                self.start_unavailable_message = start_unavailable_message
+                self.parent = parent
+                instances.append(self)
+
+            def exec(self):
+                return QtWidgets.QDialog.DialogCode.Accepted
+
+            def start_requested(self):
+                return True
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "calibration.h5"
+            calibration = write_sample_calibration(path)
+            with patched_main_window_runtime():
+                window = MainWindow()
+                try:
+                    window._on_new_calibration_ready(calibration)
+                    with (
+                        patch(
+                            "merlin_track_position.interface.main_window."
+                            "PolarCompensationDialog",
+                            FakePolarCompensationDialog,
+                        ),
+                        patch.object(
+                            window,
+                            "_on_calculate_polar_compensate_clicked",
+                        ) as start_workflow,
+                    ):
+                        window.calibration_panel.polar_compensate_button.click()
+
+                    self.assertEqual(len(instances), 1)
+                    self.assertIsNone(instances[0].model)
+                    self.assertTrue(instances[0].start_enabled)
+                    start_workflow.assert_called_once()
+                finally:
+                    window.close()
+
+    def test_polar_compensate_button_shows_existing_model_without_starting(self):
+        get_qapp()
+        instances = []
+
+        class FakePolarCompensationDialog:
+            def __init__(
+                self,
+                model,
+                *,
+                start_enabled=False,
+                start_unavailable_message="",
+                parent=None,
+            ):
+                self.model = model
+                self.start_enabled = start_enabled
+                self.start_unavailable_message = start_unavailable_message
+                self.parent = parent
+                instances.append(self)
+
+            def exec(self):
+                return QtWidgets.QDialog.DialogCode.Rejected
+
+            def start_requested(self):
+                return False
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "calibration.h5"
+            calibration = write_sample_calibration(path)
+            model = synthetic_polar_compensation_model()
+            calibration = apply_polar_compensation_model(calibration, model)
+            calibration.attrs["calibration_path"] = str(path)
+            with patched_main_window_runtime():
+                window = MainWindow()
+                try:
+                    window._on_new_calibration_ready(calibration)
+                    with (
+                        patch(
+                            "merlin_track_position.interface.main_window."
+                            "PolarCompensationDialog",
+                            FakePolarCompensationDialog,
+                        ),
+                        patch.object(
+                            window,
+                            "_on_calculate_polar_compensate_clicked",
+                        ) as start_workflow,
+                    ):
+                        window.calibration_panel.polar_compensate_button.click()
+
+                    self.assertEqual(len(instances), 1)
+                    self.assertIs(instances[0].model, calibration)
+                    self.assertFalse(instances[0].start_enabled)
+                    start_workflow.assert_not_called()
+                finally:
+                    window.close()
+
     def test_polar_compensation_probe_angles_are_sorted_and_unique(self):
         self.assertEqual(
             main_window._polar_compensation_probe_angles(0.0),

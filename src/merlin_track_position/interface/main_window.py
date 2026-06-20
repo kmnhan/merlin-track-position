@@ -289,6 +289,35 @@ def _polar_compensation_anchor_xz_from_points(
     return (float(point.x_mm), float(point.z_mm))
 
 
+_POLAR_COMPENSATION_REQUIRED_ATTRS = (
+    "polar_compensation_anchor_polar_deg",
+    "polar_compensation_anchor_x_mm",
+    "polar_compensation_anchor_z_mm",
+    "polar_compensation_anchor_to_center_x_mm",
+    "polar_compensation_anchor_to_center_z_mm",
+    "polar_compensation_center_x_mm",
+    "polar_compensation_center_z_mm",
+    "polar_compensation_residual_rms_um",
+    "polar_compensation_residual_max_um",
+)
+_POLAR_COMPENSATION_REQUIRED_VARS = (
+    "polar_compensation_probe_polar_deg",
+    "polar_compensation_probe_xz_mm",
+    "polar_compensation_predicted_xz_mm",
+    "polar_compensation_residual_um",
+)
+
+
+def _stored_polar_compensation_model(calibration: xr.Dataset) -> xr.Dataset | None:
+    if not all(
+        name in calibration.attrs for name in _POLAR_COMPENSATION_REQUIRED_ATTRS
+    ):
+        return None
+    if not all(name in calibration for name in _POLAR_COMPENSATION_REQUIRED_VARS):
+        return None
+    return calibration
+
+
 def _load_calibration_dialog_path(current_path: Path | None) -> Path:
     if current_path is not None:
         return current_path
@@ -1196,14 +1225,96 @@ class CameraSettingsDialog(QtWidgets.QDialog):
         return configs
 
 
-class PolarCompensationDiagnosticsDialog(QtWidgets.QDialog):
-    def __init__(self, model: xr.Dataset, parent: QtWidgets.QWidget | None = None):
+class PolarCompensationDialog(QtWidgets.QDialog):
+    def __init__(
+        self,
+        model: xr.Dataset | None,
+        *,
+        start_enabled: bool = False,
+        start_unavailable_message: str = "",
+        parent: QtWidgets.QWidget | None = None,
+    ):
         super().__init__(parent)
-        self.setWindowTitle("Polar Compensation Diagnostics")
+        self.setObjectName("polar_compensation_dialog")
+        self.setWindowTitle("Polar Compensation")
         self._model = model
+        self._start_requested = False
 
         layout = QtWidgets.QVBoxLayout(self)
+        self.details_group = QtWidgets.QGroupBox("Stored compensation")
+        self.details_group.setObjectName("polar_compensation_details_group")
+        details_layout = QtWidgets.QVBoxLayout(self.details_group)
+        if model is None:
+            self._populate_empty_details(details_layout)
+            self.details_group.setEnabled(False)
+        else:
+            self._populate_model_details(details_layout, model)
+        layout.addWidget(self.details_group, stretch=1)
+
+        if model is None and start_unavailable_message:
+            unavailable_label = QtWidgets.QLabel(start_unavailable_message)
+            unavailable_label.setObjectName("polar_compensation_unavailable_label")
+            unavailable_label.setWordWrap(True)
+            layout.addWidget(unavailable_label)
+
+        button_layout = QtWidgets.QHBoxLayout()
+        button_layout.addStretch(1)
+        self.start_button = QtWidgets.QPushButton("Calculate")
+        self.start_button.setObjectName("polar_compensation_start_button")
+        self.start_button.setEnabled(bool(start_enabled))
+        self.start_button.setVisible(model is None)
+        self.start_button.clicked.connect(self._request_start)
+        button_layout.addWidget(self.start_button)
+
+        close_button = QtWidgets.QPushButton("Close")
+        close_button.clicked.connect(self.reject)
+        button_layout.addWidget(close_button)
+        layout.addLayout(button_layout)
+
+    def start_requested(self) -> bool:
+        return self._start_requested
+
+    def _request_start(self) -> None:
+        self._start_requested = True
+        self.accept()
+
+    def _populate_empty_details(self, layout: QtWidgets.QVBoxLayout) -> None:
+        summary = QtWidgets.QLabel(
+            "No polar compensation model is stored for this calibration."
+        )
+        summary.setObjectName("polar_compensation_summary_label")
+        summary.setWordWrap(True)
+        layout.addWidget(summary)
+
+        table = QtWidgets.QTableWidget(4, 2)
+        table.setObjectName("polar_compensation_summary_table")
+        table.setHorizontalHeaderLabels(("Field", "Value"))
+        fields = ("Anchor polar", "Anchor x", "Anchor z", "RMS residual")
+        for row, field in enumerate(fields):
+            table.setItem(row, 0, QtWidgets.QTableWidgetItem(field))
+            table.setItem(row, 1, QtWidgets.QTableWidgetItem("n/a"))
+        table.horizontalHeader().setStretchLastSection(True)
+        table.verticalHeader().setVisible(False)
+        table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        layout.addWidget(table)
+
+        query_group = QtWidgets.QGroupBox("Predict x/z")
+        query_layout = QtWidgets.QGridLayout(query_group)
+        query_layout.addWidget(QtWidgets.QLabel("Polar"), 0, 0)
+        query_layout.addWidget(QtWidgets.QLineEdit("n/a"), 0, 1)
+        query_layout.addWidget(QtWidgets.QLabel("x"), 1, 0)
+        query_layout.addWidget(QtWidgets.QLineEdit("n/a"), 1, 1)
+        query_layout.addWidget(QtWidgets.QLabel("z"), 2, 0)
+        query_layout.addWidget(QtWidgets.QLineEdit("n/a"), 2, 1)
+        layout.addWidget(query_group)
+
+    def _populate_model_details(
+        self,
+        layout: QtWidgets.QVBoxLayout,
+        model: xr.Dataset,
+    ) -> None:
         summary = QtWidgets.QLabel(self._summary_text(model))
+        summary.setObjectName("polar_compensation_summary_label")
         summary.setWordWrap(True)
         summary.setTextInteractionFlags(
             QtCore.Qt.TextInteractionFlag.TextSelectableByMouse
@@ -1211,11 +1322,13 @@ class PolarCompensationDiagnosticsDialog(QtWidgets.QDialog):
         layout.addWidget(summary)
 
         graphics = pg.GraphicsLayoutWidget()
+        graphics.setObjectName("polar_compensation_graphics")
         graphics.setMinimumSize(760, 520)
         layout.addWidget(graphics, stretch=1)
         self._populate_plots(graphics)
 
         query_group = QtWidgets.QGroupBox("Predict x/z")
+        query_group.setObjectName("polar_compensation_predict_group")
         query_layout = QtWidgets.QGridLayout(query_group)
         self.polar_input = QtWidgets.QDoubleSpinBox()
         self.polar_input.setDecimals(4)
@@ -1240,10 +1353,6 @@ class PolarCompensationDiagnosticsDialog(QtWidgets.QDialog):
         query_layout.addWidget(copy_z, 2, 2)
         query_layout.addWidget(copy_pair, 3, 1, 1, 2)
         layout.addWidget(query_group)
-
-        close_button = QtWidgets.QPushButton("Close")
-        close_button.clicked.connect(self.accept)
-        layout.addWidget(close_button, alignment=QtCore.Qt.AlignmentFlag.AlignRight)
 
         self.polar_input.valueChanged.connect(self._update_prediction)
         copy_x.clicked.connect(lambda: self._copy_text(self.x_output.text()))
@@ -1370,6 +1479,8 @@ class PolarCompensationDiagnosticsDialog(QtWidgets.QDialog):
         plot.getAxis("left").enableAutoSIPrefix(False)
 
     def _update_prediction(self) -> None:
+        if self._model is None:
+            return
         xz = np.asarray(
             predict_polar_compensation_from_attrs(
                 self._model,
@@ -1382,6 +1493,11 @@ class PolarCompensationDiagnosticsDialog(QtWidgets.QDialog):
 
     def _copy_text(self, text: str) -> None:
         QtWidgets.QApplication.clipboard().setText(text)
+
+
+class PolarCompensationDiagnosticsDialog(PolarCompensationDialog):
+    def __init__(self, model: xr.Dataset, parent: QtWidgets.QWidget | None = None):
+        super().__init__(model, start_enabled=False, parent=parent)
 
 
 class _ImageCaptureThread(QtCore.QThread):
@@ -1745,8 +1861,8 @@ class MainWindow(_MainWindowGUI):
         self.calibration_panel.calibration_details_button.clicked.connect(
             self._on_calibration_details_clicked
         )
-        self.calibration_panel.calculate_polar_compensate_button.clicked.connect(
-            self._on_calculate_polar_compensate_clicked
+        self.calibration_panel.polar_compensate_button.clicked.connect(
+            self._on_polar_compensate_clicked
         )
         self.calibration_panel.correct_sample_button.clicked.connect(
             self._on_correct_sample_clicked
@@ -2216,6 +2332,32 @@ class MainWindow(_MainWindowGUI):
                 self._restore_calibration_idle_state()
             logger.exception("Failed while starting correction.")
             raise
+
+    @QtCore.Slot()
+    def _on_polar_compensate_clicked(self) -> None:
+        if (
+            self._calibration is None
+            or self._calibration_thread.isRunning()
+            or self._correction_thread.isRunning()
+            or self._detect_shift_thread.isRunning()
+            or self._stored_axis_move_thread.isRunning()
+            or self._polar_compensation_active
+        ):
+            return
+
+        unavailable_message = self._polar_compensation_unavailable_message()
+        model = _stored_polar_compensation_model(self._calibration)
+        dialog = PolarCompensationDialog(
+            model,
+            start_enabled=model is None and unavailable_message is None,
+            start_unavailable_message=(
+                "" if unavailable_message is None else unavailable_message
+            ),
+            parent=self,
+        )
+        if dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted:
+            if dialog.start_requested():
+                self._on_calculate_polar_compensate_clicked()
 
     @QtCore.Slot()
     def _on_calculate_polar_compensate_clicked(self) -> None:
