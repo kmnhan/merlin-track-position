@@ -1420,6 +1420,17 @@ class CalibrationPanel(QtWidgets.QWidget):
             f"{completed}/{total}: {motor_name}={float(target_deg):.4f} deg."
         )
 
+    def show_record_polar_saving(self, *, total: int) -> None:
+        self._set_display_mode("calibration")
+        self.stored_orientation_widget.setVisible(False)
+        self._set_loaded_idle_controls_enabled(False)
+        self.calibration_progress_bar.setVisible(True)
+        self.calibration_progress_bar.setRange(0, 0)
+        total = max(int(total), 0)
+        self.calibration_status_label.setText(
+            f"Saving {total} recorded polar reference image pair(s)..."
+        )
+
     def show_record_polar_result(self, calibration: xr.Dataset) -> None:
         self._set_display_mode("calibration")
         self._set_loaded_idle_controls_enabled(True)

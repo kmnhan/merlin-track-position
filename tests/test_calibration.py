@@ -1779,6 +1779,21 @@ class VisualCalibrationTests(unittest.TestCase):
                     np.uint16,
                 )
 
+    def test_successful_deferred_calibration_save_does_not_stage(self):
+        dataset = calibration_dataset()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "calibration.h5"
+            with patch(
+                "merlin_track_position.tracking.calibration_core.stage_dataset",
+            ) as stage:
+                persistence = save_calibration_dataset_deferred(dataset, path)
+
+        stage.assert_not_called()
+        self.assertTrue(persistence.flushed)
+        self.assertFalse(persistence.pending)
+        self.assertIsNone(persistence.spool_path)
+
     def test_stale_queued_calibration_write_is_not_flushed_over_changed_target(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_path = Path(tmpdir)

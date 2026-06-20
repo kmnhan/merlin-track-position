@@ -581,21 +581,21 @@ def save_calibration_dataset_deferred(
     dataset: xr.Dataset,
     path: str | Path,
 ) -> PersistenceResult:
-    """Save calibration through a local spool, then flush to the target path."""
+    """Save calibration to target, spooling locally if the target is unavailable."""
 
     output_path = normalize_target_path(path)
     dataset = _canonical_visual_calibration_dataset(dataset)
     validate_visual_calibration_dataset(dataset)
     saved = dataset.load().copy(deep=True)
-    entry = stage_dataset(
-        saved,
-        output_path,
-        operation="calibration",
-        metadata={"base_target_fingerprint": target_fingerprint(output_path)},
-    )
     try:
         save_calibration_dataset(saved, output_path)
     except Exception as exc:
+        entry = stage_dataset(
+            saved,
+            output_path,
+            operation="calibration",
+            metadata={"base_target_fingerprint": target_fingerprint(output_path)},
+        )
         return PersistenceResult(
             target_path=output_path,
             spool_path=entry.path,
@@ -604,11 +604,10 @@ def save_calibration_dataset_deferred(
             message=f"queued calibration write because target is unavailable: {exc}",
         )
 
-    discard_spool_entry(entry)
     _discard_pending_calibration_entries(output_path)
     return PersistenceResult(
         target_path=output_path,
-        spool_path=entry.path,
+        spool_path=None,
         flushed=True,
         pending=False,
         message="calibration write flushed to target",

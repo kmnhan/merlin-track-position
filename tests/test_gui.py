@@ -419,6 +419,7 @@ class FakePolarCompensationPredictionMoveThread(QtCore.QObject):
 
 class FakeRecordPolarReferenceThread(QtCore.QObject):
     sigRecordPolarProgress = QtCore.Signal(int, int, float, str, object, object)
+    sigRecordPolarSaving = QtCore.Signal(int)
     sigRecordPolarReady = QtCore.Signal(object)
     sigRecordPolarFailed = QtCore.Signal(str)
 
@@ -1870,9 +1871,11 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
             calibration = write_sample_calibration(path)
             thread = main_window._RecordPolarReferenceThread()
             progress = []
+            saving = []
             ready = []
             failed = []
             thread.sigRecordPolarProgress.connect(lambda *args: progress.append(args))
+            thread.sigRecordPolarSaving.connect(lambda total: saving.append(total))
             thread.sigRecordPolarReady.connect(lambda value: ready.append(value))
             thread.sigRecordPolarFailed.connect(lambda message: failed.append(message))
             move_calls = []
@@ -1923,6 +1926,7 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
 
             self.assertEqual(failed, [])
             self.assertEqual(len(progress), 3)
+            self.assertEqual(saving, [3])
             self.assertEqual(len(ready), 1)
             self.assertEqual(
                 move_calls,

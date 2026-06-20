@@ -739,6 +739,7 @@ BAYER_DISPLAY_CONVERSIONS = {
 
 class _RecordPolarReferenceThread(QtCore.QThread):
     sigRecordPolarProgress = QtCore.Signal(int, int, float, str, object, object)
+    sigRecordPolarSaving = QtCore.Signal(int)
     sigRecordPolarReady = QtCore.Signal(object)
     sigRecordPolarFailed = QtCore.Signal(str)
 
@@ -876,6 +877,7 @@ class _RecordPolarReferenceThread(QtCore.QThread):
 
                 if not self._running.is_set() or self.isInterruptionRequested():
                     return
+                self.sigRecordPolarSaving.emit(total)
                 updated = apply_polar_reference_stack(
                     calibration,
                     polar_deg=polar_values,
@@ -2921,6 +2923,9 @@ class MainWindow(_MainWindowGUI):
         )
         self._record_polar_thread.sigRecordPolarProgress.connect(
             self._on_record_polar_progress
+        )
+        self._record_polar_thread.sigRecordPolarSaving.connect(
+            self._on_record_polar_saving
         )
         self._record_polar_thread.sigRecordPolarReady.connect(
             self._on_record_polar_ready
@@ -5395,6 +5400,10 @@ class MainWindow(_MainWindowGUI):
             motor_name=motor_name,
             target_deg=polar_deg,
         )
+
+    @QtCore.Slot(int)
+    def _on_record_polar_saving(self, total: int) -> None:
+        self.calibration_panel.show_record_polar_saving(total=total)
 
     @QtCore.Slot(object)
     def _on_record_polar_ready(self, calibration: object) -> None:
