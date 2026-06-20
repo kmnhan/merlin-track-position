@@ -2141,7 +2141,9 @@ class MainWindow(_MainWindowGUI):
         if self._stored_axis_move_thread.isRunning():
             return "Stored-axis move is already in progress."
         if self._polar_compensation_active:
-            return "Stored-axis move is unavailable while polar compensation is running."
+            return (
+                "Stored-axis move is unavailable while polar compensation is running."
+            )
         return None
 
     def _polar_compensation_unavailable_message(self) -> str | None:
@@ -2154,7 +2156,9 @@ class MainWindow(_MainWindowGUI):
         if self._detect_shift_thread.isRunning():
             return "Polar compensation is unavailable while shift detection is running."
         if self._stored_axis_move_thread.isRunning():
-            return "Polar compensation is unavailable while a stored-axis move is running."
+            return (
+                "Polar compensation is unavailable while a stored-axis move is running."
+            )
         if self._polar_compensation_active:
             return "Polar compensation is already running."
         if self._calibration_path is None or not self._calibration_path.exists():
@@ -2247,30 +2251,14 @@ class MainWindow(_MainWindowGUI):
                 str(exc),
             )
             return
-        angle_text = ", ".join(f"{angle:g} deg" for angle in probe_angles)
-        if math.isclose(
-            float(probe_angles[-1]),
-            anchor_polar,
-            rel_tol=0.0,
-            abs_tol=POLAR_COMPENSATION_PROBE_TOLERANCE_DEG,
-        ):
-            return_text = (
-                " The final probe is the calibration polar, so no return move "
-                "will be run."
-            )
-        else:
-            return_text = (
-                " After all probes, Polar will return to the calibration angle "
-                f"{anchor_polar:g} deg, then X/Z will return to the acquired "
-                "anchor point."
-            )
+        angle_text = ", ".join(f"{angle:g}°" for angle in probe_angles)
         response = QtWidgets.QMessageBox.warning(
             self,
             "Calculate polar compensation?",
             "This workflow will move Polar to "
             f"{angle_text}. After each move, you will be asked to manually jog "
             "only X and Z until the target sample area appears inside the ROI "
-            f"for both cameras.{return_text} Continue?",
+            f"for both cameras. Continue?",
             QtWidgets.QMessageBox.StandardButton.Ok
             | QtWidgets.QMessageBox.StandardButton.Cancel,
             QtWidgets.QMessageBox.StandardButton.Cancel,
@@ -2325,21 +2313,20 @@ class MainWindow(_MainWindowGUI):
             self._finish_polar_compensation()
             return
         try:
-            self._polar_compensation_anchor_xz = _polar_compensation_anchor_xz_from_points(
-                self._polar_compensation_points,
-                target,
+            self._polar_compensation_anchor_xz = (
+                _polar_compensation_anchor_xz_from_points(
+                    self._polar_compensation_points,
+                    target,
+                )
             )
         except Exception as exc:
             self._abort_polar_compensation(str(exc))
             return
-        if (
-            self._polar_compensation_current_polar is not None
-            and math.isclose(
-                float(self._polar_compensation_current_polar),
-                target,
-                rel_tol=0.0,
-                abs_tol=POLAR_COMPENSATION_PROBE_TOLERANCE_DEG,
-            )
+        if self._polar_compensation_current_polar is not None and math.isclose(
+            float(self._polar_compensation_current_polar),
+            target,
+            rel_tol=0.0,
+            abs_tol=POLAR_COMPENSATION_PROBE_TOLERANCE_DEG,
         ):
             self._start_polar_compensation_anchor_xz_move()
             return
