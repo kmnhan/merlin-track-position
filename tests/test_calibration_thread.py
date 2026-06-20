@@ -15,6 +15,7 @@ from merlin_track_position.instruments.cameras import (
 from merlin_track_position.interface.calibration_thread import CalibrationThread
 from merlin_track_position.interface.correction_thread import CorrectionThread
 from merlin_track_position.interface.detection_thread import DetectShiftThread
+from merlin_track_position.tracking.correct import CorrectionMeasurementReference
 from merlin_track_position.tracking.sample_calibration import (
     build_sample_calibration_dataset,
 )
@@ -207,6 +208,13 @@ class CorrectionThreadTests(unittest.TestCase):
         )
         progress = xr.Dataset(attrs={"correction_iterations": 1})
         result = xr.Dataset(attrs={"correction_converged": True})
+        measurement_reference = CorrectionMeasurementReference(
+            cam0=np.zeros((4, 5), dtype=float),
+            cam1=np.zeros((6, 7), dtype=float),
+            polar_deg=1.0,
+            tilt_deg=2.0,
+            azi_deg=3.0,
+        )
         calls = []
 
         def fake_do_correction(
@@ -250,6 +258,7 @@ class CorrectionThreadTests(unittest.TestCase):
                 path,
                 correction_mode="beam",
                 shift_kwargs={"clip_percentiles": (1.0, 99.0)},
+                measurement_reference=measurement_reference,
             )
             with patch(
                 "merlin_track_position.interface.correction_thread.do_correction",
@@ -269,6 +278,7 @@ class CorrectionThreadTests(unittest.TestCase):
                     {
                         "active_command_axes": None,
                         "clip_percentiles": (1.0, 99.0),
+                        "measurement_reference": measurement_reference,
                     },
                 )
             ],

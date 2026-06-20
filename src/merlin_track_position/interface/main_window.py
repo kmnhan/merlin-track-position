@@ -89,6 +89,7 @@ from merlin_track_position.tracking.calibration_core import (
     validate_visual_calibration_dataset,
 )
 from merlin_track_position.tracking.correct import (
+    CorrectionMeasurementReference,
     ORIENTATION_READBACK_AXES,
     flush_pending_correction_history_datasets,
     load_latest_correction_history_dataset,
@@ -250,7 +251,31 @@ def _polar_compensation_probe_angles(anchor_polar: float) -> tuple[float, ...]:
             unique.append(angle)
     if len(unique) < len(POLAR_COMPENSATION_PROBE_ANGLES_DEG) + 1:
         raise ValueError("polar compensation probe angles must be unique")
-    return tuple(sorted(unique))
+    ordered = [anchor]
+    remaining = [
+        angle
+        for angle in unique
+        if not math.isclose(
+            angle,
+            anchor,
+            rel_tol=0.0,
+            abs_tol=POLAR_COMPENSATION_PROBE_TOLERANCE_DEG,
+        )
+    ]
+    current = anchor
+    while remaining:
+        next_angle = min(
+            remaining,
+            key=lambda angle: (
+                abs(angle - current),
+                abs(angle - anchor),
+                angle,
+            ),
+        )
+        ordered.append(next_angle)
+        remaining.remove(next_angle)
+        current = next_angle
+    return tuple(ordered)
 
 
 def _has_duplicate_polar_probe(angles: Sequence[float]) -> bool:
@@ -345,8 +370,28 @@ class _PolarCompensationPoint:
     x_mm: float
     y_mm: float
     z_mm: float
+    tilt_deg: float = 0.0
+    azi_deg: float = 0.0
     current_cam0: np.ndarray | None = None
     current_cam1: np.ndarray | None = None
+
+
+def _polar_compensation_orientation_from_result(
+    result: xr.Dataset,
+    *,
+    fallback_polar_deg: float,
+    fallback_tilt_deg: float,
+    fallback_azi_deg: float,
+) -> tuple[float, float, float]:
+    values = (
+        result.attrs.get("correction_current_polar_deg", fallback_polar_deg),
+        result.attrs.get("correction_current_tilt_deg", fallback_tilt_deg),
+        result.attrs.get("correction_current_azi_deg", fallback_azi_deg),
+    )
+    polar, tilt, azi = (float(value) for value in values)
+    if not all(math.isfinite(value) for value in (polar, tilt, azi)):
+        raise ValueError("correction result has invalid final orientation readbacks")
+    return polar, tilt, azi
 
 
 def _polar_compensation_current_images_from_result(
@@ -2474,7 +2519,7 @@ class MainWindow(_MainWindowGUI):
             self,
             "Calculate polar compensation?",
             "This workflow will move Polar to "
-            f"{angle_text}. After each move, you will be asked to manually jog "
+            f"{angle_text}. After each non-anchor move, you will be asked to manually jog "
             "only X and Z until the target sample area appears inside the ROI "
             f"for both cameras. Continue?",
             QtWidgets.QMessageBox.StandardButton.Ok
@@ -2605,6 +2650,9 @@ class MainWindow(_MainWindowGUI):
         self._polar_compensation_current_polar = float(final_value)
         step = self._polar_compensation_index + 1
         total = len(self._polar_compensation_angles)
+        if self._polar_compensation_current_probe_is_anchor():
+            self._start_polar_compensation_correction()
+            return
         response = QtWidgets.QMessageBox.information(
             self,
             "Manual x/z jog required",
@@ -2621,6 +2669,18 @@ class MainWindow(_MainWindowGUI):
             return
         self._start_polar_compensation_correction()
 
+    def _polar_compensation_current_probe_is_anchor(self) -> bool:
+        if self._polar_compensation_anchor_polar is None:
+            return False
+        if self._polar_compensation_current_polar is None:
+            return False
+        return math.isclose(
+            float(self._polar_compensation_current_polar),
+            float(self._polar_compensation_anchor_polar),
+            rel_tol=0.0,
+            abs_tol=POLAR_COMPENSATION_PROBE_TOLERANCE_DEG,
+        )
+
     def _start_polar_compensation_correction(self) -> None:
         if not self._polar_compensation_active:
             return
@@ -2632,6 +2692,7 @@ class MainWindow(_MainWindowGUI):
             camera_pair = self._camera_pair_for_current_images(
                 cached_after_ns=action_started_ns,
             )
+            measurement_reference = self._polar_compensation_measurement_reference()
             self._correction_thread.configure(
                 self._calibration,
                 camera_pair,
@@ -2639,6 +2700,7 @@ class MainWindow(_MainWindowGUI):
                 correction_mode=self.calibration_panel.correction_mode(),
                 shift_kwargs=self._registration_measurement_kwargs(),
                 active_command_axes=POLAR_COMPENSATION_ACTIVE_AXES,
+                measurement_reference=measurement_reference,
             )
             self._set_roi_editing_enabled(False)
             self.calibration_panel.show_polar_compensation_in_progress(
@@ -2647,6 +2709,26 @@ class MainWindow(_MainWindowGUI):
             self._correction_thread.start()
         except Exception as exc:
             self._abort_polar_compensation(str(exc))
+
+    def _polar_compensation_measurement_reference(
+        self,
+    ) -> CorrectionMeasurementReference | None:
+        if not self._polar_compensation_active:
+            return None
+        if self._polar_compensation_index <= 0:
+            return None
+        if not self._polar_compensation_points:
+            raise RuntimeError("polar compensation local reference is missing")
+        point = self._polar_compensation_points[-1]
+        if point.current_cam0 is None or point.current_cam1 is None:
+            raise RuntimeError("polar compensation local reference image is missing")
+        return CorrectionMeasurementReference(
+            cam0=point.current_cam0,
+            cam1=point.current_cam1,
+            polar_deg=point.polar_deg,
+            tilt_deg=point.tilt_deg,
+            azi_deg=point.azi_deg,
+        )
 
     def _on_polar_compensation_correction_ready(self, result: xr.Dataset) -> None:
         if not bool(result.attrs.get("correction_converged", False)):
@@ -2663,15 +2745,25 @@ class MainWindow(_MainWindowGUI):
                 raise ValueError("correction result has invalid final readbacks")
             if self._polar_compensation_current_polar is None:
                 raise RuntimeError("polar readback is missing for current probe")
+            fallback_tilt = float(self._calibration.attrs.get("tilt", 0.0))
+            fallback_azi = float(self._calibration.attrs.get("azi", 0.0))
+            polar_deg, tilt_deg, azi_deg = _polar_compensation_orientation_from_result(
+                result,
+                fallback_polar_deg=float(self._polar_compensation_current_polar),
+                fallback_tilt_deg=fallback_tilt,
+                fallback_azi_deg=fallback_azi,
+            )
             current_cam0, current_cam1 = _polar_compensation_current_images_from_result(
                 result
             )
             self._polar_compensation_points.append(
                 _PolarCompensationPoint(
-                    polar_deg=float(self._polar_compensation_current_polar),
+                    polar_deg=polar_deg,
                     x_mm=float(final_xyz[0]),
                     y_mm=float(final_xyz[1]),
                     z_mm=float(final_xyz[2]),
+                    tilt_deg=tilt_deg,
+                    azi_deg=azi_deg,
                     current_cam0=current_cam0,
                     current_cam1=current_cam1,
                 )

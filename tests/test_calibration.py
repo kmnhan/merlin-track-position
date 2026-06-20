@@ -38,6 +38,7 @@ from merlin_track_position.tracking.calibrate import (
     visual_calibration_probe_count,
 )
 from merlin_track_position.tracking.correct import (
+    CorrectionMeasurementReference,
     correction_timestamps_from_history,
     correction_total_move_by_axis_from_history,
     correction_history_path,
@@ -2023,6 +2024,91 @@ class CorrectionTests(unittest.TestCase):
         np.testing.assert_array_equal(args[3], expected_current_cam1[np.newaxis, :, :])
         self.assertNotIn("check_tiles", measure.call_args.kwargs)
 
+    def test_correction_measurement_reference_sets_registration_reference_only(self):
+        class FakeMotorBackend:
+            def get_positions(self, aliases):
+                values = {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "p": 4.0,
+                    "t": 0.0,
+                    "a": 0.0,
+                }
+                return tuple(values[str(alias)] for alias in aliases)
+
+            def move_motors_and_wait(self, *args, **kwargs):
+                raise AssertionError("correction should converge before moving")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "calibration.h5"
+            calibration = calibration_dataset().assign_attrs(tilt=0.0, azi=0.0)
+            save_calibration_dataset(calibration, path)
+            measurement_reference = CorrectionMeasurementReference(
+                cam0=np.full((4, 5), 10.0, dtype=float),
+                cam1=np.full((6, 7), 20.0, dtype=float),
+                polar_deg=1.0,
+                tilt_deg=0.0,
+                azi_deg=0.0,
+            )
+            current_cam0 = np.full((1, 4, 5), 30.0, dtype=float)
+            current_cam1 = np.full((1, 6, 7), 40.0, dtype=float)
+            measurement = shift_dataset(np.zeros((2, 2), dtype=float))
+            with (
+                patch(
+                    "merlin_track_position.tracking.correct.capture_image_stack",
+                    return_value=(current_cam0, current_cam1),
+                ),
+                patch(
+                    "merlin_track_position.tracking.correct.measure_image_error",
+                    return_value=measurement,
+                ) as measure,
+            ):
+                result = do_correction(
+                    path,
+                    object(),
+                    capture_count=1,
+                    motor_backend=FakeMotorBackend(),
+                    measurement_reference=measurement_reference,
+                    use_ecc_refinement=True,
+                    ecc_motion_model="affine",
+                )
+
+        args = measure.call_args.args
+        np.testing.assert_array_equal(args[0], measurement_reference.cam0)
+        np.testing.assert_array_equal(args[1], current_cam0)
+        np.testing.assert_array_equal(args[2], measurement_reference.cam1)
+        np.testing.assert_array_equal(args[3], current_cam1)
+
+        kwargs = measure.call_args.kwargs
+        seed_attrs = correct_module._orientation_attrs_from_reference_values(
+            reference_polar_deg=1.0,
+            reference_tilt_deg=0.0,
+            reference_azi_deg=0.0,
+            current_polar_deg=4.0,
+            current_tilt_deg=0.0,
+            current_azi_deg=0.0,
+        )
+        expected_warps, _condition = correct_module._orientation_ecc_initial_warps(
+            calibration,
+            orientation_attrs=seed_attrs,
+            reference_points=kwargs["ecc_reference_point_px"],
+        )
+        for camera in CAMERAS:
+            np.testing.assert_allclose(
+                kwargs["ecc_initial_warp"][camera],
+                expected_warps[camera],
+                atol=1e-12,
+            )
+        self.assertEqual(result.attrs["correction_calibration_polar_deg"], 0.0)
+        self.assertEqual(result.attrs["correction_current_polar_deg"], 4.0)
+        self.assertTrue(result.attrs["correction_measurement_reference_used"])
+        self.assertEqual(
+            result.attrs["correction_measurement_reference_polar_deg"],
+            1.0,
+        )
+        self.assertTrue(result.attrs["correction_orientation_seed_applied"])
+
     def test_no_move_when_initial_residual_is_under_tolerance(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = self.save_calibration(tmpdir)
@@ -2741,7 +2827,7 @@ class CorrectionTests(unittest.TestCase):
                     return_value=(10.0, 20.0, 30.0),
                 ),
             ):
-                result = do_correction(
+                do_correction(
                     path,
                     capture_count=1,
                     correction_mode="camera",

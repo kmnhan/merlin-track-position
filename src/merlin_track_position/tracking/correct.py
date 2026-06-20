@@ -92,6 +92,14 @@ class CorrectionFeedback(NamedTuple):
     parallel_px: float
 
 
+class CorrectionMeasurementReference(NamedTuple):
+    cam0: Any
+    cam1: Any
+    polar_deg: float
+    tilt_deg: float
+    azi_deg: float
+
+
 class CorrectionMotorBackend(Protocol):
     def get_positions(self, motor_aliases: Sequence[str]) -> tuple[float, ...]:
         """Return motor readback positions in the order requested."""
@@ -159,6 +167,7 @@ def do_correction(
     progress_callback: Callable[[xr.Dataset], None] | None = None,
     motor_backend: CorrectionMotorBackend | None = None,
     active_command_axes: Sequence[str] | None = None,
+    measurement_reference: CorrectionMeasurementReference | None = None,
     **shift_kwargs: Any,
 ) -> xr.Dataset:
     """Run LQR closed-loop visual-servo correction in readback-mm space."""
@@ -225,6 +234,17 @@ def do_correction(
         current_tilt_deg=current_orientation_deg["tilt"],
         current_azi_deg=current_orientation_deg["azi"],
     )
+    (
+        reference_cam0,
+        reference_cam1,
+        reference_attrs,
+        seed_orientation_attrs,
+    ) = _correction_measurement_reference_inputs(
+        calibration,
+        measurement_reference,
+        current_orientation_deg=current_orientation_deg,
+        default_orientation_attrs=orientation_attrs,
+    )
     logger.info(
         "Correction polar geometry: calibration=%g deg, current=%g deg, "
         "delta=%g deg, deadband=%g deg, rotation_applied=%s",
@@ -262,8 +282,6 @@ def do_correction(
         constants.DEFAULT_LQR_CORRECTION_KALMAN_INITIAL_COVARIANCE
     )
     lqr_kalman_innovation_gate = constants.DEFAULT_LQR_CORRECTION_KALMAN_INNOVATION_GATE
-    reference_cam0 = np.asarray(calibration["reference_cam0"].values)
-    reference_cam1 = np.asarray(calibration["reference_cam1"].values)
     axis_scale = np.asarray(
         calibration["axis_scale_readback_mm"].values,
         dtype=np.float64,
@@ -332,7 +350,7 @@ def do_correction(
     initial_shift_kwargs = _orientation_ecc_seed_shift_kwargs(
         shift_kwargs,
         calibration=calibration,
-        orientation_attrs=orientation_attrs,
+        orientation_attrs=seed_orientation_attrs,
     )
     measurement = _capture_measurement(
         calibration,
@@ -408,6 +426,10 @@ def do_correction(
         for line in str(measurement.attrs.get("warnings", "")).splitlines()
         if line.strip()
     ]
+    result_orientation_attrs = _orientation_attrs_with_seed_status(
+        orientation_attrs,
+        seed_orientation_attrs,
+    )
 
     lqr_kalman_state: dict[str, np.ndarray | float | bool] | None = None
     if lqr_kalman_filter_enabled:
@@ -513,7 +535,8 @@ def do_correction(
             correction_mode=correction_mode,
             beam_xz_angle_from_analyzer_deg=beam_xz_angle_from_analyzer_deg,
             polar_attrs=polar_attrs,
-            orientation_attrs=orientation_attrs,
+            orientation_attrs=result_orientation_attrs,
+            measurement_reference_attrs=reference_attrs,
             beam_polar_deg=(
                 None if beam_geometry is None else float(beam_geometry["polar_deg"])
             ),
@@ -754,7 +777,7 @@ def do_correction(
         after_shift_kwargs = _orientation_ecc_seed_shift_kwargs(
             shift_kwargs,
             calibration=calibration,
-            orientation_attrs=orientation_attrs,
+            orientation_attrs=seed_orientation_attrs,
         )
         after_measurement = _capture_measurement(
             calibration,
@@ -1946,6 +1969,78 @@ def _prefixed_polar_attrs(
     return {f"{prefix}_{key}": value for key, value in polar_attrs.items()}
 
 
+def _prefixed_measurement_reference_attrs(
+    prefix: str,
+    reference_attrs: Mapping[str, float | bool],
+) -> dict[str, float | bool]:
+    used = bool(reference_attrs.get("used", False))
+    attrs: dict[str, float | bool] = {f"{prefix}_used": used}
+    if used:
+        for key in ("polar_deg", "tilt_deg", "azi_deg"):
+            attrs[f"{prefix}_{key}"] = float(reference_attrs[key])
+    return attrs
+
+
+def _correction_measurement_reference_inputs(
+    calibration: xr.Dataset,
+    measurement_reference: CorrectionMeasurementReference | None,
+    *,
+    current_orientation_deg: Mapping[str, float],
+    default_orientation_attrs: Mapping[str, float | bool | str],
+) -> tuple[
+    np.ndarray,
+    np.ndarray,
+    dict[str, float | bool],
+    Mapping[str, float | bool | str],
+]:
+    if measurement_reference is None:
+        return (
+            np.asarray(calibration["reference_cam0"].values),
+            np.asarray(calibration["reference_cam1"].values),
+            {"used": False},
+            default_orientation_attrs,
+        )
+
+    reference_polar = _finite_measurement_reference_value(
+        measurement_reference.polar_deg,
+        "polar_deg",
+    )
+    reference_tilt = _finite_measurement_reference_value(
+        measurement_reference.tilt_deg,
+        "tilt_deg",
+    )
+    reference_azi = _finite_measurement_reference_value(
+        measurement_reference.azi_deg,
+        "azi_deg",
+    )
+    seed_orientation_attrs = _orientation_attrs_from_reference_values(
+        reference_polar_deg=reference_polar,
+        reference_tilt_deg=reference_tilt,
+        reference_azi_deg=reference_azi,
+        current_polar_deg=float(current_orientation_deg["polar"]),
+        current_tilt_deg=float(current_orientation_deg["tilt"]),
+        current_azi_deg=float(current_orientation_deg["azi"]),
+    )
+    return (
+        np.asarray(measurement_reference.cam0),
+        np.asarray(measurement_reference.cam1),
+        {
+            "used": True,
+            "polar_deg": reference_polar,
+            "tilt_deg": reference_tilt,
+            "azi_deg": reference_azi,
+        },
+        seed_orientation_attrs,
+    )
+
+
+def _finite_measurement_reference_value(value: Any, name: str) -> float:
+    result = float(value)
+    if not np.isfinite(result):
+        raise ValueError(f"measurement reference {name} must be finite")
+    return result
+
+
 def _runtime_orientation_attrs(
     calibration: xr.Dataset,
     *,
@@ -1953,51 +2048,106 @@ def _runtime_orientation_attrs(
     current_tilt_deg: float,
     current_azi_deg: float,
 ) -> dict[str, float | bool | str]:
-    attrs: dict[str, float | bool | str] = {
+    try:
+        calibration_tilt_deg = _calibration_orientation_attr_deg(calibration, "tilt")
+        calibration_azi_deg = _calibration_orientation_attr_deg(calibration, "azi")
+    except ValueError as exc:
+        attrs = _base_orientation_attrs()
+        attrs["orientation_seed_warning"] = f"orientation ECC seed skipped: {exc}"
+        return attrs
+
+    return _orientation_attrs_from_reference_values(
+        reference_polar_deg=float(polar_attrs["calibration_polar_deg"]),
+        reference_tilt_deg=calibration_tilt_deg,
+        reference_azi_deg=calibration_azi_deg,
+        current_polar_deg=float(polar_attrs["current_polar_deg"]),
+        current_tilt_deg=current_tilt_deg,
+        current_azi_deg=current_azi_deg,
+    )
+
+
+def _base_orientation_attrs() -> dict[str, float | bool | str]:
+    return {
         "orientation_seed_inputs_valid": False,
         "orientation_seed_applied": False,
         "orientation_seed_warning": "",
         "orientation_seed_basis_condition": np.nan,
     }
+
+
+def _orientation_attrs_from_reference_values(
+    *,
+    reference_polar_deg: float,
+    reference_tilt_deg: float,
+    reference_azi_deg: float,
+    current_polar_deg: float,
+    current_tilt_deg: float,
+    current_azi_deg: float,
+) -> dict[str, float | bool | str]:
+    attrs = _base_orientation_attrs()
     try:
-        calibration_tilt_deg = _calibration_orientation_attr_deg(calibration, "tilt")
-        calibration_azi_deg = _calibration_orientation_attr_deg(calibration, "azi")
+        reference_polar_value = float(reference_polar_deg)
+        reference_tilt_value = float(reference_tilt_deg)
+        reference_azi_value = float(reference_azi_deg)
+        current_polar_value = float(current_polar_deg)
         current_tilt_value = float(current_tilt_deg)
         current_azi_value = float(current_azi_deg)
+        if not np.isfinite(reference_polar_value):
+            raise ValueError("reference polar must be finite")
+        if not np.isfinite(reference_tilt_value):
+            raise ValueError("reference tilt must be finite")
+        if not np.isfinite(reference_azi_value):
+            raise ValueError("reference azimuth must be finite")
+        if not np.isfinite(current_polar_value):
+            raise ValueError("current polar readback must be finite")
         if not np.isfinite(current_tilt_value):
             raise ValueError("current tilt readback must be finite")
         if not np.isfinite(current_azi_value):
             raise ValueError("current azimuth readback must be finite")
     except ValueError as exc:
-        attrs["orientation_seed_warning"] = (
-            f"orientation ECC seed skipped: {exc}"
-        )
+        attrs["orientation_seed_warning"] = f"orientation ECC seed skipped: {exc}"
         return attrs
 
     azi_deadband_deg = float(constants.DEFAULT_ORIENTATION_ECC_AZIMUTH_DEADBAND_DEG)
     if not np.isfinite(azi_deadband_deg) or azi_deadband_deg < 0.0:
         raise ValueError("azimuth deadband must be finite and non-negative")
 
-    tilt_delta_deg = current_tilt_value - calibration_tilt_deg
-    azi_delta_deg = current_azi_value - calibration_azi_deg
+    tilt_delta_deg = current_tilt_value - reference_tilt_value
+    azi_delta_deg = current_azi_value - reference_azi_value
     azi_deadband_active = bool(abs(azi_delta_deg) < azi_deadband_deg)
     azi_applied_delta_deg = 0.0 if azi_deadband_active else azi_delta_deg
     attrs |= {
         "orientation_seed_inputs_valid": True,
-        "calibration_tilt_deg": float(calibration_tilt_deg),
+        "calibration_tilt_deg": float(reference_tilt_value),
         "current_tilt_deg": float(current_tilt_value),
         "tilt_delta_deg": float(tilt_delta_deg),
         "tilt_applied_delta_deg": float(tilt_delta_deg),
-        "calibration_azi_deg": float(calibration_azi_deg),
+        "calibration_azi_deg": float(reference_azi_value),
         "current_azi_deg": float(current_azi_value),
         "azi_delta_deg": float(azi_delta_deg),
         "azi_applied_delta_deg": float(azi_applied_delta_deg),
         "azi_deadband_deg": float(azi_deadband_deg),
         "azi_deadband_active": azi_deadband_active,
-        "effective_current_azi_deg": float(calibration_azi_deg + azi_applied_delta_deg),
-        "calibration_polar_deg": float(polar_attrs["calibration_polar_deg"]),
-        "current_polar_deg": float(polar_attrs["current_polar_deg"]),
+        "effective_current_azi_deg": float(reference_azi_value + azi_applied_delta_deg),
+        "calibration_polar_deg": float(reference_polar_value),
+        "current_polar_deg": float(current_polar_value),
     }
+    return attrs
+
+
+def _orientation_attrs_with_seed_status(
+    report_attrs: Mapping[str, float | bool | str],
+    seed_attrs: Mapping[str, float | bool | str],
+) -> dict[str, float | bool | str]:
+    attrs = dict(report_attrs)
+    for key in (
+        "orientation_seed_inputs_valid",
+        "orientation_seed_applied",
+        "orientation_seed_warning",
+        "orientation_seed_basis_condition",
+    ):
+        if key in seed_attrs:
+            attrs[key] = seed_attrs[key]
     return attrs
 
 
@@ -2608,6 +2758,7 @@ def _build_correction_result(
     beam_xz_angle_from_analyzer_deg: float,
     polar_attrs: Mapping[str, float | bool],
     orientation_attrs: Mapping[str, float | bool | str],
+    measurement_reference_attrs: Mapping[str, float | bool],
     beam_polar_deg: float | None,
     beam_runtime_xz_angle_deg: float | None,
     analyzer_runtime_xz_angle_deg: float | None,
@@ -2842,6 +2993,10 @@ def _build_correction_result(
         "correction_tolerance": float(correction_tolerance),
         **_prefixed_polar_attrs("correction", polar_attrs),
         **_prefixed_orientation_attrs("correction", orientation_attrs),
+        **_prefixed_measurement_reference_attrs(
+            "correction_measurement_reference",
+            measurement_reference_attrs,
+        ),
         "correction_gain": float(gain),
         "correction_final_gain": float(current_gain),
         "correction_max_normalized_step": max_normalized_attr,

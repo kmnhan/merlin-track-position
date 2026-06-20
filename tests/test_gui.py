@@ -235,6 +235,7 @@ class FakeCorrectionThread(QtCore.QObject):
         self.correction_mode = None
         self.shift_kwargs = None
         self.active_command_axes = None
+        self.measurement_reference = None
         self.started = False
         self.running = False
 
@@ -247,6 +248,7 @@ class FakeCorrectionThread(QtCore.QObject):
         correction_mode="camera",
         shift_kwargs=None,
         active_command_axes=None,
+        measurement_reference=None,
     ):
         self.calibration = calibration
         self.camera_pair = camera_pair
@@ -255,6 +257,7 @@ class FakeCorrectionThread(QtCore.QObject):
         self.correction_mode = correction_mode
         self.shift_kwargs = {} if shift_kwargs is None else dict(shift_kwargs)
         self.active_command_axes = active_command_axes
+        self.measurement_reference = measurement_reference
 
     def start(self):
         self.started = True
@@ -1818,18 +1821,18 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                 finally:
                     window.close()
 
-    def test_polar_compensation_probe_angles_are_sorted_and_unique(self):
+    def test_polar_compensation_probe_angles_start_at_anchor_and_walk_nearest(self):
         self.assertEqual(
             main_window._polar_compensation_probe_angles(0.0),
-            (-20.0, -12.5, -5.0, 0.0),
+            (0.0, -5.0, -12.5, -20.0),
         )
         self.assertEqual(
             main_window._polar_compensation_probe_angles(-15.0),
-            (-20.0, -15.0, -12.5, -5.0),
+            (-15.0, -12.5, -20.0, -5.0),
         )
         self.assertEqual(
             main_window._polar_compensation_probe_angles(-5.0),
-            (-20.0, -12.5, -10.0, -5.0),
+            (-5.0, -10.0, -12.5, -20.0),
         )
 
     def test_polar_compensation_finishes_in_place_when_anchor_is_last_probe(self):
@@ -1859,7 +1862,7 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
             window = MainWindow()
             try:
                 window._polar_compensation_active = True
-                window._polar_compensation_angles = (-20.0, -12.5, -5.0, 0.0)
+                window._polar_compensation_angles = (0.0, -5.0, -12.5, -20.0)
                 window._polar_compensation_index = 0
                 window._polar_compensation_anchor_polar = 0.0
 
@@ -1867,7 +1870,7 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
 
                 self.assertTrue(window._stored_axis_move_thread.started)
                 self.assertEqual(window._stored_axis_move_thread.axis_alias, "p")
-                self.assertEqual(window._stored_axis_move_thread.target_value, -20.0)
+                self.assertEqual(window._stored_axis_move_thread.target_value, 0.0)
                 for refresh_thread in window._image_refresh_threads.values():
                     self.assertTrue(refresh_thread.enabled)
                     self.assertEqual(refresh_thread.wait_until_idle_calls, 0)
@@ -1971,9 +1974,9 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                 try:
                     window._on_new_calibration_ready(calibration)
                     window._polar_compensation_active = True
-                    window._polar_compensation_angles = (-20.0, -12.5, -5.0, 0.0)
+                    window._polar_compensation_angles = (0.0, -5.0, -12.5, -20.0)
                     window._polar_compensation_index = 0
-                    window._polar_compensation_current_polar = -20.0
+                    window._polar_compensation_current_polar = 0.0
 
                     window._start_polar_compensation_correction()
 
@@ -1982,9 +1985,81 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                         window._correction_thread.active_command_axes,
                         main_window.POLAR_COMPENSATION_ACTIVE_AXES,
                     )
+                    self.assertIsNone(window._correction_thread.measurement_reference)
                     for refresh_thread in window._image_refresh_threads.values():
                         self.assertTrue(refresh_thread.enabled)
                         self.assertEqual(refresh_thread.wait_until_idle_calls, 0)
+                finally:
+                    window.close()
+
+    def test_polar_compensation_anchor_step_skips_manual_jog(self):
+        get_qapp()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            calibration = write_sample_calibration(Path(tmpdir) / "calibration.h5")
+            with patched_main_window_runtime():
+                window = MainWindow()
+                try:
+                    window._on_new_calibration_ready(calibration)
+                    window._polar_compensation_active = True
+                    window._polar_compensation_angles = (0.0, -5.0, -12.5, -20.0)
+                    window._polar_compensation_index = 0
+                    window._polar_compensation_anchor_polar = 0.0
+                    with patch(
+                        "merlin_track_position.interface.main_window.QtWidgets.QMessageBox.information"
+                    ) as information:
+                        window._on_polar_compensation_polar_move_ready(0.0, 0.0)
+
+                    information.assert_not_called()
+                    self.assertTrue(window._correction_thread.started)
+                    self.assertIsNone(window._correction_thread.measurement_reference)
+                finally:
+                    window.close()
+
+    def test_polar_compensation_uses_previous_point_as_local_reference(self):
+        get_qapp()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            calibration = write_sample_calibration(Path(tmpdir) / "calibration.h5")
+            reference_cam0 = np.arange(2 * 3, dtype=np.uint16).reshape(2, 3)
+            reference_cam1 = np.arange(3 * 4 * 3, dtype=np.uint16).reshape(3, 4, 3)
+            with patched_main_window_runtime():
+                window = MainWindow()
+                try:
+                    window._on_new_calibration_ready(calibration)
+                    window._polar_compensation_active = True
+                    window._polar_compensation_angles = (0.0, -5.0, -12.5, -20.0)
+                    window._polar_compensation_index = 1
+                    window._polar_compensation_current_polar = -5.0
+                    window._polar_compensation_points = [
+                        main_window._PolarCompensationPoint(
+                            polar_deg=0.0,
+                            x_mm=1.0,
+                            y_mm=2.0,
+                            z_mm=3.0,
+                            tilt_deg=-3.5,
+                            azi_deg=24.5,
+                            current_cam0=reference_cam0,
+                            current_cam1=reference_cam1,
+                        )
+                    ]
+
+                    window._start_polar_compensation_correction()
+
+                    measurement_reference = (
+                        window._correction_thread.measurement_reference
+                    )
+                    self.assertIsNotNone(measurement_reference)
+                    assert measurement_reference is not None
+                    np.testing.assert_array_equal(
+                        measurement_reference.cam0,
+                        reference_cam0,
+                    )
+                    np.testing.assert_array_equal(
+                        measurement_reference.cam1,
+                        reference_cam1,
+                    )
+                    self.assertEqual(measurement_reference.polar_deg, 0.0)
+                    self.assertEqual(measurement_reference.tilt_deg, -3.5)
+                    self.assertEqual(measurement_reference.azi_deg, 24.5)
                 finally:
                     window.close()
 

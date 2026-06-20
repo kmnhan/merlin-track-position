@@ -12,6 +12,7 @@ from qtpy import QtCore
 from merlin_track_position.instruments.cameras import CameraPairPlugin
 from merlin_track_position import constants
 from merlin_track_position.tracking.correct import do_correction
+from merlin_track_position.tracking.correct import CorrectionMeasurementReference
 
 __all__ = ("CorrectionThread",)
 
@@ -36,6 +37,7 @@ class CorrectionThread(QtCore.QThread):
         self._correction_mode = constants.DEFAULT_CORRECTION_MODE
         self._shift_kwargs: dict[str, Any] = {}
         self._active_command_axes: tuple[str, ...] | None = None
+        self._measurement_reference: CorrectionMeasurementReference | None = None
 
     def configure(
         self,
@@ -46,6 +48,7 @@ class CorrectionThread(QtCore.QThread):
         correction_mode: str = constants.DEFAULT_CORRECTION_MODE,
         shift_kwargs: Mapping[str, Any] | None = None,
         active_command_axes: tuple[str, ...] | None = None,
+        measurement_reference: CorrectionMeasurementReference | None = None,
     ) -> None:
         """Set the parameters for the next correction run."""
         if self.isRunning():
@@ -57,6 +60,7 @@ class CorrectionThread(QtCore.QThread):
         self._correction_mode = str(correction_mode)
         self._shift_kwargs = {} if shift_kwargs is None else dict(shift_kwargs)
         self._active_command_axes = active_command_axes
+        self._measurement_reference = measurement_reference
         logger.info(
             "Configured correction thread: calibration_path=%s, correction_mode=%s, "
             "active_command_axes=%s",
@@ -91,6 +95,7 @@ class CorrectionThread(QtCore.QThread):
                     motor_backend=self._motor_backend,
                     correction_mode=self._correction_mode,
                     active_command_axes=self._active_command_axes,
+                    measurement_reference=self._measurement_reference,
                     **self._shift_kwargs,
                 )
             except Exception as exc:
