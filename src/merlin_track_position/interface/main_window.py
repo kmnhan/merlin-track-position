@@ -3753,6 +3753,7 @@ class MainWindow(_MainWindowGUI):
         self._update_reset_beam_target_button()
         self.calibration_panel.show_polar_compensation_result(model)
         self._refresh_initial_transform_preview_after_known_state_change()
+        self._release_basler_if_live_refresh_disabled()
         PolarCompensationDiagnosticsDialog(model, self).exec()
 
     def _abort_polar_compensation(self, message: str) -> None:
@@ -3767,6 +3768,7 @@ class MainWindow(_MainWindowGUI):
         self._polar_compensation_returning_to_anchor = False
         self._polar_compensation_returning_xz = False
         self._restore_calibration_idle_state()
+        self._release_basler_if_live_refresh_disabled()
         QtWidgets.QMessageBox.warning(
             self,
             "Polar compensation stopped",
@@ -4212,6 +4214,9 @@ class MainWindow(_MainWindowGUI):
     @QtCore.Slot(bool)
     def _on_image_auto_refresh_toggled(self, enabled: bool) -> None:
         self._set_image_refresh_enabled(enabled)
+        if not enabled:
+            self._wait_for_image_refresh_idle()
+            self._release_basler_if_live_refresh_disabled()
 
     @QtCore.Slot(bool)
     def _on_initial_transform_preview_toggled(self, enabled: bool) -> None:
@@ -4304,6 +4309,10 @@ class MainWindow(_MainWindowGUI):
     def _wait_for_image_refresh_idle(self) -> None:
         for thread in self._image_refresh_threads.values():
             thread.wait_until_idle()
+
+    def _release_basler_if_live_refresh_disabled(self) -> None:
+        if not self.image_auto_refresh_checkbox.isChecked():
+            close_basler_camera()
 
     def _set_initial_transform_preview_checked(self, checked: bool) -> None:
         was_blocked = self.initial_transform_preview_checkbox.blockSignals(True)
@@ -4905,6 +4914,7 @@ class MainWindow(_MainWindowGUI):
             validate_visual_calibration_dataset(calibration)
         except Exception as exc:
             self._restore_calibration_idle_state()
+            self._release_basler_if_live_refresh_disabled()
             QtWidgets.QMessageBox.critical(
                 self,
                 "Could not use calibration",
@@ -4938,6 +4948,7 @@ class MainWindow(_MainWindowGUI):
         self._update_reset_beam_target_button()
         self._refresh_initial_transform_preview_after_known_state_change()
         self._schedule_persistence_flush_if_needed()
+        self._release_basler_if_live_refresh_disabled()
 
     @QtCore.Slot(str)
     def _on_new_calibration_failed(self, error_message: str) -> None:
@@ -4946,6 +4957,7 @@ class MainWindow(_MainWindowGUI):
         self._calibration_processing_started_at = None
         self._calibration_total_steps = 0
         self._restore_calibration_idle_state()
+        self._release_basler_if_live_refresh_disabled()
         QtWidgets.QMessageBox.critical(
             self,
             "Could not create calibration",
@@ -4988,6 +5000,7 @@ class MainWindow(_MainWindowGUI):
         except Exception as exc:
             self._restore_calibration_idle_state()
             self._reply_to_pending_server_correction(False, str(exc))
+            self._release_basler_if_live_refresh_disabled()
             QtWidgets.QMessageBox.critical(
                 self,
                 "Could not use correction result",
@@ -5000,6 +5013,7 @@ class MainWindow(_MainWindowGUI):
             self._correction_server_result_message(result),
         )
         logger.info("Correction result applied to GUI.")
+        self._release_basler_if_live_refresh_disabled()
 
     @QtCore.Slot(object)
     def _on_correction_progress(self, result: object) -> None:
@@ -5029,6 +5043,7 @@ class MainWindow(_MainWindowGUI):
             return
         self._reply_to_pending_server_correction(False, error_message)
         self._restore_calibration_idle_state()
+        self._release_basler_if_live_refresh_disabled()
         QtWidgets.QMessageBox.critical(
             self,
             "Could not correct sample",
@@ -5048,6 +5063,7 @@ class MainWindow(_MainWindowGUI):
             self._set_reference_preview_button_enabled(True)
         except Exception as exc:
             self._restore_calibration_idle_state()
+            self._release_basler_if_live_refresh_disabled()
             QtWidgets.QMessageBox.critical(
                 self,
                 "Could not use shift detection result",
@@ -5056,11 +5072,13 @@ class MainWindow(_MainWindowGUI):
             return
 
         logger.info("Shift detection result applied to GUI.")
+        self._release_basler_if_live_refresh_disabled()
 
     @QtCore.Slot(str)
     def _on_detect_shift_failed(self, error_message: str) -> None:
         logger.error("Shift detection failed signal received: %s", error_message)
         self._restore_calibration_idle_state()
+        self._release_basler_if_live_refresh_disabled()
         QtWidgets.QMessageBox.critical(
             self,
             "Could not detect shift",
@@ -5112,8 +5130,10 @@ class MainWindow(_MainWindowGUI):
             self._update_reset_beam_target_button()
             self._refresh_initial_transform_preview_after_known_state_change()
             self._schedule_persistence_flush_if_needed()
+            self._release_basler_if_live_refresh_disabled()
         except Exception as exc:
             self._restore_calibration_idle_state()
+            self._release_basler_if_live_refresh_disabled()
             QtWidgets.QMessageBox.critical(
                 self,
                 "Could not use recorded polar references",
@@ -5124,6 +5144,7 @@ class MainWindow(_MainWindowGUI):
     def _on_record_polar_failed(self, error_message: str) -> None:
         logger.error("Record Polar failed signal received: %s", error_message)
         self._restore_calibration_idle_state()
+        self._release_basler_if_live_refresh_disabled()
         QtWidgets.QMessageBox.critical(
             self,
             "Could not record polar references",

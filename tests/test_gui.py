@@ -4237,6 +4237,41 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                 finally:
                     window.close()
 
+    def test_live_refresh_disabled_correction_releases_basler_after_result(self):
+        get_qapp()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "calibration.h5"
+            calibration = write_sample_calibration(path)
+            result = correction_result(converged=True, moves=1, residual=0.05)
+            with patched_main_window_runtime():
+                window = MainWindow()
+                try:
+                    window._on_new_calibration_ready(calibration)
+                    window.image_auto_refresh_checkbox.setChecked(False)
+                    main_window.close_basler_camera.reset_mock()
+
+                    window._start_correction()
+                    main_window.close_basler_camera.assert_not_called()
+
+                    window._on_correction_ready(result)
+                    main_window.close_basler_camera.assert_called_once_with()
+                finally:
+                    window.close()
+
+    def test_disabling_live_refresh_closes_basler_after_refresh_idle(self):
+        get_qapp()
+        with patched_main_window_runtime():
+            window = MainWindow()
+            try:
+                window.image_auto_refresh_checkbox.setChecked(False)
+
+                for refresh_thread in window._image_refresh_threads.values():
+                    self.assertFalse(refresh_thread.enabled)
+                    self.assertEqual(refresh_thread.wait_until_idle_calls, 1)
+                main_window.close_basler_camera.assert_called_once_with()
+            finally:
+                window.close()
+
     def test_stored_axis_move_cancel_does_not_start_thread(self):
         get_qapp()
         with tempfile.TemporaryDirectory() as tmpdir:
