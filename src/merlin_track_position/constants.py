@@ -30,9 +30,9 @@ MOTOR_BACKLASH_CORRECTION: dict[str, float] = {
 # motor behavior.
 CORRECTION_USE_BCS_API_BACKLASH: bool = False
 
-# Stale-status readback fallback for motor moves. Values are keyed by motor alias
-# and are in each motor's command units. For x/y/z this is mm; for p/t/a this is
-# degrees.
+# Motor readback deadbands used by correction and geometry checks.
+# Values are keyed by motor alias and are in each motor's command units. For
+# x/y/z this is mm; for p/t/a this is degrees.
 MOTOR_STALE_READBACK_DEADBAND: dict[str, float] = {
     "x": 0.01,
     "y": 0.1,
@@ -46,7 +46,6 @@ MOTOR_STALE_READBACK_DEADBAND: dict[str, float] = {
     "TC": 0.001,
     "TD": 0.001,
 }
-MOTOR_STALE_READBACK_DELAY_S: float = 10.0
 
 # Default number of image pairs captured at each measurement position.
 DEFAULT_CALIBRATION_CAPTURE_COUNT: int = 3

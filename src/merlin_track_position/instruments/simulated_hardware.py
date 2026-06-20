@@ -237,8 +237,6 @@ class SimulatedHardware:
         self,
         motor_aliases: Iterable[str],
         goals: Iterable[float],
-        *,
-        max_retries: int = 4,
     ) -> tuple[float, ...]:
         aliases = tuple(motor_aliases)
         goals = tuple(float(goal) for goal in goals)
@@ -248,9 +246,6 @@ class SimulatedHardware:
                 "Simulated move failed: length of goals does not match "
                 "length of motor_aliases."
             )
-            return self.get_positions(aliases)
-        if max_retries < 0:
-            logger.error("Simulated move failed: max_retries must be non-negative.")
             return self.get_positions(aliases)
 
         with self._move_lock:

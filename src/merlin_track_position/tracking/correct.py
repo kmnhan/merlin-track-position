@@ -101,7 +101,6 @@ class CorrectionMotorBackend(Protocol):
         motor_aliases: Sequence[str],
         goals: Sequence[float],
         *,
-        max_retries: int = 4,
         backlash_correction: dict[str, float] | None = None,
         move_timeout_s: float = 60.0,
     ) -> tuple[float, ...]:
@@ -117,14 +116,12 @@ class DirectBCSMotorBackend:
         motor_aliases: Sequence[str],
         goals: Sequence[float],
         *,
-        max_retries: int = 4,
         backlash_correction: dict[str, float] | None = None,
         move_timeout_s: float = 60.0,
     ) -> tuple[float, ...]:
         return move_motors_and_wait(
             motor_aliases,
             goals,
-            max_retries=max_retries,
             backlash_correction=backlash_correction,
             move_timeout_s=move_timeout_s,
         )
@@ -135,7 +132,6 @@ def do_correction(
     camera_pair: CameraPairPlugin | None = None,
     *,
     calibration_path: str | Path | None = None,
-    max_retries: int = 4,
     capture_count: int = constants.DEFAULT_CORRECTION_CAPTURE_COUNT,
     capture_aggregation: str = CAPTURE_AGGREGATION_MEDIAN_SHIFTS,
     lqr_projected_tolerance: Any = _USE_DEFAULT,
@@ -716,7 +712,6 @@ def do_correction(
             motor_backend.move_motors_and_wait(
                 active_axes,
                 active_requested_position_mm,
-                max_retries=max_retries,
                 backlash_correction=correction_backlash,
             ),
             dtype=np.float64,

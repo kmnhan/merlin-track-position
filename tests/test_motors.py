@@ -28,7 +28,6 @@ class FakeBCSServer:
         status=BCSz.MotorStatus.MOVE_COMPLETE.value,
         move_responses=(),
         get_motor_responses=(),
-        goal_latched_by_move=(),
     ):
         self._final_positions_by_move = [
             tuple(positions) for positions in final_positions_by_move
@@ -37,7 +36,6 @@ class FakeBCSServer:
         self._status = int(status)
         self._move_responses = list(move_responses)
         self._get_motor_responses = list(get_motor_responses)
-        self._goal_latched_by_move = list(goal_latched_by_move)
         self._positions_by_motor = {}
         self._goals_by_motor = {}
         self._times_by_motor = {}
@@ -61,15 +59,9 @@ class FakeBCSServer:
         move_index = min(
             len(self.move_calls) - 1, len(self._final_positions_by_move) - 1
         )
-        latch_goal = (
-            self._goal_latched_by_move[move_index]
-            if move_index < len(self._goal_latched_by_move)
-            else True
-        )
         final_positions = self._final_positions_by_move[move_index]
         for motor, goal, position in zip(motors, goals, final_positions, strict=True):
-            if latch_goal:
-                self._goals_by_motor[motor] = float(goal)
+            self._goals_by_motor[motor] = float(goal)
             self._positions_by_motor[motor] = position
             self._times_by_motor[motor] = len(self.move_calls)
         return response
@@ -205,7 +197,7 @@ class MoveMotorsAndWaitTests(unittest.TestCase):
         self.assertEqual(len(created), 1)
         self.assertTrue(created[0]._zmq_socket.closed)
 
-    def test_public_helper_forwards_retry_arguments(self):
+    def test_public_helper_uses_bcs_move(self):
         server = object()
 
         @contextlib.contextmanager
@@ -223,14 +215,13 @@ class MoveMotorsAndWaitTests(unittest.TestCase):
                 return_value=(1.0,),
             ) as move,
         ):
-            positions = move_motors_and_wait(("x",), (1.0,), max_retries=2)
+            positions = move_motors_and_wait(("x",), (1.0,))
 
         self.assertEqual(positions, (1.0,))
         move.assert_called_once_with(
             server,
             ("x",),
             (1.0,),
-            max_retries=2,
             backlash_correction=constants.MOTOR_BACKLASH_CORRECTION,
             move_timeout_s=60.0,
         )
@@ -243,18 +234,17 @@ class MoveMotorsAndWaitTests(unittest.TestCase):
                 server,
                 ("x", "y"),
                 (10.0, 2.0),
-                max_retries=3,
             )
 
         self.assertEqual(positions, (9.5, 2.5))
         self.assertEqual(len(server.move_calls), 1)
 
-    def test_stale_move_complete_before_goal_latch_is_not_accepted(self):
+    def test_waits_until_bcs_reports_move_complete(self):
         server = FakeBCSServer(
             [(1.0,)],
             get_motor_responses=[
-                _get_motor_response((0.0,), goals=(0.0,)),
-                _get_motor_response((0.0,), goals=(0.0,)),
+                _get_motor_response((0.0,), status=0, goals=(0.0,)),
+                _get_motor_response((0.0,), status=0, goals=(0.0,)),
                 _get_motor_response((1.0,), goals=(1.0,)),
                 _get_motor_response((1.0,), goals=(1.0,)),
             ],
@@ -271,7 +261,6 @@ class MoveMotorsAndWaitTests(unittest.TestCase):
                 server,
                 ("x",),
                 (1.0,),
-                max_retries=0,
                 backlash_correction={},
             )
 
@@ -540,82 +529,82 @@ class MoveMotorsAndWaitTests(unittest.TestCase):
 
         self.assertEqual(len(server.move_calls), 1)
 
-    def test_stale_status_accepts_position_readback_after_delay(self):
+    def test_position_readback_at_goal_waits_for_move_complete_status(self):
         server = FakeBCSServer(
             [(10.0005, 1.9995)],
-            status=0,
+            get_motor_responses=[
+                _get_motor_response((0.0, 2.0), status=0),
+                _get_motor_response((10.0005, 1.9995), status=0),
+                _get_motor_response(
+                    (10.0005, 1.9995),
+                    status=BCSz.MotorStatus.MOVE_COMPLETE.value,
+                ),
+                _get_motor_response(
+                    (10.0005, 1.9995),
+                    status=BCSz.MotorStatus.MOVE_COMPLETE.value,
+                ),
+            ],
         )
 
         with (
-            patch("merlin_track_position.instruments.motors.time.sleep"),
+            patch("merlin_track_position.instruments.motors.time.sleep") as sleep,
             patch(
                 "merlin_track_position.instruments.motors.time.monotonic",
-                side_effect=[0.0, constants.MOTOR_STALE_READBACK_DELAY_S],
+                side_effect=[0.0, 0.0, 0.1, 0.2],
             ),
         ):
             positions = _move_motors_and_wait(
                 server,
                 ("x", "y"),
                 (10.0, 2.0),
-                max_retries=3,
+                backlash_correction={},
             )
 
         self.assertEqual(positions, (10.0005, 1.9995))
         self.assertEqual(len(server.move_calls), 1)
-
-    def test_stale_status_accepts_axis_specific_readback_deadband(self):
-        server = FakeBCSServer(
-            [(10.0005, 2.004)],
-            status=0,
+        self.assertEqual(
+            sleep.call_args_list,
+            [call(0.25), call(0.25), call(0.25)],
         )
 
-        with (
-            patch.object(
-                constants,
-                "MOTOR_STALE_READBACK_DEADBAND",
-                {"x": 0.001, "y": 0.005},
-            ),
-            patch("merlin_track_position.instruments.motors.time.sleep"),
-            patch(
-                "merlin_track_position.instruments.motors.time.monotonic",
-                side_effect=[0.0, constants.MOTOR_STALE_READBACK_DELAY_S],
-            ),
-        ):
-            positions = _move_motors_and_wait(
-                server,
-                ("x", "y"),
-                (10.0, 2.0),
-                max_retries=3,
-            )
-
-        self.assertEqual(positions, (10.0005, 2.004))
-        self.assertEqual(len(server.move_calls), 1)
-
-    def test_raw_move_complete_accepts_position_readback_without_stale_delay(self):
+    def test_raw_move_complete_waits_for_move_complete_status(self):
         server = FakeBCSServer(
             [(10.0005,)],
-            status=BCSz.MotorStatus.RAW_MOVE_COMPLETE.value,
+            get_motor_responses=[
+                _get_motor_response((0.0,), status=0),
+                _get_motor_response(
+                    (10.0005,),
+                    status=BCSz.MotorStatus.RAW_MOVE_COMPLETE.value,
+                ),
+                _get_motor_response(
+                    (10.0005,),
+                    status=BCSz.MotorStatus.MOVE_COMPLETE.value,
+                ),
+                _get_motor_response(
+                    (10.0005,),
+                    status=BCSz.MotorStatus.MOVE_COMPLETE.value,
+                ),
+            ],
         )
 
         with (
             patch("merlin_track_position.instruments.motors.time.sleep"),
             patch(
                 "merlin_track_position.instruments.motors.time.monotonic",
-                side_effect=[0.0, 0.0],
+                side_effect=[0.0, 0.0, 0.1, 0.2],
             ),
         ):
             positions = _move_motors_and_wait(
                 server,
                 ("x",),
                 (10.0,),
-                max_retries=3,
                 backlash_correction={},
             )
 
         self.assertEqual(positions, (10.0005,))
         self.assertEqual(len(server.move_calls), 1)
 
-    def test_stale_status_does_not_accept_position_readback_before_delay(self):
+    def test_non_complete_status_times_out_even_when_position_is_at_goal(self):
         server = FakeBCSServer(
             [(10.0, 2.0)],
             status=0,
@@ -625,7 +614,7 @@ class MoveMotorsAndWaitTests(unittest.TestCase):
             patch("merlin_track_position.instruments.motors.time.sleep"),
             patch(
                 "merlin_track_position.instruments.motors.time.monotonic",
-                side_effect=[0.0, 0.0, constants.MOTOR_STALE_READBACK_DELAY_S - 0.1],
+                side_effect=[0.0, 0.0],
             ),
             self.assertRaisesRegex(TimeoutError, "Timed out waiting"),
         ):
@@ -633,31 +622,7 @@ class MoveMotorsAndWaitTests(unittest.TestCase):
                 server,
                 ("x", "y"),
                 (10.0, 2.0),
-                move_timeout_s=constants.MOTOR_STALE_READBACK_DELAY_S - 0.1,
-            )
-
-        self.assertEqual(len(server.move_calls), 1)
-
-    def test_stale_status_outside_readback_deadband_times_out(self):
-        outside_x_deadband = 10.0 + constants.MOTOR_STALE_READBACK_DEADBAND["x"] + 0.001
-        server = FakeBCSServer(
-            [(outside_x_deadband, 2.0)],
-            status=0,
-        )
-
-        with (
-            patch("merlin_track_position.instruments.motors.time.sleep"),
-            patch(
-                "merlin_track_position.instruments.motors.time.monotonic",
-                side_effect=[0.0, constants.MOTOR_STALE_READBACK_DELAY_S],
-            ),
-            self.assertRaisesRegex(TimeoutError, "Timed out waiting"),
-        ):
-            _move_motors_and_wait(
-                server,
-                ("x", "y"),
-                (10.0, 2.0),
-                move_timeout_s=constants.MOTOR_STALE_READBACK_DELAY_S,
+                move_timeout_s=0.0,
             )
 
         self.assertEqual(len(server.move_calls), 1)
@@ -732,12 +697,10 @@ class MoveMotorsAndWaitTests(unittest.TestCase):
         self.assertEqual(server.move_calls[1][0], (MOTOR_NAMES["x"], MOTOR_NAMES["y"]))
         self.assertEqual(server.move_calls[1][1], (0.02, 2.0))
 
-    def test_backlash_preposition_is_retried_when_raw_complete_without_motion(self):
+    def test_backlash_preposition_waits_for_move_complete_status(self):
         server = FakeBCSServer(
             [
                 (0.5,),
-                (0.395,),
-                (0.495,),
             ],
             initial_positions=(0.5,),
             status=BCSz.MotorStatus.RAW_MOVE_COMPLETE.value,
@@ -747,57 +710,47 @@ class MoveMotorsAndWaitTests(unittest.TestCase):
             patch("merlin_track_position.instruments.motors.time.sleep"),
             patch(
                 "merlin_track_position.instruments.motors.time.monotonic",
-                side_effect=[
-                    0.0,
-                    constants.MOTOR_STALE_READBACK_DELAY_S,
-                    constants.MOTOR_STALE_READBACK_DELAY_S,
-                    constants.MOTOR_STALE_READBACK_DELAY_S,
-                    constants.MOTOR_STALE_READBACK_DELAY_S,
-                    constants.MOTOR_STALE_READBACK_DELAY_S,
-                ],
+                side_effect=[0.0, 0.0],
             ),
+            self.assertRaisesRegex(TimeoutError, "Timed out waiting"),
         ):
-            positions = _move_motors_and_wait(
+            _move_motors_and_wait(
                 server,
                 ("x",),
                 (0.495,),
-                max_retries=1,
+                move_timeout_s=0.0,
                 backlash_correction={"x": 0.1},
             )
 
-        self.assertEqual(positions, (0.495,))
         self.assertEqual(
             server.move_calls,
             [
                 ((MOTOR_NAMES["x"],), (0.395,)),
-                ((MOTOR_NAMES["x"],), (0.395,)),
-                ((MOTOR_NAMES["x"],), (0.495,)),
             ],
         )
 
-    def test_raw_complete_without_goal_latch_reports_goal_did_not_latch(self):
+    def test_raw_complete_without_move_complete_times_out(self):
         server = FakeBCSServer(
             [
                 (0.5,),
             ],
             initial_positions=(0.5,),
             status=BCSz.MotorStatus.RAW_MOVE_COMPLETE.value,
-            goal_latched_by_move=[False],
         )
 
         with (
             patch("merlin_track_position.instruments.motors.time.sleep"),
             patch(
                 "merlin_track_position.instruments.motors.time.monotonic",
-                side_effect=[0.0, constants.MOTOR_STALE_READBACK_DELAY_S],
+                side_effect=[0.0, 0.0],
             ),
-            self.assertRaisesRegex(TimeoutError, "goal_did_not_latch"),
+            self.assertRaisesRegex(TimeoutError, "Timed out waiting"),
         ):
             _move_motors_and_wait(
                 server,
                 ("x",),
                 (0.395,),
-                max_retries=0,
+                move_timeout_s=0.0,
                 backlash_correction={},
             )
 

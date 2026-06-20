@@ -132,7 +132,6 @@ class TrackShiftMotorBackend:
         motor_aliases: Sequence[str],
         goals: Sequence[float],
         *,
-        max_retries: int = 4,
         backlash_correction: dict[str, float] | None = None,
         move_timeout_s: float = 60.0,
     ) -> tuple[float, ...]:
@@ -174,7 +173,6 @@ class TrackShiftMotorBackend:
             "axes": list(axes),
             "targets_mm": targets_mm,
             "timeout_ms": timeout_ms,
-            "max_retries": int(max_retries),
         }
         with self._condition:
             if self._pending_move_id == move_id:

@@ -16,10 +16,6 @@ _MOTOR_POSITION_CACHE_LOCK = threading.RLock()
 _MOTOR_POSITION_CACHE: dict[str, tuple[float, float, str]] = {}
 
 
-class _MotorMoveDidNotStartError(TimeoutError):
-    pass
-
-
 def update_motor_position_cache(
     axis_positions: Mapping[str, float],
     *,
@@ -156,24 +152,17 @@ def _wait_until_move_complete(
     goals: Iterable[float],
     *,
     timeout_s: float = DEFAULT_MOVE_TIMEOUT_S,
-    start_positions: Iterable[float] | None = None,
 ) -> tuple[float, ...]:
     motor_aliases = tuple(motor_aliases)
     goals = tuple(float(goal) for goal in goals)
-    if start_positions is not None:
-        start_positions = tuple(float(position) for position in start_positions)
     timeout_s = _validate_move_timeout(timeout_s)
-    stale_readback_deadbands = _stale_readback_deadbands(motor_aliases)
-    stale_readback_delay_s = _stale_readback_delay_s()
     started_at = time.monotonic()
     next_log_elapsed_s = 5.0
     logger.info(
         "Waiting for motor move completion: motor_aliases=%s, goals=%s, "
-        "stale_readback_deadbands=%s, stale_readback_delay_s=%g, timeout_s=%g",
+        "timeout_s=%g",
         motor_aliases,
         goals,
-        stale_readback_deadbands,
-        stale_readback_delay_s,
         timeout_s,
     )
     while True:
@@ -186,109 +175,21 @@ def _wait_until_move_complete(
         status = tuple(int(motor_status) for motor_status in status)
         goal_readbacks = tuple(float(goal) for goal in goal_readbacks)
         elapsed_s = time.monotonic() - started_at
-        goal_latched = _positions_within_deadband(
-            goal_readbacks,
-            goals,
-            stale_readback_deadbands,
-        )
-        position_at_goal = _positions_within_deadband(
-            positions,
-            goals,
-            stale_readback_deadbands,
-        )
-        position_at_start = (
-            start_positions is not None
-            and _positions_within_deadband(
-                positions,
-                start_positions,
-                stale_readback_deadbands,
-            )
-        )
-        start_at_goal = (
-            start_positions is not None
-            and _positions_within_deadband(
-                start_positions,
-                goals,
-                stale_readback_deadbands,
-            )
-        )
         if _motor_statuses_all_set(status, BCSz.MotorStatus.MOVE_COMPLETE):
-            move_complete_is_current = goal_latched and (
-                position_at_goal
-                or start_positions is None
-                or start_at_goal
-                or not position_at_start
-            )
-            if move_complete_is_current:
-                time.sleep(0.25)
+            time.sleep(0.25)
 
-                # Get the final positions one more time just to be extra careful
-                positions = _get_positions(bcs_server, motor_aliases)
-                logger.info(
-                    "Motor move complete: motor_aliases=%s, positions=%s, "
-                    "goal_readbacks=%s, elapsed_s=%.1f",
-                    motor_aliases,
-                    positions,
-                    goal_readbacks,
-                    time.monotonic() - started_at,
-                )
-                return positions
-        if _motor_statuses_all_set(
-            status,
-            BCSz.MotorStatus.RAW_MOVE_COMPLETE,
-        ) and position_at_goal:
+            positions = _get_positions(bcs_server, motor_aliases)
             logger.info(
-                "Motor move accepted by raw-complete position readback: "
-                "motor_aliases=%s, positions=%s, goals=%s, "
-                "goal_readbacks=%s, readback_times=%s, "
-                "stale_readback_deadbands=%s, status=%s, elapsed_s=%.1f",
+                "Motor move complete by BCS status: motor_aliases=%s, "
+                "positions=%s, goals=%s, goal_readbacks=%s, readback_times=%s, "
+                "status=%s, elapsed_s=%.1f",
                 motor_aliases,
                 positions,
                 goals,
                 goal_readbacks,
                 readback_times,
-                stale_readback_deadbands,
                 status,
-                elapsed_s,
-            )
-            return positions
-        if (
-            start_positions is not None
-            and elapsed_s >= stale_readback_delay_s
-            and (
-                _motor_statuses_all_set(status, BCSz.MotorStatus.RAW_MOVE_COMPLETE)
-                or _motor_statuses_all_set(status, BCSz.MotorStatus.MOVE_COMPLETE)
-            )
-            and position_at_start
-        ):
-            stall_reason = (
-                "latched_but_position_did_not_move"
-                if goal_latched
-                else "goal_did_not_latch"
-            )
-            raise _MotorMoveDidNotStartError(
-                "Motor move did not start: "
-                f"reason={stall_reason}, "
-                f"motor_aliases={motor_aliases}, goals={goals}, "
-                f"goal_readbacks={goal_readbacks}, start_positions={start_positions}, "
-                f"positions={positions}, readback_times={readback_times}, "
-                f"stale_readback_deadbands={stale_readback_deadbands}, "
-                f"status={status}, elapsed_s={elapsed_s:.1f}"
-            )
-        if elapsed_s >= stale_readback_delay_s and position_at_goal:
-            logger.info(
-                "Motor move accepted by stale-status position readback: "
-                "motor_aliases=%s, positions=%s, goals=%s, "
-                "goal_readbacks=%s, readback_times=%s, "
-                "stale_readback_deadbands=%s, status=%s, elapsed_s=%.1f",
-                motor_aliases,
-                positions,
-                goals,
-                goal_readbacks,
-                readback_times,
-                stale_readback_deadbands,
-                status,
-                elapsed_s,
+                time.monotonic() - started_at,
             )
             return positions
         if elapsed_s >= timeout_s:
@@ -300,22 +201,18 @@ def _wait_until_move_complete(
                 f"motor_aliases={motor_aliases}, goals={goals}, "
                 f"goal_readbacks={goal_readbacks}, positions={positions}, "
                 f"position_errors={position_errors}, readback_times={readback_times}, "
-                f"stale_readback_deadbands={stale_readback_deadbands}, "
                 f"status={status}, elapsed_s={elapsed_s:.1f}"
             )
         if elapsed_s >= next_log_elapsed_s:
             logger.info(
                 "Still waiting for motor move completion: motor_aliases=%s, "
                 "positions=%s, goals=%s, goal_readbacks=%s, readback_times=%s, "
-                "goal_latched=%s, stale_readback_deadbands=%s, status=%s, "
-                "elapsed_s=%.1f",
+                "status=%s, elapsed_s=%.1f",
                 motor_aliases,
                 positions,
                 goals,
                 goal_readbacks,
                 readback_times,
-                goal_latched,
-                stale_readback_deadbands,
                 status,
                 elapsed_s,
             )
@@ -328,18 +225,15 @@ def _move_motors_and_wait(
     motor_aliases: Iterable[str],
     goals: Iterable[float],
     *,
-    max_retries: int = 4,
     move_timeout_s: float = DEFAULT_MOVE_TIMEOUT_S,
     backlash_correction: Mapping[str, float] | None = None,
 ) -> tuple[float, ...]:
     motor_aliases = tuple(motor_aliases)
     goals = tuple(float(goal) for goal in goals)
     logger.debug(
-        "Requesting move: motor_aliases=%s, goals=%s, max_retries=%d, "
-        "backlash_correction=%s",
+        "Requesting move: motor_aliases=%s, goals=%s, backlash_correction=%s",
         motor_aliases,
         goals,
-        max_retries,
         backlash_correction,
     )
 
@@ -347,9 +241,6 @@ def _move_motors_and_wait(
         logger.error(
             "Move failed: length of goals does not match length of motor_aliases."
         )
-        return get_positions(motor_aliases)
-    if max_retries < 0:
-        logger.error("Move failed: max_retries must be non-negative.")
         return get_positions(motor_aliases)
     move_timeout_s = _validate_move_timeout(move_timeout_s)
 
@@ -384,9 +275,7 @@ def _move_motors_and_wait(
             pre_aliases,
             pre_goals,
             phase="backlash_preposition",
-            max_retries=max_retries,
             timeout_s=move_timeout_s,
-            start_positions=_items_at(current_positions, pre_indices),
         )
         current_positions = _get_positions(bcs_server, motor_aliases)
 
@@ -395,9 +284,7 @@ def _move_motors_and_wait(
         motor_aliases,
         goals,
         phase="final",
-        max_retries=max_retries,
         timeout_s=move_timeout_s,
-        start_positions=current_positions,
     )
     final_positions = _get_positions(bcs_server, motor_aliases)
     logger.debug(
@@ -457,64 +344,28 @@ def _move_motor_phase_and_wait(
     goals: Iterable[float],
     *,
     phase: str,
-    max_retries: int,
     timeout_s: float,
-    start_positions: Iterable[float] | None = None,
 ) -> tuple[float, ...]:
     aliases = tuple(motor_aliases)
     goals = tuple(float(goal) for goal in goals)
-    if start_positions is not None:
-        start_positions = tuple(float(position) for position in start_positions)
-
-    for attempt_index in range(max_retries + 1):
-        if start_positions is None or attempt_index > 0:
-            start_positions = _get_positions(bcs_server, aliases)
-        logger.info(
-            "Starting motor move phase: phase=%s, attempt=%d/%d, "
-            "motor_aliases=%s, goals=%s, start_positions=%s",
-            phase,
-            attempt_index + 1,
-            max_retries + 1,
-            aliases,
-            goals,
-            start_positions,
-        )
-        _move_motor(
-            bcs_server,
-            aliases,
-            goals,
-        )
-        # wait just a bit to let the move begin.
-        time.sleep(0.25)
-        try:
-            return _wait_until_move_complete(
-                bcs_server,
-                aliases,
-                goals,
-                timeout_s=timeout_s,
-                start_positions=start_positions,
-            )
-        except _MotorMoveDidNotStartError as exc:
-            if attempt_index >= max_retries:
-                raise TimeoutError(
-                    "Motor move did not start after retries: "
-                    f"phase={phase}, attempts={max_retries + 1}, "
-                    f"motor_aliases={aliases}, goals={goals}, "
-                    f"start_positions={start_positions}, last_error={exc}"
-                ) from exc
-            logger.warning(
-                "Motor move did not start; retrying: phase=%s, attempt=%d/%d, "
-                "motor_aliases=%s, goals=%s, start_positions=%s, error=%s",
-                phase,
-                attempt_index + 1,
-                max_retries + 1,
-                aliases,
-                goals,
-                start_positions,
-                exc,
-            )
-
-    raise AssertionError("unreachable move retry loop exit")
+    logger.info(
+        "Starting motor move phase: phase=%s, motor_aliases=%s, goals=%s",
+        phase,
+        aliases,
+        goals,
+    )
+    _move_motor(
+        bcs_server,
+        aliases,
+        goals,
+    )
+    time.sleep(0.25)
+    return _wait_until_move_complete(
+        bcs_server,
+        aliases,
+        goals,
+        timeout_s=timeout_s,
+    )
 
 
 def _bcs_motor_names(motor_aliases: Iterable[str]) -> tuple[str, ...]:
@@ -667,53 +518,6 @@ def _bcs_response_context(
     return ", ".join(parts)
 
 
-def _stale_readback_deadbands(motor_aliases: Iterable[str]) -> tuple[float, ...]:
-    aliases = tuple(motor_aliases)
-    configured_deadbands = constants.MOTOR_STALE_READBACK_DEADBAND
-    if isinstance(configured_deadbands, Mapping):
-        deadbands = []
-        for alias in aliases:
-            try:
-                deadband_value = configured_deadbands[alias]
-            except KeyError as exc:
-                raise ValueError(
-                    "MOTOR_STALE_READBACK_DEADBAND missing value for "
-                    f"motor alias {alias!r}"
-                ) from exc
-            deadbands.append(_validate_stale_readback_deadband(deadband_value))
-        return tuple(deadbands)
-
-    deadband = _validate_stale_readback_deadband(configured_deadbands)
-    return (deadband,) * len(aliases)
-
-
-def _validate_stale_readback_deadband(deadband_value: float) -> float:
-    deadband = float(deadband_value)
-    if not np.isfinite(deadband) or deadband < 0.0:
-        raise ValueError(
-            "MOTOR_STALE_READBACK_DEADBAND values must be finite and non-negative"
-        )
-    return deadband
-
-
-def _stale_readback_delay_s() -> float:
-    delay_s = float(constants.MOTOR_STALE_READBACK_DELAY_S)
-    if not np.isfinite(delay_s) or delay_s < 0.0:
-        raise ValueError("MOTOR_STALE_READBACK_DELAY_S must be finite and non-negative")
-    return delay_s
-
-
-def _positions_within_deadband(
-    positions: Iterable[float],
-    goals: Iterable[float],
-    deadbands: Iterable[float],
-) -> bool:
-    return all(
-        abs(float(position) - float(goal)) <= float(deadband)
-        for position, goal, deadband in zip(positions, goals, deadbands, strict=True)
-    )
-
-
 def _motor_statuses_all_set(
     statuses: Iterable[int],
     flag: BCSz.MotorStatus,
@@ -799,7 +603,6 @@ def move_motors_and_wait(
     motor_aliases: Iterable[str],
     goals: Iterable[float],
     *,
-    max_retries: int = 4,
     move_timeout_s: float = DEFAULT_MOVE_TIMEOUT_S,
     backlash_correction: Mapping[str, float] | None = None,
 ) -> tuple[float, ...]:
@@ -811,14 +614,9 @@ def move_motors_and_wait(
         Iterable of motor aliases to move, e.g. ("x", "y").
     goals
         Iterable of goal positions corresponding to motor_aliases, e.g. (1.0, 2.0).
-    max_retries
-        Number of times to reissue a move phase when the controller reports raw
-        completion but readback remains at the pre-move position outside the
-        goal deadband.
     move_timeout_s
-        Maximum time to wait for each move phase to either report complete or, after
-        the stale-readback delay, reach its requested readback position. Default is
-        60 seconds.
+        Maximum time to wait for each direct BCS move phase to report
+        ``MOVE_COMPLETE``. Default is 60 seconds.
     backlash_correction
         Mapping from motor alias to backlash take-up distance in that motor's command
         units. For x and z this is millimeters. When omitted,
@@ -829,18 +627,15 @@ def move_motors_and_wait(
     goals = tuple(float(goal) for goal in goals)
     move_timeout_s = _validate_move_timeout(move_timeout_s)
     logger.info(
-        "Moving motors and waiting: motor_aliases=%s, goals=%s, max_retries=%d, "
-        "move_timeout_s=%g",
+        "Moving motors and waiting: motor_aliases=%s, goals=%s, move_timeout_s=%g",
         motor_aliases,
         goals,
-        max_retries,
         move_timeout_s,
     )
     if not constants.IS_DAQ_PC:
         positions = simulator.move_motors_and_wait(
             motor_aliases,
             goals,
-            max_retries=max_retries,
         )
         _update_motor_position_cache_from_sequence(
             motor_aliases,
@@ -858,7 +653,6 @@ def move_motors_and_wait(
             server,
             motor_aliases,
             goals,
-            max_retries=max_retries,
             move_timeout_s=move_timeout_s,
             backlash_correction=backlash_correction,
         )

@@ -47,7 +47,6 @@ class TrackShiftMotorBackendTests(unittest.TestCase):
         final_positions = backend.move_motors_and_wait(
             ("x", "z"),
             (0.5, -1.25),
-            max_retries=2,
             move_timeout_s=12.0,
         )
 
@@ -61,7 +60,7 @@ class TrackShiftMotorBackendTests(unittest.TestCase):
             {"x": 0.5, "y": 2.0, "z": -1.25},
         )
         self.assertEqual(requests[0]["timeout_ms"], 60_000)
-        self.assertEqual(requests[0]["max_retries"], 2)
+        self.assertNotIn("max_retries", requests[0])
         self.assertEqual(backend.get_positions(("x", "y", "z")), (0.5, 2.0, -1.25))
         self.assertEqual(
             cached_motor_positions(("x", "y", "z")),

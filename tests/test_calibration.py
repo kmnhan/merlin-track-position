@@ -2364,7 +2364,6 @@ class CorrectionTests(unittest.TestCase):
                 motor_aliases,
                 goals,
                 *,
-                max_retries=4,
                 backlash_correction=None,
                 move_timeout_s=60.0,
             ):
@@ -2484,11 +2483,10 @@ class CorrectionTests(unittest.TestCase):
                 motor_aliases,
                 goals,
                 *,
-                max_retries=4,
                 backlash_correction=None,
                 move_timeout_s=60.0,
             ):
-                del max_retries, backlash_correction, move_timeout_s
+                del backlash_correction, move_timeout_s
                 self.moves.append((tuple(motor_aliases), tuple(goals)))
                 for axis, goal in zip(motor_aliases, goals, strict=True):
                     self.positions[COMMAND_AXES.index(axis)] = float(goal)
