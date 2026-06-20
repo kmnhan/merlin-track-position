@@ -120,7 +120,12 @@ from merlin_track_position.tracking.roi import (
     roi_local_point_from_full_frame,
 )
 
-__all__ = ("CalibrationStartDialog", "CameraSettingsDialog", "MainWindow")
+__all__ = (
+    "CalibrationStartDialog",
+    "CameraSettingsDialog",
+    "MainWindow",
+    "TrackShiftFileDialog",
+)
 
 logger = logging.getLogger("merlin_track_position.interface.main_window")
 LOG_FILE_NAME = "track-position.log"
@@ -129,6 +134,7 @@ LOG_FILE_BACKUP_COUNT = 5
 LOG_FORMAT = "%(asctime)s %(levelname)s [%(name)s] %(message)s"
 _FILE_LOG_HANDLER_MARKER = "_merlin_track_position_file_log_handler"
 DEFAULT_CALIBRATION_FILE_NAME = "calibration.h5"
+DEFAULT_TRACK_SHIFT_FILE_NAME = "track_shift.txt"
 _CV2_WARP_AFFINE_DTYPES = frozenset(
     np.dtype(dtype)
     for dtype in (
@@ -234,6 +240,10 @@ def _default_calibration_directory() -> Path:
 
 def _default_calibration_path() -> Path:
     return _default_calibration_directory() / DEFAULT_CALIBRATION_FILE_NAME
+
+
+def _default_track_shift_path() -> Path:
+    return _default_calibration_directory() / DEFAULT_TRACK_SHIFT_FILE_NAME
 
 
 def _polar_compensation_probe_angles(anchor_polar: float) -> tuple[float, ...]:
@@ -624,6 +634,16 @@ POLAR_COMPENSATION_ACTIVE_AXES = ("x", "z")
 RECORD_POLAR_MAX_DEG = 13.0
 RECORD_POLAR_STEP_DEG = 1.0
 RECORD_POLAR_MOTOR_OPTIONS = (("Polar", "p"), ("Polar Compens", "pc"))
+TRACK_SHIFT_MOTOR_LIMITS = {
+    "Polar": (-91.0, 70.0),
+    "Polar Compens": (-91.0, 70.0),
+    "BL Energy": (10.0, 200.0),
+}
+TRACK_SHIFT_DEFAULT_INCREMENTS = {
+    "Polar": 0.5,
+    "Polar Compens": 0.5,
+    "BL Energy": 2.0,
+}
 PERSISTENCE_FLUSH_INTERVAL_MS = 5000
 DEFAULT_AUTO_CORRECTION_INTERVAL_SECONDS = 180.0
 AUTO_CORRECTION_INTERVAL_SETTINGS_KEY = "auto_correction/interval_seconds"
@@ -1596,6 +1616,59 @@ def _clamped_record_polar_value(value: float) -> float:
     return min(max(numeric, -180.0), RECORD_POLAR_MAX_DEG)
 
 
+def _track_shift_values(start: float, stop: float, increment: float) -> np.ndarray:
+    start_value = float(start)
+    stop_value = float(stop)
+    step = float(increment)
+    if not all(math.isfinite(value) for value in (start_value, stop_value, step)):
+        raise ValueError("start, stop, and increment must be finite")
+    if step <= 0.0:
+        raise ValueError("increment must be positive")
+
+    direction = 1.0 if stop_value >= start_value else -1.0
+    signed_step = direction * step
+    span = abs(stop_value - start_value)
+    count = int(math.floor(span / step + 1.0e-12)) + 1
+    values = start_value + signed_step * np.arange(count, dtype=np.float64)
+    if values.size == 0:
+        return np.asarray([start_value], dtype=np.float64)
+    return values
+
+
+def write_track_shift_file(
+    path: str | Path,
+    *,
+    motor_name: str,
+    start: float,
+    stop: float,
+    increment: float,
+) -> Path:
+    motor = str(motor_name)
+    if motor not in TRACK_SHIFT_MOTOR_LIMITS:
+        raise ValueError(f"unsupported track-shift motor {motor!r}")
+    lower, upper = TRACK_SHIFT_MOTOR_LIMITS[motor]
+    start_value = float(start)
+    stop_value = float(stop)
+    increment_value = float(increment)
+    if not (lower <= start_value <= upper and lower <= stop_value <= upper):
+        raise ValueError(
+            f"{motor} start and stop must be between {lower:g} and {upper:g}"
+        )
+    values = _track_shift_values(start_value, stop_value, increment_value)
+
+    output_path = Path(path).expanduser()
+    if output_path.suffix == "":
+        output_path = output_path.with_suffix(".txt")
+    if output_path.suffix.lower() != ".txt":
+        raise ValueError("track-shift output path must be a .txt file")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8", newline="") as handle:
+        handle.write(f"{motor}\tTrack Shift\n")
+        for index, value in enumerate(values):
+            handle.write(f"{value:.12g}\t{index}\n")
+    return output_path
+
+
 class RecordPolarDialog(QtWidgets.QDialog):
     def __init__(
         self,
@@ -1678,6 +1751,129 @@ class RecordPolarDialog(QtWidgets.QDialog):
         except Exception as exc:
             QtWidgets.QMessageBox.critical(
                 self, "Invalid polar record settings", str(exc)
+            )
+            return
+        self.accept()
+
+
+class TrackShiftFileDialog(QtWidgets.QDialog):
+    def __init__(
+        self,
+        *,
+        default_output_path: Path | None = None,
+        parent: QtWidgets.QWidget | None = None,
+    ):
+        super().__init__(parent)
+        self.setObjectName("track_shift_file_dialog")
+        self.setWindowTitle("Track Shift File")
+
+        if default_output_path is None:
+            default_output_path = Path.home() / DEFAULT_TRACK_SHIFT_FILE_NAME
+
+        layout = QtWidgets.QVBoxLayout(self)
+        form_layout = QtWidgets.QFormLayout()
+
+        path_row = QtWidgets.QHBoxLayout()
+        self.path_edit = QtWidgets.QLineEdit(str(default_output_path))
+        self.path_edit.setObjectName("track_shift_output_path_edit")
+        browse_button = QtWidgets.QPushButton("Browse...")
+        browse_button.setObjectName("track_shift_browse_button")
+        browse_button.clicked.connect(self._browse_output_path)
+        path_row.addWidget(self.path_edit, stretch=1)
+        path_row.addWidget(browse_button)
+        form_layout.addRow("Save to", path_row)
+
+        self.motor_combo = QtWidgets.QComboBox()
+        self.motor_combo.setObjectName("track_shift_motor_combo")
+        for motor_name in TRACK_SHIFT_MOTOR_LIMITS:
+            self.motor_combo.addItem(motor_name, motor_name)
+        self.motor_combo.currentIndexChanged.connect(self._update_motor_limits)
+        form_layout.addRow("Motor", self.motor_combo)
+
+        self.start_spinbox = QtWidgets.QDoubleSpinBox()
+        self.start_spinbox.setObjectName("track_shift_start_spinbox")
+        self.start_spinbox.setDecimals(4)
+        self.start_spinbox.setAccelerated(True)
+        form_layout.addRow("Start", self.start_spinbox)
+
+        self.stop_spinbox = QtWidgets.QDoubleSpinBox()
+        self.stop_spinbox.setObjectName("track_shift_stop_spinbox")
+        self.stop_spinbox.setDecimals(4)
+        self.stop_spinbox.setAccelerated(True)
+        form_layout.addRow("Stop", self.stop_spinbox)
+
+        self.increment_spinbox = QtWidgets.QDoubleSpinBox()
+        self.increment_spinbox.setObjectName("track_shift_increment_spinbox")
+        self.increment_spinbox.setDecimals(4)
+        self.increment_spinbox.setAccelerated(True)
+        form_layout.addRow("Increment", self.increment_spinbox)
+        layout.addLayout(form_layout)
+
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok
+            | QtWidgets.QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self._validate_and_accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self._update_motor_limits()
+
+    def _browse_output_path(self) -> None:
+        file_name, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Save track-shift file",
+            self.path_edit.text(),
+            "Text files (*.txt);;All files (*)",
+        )
+        if file_name:
+            self.path_edit.setText(file_name)
+
+    def _update_motor_limits(self) -> None:
+        motor_name = self.motor_name()
+        lower, upper = TRACK_SHIFT_MOTOR_LIMITS[motor_name]
+        default_increment = TRACK_SHIFT_DEFAULT_INCREMENTS[motor_name]
+        for spinbox in (self.start_spinbox, self.stop_spinbox):
+            spinbox.setRange(lower, upper)
+            spinbox.setSingleStep(default_increment)
+        self.start_spinbox.setValue(lower)
+        self.stop_spinbox.setValue(upper)
+        self.increment_spinbox.setRange(0.0001, abs(upper - lower))
+        self.increment_spinbox.setSingleStep(default_increment)
+        self.increment_spinbox.setValue(default_increment)
+
+    def motor_name(self) -> str:
+        return str(self.motor_combo.currentData() or self.motor_combo.currentText())
+
+    def parameters(self) -> tuple[Path, str, float, float, float]:
+        return (
+            self.output_path(),
+            self.motor_name(),
+            float(self.start_spinbox.value()),
+            float(self.stop_spinbox.value()),
+            float(self.increment_spinbox.value()),
+        )
+
+    def output_path(self) -> Path:
+        return Path(self.path_edit.text()).expanduser()
+
+    def _validate_and_accept(self) -> None:
+        try:
+            if not self.path_edit.text().strip():
+                raise ValueError("choose a file path for the track-shift file")
+            path, motor_name, start, stop, increment = self.parameters()
+            write_track_shift_file(
+                path,
+                motor_name=motor_name,
+                start=start,
+                stop=stop,
+                increment=increment,
+            )
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Could not write track-shift file",
+                str(exc),
             )
             return
         self.accept()
@@ -2244,6 +2440,9 @@ class _MainWindowGUI(QtWidgets.QMainWindow):
         self.shift_monitor_action = QtGui.QAction("Shift Monitor", self)
         self.shift_monitor_action.setObjectName("shift_monitor_action")
         tools_menu.addAction(self.shift_monitor_action)
+        self.track_shift_file_action = QtGui.QAction("Track Shift File...", self)
+        self.track_shift_file_action.setObjectName("track_shift_file_action")
+        tools_menu.addAction(self.track_shift_file_action)
         self.camera_settings_action = QtGui.QAction("Camera Settings", self)
         self.camera_settings_action.setObjectName("camera_settings_action")
         tools_menu.addAction(self.camera_settings_action)
@@ -2547,6 +2746,9 @@ class MainWindow(_MainWindowGUI):
             self._on_stored_axis_move_requested
         )
         self.shift_monitor_action.triggered.connect(self._on_shift_monitor_triggered)
+        self.track_shift_file_action.triggered.connect(
+            self._on_track_shift_file_triggered
+        )
         self.camera_settings_action.triggered.connect(
             self._on_camera_settings_triggered
         )
@@ -2718,6 +2920,22 @@ class MainWindow(_MainWindowGUI):
         self._shift_monitor_window.show()
         self._shift_monitor_window.raise_()
         self._shift_monitor_window.activateWindow()
+
+    @QtCore.Slot()
+    def _on_track_shift_file_triggered(self) -> None:
+        try:
+            default_output_path = _default_track_shift_path()
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Could not choose data directory",
+                str(exc),
+            )
+            return
+        TrackShiftFileDialog(
+            default_output_path=default_output_path,
+            parent=self,
+        ).exec()
 
     @QtCore.Slot()
     def _on_camera_settings_triggered(self) -> None:

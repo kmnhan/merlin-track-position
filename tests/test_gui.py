@@ -24,6 +24,7 @@ from merlin_track_position.interface.main_window import (  # noqa: E402
     CameraSettingsDialog,
     CalibrationStartDialog,
     MainWindow,
+    TrackShiftFileDialog,
     _clamp_roi_geometry,
     _default_roi_geometry,
     _roi_geometries_from_calibration_metadata,
@@ -87,7 +88,7 @@ from merlin_track_position.tracking.polar_reference import (  # noqa: E402
 from merlin_track_position.tracking.sample_calibration import (  # noqa: E402
     build_sample_calibration_dataset,
 )
-from qtpy import QtCore, QtWidgets  # noqa: E402
+from qtpy import QtCore, QtGui, QtWidgets  # noqa: E402
 
 _APP = None
 
@@ -5085,6 +5086,179 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
 
 
 class CalibrationStartDialogTests(unittest.TestCase):
+    def test_track_shift_writer_creates_tab_separated_txt(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = main_window.write_track_shift_file(
+                Path(tmpdir) / "shift",
+                motor_name="Polar",
+                start=-1.0,
+                stop=1.0,
+                increment=0.5,
+            )
+
+            self.assertEqual(output, Path(tmpdir) / "shift.txt")
+            self.assertEqual(
+                output.read_text(encoding="utf-8").splitlines(),
+                [
+                    "Polar\tTrack Shift",
+                    "-1\t0",
+                    "-0.5\t1",
+                    "0\t2",
+                    "0.5\t3",
+                    "1\t4",
+                ],
+            )
+
+    def test_track_shift_writer_supports_descending_values(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = main_window.write_track_shift_file(
+                Path(tmpdir) / "energy.txt",
+                motor_name="BL Energy",
+                start=14.0,
+                stop=10.0,
+                increment=2.0,
+            )
+
+            self.assertEqual(
+                output.read_text(encoding="utf-8").splitlines(),
+                [
+                    "BL Energy\tTrack Shift",
+                    "14\t0",
+                    "12\t1",
+                    "10\t2",
+                ],
+            )
+
+    def test_track_shift_dialog_exposes_motor_limits_and_defaults(self):
+        get_qapp()
+        dialog = TrackShiftFileDialog(
+            default_output_path=Path("/tmp/current_scan/track_shift.txt")
+        )
+        try:
+            path_edit = dialog.findChild(
+                QtWidgets.QLineEdit,
+                "track_shift_output_path_edit",
+            )
+            combo = dialog.findChild(QtWidgets.QComboBox, "track_shift_motor_combo")
+            start = dialog.findChild(
+                QtWidgets.QDoubleSpinBox,
+                "track_shift_start_spinbox",
+            )
+            stop = dialog.findChild(
+                QtWidgets.QDoubleSpinBox,
+                "track_shift_stop_spinbox",
+            )
+            increment = dialog.findChild(
+                QtWidgets.QDoubleSpinBox,
+                "track_shift_increment_spinbox",
+            )
+
+            self.assertIsNotNone(path_edit)
+            self.assertIsNotNone(combo)
+            self.assertIsNotNone(start)
+            self.assertIsNotNone(stop)
+            self.assertIsNotNone(increment)
+            assert path_edit is not None
+            assert combo is not None
+            assert start is not None
+            assert stop is not None
+            assert increment is not None
+            self.assertEqual(path_edit.text(), "/tmp/current_scan/track_shift.txt")
+            self.assertEqual(
+                [combo.itemText(index) for index in range(combo.count())],
+                ["Polar", "Polar Compens", "BL Energy"],
+            )
+            self.assertEqual(start.minimum(), -91.0)
+            self.assertEqual(start.maximum(), 70.0)
+            self.assertEqual(stop.minimum(), -91.0)
+            self.assertEqual(stop.maximum(), 70.0)
+            self.assertEqual(increment.value(), 0.5)
+
+            combo.setCurrentText("BL Energy")
+
+            self.assertEqual(start.minimum(), 10.0)
+            self.assertEqual(start.maximum(), 200.0)
+            self.assertEqual(stop.minimum(), 10.0)
+            self.assertEqual(stop.maximum(), 200.0)
+            self.assertEqual(increment.value(), 2.0)
+        finally:
+            dialog.close()
+
+    def test_track_shift_dialog_browse_uses_current_txt_path(self):
+        get_qapp()
+        dialog = TrackShiftFileDialog(
+            default_output_path=Path("/tmp/current_scan/track_shift.txt")
+        )
+        try:
+            browse = dialog.findChild(
+                QtWidgets.QPushButton,
+                "track_shift_browse_button",
+            )
+            self.assertIsNotNone(browse)
+            assert browse is not None
+            with patch(
+                "merlin_track_position.interface.main_window."
+                "QtWidgets.QFileDialog.getSaveFileName",
+                return_value=("/tmp/current_scan/new_track_shift.txt", ""),
+            ) as get_save_file_name:
+                browse.click()
+
+            get_save_file_name.assert_called_once_with(
+                dialog,
+                "Save track-shift file",
+                "/tmp/current_scan/track_shift.txt",
+                "Text files (*.txt);;All files (*)",
+            )
+            self.assertEqual(
+                dialog.output_path(),
+                Path("/tmp/current_scan/new_track_shift.txt"),
+            )
+        finally:
+            dialog.close()
+
+    def test_track_shift_menu_action_opens_dialog_at_default_data_path(self):
+        get_qapp()
+        instances = []
+
+        class FakeTrackShiftFileDialog:
+            def __init__(self, *, default_output_path=None, parent=None):
+                self.default_output_path = default_output_path
+                self.parent = parent
+                instances.append(self)
+
+            def exec(self):
+                return QtWidgets.QDialog.DialogCode.Rejected
+
+        default_path = Path("/tmp/current_scan/track_shift.txt")
+        with patched_main_window_runtime():
+            window = MainWindow()
+            try:
+                action = window.findChild(
+                    QtGui.QAction,
+                    "track_shift_file_action",
+                )
+                self.assertIsNotNone(action)
+                with (
+                    patch.object(
+                        main_window,
+                        "_default_track_shift_path",
+                        return_value=default_path,
+                    ),
+                    patch.object(
+                        main_window,
+                        "TrackShiftFileDialog",
+                        FakeTrackShiftFileDialog,
+                    ),
+                ):
+                    assert action is not None
+                    action.trigger()
+
+                self.assertEqual(len(instances), 1)
+                self.assertEqual(instances[0].default_output_path, default_path)
+                self.assertIs(instances[0].parent, window)
+            finally:
+                window.close()
+
     def test_dialog_exposes_save_path(self):
         get_qapp()
         dialog = CalibrationStartDialog()
