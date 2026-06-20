@@ -80,6 +80,10 @@ from merlin_track_position.tracking.polar_compensation import (  # noqa: E402
     fit_polar_compensation_model,
     predict_polar_compensation_xz,
 )
+from merlin_track_position.tracking.polar_reference import (  # noqa: E402
+    apply_polar_reference_stack,
+    polar_reference_target_positions,
+)
 from merlin_track_position.tracking.sample_calibration import (  # noqa: E402
     build_sample_calibration_dataset,
 )
@@ -371,6 +375,67 @@ class FakePolarCompensationXzMoveThread(QtCore.QObject):
         pass
 
 
+class FakeRecordPolarReferenceThread(QtCore.QObject):
+    sigRecordPolarProgress = QtCore.Signal(int, int, float, str, object, object)
+    sigRecordPolarReady = QtCore.Signal(object)
+    sigRecordPolarFailed = QtCore.Signal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.calibration = None
+        self.camera_pair = None
+        self.calibration_path = None
+        self.motor_alias = None
+        self.motor_name = None
+        self.minimum_deg = None
+        self.maximum_deg = None
+        self.capture_count = None
+        self.targets = ()
+        self.started = False
+        self.running = False
+
+    def configure(
+        self,
+        calibration,
+        camera_pair,
+        calibration_path,
+        *,
+        motor_alias,
+        motor_name,
+        minimum_deg,
+        maximum_deg,
+        capture_count,
+    ):
+        self.calibration = calibration
+        self.camera_pair = camera_pair
+        self.calibration_path = Path(calibration_path)
+        self.motor_alias = str(motor_alias)
+        self.motor_name = str(motor_name)
+        self.minimum_deg = float(minimum_deg)
+        self.maximum_deg = float(maximum_deg)
+        self.capture_count = int(capture_count)
+        self.targets = tuple(
+            float(value)
+            for value in polar_reference_target_positions(
+                self.minimum_deg,
+                self.maximum_deg,
+            )
+        )
+
+    def start(self):
+        self.started = True
+        self.running = True
+
+    def isRunning(self):
+        return self.running
+
+    def stop(self):
+        self.running = False
+
+    def wait(self):
+        pass
+
+
 @contextmanager
 def patched_main_window_runtime(settings=None):
     settings = settings or FakeSettings()
@@ -402,6 +467,10 @@ def patched_main_window_runtime(settings=None):
         patch(
             "merlin_track_position.interface.main_window._PolarCompensationXzMoveThread",
             FakePolarCompensationXzMoveThread,
+        ),
+        patch(
+            "merlin_track_position.interface.main_window._RecordPolarReferenceThread",
+            FakeRecordPolarReferenceThread,
         ),
         patch("merlin_track_position.interface.main_window.close_basler_camera"),
     ):
@@ -1303,6 +1372,7 @@ class CalibrationPanelTests(unittest.TestCase):
         self.assertTrue(panel.correct_sample_button.isEnabled())
         self.assertTrue(panel.detect_shift_button.isEnabled())
         self.assertTrue(panel.calculate_polar_compensate_button.isEnabled())
+        self.assertTrue(panel.record_polar_button.isEnabled())
         self.assertFalse(panel.calibration_review_widget.isHidden())
         self.assertTrue(panel.correction_steps_group.isHidden())
         self.assertNotEqual(panel.metric_labels["axis_scale_readback_mm"].text(), "n/a")
@@ -1327,6 +1397,7 @@ class CalibrationPanelTests(unittest.TestCase):
         self.assertFalse(panel.correct_sample_button.isEnabled())
         self.assertFalse(panel.detect_shift_button.isEnabled())
         self.assertFalse(panel.calculate_polar_compensate_button.isEnabled())
+        self.assertFalse(panel.record_polar_button.isEnabled())
 
         panel.show_loaded_calibration(calibration, "test.h5")
         panel.show_correction_in_progress()
@@ -1338,6 +1409,7 @@ class CalibrationPanelTests(unittest.TestCase):
         self.assertFalse(panel.save_calibration_button.isEnabled())
         self.assertFalse(panel.calibration_details_button.isEnabled())
         self.assertFalse(panel.calculate_polar_compensate_button.isEnabled())
+        self.assertFalse(panel.record_polar_button.isEnabled())
         self.assertFalse(panel.correct_sample_button.isEnabled())
         self.assertFalse(panel.detect_shift_button.isEnabled())
         self.assertFalse(panel.new_calibration_button.isEnabled())
@@ -1598,6 +1670,238 @@ class CalibrationPanelTests(unittest.TestCase):
 
 
 class MainWindowCalibrationStateTests(unittest.TestCase):
+    def test_record_polar_dialog_exposes_range_and_motor_options(self):
+        get_qapp()
+        dialog = main_window.RecordPolarDialog(
+            default_minimum_deg=-5.0,
+            default_maximum_deg=20.0,
+        )
+        try:
+            minimum = dialog.findChild(
+                QtWidgets.QDoubleSpinBox,
+                "record_polar_minimum_spinbox",
+            )
+            maximum = dialog.findChild(
+                QtWidgets.QDoubleSpinBox,
+                "record_polar_maximum_spinbox",
+            )
+            combo = dialog.findChild(
+                QtWidgets.QComboBox,
+                "record_polar_motor_combo",
+            )
+            start = dialog.findChild(
+                QtWidgets.QPushButton,
+                "record_polar_start_button",
+            )
+
+            self.assertIsNotNone(minimum)
+            self.assertIsNotNone(maximum)
+            self.assertIsNotNone(combo)
+            self.assertIsNotNone(start)
+            assert minimum is not None
+            assert maximum is not None
+            assert combo is not None
+            self.assertEqual(minimum.value(), -5.0)
+            self.assertEqual(maximum.maximum(), 13.0)
+            self.assertEqual(maximum.value(), 13.0)
+            self.assertEqual(
+                [combo.itemText(index) for index in range(combo.count())],
+                ["Polar", "Polar Compens"],
+            )
+            self.assertEqual(combo.currentText(), "Polar Compens")
+            self.assertEqual(dialog.parameters()[2:], ("pc", "Polar Compens"))
+        finally:
+            dialog.close()
+
+    def test_record_polar_button_configures_thread_from_dialog(self):
+        get_qapp()
+
+        class FakeRecordPolarDialog:
+            def __init__(
+                self,
+                *,
+                default_minimum_deg=0.0,
+                default_maximum_deg=13.0,
+                parent=None,
+            ):
+                self.default_minimum_deg = default_minimum_deg
+                self.default_maximum_deg = default_maximum_deg
+                self.parent = parent
+
+            def exec(self):
+                return QtWidgets.QDialog.DialogCode.Accepted
+
+            def parameters(self):
+                return -2.0, 0.4, "pc", "Polar Compens"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "calibration.h5"
+            calibration = write_sample_calibration(path).assign_attrs(polar=-2.5)
+            with patched_main_window_runtime():
+                window = MainWindow()
+                try:
+                    window._on_new_calibration_ready(calibration)
+                    camera_pair = object()
+                    with (
+                        patch(
+                            "merlin_track_position.interface.main_window."
+                            "RecordPolarDialog",
+                            FakeRecordPolarDialog,
+                        ),
+                        patch.object(
+                            window,
+                            "_camera_pair_for_current_images",
+                            return_value=camera_pair,
+                        ),
+                    ):
+                        window.calibration_panel.record_polar_button.click()
+
+                    thread = window._record_polar_thread
+                    self.assertTrue(thread.started)
+                    self.assertEqual(thread.calibration_path, path)
+                    self.assertIs(thread.camera_pair, camera_pair)
+                    self.assertEqual(thread.motor_alias, "pc")
+                    self.assertEqual(thread.motor_name, "Polar Compens")
+                    self.assertEqual(thread.minimum_deg, -2.0)
+                    self.assertEqual(thread.maximum_deg, 0.4)
+                    self.assertEqual(
+                        thread.targets,
+                        tuple(polar_reference_target_positions(-2.0, 0.4)),
+                    )
+                    self.assertIn(
+                        "Recording polar reference 0/",
+                        window.calibration_panel.calibration_status_label.text(),
+                    )
+                finally:
+                    window.close()
+
+    def test_record_polar_ready_updates_loaded_calibration(self):
+        get_qapp()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "calibration.h5"
+            calibration = write_sample_calibration(path)
+            updated = apply_polar_reference_stack(
+                calibration,
+                polar_deg=[-1.0, 0.0],
+                tilt_deg=[2.0, 2.5],
+                azi_deg=[3.0, 3.5],
+                x_mm=[10.0, 10.1],
+                z_mm=[30.0, 30.1],
+                cam0=np.zeros((2, 4, 5), dtype=np.uint16),
+                cam1=np.zeros((2, 6, 7), dtype=np.uint16),
+                source_motor_name="Polar",
+                minimum_deg=-1.0,
+                maximum_deg=0.0,
+            ).assign_attrs(calibration_path=str(path))
+            with patched_main_window_runtime():
+                window = MainWindow()
+                try:
+                    window._on_new_calibration_ready(calibration)
+
+                    window._on_record_polar_ready(updated)
+
+                    assert window._calibration is not None
+                    self.assertIn("polar_reference_cam0", window._calibration)
+                    self.assertEqual(
+                        window._calibration.attrs["polar_reference_count"],
+                        2,
+                    )
+                    self.assertTrue(
+                        window.calibration_panel.record_polar_button.isEnabled()
+                    )
+                    self.assertIn(
+                        "Recorded 2 polar reference image pair",
+                        window.calibration_panel.calibration_status_label.text(),
+                    )
+                finally:
+                    window.close()
+
+    def test_record_polar_thread_persists_images_and_xz_readbacks(self):
+        get_qapp()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "calibration.h5"
+            calibration = write_sample_calibration(path)
+            thread = main_window._RecordPolarReferenceThread()
+            progress = []
+            ready = []
+            failed = []
+            thread.sigRecordPolarProgress.connect(lambda *args: progress.append(args))
+            thread.sigRecordPolarReady.connect(lambda value: ready.append(value))
+            thread.sigRecordPolarFailed.connect(lambda message: failed.append(message))
+            move_calls = []
+            capture_counts = []
+
+            def fake_move_motors(aliases, goals):
+                move_calls.append((tuple(aliases), tuple(goals)))
+                return tuple(float(goal) for goal in goals)
+
+            def fake_refresh(aliases):
+                self.assertEqual(tuple(aliases), ("x", "z", "t", "a"))
+                index = len(move_calls) - 1
+                return (10.0 + index, 30.0 + index, 2.0 + index, 3.0 + index)
+
+            def fake_capture(_camera_pair, capture_count):
+                capture_counts.append(int(capture_count))
+                value = len(move_calls)
+                cam0 = np.full((capture_count, 4, 5), value, dtype=np.uint16)
+                cam1 = np.full((capture_count, 6, 7), value + 10, dtype=np.uint16)
+                return (cam0, cam1), (cam0, cam1)
+
+            thread.configure(
+                calibration,
+                object(),
+                path,
+                motor_alias="p",
+                motor_name="Polar",
+                minimum_deg=-1.0,
+                maximum_deg=1.0,
+                capture_count=2,
+            )
+            with (
+                patch(
+                    "merlin_track_position.interface.main_window.move_motors_and_wait",
+                    side_effect=fake_move_motors,
+                ),
+                patch(
+                    "merlin_track_position.interface.main_window.refresh_motor_positions",
+                    side_effect=fake_refresh,
+                ),
+                patch(
+                    "merlin_track_position.interface.main_window."
+                    "capture_image_and_display_stacks",
+                    side_effect=fake_capture,
+                ),
+            ):
+                thread.run()
+
+            self.assertEqual(failed, [])
+            self.assertEqual(len(progress), 3)
+            self.assertEqual(len(ready), 1)
+            self.assertEqual(
+                move_calls,
+                [
+                    (("p",), (-1.0,)),
+                    (("p",), (0.0,)),
+                    (("p",), (1.0,)),
+                ],
+            )
+            self.assertEqual(capture_counts, [2, 2, 2])
+            loaded = load_calibration_dataset(path)
+            np.testing.assert_allclose(
+                loaded["polar_reference_polar_deg"].values,
+                [-1.0, 0.0, 1.0],
+            )
+            np.testing.assert_allclose(
+                loaded["polar_reference_x_mm"].values,
+                [10.0, 11.0, 12.0],
+            )
+            np.testing.assert_allclose(
+                loaded["polar_reference_z_mm"].values,
+                [30.0, 31.0, 32.0],
+            )
+            self.assertEqual(loaded["polar_reference_cam0"].dtype, np.dtype(np.uint16))
+            self.assertEqual(loaded.attrs["polar_reference_source_motor_name"], "Polar")
+
     def test_polar_compensation_dialog_empty_state_enables_calculation(self):
         get_qapp()
         dialog = main_window.PolarCompensationDialog(
@@ -3391,7 +3695,9 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                     window.image_items["cam0"].image,
                     current_cam0,
                 )
-                self.assertIn("missing orientation", window.statusBar().currentMessage())
+                self.assertIn(
+                    "missing orientation", window.statusBar().currentMessage()
+                )
                 image_width, image_height = main_window.CAMERA_IMAGE_SIZES["cam0"]
                 assert_rect_close(
                     self,
@@ -3882,8 +4188,12 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                             window._registration_config
                         ),
                     )
-                    self.assertIsInstance(thread.camera_pair.cam0, CachedFrameCameraPlugin)
-                    self.assertIsInstance(thread.camera_pair.cam1, CachedFrameCameraPlugin)
+                    self.assertIsInstance(
+                        thread.camera_pair.cam0, CachedFrameCameraPlugin
+                    )
+                    self.assertIsInstance(
+                        thread.camera_pair.cam1, CachedFrameCameraPlugin
+                    )
                     self.assertIn(
                         "Correction in progress",
                         window.calibration_panel.calibration_status_label.text(),
@@ -4292,8 +4602,12 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                             window._registration_config
                         ),
                     )
-                    self.assertIsInstance(thread.camera_pair.cam0, CachedFrameCameraPlugin)
-                    self.assertIsInstance(thread.camera_pair.cam1, CachedFrameCameraPlugin)
+                    self.assertIsInstance(
+                        thread.camera_pair.cam0, CachedFrameCameraPlugin
+                    )
+                    self.assertIsInstance(
+                        thread.camera_pair.cam1, CachedFrameCameraPlugin
+                    )
                     self.assertIsNone(window._last_correction_result)
                     self.assertFalse(window._server_correction_pending)
                     self.assertIn(
@@ -4376,8 +4690,12 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                             window._registration_config
                         ),
                     )
-                    self.assertIsInstance(thread.camera_pair.cam0, CachedFrameCameraPlugin)
-                    self.assertIsInstance(thread.camera_pair.cam1, CachedFrameCameraPlugin)
+                    self.assertIsInstance(
+                        thread.camera_pair.cam0, CachedFrameCameraPlugin
+                    )
+                    self.assertIsInstance(
+                        thread.camera_pair.cam1, CachedFrameCameraPlugin
+                    )
                     self.assertEqual(window._server.result_calls, [])
                     self.assertTrue(window._server_correction_pending)
                     self.assertEqual(window._server_correction_target, 7)

@@ -36,6 +36,7 @@ from merlin_track_position.instruments.cameras import (
     camera_pair_from_configs,
     cached_camera_pair_from_frame_cache,
     capture_timestamped_frame_from_config,
+    capture_image_and_display_stacks,
     crop_image_to_roi,
     normalize_capture_count,
 )
@@ -81,7 +82,10 @@ from merlin_track_position.interface.registration_settings import (
 )
 from merlin_track_position.interface.shift_monitor_window import ShiftMonitorWindow
 from merlin_track_position.server import MotorServer
-from merlin_track_position.tracking.calibrate import visual_calibration_probe_count
+from merlin_track_position.tracking.calibrate import (
+    _representative_image,
+    visual_calibration_probe_count,
+)
 from merlin_track_position.tracking.calibration_core import (
     flush_pending_calibration_datasets,
     load_calibration_dataset,
@@ -103,6 +107,10 @@ from merlin_track_position.tracking.polar_compensation import (
     apply_polar_compensation_model,
     fit_polar_compensation_model,
     predict_polar_compensation_from_attrs,
+)
+from merlin_track_position.tracking.polar_reference import (
+    apply_polar_reference_stack,
+    polar_reference_target_positions,
 )
 from merlin_track_position.tracking.roi import (
     BEAM_TARGET_ATTR_KEYS,
@@ -613,6 +621,9 @@ POLAR_COMPENSATION_PROBE_ANGLES_DEG = (-20.0, -12.5, -5.0)
 POLAR_COMPENSATION_DUPLICATE_PROBE_DEG = -10.0
 POLAR_COMPENSATION_PROBE_TOLERANCE_DEG = 0.1
 POLAR_COMPENSATION_ACTIVE_AXES = ("x", "z")
+RECORD_POLAR_MAX_DEG = 13.0
+RECORD_POLAR_STEP_DEG = 1.0
+RECORD_POLAR_MOTOR_OPTIONS = (("Polar", "p"), ("Polar Compens", "pc"))
 PERSISTENCE_FLUSH_INTERVAL_MS = 5000
 DEFAULT_AUTO_CORRECTION_INTERVAL_SECONDS = 180.0
 AUTO_CORRECTION_INTERVAL_SETTINGS_KEY = "auto_correction/interval_seconds"
@@ -629,6 +640,195 @@ BAYER_DISPLAY_CONVERSIONS = {
     "bayergr": cv2.COLOR_BayerGRBG2RGB,
     "bayerrg": cv2.COLOR_BayerRGGB2RGB,
 }
+
+
+class _RecordPolarReferenceThread(QtCore.QThread):
+    sigRecordPolarProgress = QtCore.Signal(int, int, float, str, object, object)
+    sigRecordPolarReady = QtCore.Signal(object)
+    sigRecordPolarFailed = QtCore.Signal(str)
+
+    def __init__(self, parent: QtCore.QObject | None = None):
+        super().__init__(parent)
+        self._running = threading.Event()
+        self._calibration: xr.Dataset | None = None
+        self._camera_pair: CameraPairPlugin | None = None
+        self._calibration_path: Path | None = None
+        self._motor_alias: str | None = None
+        self._motor_name: str | None = None
+        self._minimum_deg: float | None = None
+        self._maximum_deg: float | None = None
+        self._capture_count: int = 1
+        self._targets: tuple[float, ...] = ()
+
+    @property
+    def targets(self) -> tuple[float, ...]:
+        return self._targets
+
+    def configure(
+        self,
+        calibration: xr.Dataset,
+        camera_pair: CameraPairPlugin,
+        calibration_path: str | Path,
+        *,
+        motor_alias: str,
+        motor_name: str,
+        minimum_deg: float,
+        maximum_deg: float,
+        capture_count: int,
+    ) -> None:
+        if self.isRunning():
+            raise RuntimeError(
+                "cannot configure record-polar thread while it is running"
+            )
+        if not isinstance(calibration, xr.Dataset):
+            raise TypeError("calibration must be an xarray Dataset")
+        alias = str(motor_alias)
+        allowed_aliases = {
+            option_alias for _label, option_alias in RECORD_POLAR_MOTOR_OPTIONS
+        }
+        if alias not in allowed_aliases:
+            raise ValueError(f"unsupported record-polar motor alias {alias!r}")
+        minimum = float(minimum_deg)
+        maximum = float(maximum_deg)
+        if not math.isfinite(minimum) or not math.isfinite(maximum):
+            raise ValueError("record-polar minimum and maximum must be finite")
+        if minimum > maximum:
+            raise ValueError("record-polar minimum must be <= maximum")
+        if maximum > RECORD_POLAR_MAX_DEG:
+            raise ValueError(
+                f"record-polar maximum must be <= {RECORD_POLAR_MAX_DEG:g}"
+            )
+        targets = tuple(
+            float(value)
+            for value in polar_reference_target_positions(
+                minimum,
+                maximum,
+                step_deg=RECORD_POLAR_STEP_DEG,
+            )
+        )
+        if not targets:
+            raise ValueError("record-polar target list must not be empty")
+
+        self._calibration = calibration
+        self._camera_pair = camera_pair
+        self._calibration_path = Path(calibration_path)
+        self._motor_alias = alias
+        self._motor_name = str(motor_name)
+        self._minimum_deg = minimum
+        self._maximum_deg = maximum
+        self._capture_count = normalize_capture_count(capture_count)
+        self._targets = targets
+
+    def run(self) -> None:
+        self._running.set()
+        try:
+            try:
+                calibration, camera_pair, path = self._configured_inputs()
+                motor_alias = cast(str, self._motor_alias)
+                motor_name = cast(str, self._motor_name)
+                minimum = cast(float, self._minimum_deg)
+                maximum = cast(float, self._maximum_deg)
+
+                polar_values: list[float] = []
+                tilt_values: list[float] = []
+                azi_values: list[float] = []
+                x_values: list[float] = []
+                z_values: list[float] = []
+                cam0_images: list[np.ndarray] = []
+                cam1_images: list[np.ndarray] = []
+                total = len(self._targets)
+
+                for index, target in enumerate(self._targets, start=1):
+                    if not self._running.is_set() or self.isInterruptionRequested():
+                        return
+                    final_positions = move_motors_and_wait((motor_alias,), (target,))
+                    if len(final_positions) != 1:
+                        raise ValueError("record-polar move returned unexpected count")
+                    recorded_polar = float(final_positions[0])
+                    x_mm, z_mm, tilt_deg, azi_deg = (
+                        float(value)
+                        for value in refresh_motor_positions(("x", "z", "t", "a"))
+                    )
+                    stacks, display_stacks = capture_image_and_display_stacks(
+                        camera_pair,
+                        self._capture_count,
+                    )
+                    if len(stacks) != 2 or len(display_stacks) != 2:
+                        raise ValueError("record-polar capture must return two cameras")
+
+                    cam0 = _representative_image(stacks[0])
+                    cam1 = _representative_image(stacks[1])
+                    display_cam0 = _representative_image(display_stacks[0])
+                    display_cam1 = _representative_image(display_stacks[1])
+
+                    polar_values.append(recorded_polar)
+                    tilt_values.append(tilt_deg)
+                    azi_values.append(azi_deg)
+                    x_values.append(x_mm)
+                    z_values.append(z_mm)
+                    cam0_images.append(cam0)
+                    cam1_images.append(cam1)
+
+                    if self._running.is_set() and not self.isInterruptionRequested():
+                        self.sigRecordPolarProgress.emit(
+                            index,
+                            total,
+                            recorded_polar,
+                            motor_name,
+                            display_cam0,
+                            display_cam1,
+                        )
+
+                if not self._running.is_set() or self.isInterruptionRequested():
+                    return
+                updated = apply_polar_reference_stack(
+                    calibration,
+                    polar_deg=polar_values,
+                    tilt_deg=tilt_values,
+                    azi_deg=azi_values,
+                    x_mm=x_values,
+                    z_mm=z_values,
+                    cam0=np.stack(cam0_images, axis=0),
+                    cam1=np.stack(cam1_images, axis=0),
+                    source_motor_name=motor_name,
+                    minimum_deg=minimum,
+                    maximum_deg=maximum,
+                    step_deg=RECORD_POLAR_STEP_DEG,
+                )
+                persistence = save_calibration_dataset_deferred(updated, path)
+                if persistence.flushed:
+                    saved = load_calibration_dataset(path)
+                else:
+                    saved = updated.load().copy(deep=True)
+                    saved.attrs["calibration_path"] = str(path)
+                    saved = saved.assign_attrs(
+                        persistence_result_attrs("calibration", persistence)
+                    )
+                if self._running.is_set() and not self.isInterruptionRequested():
+                    self.sigRecordPolarReady.emit(saved)
+            except Exception as exc:
+                logger.exception("Record Polar failed.")
+                if self._running.is_set() and not self.isInterruptionRequested():
+                    self.sigRecordPolarFailed.emit(str(exc))
+        finally:
+            self._running.clear()
+
+    def _configured_inputs(self) -> tuple[xr.Dataset, CameraPairPlugin, Path]:
+        if self._calibration is None:
+            raise RuntimeError("record-polar thread has no calibration")
+        if self._camera_pair is None:
+            raise RuntimeError("record-polar thread has no camera pair")
+        if self._calibration_path is None:
+            raise RuntimeError("record-polar thread has no calibration path")
+        if self._motor_alias is None or self._motor_name is None:
+            raise RuntimeError("record-polar thread has no motor configured")
+        if self._minimum_deg is None or self._maximum_deg is None:
+            raise RuntimeError("record-polar thread has no range configured")
+        return self._calibration, self._camera_pair, self._calibration_path
+
+    def stop(self) -> None:
+        self._running.clear()
+        self.requestInterruption()
 
 
 def _frame_cache_capacity_for_capture_count(capture_count: int) -> int:
@@ -1386,6 +1586,103 @@ class CameraSettingsDialog(QtWidgets.QDialog):
         return configs
 
 
+def _clamped_record_polar_value(value: float) -> float:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(numeric):
+        return 0.0
+    return min(max(numeric, -180.0), RECORD_POLAR_MAX_DEG)
+
+
+class RecordPolarDialog(QtWidgets.QDialog):
+    def __init__(
+        self,
+        *,
+        default_minimum_deg: float = 0.0,
+        default_maximum_deg: float = RECORD_POLAR_MAX_DEG,
+        parent: QtWidgets.QWidget | None = None,
+    ):
+        super().__init__(parent)
+        self.setObjectName("record_polar_dialog")
+        self.setWindowTitle("Record Polar")
+
+        minimum = _clamped_record_polar_value(default_minimum_deg)
+        maximum = _clamped_record_polar_value(default_maximum_deg)
+        if minimum > maximum:
+            minimum = maximum
+
+        layout = QtWidgets.QVBoxLayout(self)
+        form = QtWidgets.QFormLayout()
+
+        self.minimum_spinbox = QtWidgets.QDoubleSpinBox()
+        self.minimum_spinbox.setObjectName("record_polar_minimum_spinbox")
+        self.minimum_spinbox.setDecimals(4)
+        self.minimum_spinbox.setRange(-180.0, RECORD_POLAR_MAX_DEG)
+        self.minimum_spinbox.setSingleStep(1.0)
+        self.minimum_spinbox.setSuffix(" deg")
+        self.minimum_spinbox.setValue(minimum)
+        form.addRow("Minimum", self.minimum_spinbox)
+
+        self.maximum_spinbox = QtWidgets.QDoubleSpinBox()
+        self.maximum_spinbox.setObjectName("record_polar_maximum_spinbox")
+        self.maximum_spinbox.setDecimals(4)
+        self.maximum_spinbox.setRange(-180.0, RECORD_POLAR_MAX_DEG)
+        self.maximum_spinbox.setSingleStep(1.0)
+        self.maximum_spinbox.setSuffix(" deg")
+        self.maximum_spinbox.setValue(maximum)
+        form.addRow("Maximum", self.maximum_spinbox)
+
+        self.motor_combo = QtWidgets.QComboBox()
+        self.motor_combo.setObjectName("record_polar_motor_combo")
+        for label, alias in RECORD_POLAR_MOTOR_OPTIONS:
+            self.motor_combo.addItem(label, alias)
+        default_motor_index = self.motor_combo.findData("pc")
+        self.motor_combo.setCurrentIndex(max(default_motor_index, 0))
+        form.addRow("Motor", self.motor_combo)
+
+        layout.addLayout(form)
+
+        button_layout = QtWidgets.QHBoxLayout()
+        button_layout.addStretch(1)
+        self.start_button = QtWidgets.QPushButton("Start")
+        self.start_button.setObjectName("record_polar_start_button")
+        self.start_button.clicked.connect(self._validate_and_accept)
+        button_layout.addWidget(self.start_button)
+        cancel_button = QtWidgets.QPushButton("Cancel")
+        cancel_button.clicked.connect(self.reject)
+        button_layout.addWidget(cancel_button)
+        layout.addLayout(button_layout)
+
+    def parameters(self) -> tuple[float, float, str, str]:
+        minimum = float(self.minimum_spinbox.value())
+        maximum = float(self.maximum_spinbox.value())
+        motor_alias = str(self.motor_combo.currentData())
+        motor_name = str(self.motor_combo.currentText())
+        return minimum, maximum, motor_alias, motor_name
+
+    def _validate_and_accept(self) -> None:
+        minimum, maximum, motor_alias, _motor_name = self.parameters()
+        try:
+            if not math.isfinite(minimum) or not math.isfinite(maximum):
+                raise ValueError("minimum and maximum must be finite")
+            if minimum > maximum:
+                raise ValueError("minimum must be less than or equal to maximum")
+            if maximum > RECORD_POLAR_MAX_DEG:
+                raise ValueError(f"maximum must be <= {RECORD_POLAR_MAX_DEG:g} deg")
+            if motor_alias not in {
+                alias for _label, alias in RECORD_POLAR_MOTOR_OPTIONS
+            }:
+                raise ValueError("selected motor is not supported")
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(
+                self, "Invalid polar record settings", str(exc)
+            )
+            return
+        self.accept()
+
+
 class PolarCompensationDialog(QtWidgets.QDialog):
     def __init__(
         self,
@@ -2114,6 +2411,7 @@ class MainWindow(_MainWindowGUI):
         self._detect_shift_thread = DetectShiftThread(self)
         self._stored_axis_move_thread = _StoredAxisMoveThread(self)
         self._polar_compensation_xz_move_thread = _PolarCompensationXzMoveThread(self)
+        self._record_polar_thread = _RecordPolarReferenceThread(self)
         self._calibration_total_steps = 0
         self._calibration_started_at: float | None = None
         self._calibration_processing_started_at: float | None = None
@@ -2224,6 +2522,9 @@ class MainWindow(_MainWindowGUI):
         self.calibration_panel.polar_compensate_button.clicked.connect(
             self._on_polar_compensate_clicked
         )
+        self.calibration_panel.record_polar_button.clicked.connect(
+            self._on_record_polar_clicked
+        )
         self.calibration_panel.correct_sample_button.clicked.connect(
             self._on_correct_sample_clicked
         )
@@ -2279,6 +2580,15 @@ class MainWindow(_MainWindowGUI):
         )
         self._polar_compensation_xz_move_thread.sigPolarCompensationXzMoveFailed.connect(
             self._on_polar_compensation_xz_move_failed
+        )
+        self._record_polar_thread.sigRecordPolarProgress.connect(
+            self._on_record_polar_progress
+        )
+        self._record_polar_thread.sigRecordPolarReady.connect(
+            self._on_record_polar_ready
+        )
+        self._record_polar_thread.sigRecordPolarFailed.connect(
+            self._on_record_polar_failed
         )
         self.image_auto_refresh_checkbox.toggled.connect(
             self._on_image_auto_refresh_toggled
@@ -2585,6 +2895,8 @@ class MainWindow(_MainWindowGUI):
             return "Correction is unavailable while a stored-axis move is running."
         if self._polar_compensation_active:
             return "Correction is unavailable while polar compensation is running."
+        if self._record_polar_thread.isRunning():
+            return "Correction is unavailable while Record Polar is running."
         if self._calibration_path is None or not self._calibration_path.exists():
             return "Correction requires a calibration file on disk."
         mismatch_message = self._camera_config_mismatch_message()
@@ -2605,6 +2917,8 @@ class MainWindow(_MainWindowGUI):
             return "Shift detection is unavailable while a stored-axis move is running."
         if self._polar_compensation_active:
             return "Shift detection is unavailable while polar compensation is running."
+        if self._record_polar_thread.isRunning():
+            return "Shift detection is unavailable while Record Polar is running."
         mismatch_message = self._camera_config_mismatch_message()
         if mismatch_message is not None:
             return mismatch_message
@@ -2625,6 +2939,8 @@ class MainWindow(_MainWindowGUI):
             return (
                 "Stored-axis move is unavailable while polar compensation is running."
             )
+        if self._record_polar_thread.isRunning():
+            return "Stored-axis move is unavailable while Record Polar is running."
         return None
 
     def _polar_compensation_unavailable_message(self) -> str | None:
@@ -2642,8 +2958,32 @@ class MainWindow(_MainWindowGUI):
             )
         if self._polar_compensation_active:
             return "Polar compensation is already running."
+        if self._record_polar_thread.isRunning():
+            return "Polar compensation is unavailable while Record Polar is running."
         if self._calibration_path is None or not self._calibration_path.exists():
             return "Polar compensation requires a calibration file on disk."
+        mismatch_message = self._camera_config_mismatch_message()
+        if mismatch_message is not None:
+            return mismatch_message
+        return None
+
+    def _record_polar_unavailable_message(self) -> str | None:
+        if self._calibration is None:
+            return "Record Polar requires a loaded calibration."
+        if self._calibration_thread.isRunning():
+            return "Record Polar is unavailable while calibration is running."
+        if self._correction_thread.isRunning():
+            return "Record Polar is unavailable while correction is running."
+        if self._detect_shift_thread.isRunning():
+            return "Record Polar is unavailable while shift detection is running."
+        if self._stored_axis_move_thread.isRunning():
+            return "Record Polar is unavailable while a stored-axis move is running."
+        if self._polar_compensation_active:
+            return "Record Polar is unavailable while polar compensation is running."
+        if self._record_polar_thread.isRunning():
+            return "Record Polar is already running."
+        if self._calibration_path is None or not self._calibration_path.exists():
+            return "Record Polar requires a calibration file on disk."
         mismatch_message = self._camera_config_mismatch_message()
         if mismatch_message is not None:
             return mismatch_message
@@ -2708,6 +3048,7 @@ class MainWindow(_MainWindowGUI):
             or self._detect_shift_thread.isRunning()
             or self._stored_axis_move_thread.isRunning()
             or self._polar_compensation_active
+            or self._record_polar_thread.isRunning()
         ):
             return
 
@@ -2729,6 +3070,75 @@ class MainWindow(_MainWindowGUI):
         if dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted:
             if dialog.start_requested():
                 self._on_calculate_polar_compensate_clicked(dialog.probe_angles())
+
+    @QtCore.Slot()
+    def _on_record_polar_clicked(self) -> None:
+        unavailable_message = self._record_polar_unavailable_message()
+        if unavailable_message is not None:
+            if self._calibration is not None:
+                QtWidgets.QMessageBox.critical(
+                    self,
+                    "Could not record polar references",
+                    unavailable_message,
+                )
+            return
+        if self._calibration is None or self._calibration_path is None:
+            return
+
+        try:
+            default_minimum = float(self._calibration.attrs.get("polar", 0.0))
+        except Exception:
+            default_minimum = 0.0
+        dialog = RecordPolarDialog(
+            default_minimum_deg=default_minimum,
+            default_maximum_deg=RECORD_POLAR_MAX_DEG,
+            parent=self,
+        )
+        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+
+        minimum, maximum, motor_alias, motor_name = dialog.parameters()
+        try:
+            action_started_ns = time.time_ns()
+            camera_pair = self._camera_pair_for_current_images(
+                cached_after_ns=action_started_ns,
+            )
+            self._record_polar_thread.configure(
+                self._calibration,
+                camera_pair,
+                self._calibration_path,
+                motor_alias=motor_alias,
+                motor_name=motor_name,
+                minimum_deg=minimum,
+                maximum_deg=maximum,
+                capture_count=int(self._registration_config["capture_count"]),
+            )
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Could not record polar references",
+                str(exc),
+            )
+            return
+
+        try:
+            self._stop_auto_correction(uncheck=True)
+            self._set_roi_editing_enabled(False)
+            targets = self._record_polar_thread.targets
+            self.calibration_panel.show_record_polar_in_progress(
+                completed=0,
+                total=len(targets),
+                motor_name=motor_name,
+                target_deg=targets[0] if targets else minimum,
+            )
+            self._record_polar_thread.start()
+        except Exception as exc:
+            self._restore_calibration_idle_state()
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Could not record polar references",
+                str(exc),
+            )
 
     @QtCore.Slot()
     def _on_calculate_polar_compensate_clicked(
@@ -3963,6 +4373,7 @@ class MainWindow(_MainWindowGUI):
             or self._detect_shift_thread.isRunning()
             or self._stored_axis_move_thread.isRunning()
             or self._polar_compensation_active
+            or self._record_polar_thread.isRunning()
         ):
             return
 
@@ -4009,6 +4420,7 @@ class MainWindow(_MainWindowGUI):
             or self._detect_shift_thread.isRunning()
             or self._stored_axis_move_thread.isRunning()
             or self._polar_compensation_active
+            or self._record_polar_thread.isRunning()
         ):
             return
 
@@ -4071,6 +4483,7 @@ class MainWindow(_MainWindowGUI):
             or self._detect_shift_thread.isRunning()
             or self._stored_axis_move_thread.isRunning()
             or self._polar_compensation_active
+            or self._record_polar_thread.isRunning()
         ):
             return
         if self._calibration is not None:
@@ -4436,6 +4849,69 @@ class MainWindow(_MainWindowGUI):
             error_message,
         )
 
+    @QtCore.Slot(int, int, float, str, object, object)
+    def _on_record_polar_progress(
+        self,
+        completed: int,
+        total: int,
+        polar_deg: float,
+        motor_name: str,
+        image_cam0: object,
+        image_cam1: object,
+    ) -> None:
+        self._on_image_capture_ready("cam0", image_cam0)
+        self._on_image_capture_ready("cam1", image_cam1)
+        self.calibration_panel.show_record_polar_in_progress(
+            completed=completed,
+            total=total,
+            motor_name=motor_name,
+            target_deg=polar_deg,
+        )
+
+    @QtCore.Slot(object)
+    def _on_record_polar_ready(self, calibration: object) -> None:
+        try:
+            if not isinstance(calibration, xr.Dataset):
+                raise TypeError("record-polar thread did not return an xarray Dataset")
+            validate_visual_calibration_dataset(calibration)
+            self._apply_calibration_roi_metadata(
+                calibration,
+                persist=False,
+            )
+            self._apply_calibration_beam_target_metadata(
+                calibration,
+                preserve_user_overrides=True,
+                persist=False,
+            )
+            path_value = calibration.attrs.get("calibration_path")
+            if path_value:
+                self._calibration_path = Path(str(path_value))
+            self._calibration = calibration
+            self._set_roi_editing_enabled(False)
+            self.calibration_panel.show_record_polar_result(calibration)
+            self._set_reference_preview_button_enabled(True)
+            self._set_shift_monitor_calibration()
+            self._update_reset_beam_target_button()
+            self._refresh_initial_transform_preview_after_known_state_change()
+            self._schedule_persistence_flush_if_needed()
+        except Exception as exc:
+            self._restore_calibration_idle_state()
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Could not use recorded polar references",
+                str(exc),
+            )
+
+    @QtCore.Slot(str)
+    def _on_record_polar_failed(self, error_message: str) -> None:
+        logger.error("Record Polar failed signal received: %s", error_message)
+        self._restore_calibration_idle_state()
+        QtWidgets.QMessageBox.critical(
+            self,
+            "Could not record polar references",
+            error_message,
+        )
+
     @QtCore.Slot()
     def _on_calibration_details_clicked(self) -> None:
         if (
@@ -4444,6 +4920,7 @@ class MainWindow(_MainWindowGUI):
             or self._detect_shift_thread.isRunning()
             or self._stored_axis_move_thread.isRunning()
             or self._polar_compensation_active
+            or self._record_polar_thread.isRunning()
         ):
             return
 
@@ -4519,9 +4996,7 @@ class MainWindow(_MainWindowGUI):
         )
 
     def _current_roi_geometries(self) -> dict[str, RoiGeometry]:
-        return {
-            camera: self._get_roi_geometry(camera) for camera in CAMERA_IMAGE_SIZES
-        }
+        return {camera: self._get_roi_geometry(camera) for camera in CAMERA_IMAGE_SIZES}
 
     def _camera_pair_for_current_images(
         self,
@@ -4638,6 +5113,9 @@ class MainWindow(_MainWindowGUI):
 
         self._polar_compensation_xz_move_thread.stop()
         self._polar_compensation_xz_move_thread.wait()
+
+        self._record_polar_thread.stop()
+        self._record_polar_thread.wait()
 
         close_basler_camera()
 

@@ -673,6 +673,9 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.polar_compensate_button.setObjectName("polar_compensate_button")
         self.polar_compensate_button.setEnabled(False)
         self.calculate_polar_compensate_button = self.polar_compensate_button
+        self.record_polar_button = QtWidgets.QPushButton("Record Polar")
+        self.record_polar_button.setObjectName("record_polar_button")
+        self.record_polar_button.setEnabled(False)
         self.correct_sample_button = QtWidgets.QPushButton("Correct sample")
         self.correct_sample_button.setEnabled(False)
         self.auto_correction_checkbox = QtWidgets.QCheckBox("Auto correct every:")
@@ -702,6 +705,7 @@ class CalibrationPanel(QtWidgets.QWidget):
         calibration_button_layout.addWidget(self.save_calibration_button)
         calibration_button_layout.addWidget(self.calibration_details_button)
         calibration_button_layout.addWidget(self.calculate_polar_compensate_button)
+        calibration_button_layout.addWidget(self.record_polar_button)
         calibration_button_layout.addWidget(self.new_calibration_button)
         calibration_layout.addLayout(calibration_button_layout)
 
@@ -915,6 +919,7 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.save_calibration_button.setEnabled(False)
         self.calibration_details_button.setEnabled(False)
         self.calculate_polar_compensate_button.setEnabled(False)
+        self.record_polar_button.setEnabled(False)
         self.correct_sample_button.setEnabled(False)
         self.correction_mode_combo.setEnabled(False)
         self.auto_correction_checkbox.setChecked(False)
@@ -946,6 +951,7 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.save_calibration_button.setEnabled(False)
         self.calibration_details_button.setEnabled(False)
         self.calculate_polar_compensate_button.setEnabled(False)
+        self.record_polar_button.setEnabled(False)
         self.correct_sample_button.setEnabled(False)
         self.correction_mode_combo.setEnabled(False)
         self.auto_correction_checkbox.setChecked(False)
@@ -1011,6 +1017,7 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.save_calibration_button.setEnabled(enabled)
         self.calibration_details_button.setEnabled(enabled)
         self.calculate_polar_compensate_button.setEnabled(enabled)
+        self.record_polar_button.setEnabled(enabled)
         self.correct_sample_button.setEnabled(enabled)
         self.correction_mode_combo.setEnabled(enabled)
         self.auto_correction_checkbox.setEnabled(enabled)
@@ -1201,6 +1208,7 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.save_calibration_button.setEnabled(False)
         self.calibration_details_button.setEnabled(False)
         self.calculate_polar_compensate_button.setEnabled(False)
+        self.record_polar_button.setEnabled(False)
         self.correct_sample_button.setEnabled(False)
         self.correction_mode_combo.setEnabled(False)
         self.auto_correction_checkbox.setEnabled(True)
@@ -1248,6 +1256,7 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.save_calibration_button.setEnabled(False)
         self.calibration_details_button.setEnabled(False)
         self.calculate_polar_compensate_button.setEnabled(False)
+        self.record_polar_button.setEnabled(False)
         self.correct_sample_button.setEnabled(False)
         self.correction_mode_combo.setEnabled(False)
         self.auto_correction_checkbox.setEnabled(False)
@@ -1306,6 +1315,7 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.save_calibration_button.setEnabled(False)
         self.calibration_details_button.setEnabled(False)
         self.calculate_polar_compensate_button.setEnabled(False)
+        self.record_polar_button.setEnabled(False)
         self.correct_sample_button.setEnabled(False)
         self.correction_mode_combo.setEnabled(False)
         self.auto_correction_checkbox.setEnabled(True)
@@ -1324,6 +1334,7 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.save_calibration_button.setEnabled(False)
         self.calibration_details_button.setEnabled(False)
         self.calculate_polar_compensate_button.setEnabled(False)
+        self.record_polar_button.setEnabled(False)
         self.correct_sample_button.setEnabled(False)
         self.correction_mode_combo.setEnabled(False)
         self.auto_correction_checkbox.setEnabled(False)
@@ -1346,6 +1357,38 @@ class CalibrationPanel(QtWidgets.QWidget):
             f"{_format_number(model.attrs.get('polar_compensation_residual_rms_um'))} um, "
             "max residual "
             f"{_format_number(model.attrs.get('polar_compensation_residual_max_um'))} um."
+        )
+
+    def show_record_polar_in_progress(
+        self,
+        *,
+        completed: int,
+        total: int,
+        motor_name: str,
+        target_deg: float,
+    ) -> None:
+        self._set_display_mode("calibration")
+        self.stored_orientation_widget.setVisible(False)
+        self._set_loaded_idle_controls_enabled(False)
+        total = max(int(total), 1)
+        completed = min(max(int(completed), 0), total)
+        self.calibration_progress_bar.setVisible(True)
+        self.calibration_progress_bar.setRange(0, total)
+        self.calibration_progress_bar.setValue(completed)
+        self.calibration_progress_bar.setFormat(f"{completed} / {total} references")
+        self.calibration_status_label.setText(
+            "Recording polar reference "
+            f"{completed}/{total}: {motor_name}={float(target_deg):.4f} deg."
+        )
+
+    def show_record_polar_result(self, calibration: xr.Dataset) -> None:
+        self._set_display_mode("calibration")
+        self._set_loaded_idle_controls_enabled(True)
+        self._show_stored_orientation(calibration)
+        self.calibration_progress_bar.setVisible(False)
+        count = int(calibration.attrs.get("polar_reference_count", 0))
+        self.calibration_status_label.setText(
+            f"Recorded {count} polar reference image pair(s)."
         )
 
     def show_detection_result(self, result: xr.Dataset) -> None:

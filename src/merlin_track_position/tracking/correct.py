@@ -50,6 +50,7 @@ from merlin_track_position.tracking.persistence import (
     persistence_result_attrs,
     stage_dataset,
 )
+from merlin_track_position.tracking.polar_reference import closest_polar_reference
 from merlin_track_position.tracking.roi import (
     beam_target_point_from_attrs_or_default,
     matching_reference_and_stack,
@@ -1827,8 +1828,8 @@ def _calibration_polar_deg(calibration: xr.Dataset) -> float:
 def _read_initial_readback_position_and_polar_deg(
     motor_backend: CorrectionMotorBackend,
 ) -> tuple[np.ndarray, float]:
-    readback_position_mm, orientation = _read_initial_readback_position_and_orientation_deg(
-        motor_backend
+    readback_position_mm, orientation = (
+        _read_initial_readback_position_and_orientation_deg(motor_backend)
     )
     return readback_position_mm, float(orientation["polar"])
 
@@ -1994,11 +1995,31 @@ def _correction_measurement_reference_inputs(
     Mapping[str, float | bool | str],
 ]:
     if measurement_reference is None:
-        return (
-            np.asarray(calibration["reference_cam0"].values),
-            np.asarray(calibration["reference_cam1"].values),
-            {"used": False},
-            default_orientation_attrs,
+        stored_reference = closest_polar_reference(
+            calibration,
+            float(current_orientation_deg["polar"]),
+        )
+        if stored_reference is None:
+            return (
+                np.asarray(calibration["reference_cam0"].values),
+                np.asarray(calibration["reference_cam1"].values),
+                {"used": False},
+                default_orientation_attrs,
+            )
+        (
+            stored_cam0,
+            stored_cam1,
+            stored_polar,
+            stored_tilt,
+            stored_azi,
+            _stored_index,
+        ) = stored_reference
+        measurement_reference = CorrectionMeasurementReference(
+            stored_cam0,
+            stored_cam1,
+            stored_polar,
+            stored_tilt,
+            stored_azi,
         )
 
     reference_polar = _finite_measurement_reference_value(
@@ -3212,7 +3233,9 @@ def _validate_readback_correction(correction_readback_mm: np.ndarray) -> np.ndar
     return correction
 
 
-def _active_command_axis_indices(active_command_axes: Sequence[str] | None) -> tuple[int, ...]:
+def _active_command_axis_indices(
+    active_command_axes: Sequence[str] | None,
+) -> tuple[int, ...]:
     if active_command_axes is None:
         return tuple(range(len(COMMAND_AXES)))
     axes = tuple(str(axis) for axis in active_command_axes)

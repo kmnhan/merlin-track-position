@@ -48,6 +48,10 @@ from merlin_track_position.tracking.correct import (
 )
 from merlin_track_position.tracking.detect import detect_shift
 from merlin_track_position.tracking.persistence import pending_entry_count
+from merlin_track_position.tracking.polar_reference import (
+    apply_polar_reference_stack,
+    polar_reference_target_positions,
+)
 from merlin_track_position.tracking.roi import roi_geometry_from_attrs
 from merlin_track_position.tracking.shift import estimate_shift
 
@@ -592,7 +596,9 @@ class ShiftDetectionTests(unittest.TestCase):
         and AZIMUTH_75P8_CALIBRATION_PATH.exists(),
         "large-azimuth calibration benchmark files are not available",
     )
-    def test_orientation_ecc_seed_large_azimuth_translation_comes_from_model_phase(self):
+    def test_orientation_ecc_seed_large_azimuth_translation_comes_from_model_phase(
+        self,
+    ):
         calibrations = {
             "azim47p5": load_calibration_dataset(
                 AZIMUTH_47P5_CALIBRATION_PATH
@@ -1644,6 +1650,68 @@ class VisualCalibrationTests(unittest.TestCase):
         np.testing.assert_array_equal(loaded["reference_cam0"].values, reference_cam0)
         np.testing.assert_array_equal(loaded["reference_cam1"].values, reference_cam1)
 
+    def test_polar_reference_targets_include_endpoints(self):
+        targets = polar_reference_target_positions(-2.2, 1.1)
+
+        self.assertEqual(float(targets[0]), -2.2)
+        self.assertEqual(float(targets[-1]), 1.1)
+        self.assertLessEqual(float(np.max(np.diff(targets))), 1.0)
+        np.testing.assert_array_equal(
+            polar_reference_target_positions(5.0, 5.0),
+            np.asarray([5.0]),
+        )
+
+    def test_saved_calibration_preserves_polar_reference_stack(self):
+        dataset = calibration_dataset()
+        cam0 = np.arange(3 * 4 * 5, dtype=np.uint16).reshape(3, 4, 5)
+        cam1 = np.arange(3 * 6 * 7, dtype=np.uint16).reshape(3, 6, 7)
+        updated = apply_polar_reference_stack(
+            dataset,
+            polar_deg=[-2.0, -1.0, 0.0],
+            tilt_deg=[1.0, 1.5, 2.0],
+            azi_deg=[3.0, 3.5, 4.0],
+            x_mm=[10.0, 10.1, 10.2],
+            z_mm=[30.0, 30.1, 30.2],
+            cam0=cam0,
+            cam1=cam1,
+            source_motor_name="Polar Compens",
+            minimum_deg=-2.0,
+            maximum_deg=0.0,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "calibration.h5"
+            save_calibration_dataset(updated, path)
+            with h5py.File(path, "r") as saved_file:
+                assert_hdf5_image_dataset_compressed(
+                    self,
+                    saved_file["polar_reference_cam0"],
+                    np.uint16,
+                )
+                assert_hdf5_image_dataset_compressed(
+                    self,
+                    saved_file["polar_reference_cam1"],
+                    np.uint16,
+                )
+            loaded = load_calibration_dataset(path)
+
+        self.assertEqual(
+            loaded.attrs["polar_reference_source_motor_name"], "Polar Compens"
+        )
+        self.assertEqual(loaded.attrs["polar_reference_count"], 3)
+        self.assertEqual(loaded["polar_reference_cam0"].dtype, np.dtype(np.uint16))
+        self.assertEqual(loaded["polar_reference_cam1"].dtype, np.dtype(np.uint16))
+        np.testing.assert_array_equal(loaded["polar_reference_cam0"].values, cam0)
+        np.testing.assert_array_equal(loaded["polar_reference_cam1"].values, cam1)
+        np.testing.assert_allclose(
+            loaded["polar_reference_x_mm"].values,
+            [10.0, 10.1, 10.2],
+        )
+        np.testing.assert_allclose(
+            loaded["polar_reference_z_mm"].values,
+            [30.0, 30.1, 30.2],
+        )
+
     def test_saved_calibration_accepts_color_reference_images(self):
         dataset = calibration_dataset()
         reference_cam0 = np.arange(4 * 5 * 3, dtype=np.uint16).reshape(4, 5, 3)
@@ -1907,6 +1975,16 @@ class CorrectionTests(unittest.TestCase):
         save_calibration_dataset(calibration_dataset(), path)
         return path
 
+    def motor_backend(self, positions):
+        class FakeMotorBackend:
+            def get_positions(self, aliases):
+                return tuple(float(positions[str(alias)]) for alias in aliases)
+
+            def move_motors_and_wait(self, *args, **kwargs):
+                raise AssertionError("correction should converge before moving")
+
+        return FakeMotorBackend()
+
     def patch_hardware(self, measurements, *, positions=(10.0, 20.0, 30.0)):
         measurement_iter = iter(measurements)
 
@@ -2108,6 +2186,187 @@ class CorrectionTests(unittest.TestCase):
             1.0,
         )
         self.assertTrue(result.attrs["correction_orientation_seed_applied"])
+
+    def test_correction_uses_closest_stored_polar_reference(self):
+        positions = {
+            "x": 0.0,
+            "y": 0.0,
+            "z": 0.0,
+            "p": -4.6,
+            "t": 0.25,
+            "a": 0.5,
+        }
+        stored_cam0 = np.stack(
+            [np.full((4, 5), value, dtype=float) for value in (10.0, 20.0, 30.0)],
+            axis=0,
+        )
+        stored_cam1 = np.stack(
+            [np.full((6, 7), value, dtype=float) for value in (40.0, 50.0, 60.0)],
+            axis=0,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "calibration.h5"
+            calibration = apply_polar_reference_stack(
+                calibration_dataset().assign_attrs(tilt=0.0, azi=0.0),
+                polar_deg=[-10.0, -5.0, 0.0],
+                tilt_deg=[1.0, 2.0, 3.0],
+                azi_deg=[4.0, 5.0, 6.0],
+                x_mm=[7.0, 8.0, 9.0],
+                z_mm=[17.0, 18.0, 19.0],
+                cam0=stored_cam0,
+                cam1=stored_cam1,
+                source_motor_name="Polar",
+                minimum_deg=-10.0,
+                maximum_deg=0.0,
+            )
+            save_calibration_dataset(calibration, path)
+            current_cam0 = np.full((1, 4, 5), 70.0, dtype=float)
+            current_cam1 = np.full((1, 6, 7), 80.0, dtype=float)
+            with (
+                patch(
+                    "merlin_track_position.tracking.correct.capture_image_stack",
+                    return_value=(current_cam0, current_cam1),
+                ),
+                patch(
+                    "merlin_track_position.tracking.correct.measure_image_error",
+                    return_value=shift_dataset(np.zeros((2, 2), dtype=float)),
+                ) as measure,
+            ):
+                result = do_correction(
+                    path,
+                    object(),
+                    capture_count=1,
+                    motor_backend=self.motor_backend(positions),
+                )
+
+        args = measure.call_args.args
+        np.testing.assert_array_equal(args[0], stored_cam0[1])
+        np.testing.assert_array_equal(args[1], current_cam0)
+        np.testing.assert_array_equal(args[2], stored_cam1[1])
+        np.testing.assert_array_equal(args[3], current_cam1)
+        self.assertEqual(result.attrs["correction_calibration_polar_deg"], 0.0)
+        self.assertEqual(result.attrs["correction_current_polar_deg"], -4.6)
+        self.assertTrue(result.attrs["correction_measurement_reference_used"])
+        self.assertEqual(
+            result.attrs["correction_measurement_reference_polar_deg"],
+            -5.0,
+        )
+        self.assertEqual(
+            result.attrs["correction_measurement_reference_tilt_deg"],
+            2.0,
+        )
+        self.assertEqual(
+            result.attrs["correction_measurement_reference_azi_deg"],
+            5.0,
+        )
+
+    def test_explicit_measurement_reference_overrides_stored_polar_reference(self):
+        positions = {
+            "x": 0.0,
+            "y": 0.0,
+            "z": 0.0,
+            "p": -4.6,
+            "t": 0.25,
+            "a": 0.5,
+        }
+        stored_cam0 = np.stack(
+            [np.full((4, 5), value, dtype=float) for value in (10.0, 20.0)],
+            axis=0,
+        )
+        stored_cam1 = np.stack(
+            [np.full((6, 7), value, dtype=float) for value in (40.0, 50.0)],
+            axis=0,
+        )
+        measurement_reference = CorrectionMeasurementReference(
+            cam0=np.full((4, 5), 90.0, dtype=float),
+            cam1=np.full((6, 7), 100.0, dtype=float),
+            polar_deg=2.0,
+            tilt_deg=3.0,
+            azi_deg=4.0,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "calibration.h5"
+            calibration = apply_polar_reference_stack(
+                calibration_dataset().assign_attrs(tilt=0.0, azi=0.0),
+                polar_deg=[-10.0, -5.0],
+                tilt_deg=[1.0, 2.0],
+                azi_deg=[3.0, 4.0],
+                x_mm=[7.0, 8.0],
+                z_mm=[17.0, 18.0],
+                cam0=stored_cam0,
+                cam1=stored_cam1,
+                source_motor_name="Polar",
+                minimum_deg=-10.0,
+                maximum_deg=-5.0,
+            )
+            save_calibration_dataset(calibration, path)
+            current_cam0 = np.full((1, 4, 5), 70.0, dtype=float)
+            current_cam1 = np.full((1, 6, 7), 80.0, dtype=float)
+            with (
+                patch(
+                    "merlin_track_position.tracking.correct.capture_image_stack",
+                    return_value=(current_cam0, current_cam1),
+                ),
+                patch(
+                    "merlin_track_position.tracking.correct.measure_image_error",
+                    return_value=shift_dataset(np.zeros((2, 2), dtype=float)),
+                ) as measure,
+            ):
+                result = do_correction(
+                    path,
+                    object(),
+                    capture_count=1,
+                    motor_backend=self.motor_backend(positions),
+                    measurement_reference=measurement_reference,
+                )
+
+        args = measure.call_args.args
+        np.testing.assert_array_equal(args[0], measurement_reference.cam0)
+        np.testing.assert_array_equal(args[2], measurement_reference.cam1)
+        self.assertTrue(result.attrs["correction_measurement_reference_used"])
+        self.assertEqual(
+            result.attrs["correction_measurement_reference_polar_deg"],
+            2.0,
+        )
+
+    def test_correction_without_stored_polar_reference_uses_calibration_reference(self):
+        positions = {
+            "x": 0.0,
+            "y": 0.0,
+            "z": 0.0,
+            "p": 0.0,
+            "t": 0.0,
+            "a": 0.0,
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "calibration.h5"
+            calibration = calibration_dataset().assign_attrs(tilt=0.0, azi=0.0)
+            save_calibration_dataset(calibration, path)
+            current_cam0 = np.full((1, 4, 5), 70.0, dtype=float)
+            current_cam1 = np.full((1, 6, 7), 80.0, dtype=float)
+            with (
+                patch(
+                    "merlin_track_position.tracking.correct.capture_image_stack",
+                    return_value=(current_cam0, current_cam1),
+                ),
+                patch(
+                    "merlin_track_position.tracking.correct.measure_image_error",
+                    return_value=shift_dataset(np.zeros((2, 2), dtype=float)),
+                ) as measure,
+            ):
+                result = do_correction(
+                    path,
+                    object(),
+                    capture_count=1,
+                    motor_backend=self.motor_backend(positions),
+                )
+
+        args = measure.call_args.args
+        np.testing.assert_array_equal(args[0], calibration["reference_cam0"].values)
+        np.testing.assert_array_equal(args[2], calibration["reference_cam1"].values)
+        self.assertFalse(result.attrs["correction_measurement_reference_used"])
 
     def test_no_move_when_initial_residual_is_under_tolerance(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2675,7 +2934,9 @@ class CorrectionTests(unittest.TestCase):
             result["px_per_readback_mm"].values, runtime_jacobian
         )
 
-    def test_correction_initial_measurement_does_not_seed_ecc_translation_from_readbacks(self):
+    def test_correction_initial_measurement_does_not_seed_ecc_translation_from_readbacks(
+        self,
+    ):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "calibration.h5"
             calibration = calibration_dataset().assign_attrs(

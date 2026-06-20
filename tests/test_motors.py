@@ -8,6 +8,7 @@ from merlin_track_position import constants
 from merlin_track_position.constants import MOTOR_NAMES
 from merlin_track_position.instruments.motors import (
     _bcs_server_context,
+    _bcs_motor_names,
     _clear_motor_position_cache,
     _move_motors_and_wait,
     cached_motor_positions,
@@ -118,6 +119,10 @@ class MotorConfigurationTests(unittest.TestCase):
         )
 
         self.assertEqual(missing_aliases, [])
+
+    def test_polar_compens_alias_maps_to_exact_bcs_motor_name(self):
+        self.assertEqual(_bcs_motor_names(("pc",)), ("Polar Compens",))
+        self.assertIn("pc", constants.MOTOR_READBACK_DEADBAND)
 
 
 def _get_motor_response(
@@ -915,14 +920,18 @@ class MotorPositionCacheTests(unittest.TestCase):
         _clear_motor_position_cache()
 
     def test_update_and_cached_motor_positions_are_explicit(self):
-        with patch("merlin_track_position.instruments.motors.time.monotonic", return_value=10.0):
+        with patch(
+            "merlin_track_position.instruments.motors.time.monotonic", return_value=10.0
+        ):
             updated = update_motor_position_cache(
                 {"x": 1.25, "p": -4.5},
                 source="test",
             )
 
         self.assertEqual(updated, {"x": 1.25, "p": -4.5})
-        with patch("merlin_track_position.instruments.motors.time.monotonic", return_value=12.0):
+        with patch(
+            "merlin_track_position.instruments.motors.time.monotonic", return_value=12.0
+        ):
             self.assertEqual(
                 cached_motor_positions(("p", "x"), max_age_s=3.0),
                 (-4.5, 1.25),
