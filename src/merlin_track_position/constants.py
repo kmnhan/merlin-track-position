@@ -83,7 +83,7 @@ CORRECTION_OBSERVATION_WEIGHTS: tuple[float, float, float, float] | None = (
 )
 DEFAULT_CORRECTION_MIN_COMMAND_NORM_MM: float = 1e-9
 DEFAULT_CORRECTION_MOVE_DELTA_DEADBAND_UM: float = 0.1
-DEFAULT_CORRECTION_MAX_MOVES: int = 20
+DEFAULT_CORRECTION_MAX_MOVES: int = 30
 DEFAULT_CORRECTION_MODE: str = "beam"
 
 # Beam-frame correction geometry. At polar=0, the beam is +65 degrees from +z
