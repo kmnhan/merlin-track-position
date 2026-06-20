@@ -1871,6 +1871,113 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
             finally:
                 window.close()
 
+    def test_polar_compensation_progress_shows_correction_steps(self):
+        get_qapp()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "calibration.h5"
+            calibration = write_sample_calibration(path)
+            result = correction_result_with_moves()
+            with patched_main_window_runtime():
+                window = MainWindow()
+                try:
+                    window._on_new_calibration_ready(calibration)
+                    window._polar_compensation_active = True
+                    window._polar_compensation_angles = (-20.0, -12.5, -5.0, 0.0)
+                    window._polar_compensation_index = 1
+                    window._polar_compensation_current_polar = -12.5
+
+                    window._on_correction_progress(result)
+
+                    self.assertIs(window._last_correction_result, result)
+                    self.assertFalse(
+                        window.calibration_panel.correct_sample_button.isEnabled()
+                    )
+                    self.assertIn(
+                        "Polar compensation X/Z correction 2/4",
+                        window.calibration_panel.calibration_status_label.text(),
+                    )
+                    self.assertEqual(
+                        window.calibration_panel.correction_steps_table.rowCount(),
+                        2,
+                    )
+                    self.assertFalse(
+                        window.calibration_panel.correction_steps_group.isHidden()
+                    )
+                finally:
+                    window.close()
+
+    def test_polar_compensation_finish_stores_probe_images_in_calibration(self):
+        get_qapp()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "calibration.h5"
+            calibration = write_sample_calibration(path)
+            polar = np.asarray([-20.0, -12.5, -5.0, 0.0], dtype=float)
+            anchor_xz = np.asarray([1.25, 3.5], dtype=float)
+            anchor_to_center = np.asarray([0.4, -0.2], dtype=float)
+            xz = predict_polar_compensation_xz(
+                polar,
+                anchor_polar_deg=0.0,
+                anchor_xz_mm=anchor_xz,
+                anchor_to_center_xz_mm=anchor_to_center,
+            )
+            current_cam0 = np.arange(polar.size * 2 * 3, dtype=np.uint16).reshape(
+                polar.size,
+                2,
+                3,
+            )
+            current_cam1 = np.arange(
+                polar.size * 3 * 4 * 3,
+                dtype=np.uint16,
+            ).reshape(polar.size, 3, 4, 3)
+            with patched_main_window_runtime():
+                window = MainWindow()
+                try:
+                    window._on_new_calibration_ready(calibration)
+                    window._polar_compensation_active = True
+                    window._polar_compensation_angles = tuple(
+                        float(value) for value in polar
+                    )
+                    window._polar_compensation_index = len(polar)
+                    window._polar_compensation_current_polar = float(polar[-1])
+                    window._polar_compensation_anchor_polar = 0.0
+                    window._polar_compensation_points = [
+                        main_window._PolarCompensationPoint(
+                            polar_deg=float(polar_value),
+                            x_mm=float(point[0]),
+                            y_mm=0.0,
+                            z_mm=float(point[1]),
+                            current_cam0=current_cam0[index],
+                            current_cam1=current_cam1[index],
+                        )
+                        for index, (polar_value, point) in enumerate(
+                            zip(polar, xz, strict=True)
+                        )
+                    ]
+
+                    with patch(
+                        "merlin_track_position.interface.main_window."
+                        "PolarCompensationDiagnosticsDialog"
+                    ) as diagnostics_dialog:
+                        window._finish_polar_compensation()
+
+                    diagnostics_dialog.assert_called_once()
+                    saved = load_calibration_dataset(path)
+                    np.testing.assert_array_equal(
+                        saved["polar_compensation_current_cam0"].values,
+                        current_cam0,
+                    )
+                    np.testing.assert_array_equal(
+                        saved["polar_compensation_current_cam1"].values,
+                        current_cam1,
+                    )
+                    self.assertFalse(window._polar_compensation_active)
+                    self.assertIn(
+                        "Polar compensation fitted",
+                        window.calibration_panel.calibration_status_label.text(),
+                    )
+                finally:
+                    window.close()
+
     def test_camera_display_transform_comes_from_settings(self):
         get_qapp()
         settings = FakeSettings()

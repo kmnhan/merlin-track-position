@@ -134,6 +134,89 @@ class PolarCompensationTests(unittest.TestCase):
             ),
         )
 
+    def test_fit_stores_probe_current_images(self):
+        anchor = np.asarray([1.0, 2.0])
+        radius = np.asarray([0.5, -0.25])
+        polar = np.asarray([-20.0, -12.5, -5.0, 0.0])
+        predicted = predict_polar_compensation_xz(
+            polar,
+            anchor_polar_deg=0.0,
+            anchor_xz_mm=anchor,
+            anchor_to_center_xz_mm=radius,
+        )
+        current_cam0 = np.arange(polar.size * 2 * 3, dtype=np.uint16).reshape(
+            polar.size,
+            2,
+            3,
+        )
+        current_cam1 = np.arange(polar.size * 3 * 4 * 3, dtype=np.uint16).reshape(
+            polar.size,
+            3,
+            4,
+            3,
+        )
+
+        model = fit_polar_compensation_model(
+            polar,
+            predicted[:, 0],
+            np.zeros(polar.shape),
+            predicted[:, 1],
+            anchor_polar_deg=0.0,
+            current_cam0=current_cam0,
+            current_cam1=current_cam1,
+        )
+        calibration = apply_polar_compensation_model(
+            model.drop_vars(model.data_vars),
+            model,
+        )
+
+        self.assertEqual(
+            calibration["polar_compensation_current_cam0"].dims,
+            (
+                "polar_compensation_probe",
+                "polar_compensation_y_cam0",
+                "polar_compensation_x_cam0",
+            ),
+        )
+        self.assertEqual(
+            calibration["polar_compensation_current_cam1"].dims,
+            (
+                "polar_compensation_probe",
+                "polar_compensation_y_cam1",
+                "polar_compensation_x_cam1",
+                "polar_compensation_channel_cam1",
+            ),
+        )
+        np.testing.assert_array_equal(
+            calibration["polar_compensation_current_cam0"].values,
+            current_cam0,
+        )
+        np.testing.assert_array_equal(
+            calibration["polar_compensation_current_cam1"].values,
+            current_cam1,
+        )
+
+    def test_rejects_mismatched_probe_image_count(self):
+        anchor = np.asarray([1.0, 2.0])
+        radius = np.asarray([0.5, -0.25])
+        polar = np.asarray([-20.0, -12.5, -5.0, 0.0])
+        predicted = predict_polar_compensation_xz(
+            polar,
+            anchor_polar_deg=0.0,
+            anchor_xz_mm=anchor,
+            anchor_to_center_xz_mm=radius,
+        )
+
+        with self.assertRaisesRegex(ValueError, "one image per polar probe"):
+            fit_polar_compensation_model(
+                polar,
+                predicted[:, 0],
+                np.zeros(polar.shape),
+                predicted[:, 1],
+                anchor_polar_deg=0.0,
+                current_cam0=np.zeros((polar.size - 1, 2, 3), dtype=np.uint16),
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

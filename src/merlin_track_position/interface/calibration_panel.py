@@ -1234,6 +1234,51 @@ class CalibrationPanel(QtWidgets.QWidget):
         self.correction_warnings_text.setPlainText(_correction_warning_text(result))
         self._show_correction_steps(result, in_progress=True)
 
+    def show_polar_compensation_correction_progress(
+        self,
+        result: xr.Dataset,
+        *,
+        step: int,
+        total: int,
+        polar_deg: float | None,
+    ) -> None:
+        self._set_display_mode("correction")
+        self.stored_orientation_widget.setVisible(False)
+        self.load_calibration_button.setEnabled(False)
+        self.save_calibration_button.setEnabled(False)
+        self.calibration_details_button.setEnabled(False)
+        self.calculate_polar_compensate_button.setEnabled(False)
+        self.correct_sample_button.setEnabled(False)
+        self.correction_mode_combo.setEnabled(False)
+        self.auto_correction_checkbox.setEnabled(False)
+        self.auto_correction_interval_spinbox.setEnabled(False)
+        self.detect_shift_button.setEnabled(False)
+        self.new_calibration_button.setEnabled(False)
+        self.new_calibration_button.setText("Clear calibration")
+        self.calibration_progress_bar.setVisible(True)
+        self.calibration_progress_bar.setRange(0, 0)
+
+        moves = int(
+            result.attrs.get("correction_iterations", result.sizes.get("move", 0))
+        )
+        residual, residual_label, residual_suffix = _correction_status_residual(result)
+        polar_text = "" if polar_deg is None else f" at p={float(polar_deg):.4f} deg"
+        if moves == 0:
+            self.calibration_status_label.setText(
+                "Polar compensation X/Z correction "
+                f"{int(step)}/{int(total)}{polar_text} before first move; current "
+                f"{residual_label} {_format_number(residual)}{residual_suffix}."
+            )
+        else:
+            self.calibration_status_label.setText(
+                "Polar compensation X/Z correction "
+                f"{int(step)}/{int(total)}{polar_text} after {moves} move(s); "
+                f"current {residual_label} "
+                f"{_format_number(residual)}{residual_suffix}."
+            )
+        self.correction_warnings_text.setPlainText(_correction_warning_text(result))
+        self._show_correction_steps(result, in_progress=True)
+
     def show_correction_result(self, result: xr.Dataset) -> None:
         self._set_display_mode("correction")
         self._set_loaded_idle_controls_enabled(True)

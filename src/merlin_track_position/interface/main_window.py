@@ -342,6 +342,45 @@ class _PolarCompensationPoint:
     x_mm: float
     y_mm: float
     z_mm: float
+    current_cam0: np.ndarray | None = None
+    current_cam1: np.ndarray | None = None
+
+
+def _polar_compensation_current_images_from_result(
+    result: xr.Dataset,
+) -> tuple[np.ndarray, np.ndarray]:
+    images: list[np.ndarray] = []
+    for name in ("current_cam0", "current_cam1"):
+        if name not in result:
+            raise ValueError(f"polar compensation correction result is missing {name}")
+        image = np.asarray(result[name].values)
+        if image.ndim not in (2, 3):
+            raise ValueError(f"{name} must be a 2-D or 3-D image")
+        if image.shape[0] == 0 or image.shape[1] == 0:
+            raise ValueError(f"{name} must not be empty")
+        images.append(image.copy())
+    return images[0], images[1]
+
+
+def _polar_compensation_image_stacks_from_points(
+    points: Sequence[_PolarCompensationPoint],
+) -> tuple[np.ndarray, np.ndarray]:
+    stacks: list[np.ndarray] = []
+    for camera_name in ("current_cam0", "current_cam1"):
+        images = [getattr(point, camera_name) for point in points]
+        if any(image is None for image in images):
+            raise ValueError(
+                "polar compensation cannot save without captured correction images"
+            )
+        try:
+            stacks.append(
+                np.stack(tuple(np.asarray(image) for image in images), axis=0)
+            )
+        except ValueError as exc:
+            raise ValueError(
+                "polar compensation correction images must have matching shapes"
+            ) from exc
+    return stacks[0], stacks[1]
 
 
 STORED_ORIENTATION_LABELS_BY_ALIAS = {
@@ -2594,12 +2633,17 @@ class MainWindow(_MainWindowGUI):
                 raise ValueError("correction result has invalid final readbacks")
             if self._polar_compensation_current_polar is None:
                 raise RuntimeError("polar readback is missing for current probe")
+            current_cam0, current_cam1 = _polar_compensation_current_images_from_result(
+                result
+            )
             self._polar_compensation_points.append(
                 _PolarCompensationPoint(
                     polar_deg=float(self._polar_compensation_current_polar),
                     x_mm=float(final_xyz[0]),
                     y_mm=float(final_xyz[1]),
                     z_mm=float(final_xyz[2]),
+                    current_cam0=current_cam0,
+                    current_cam1=current_cam1,
                 )
             )
         except Exception as exc:
@@ -2655,12 +2699,17 @@ class MainWindow(_MainWindowGUI):
         try:
             anchor_polar = float(self._calibration.attrs["polar"])
             points = tuple(self._polar_compensation_points)
+            current_cam0, current_cam1 = _polar_compensation_image_stacks_from_points(
+                points
+            )
             model = fit_polar_compensation_model(
                 [point.polar_deg for point in points],
                 [point.x_mm for point in points],
                 [point.y_mm for point in points],
                 [point.z_mm for point in points],
                 anchor_polar_deg=anchor_polar,
+                current_cam0=current_cam0,
+                current_cam1=current_cam1,
             )
             updated = apply_polar_compensation_model(self._calibration, model)
             persistence = save_calibration_dataset_deferred(
@@ -3970,8 +4019,11 @@ class MainWindow(_MainWindowGUI):
             return
         self._last_correction_result = result
         if self._polar_compensation_active:
-            self.calibration_panel.show_polar_compensation_in_progress(
-                "Correcting X/Z with Y frozen for polar compensation..."
+            self.calibration_panel.show_polar_compensation_correction_progress(
+                result,
+                step=self._polar_compensation_index + 1,
+                total=len(self._polar_compensation_angles),
+                polar_deg=self._polar_compensation_current_polar,
             )
         else:
             self.calibration_panel.show_correction_progress(result)

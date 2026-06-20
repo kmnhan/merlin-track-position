@@ -807,6 +807,20 @@ probe_capture_shift_mad_px(probe, camera, pixel_axis)
 probe_registration_warnings(probe, camera)
 ```
 
+When polar compensation has been fitted, the calibration file also stores the
+fit inputs, fit residuals, and representative current ROI image from each
+in-plane correction probe:
+
+```text
+polar_compensation_probe_polar_deg(polar_compensation_probe)
+polar_compensation_probe_xz_mm(polar_compensation_probe, polar_compensation_axis)
+polar_compensation_probe_y_mm(polar_compensation_probe)
+polar_compensation_predicted_xz_mm(polar_compensation_probe, polar_compensation_axis)
+polar_compensation_residual_um(polar_compensation_probe, polar_compensation_axis)
+polar_compensation_current_cam0(polar_compensation_probe, polar_compensation_y_cam0, polar_compensation_x_cam0)
+polar_compensation_current_cam1(polar_compensation_probe, polar_compensation_y_cam1, polar_compensation_x_cam1[, polar_compensation_channel_cam1])
+```
+
 Persisted calibration datasets omit values that can be recomputed exactly, such
 as predicted probe shifts, probe residuals, axis sensitivities, scale bounds,
 and condition number. `calibration_path` is attached only to loaded in-memory
