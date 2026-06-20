@@ -181,6 +181,7 @@ def do_correction(
     beam_vertical_tolerance_um: float = constants.DEFAULT_BEAM_VERTICAL_TOLERANCE_UM,
     weights: Sequence[float] | np.ndarray | None = None,
     progress_callback: Callable[[xr.Dataset], None] | None = None,
+    completion_callback: Callable[[xr.Dataset], None] | None = None,
     motor_backend: CorrectionMotorBackend | None = None,
     active_command_axes: Sequence[str] | None = None,
     measurement_reference: CorrectionMeasurementReference | None = None,
@@ -595,15 +596,13 @@ def do_correction(
             active_axis_names=active_axis_names,
         )
 
-    def save_progress(completed: bool) -> xr.Dataset:
+    def persist_progress(progress: xr.Dataset, *, completed: bool) -> xr.Dataset:
         logger.info(
             "Saving correction progress: completed=%s, run_id=%d, path=%s",
             completed,
             correction_run_id,
             correction_log_path,
         )
-        progress = build_result(completed)
-        progress = _apply_calibration_persistence_attrs(progress, calibration)
         persistence = save_correction_history_dataset_deferred(
             progress,
             correction_log_path,
@@ -616,6 +615,11 @@ def do_correction(
             progress_callback(progress)
         logger.info("Saved correction progress: completed=%s", completed)
         return progress
+
+    def save_progress(completed: bool) -> xr.Dataset:
+        progress = build_result(completed)
+        progress = _apply_calibration_persistence_attrs(progress, calibration)
+        return persist_progress(progress, completed=completed)
 
     # Publish the initial measurement and planned correction before any motor move.
     save_progress(completed=False)
@@ -994,7 +998,14 @@ def do_correction(
             criterion_residual,
         )
 
-    return save_progress(completed=True)
+    completed_result = build_result(completed=True)
+    completed_result = _apply_calibration_persistence_attrs(
+        completed_result,
+        calibration,
+    )
+    if completion_callback is not None:
+        completion_callback(completed_result)
+    return persist_progress(completed_result, completed=True)
 
 
 def _resolve_calibration_and_path(

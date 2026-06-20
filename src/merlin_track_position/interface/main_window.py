@@ -2897,6 +2897,9 @@ class MainWindow(_MainWindowGUI):
         self._correction_thread.sigCorrectionProgress.connect(
             self._on_correction_progress
         )
+        self._correction_thread.sigCorrectionCompleted.connect(
+            self._on_correction_completed
+        )
         self._correction_thread.sigCorrectionReady.connect(self._on_correction_ready)
         self._correction_thread.sigCorrectionFailed.connect(self._on_correction_failed)
         self._detect_shift_thread.sigDetectionReady.connect(self._on_detect_shift_ready)
@@ -3145,12 +3148,8 @@ class MainWindow(_MainWindowGUI):
     def _calibration_after_correction_result(self, result: xr.Dataset) -> xr.Dataset:
         if self._calibration_path is None:
             raise RuntimeError("correction finished without a calibration path")
-        if (
-            result.attrs.get("calibration_persistence_status") == "pending"
-            and self._calibration is not None
-            and "px_per_readback_mm" in result
-        ):
-            calibration = self._calibration.load().copy(deep=True)
+        if self._calibration is not None:
+            calibration = self._calibration.copy(deep=False)
             for key, value in result.attrs.items():
                 if (
                     key.startswith("calibration_persistence_")
@@ -5262,6 +5261,30 @@ class MainWindow(_MainWindowGUI):
         )
 
     @QtCore.Slot(object)
+    def _on_correction_completed(self, result: object) -> None:
+        logger.info("Correction completed signal received.")
+        if not isinstance(result, xr.Dataset):
+            logger.warning(
+                "Ignoring correction completion with unexpected type: %s",
+                type(result).__name__,
+            )
+            return
+        self._last_correction_result = result
+        if self._polar_compensation_active:
+            self.calibration_panel.show_polar_compensation_correction_saving(
+                result,
+                step=self._polar_compensation_index + 1,
+                total=len(self._polar_compensation_angles),
+                polar_deg=self._polar_compensation_current_polar,
+            )
+            return
+        self._reply_to_pending_server_correction(
+            True,
+            self._correction_server_result_message(result),
+        )
+        self.calibration_panel.show_correction_saving(result)
+
+    @QtCore.Slot(object)
     def _on_correction_ready(self, result: object) -> None:
         logger.info("Correction ready signal received.")
         if self._polar_compensation_active:
@@ -5292,8 +5315,11 @@ class MainWindow(_MainWindowGUI):
             self._set_reference_preview_button_enabled(True)
             self._set_shift_monitor_calibration()
             self._update_reset_beam_target_button()
-            self._refresh_initial_transform_preview_after_known_state_change()
-            self._flush_pending_persistence()
+            QtCore.QTimer.singleShot(
+                0,
+                self._refresh_initial_transform_preview_after_known_state_change,
+            )
+            self._schedule_persistence_flush_if_needed()
         except Exception as exc:
             self._restore_calibration_idle_state()
             self._reply_to_pending_server_correction(False, str(exc))
@@ -5305,10 +5331,6 @@ class MainWindow(_MainWindowGUI):
             )
             return
 
-        self._reply_to_pending_server_correction(
-            True,
-            self._correction_server_result_message(result),
-        )
         logger.info("Correction result applied to GUI.")
         self._release_basler_if_live_refresh_disabled()
 

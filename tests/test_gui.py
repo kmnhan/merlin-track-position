@@ -228,6 +228,7 @@ class FakeMotorServer(QtCore.QObject):
 
 class FakeCorrectionThread(QtCore.QObject):
     sigCorrectionProgress = QtCore.Signal(object)
+    sigCorrectionCompleted = QtCore.Signal(object)
     sigCorrectionReady = QtCore.Signal(object)
     sigCorrectionFailed = QtCore.Signal(str)
 
@@ -1595,6 +1596,52 @@ class CalibrationPanelTests(unittest.TestCase):
             summary,
         )
         self.assertIn("Next correction: x=1.5 um, y=-2 um, z=0 um.", summary)
+
+    def test_correction_saving_shows_completed_state(self):
+        get_qapp()
+        panel = CalibrationPanel()
+        result = correction_result(converged=True, moves=2, residual=0.125)
+
+        panel.show_correction_saving(result)
+
+        self.assertFalse(panel.calibration_progress_bar.isHidden())
+        self.assertEqual(panel.calibration_progress_bar.minimum(), 0)
+        self.assertEqual(panel.calibration_progress_bar.maximum(), 0)
+        self.assertFalse(panel.correct_sample_button.isEnabled())
+        self.assertIn(
+            "Correction converged after 2 move(s)",
+            panel.calibration_status_label.text(),
+        )
+        self.assertIn(
+            "Saving correction history",
+            panel.calibration_status_label.text(),
+        )
+
+    def test_polar_compensation_correction_saving_shows_completed_state(self):
+        get_qapp()
+        panel = CalibrationPanel()
+        result = correction_result(converged=True, moves=2, residual=0.125)
+
+        panel.show_polar_compensation_correction_saving(
+            result,
+            step=2,
+            total=4,
+            polar_deg=-5.0,
+        )
+
+        self.assertFalse(panel.calibration_progress_bar.isHidden())
+        self.assertEqual(panel.calibration_progress_bar.minimum(), 0)
+        self.assertEqual(panel.calibration_progress_bar.maximum(), 0)
+        self.assertFalse(panel.correct_sample_button.isEnabled())
+        self.assertFalse(panel.auto_correction_checkbox.isEnabled())
+        self.assertIn(
+            "Polar compensation X/Z correction 2/4 at p=-5.0000 deg converged",
+            panel.calibration_status_label.text(),
+        )
+        self.assertIn(
+            "Saving correction history",
+            panel.calibration_status_label.text(),
+        )
 
     def test_correction_result_displays_move_steps_in_microns(self):
         get_qapp()
@@ -4987,7 +5034,7 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                 finally:
                     window.close()
 
-    def test_server_triggered_correction_success_replies_ok_after_result(self):
+    def test_server_triggered_correction_success_replies_ok_after_completion(self):
         get_qapp()
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "calibration.h5"
@@ -5000,7 +5047,7 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                     window._on_move_detected(8)
 
                     window._correction_thread.running = False
-                    window._on_correction_ready(result)
+                    window._on_correction_completed(result)
 
                     self.assertFalse(window._server_correction_pending)
                     self.assertIsNone(window._server_correction_target)
@@ -5008,6 +5055,16 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                     success, message = window._server.result_calls[0]
                     self.assertTrue(success)
                     self.assertIn("did not converge after 3 move(s)", message)
+                    self.assertIn(
+                        "Saving correction history",
+                        window.calibration_panel.calibration_status_label.text(),
+                    )
+
+                    window._on_correction_ready(result)
+
+                    self.assertFalse(window._server_correction_pending)
+                    self.assertIsNone(window._server_correction_target)
+                    self.assertEqual(len(window._server.result_calls), 1)
                 finally:
                     window.close()
 
@@ -5062,7 +5119,7 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
             finally:
                 window.close()
 
-    def test_correction_success_stores_result_reloads_calibration_and_reports_status(
+    def test_correction_success_stores_result_reuses_calibration_and_reports_status(
         self,
     ):
         get_qapp()
@@ -5076,10 +5133,29 @@ class MainWindowCalibrationStateTests(unittest.TestCase):
                     window._on_new_calibration_ready(calibration)
                     window.calibration_panel.show_correction_in_progress()
 
-                    window._on_correction_ready(result)
+                    with (
+                        patch.object(
+                            window,
+                            "_load_calibration_from_path",
+                            side_effect=AssertionError("unexpected calibration reload"),
+                        ) as load_calibration,
+                        patch.object(
+                            window,
+                            "_flush_pending_persistence",
+                            side_effect=AssertionError("unexpected sync flush"),
+                        ) as flush_pending,
+                        patch.object(
+                            window,
+                            "_schedule_persistence_flush_if_needed",
+                        ) as schedule_flush,
+                    ):
+                        window._on_correction_ready(result)
 
                     self.assertIs(window._last_correction_result, result)
                     self.assertEqual(window._calibration_path, path)
+                    load_calibration.assert_not_called()
+                    flush_pending.assert_not_called()
+                    schedule_flush.assert_called_once()
                     self.assertTrue(
                         window.calibration_panel.correct_sample_button.isEnabled()
                     )

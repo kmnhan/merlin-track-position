@@ -4772,8 +4772,13 @@ class CorrectionTests(unittest.TestCase):
             p0 = x_shift(30.0)
             p1 = x_shift(10.0)
             progress_results = []
+            completion_results = []
+            save_events = []
             hardware_patches = self.patch_hardware(
                 [shift_dataset(p0), shift_dataset(p1)]
+            )
+            original_save_correction_history = (
+                correct_module.save_correction_history_dataset_deferred
             )
 
             def fake_move_motors_and_wait(*args, **kwargs):
@@ -4784,6 +4789,22 @@ class CorrectionTests(unittest.TestCase):
                 self.assertIn("correction_readback_delta_mm", first_progress)
                 return (10.0, 20.0, 30.0)
 
+            def record_completion(completed_result):
+                save_events.append("completion")
+                completion_results.append(completed_result)
+
+            def save_with_order_check(result_to_save, output_path, *, run_id):
+                if bool(result_to_save.attrs.get("correction_history_completed", False)):
+                    self.assertEqual(save_events[-1], "completion")
+                    save_events.append("final_save")
+                else:
+                    save_events.append("progress_save")
+                return original_save_correction_history(
+                    result_to_save,
+                    output_path,
+                    run_id=run_id,
+                )
+
             with (
                 hardware_patches[0],
                 hardware_patches[1],
@@ -4792,6 +4813,11 @@ class CorrectionTests(unittest.TestCase):
                     "merlin_track_position.tracking.correct.move_motors_and_wait",
                     side_effect=fake_move_motors_and_wait,
                 ),
+                patch(
+                    "merlin_track_position.tracking.correct."
+                    "save_correction_history_dataset_deferred",
+                    side_effect=save_with_order_check,
+                ),
             ):
                 result = do_correction(
                     path,
@@ -4799,6 +4825,7 @@ class CorrectionTests(unittest.TestCase):
                     correction_mode="camera",
                     max_moves=1,
                     progress_callback=progress_results.append,
+                    completion_callback=record_completion,
                 )
 
         self.assertEqual(len(progress_results), 2)
@@ -4807,6 +4834,15 @@ class CorrectionTests(unittest.TestCase):
         self.assertEqual(initial_progress.sizes["move"], 0)
         self.assertFalse(progress.attrs["correction_history_completed"])
         self.assertEqual(progress.sizes["move"], 1)
+        self.assertEqual(len(completion_results), 1)
+        completed_result = completion_results[0]
+        self.assertTrue(completed_result.attrs["correction_history_completed"])
+        self.assertEqual(completed_result.sizes["move"], 1)
+        self.assertNotIn(
+            "correction_history_persistence_status",
+            completed_result.attrs,
+        )
+        self.assertEqual(save_events[-2:], ["completion", "final_save"])
         self.assertEqual(result.attrs["correction_history_completed"], True)
 
     def test_latest_correction_history_dataset_can_be_reloaded(self):

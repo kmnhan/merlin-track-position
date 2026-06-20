@@ -207,6 +207,7 @@ class CorrectionThreadTests(unittest.TestCase):
             image_shape_cam1=(6, 7),
         )
         progress = xr.Dataset(attrs={"correction_iterations": 1})
+        completed = xr.Dataset(attrs={"correction_converged": True})
         result = xr.Dataset(attrs={"correction_converged": True})
         measurement_reference = CorrectionMeasurementReference(
             cam0=np.zeros((4, 5), dtype=float),
@@ -223,6 +224,7 @@ class CorrectionThreadTests(unittest.TestCase):
             *,
             calibration_path,
             progress_callback,
+            completion_callback,
             motor_backend,
             correction_mode,
             **shift_kwargs,
@@ -238,16 +240,31 @@ class CorrectionThreadTests(unittest.TestCase):
                 )
             )
             progress_callback(progress)
+            completion_callback(completed)
             return result
 
         thread = CorrectionThread()
         progress_results = []
+        completed_results = []
         ready = []
         failed = []
-        thread.sigCorrectionProgress.connect(
-            lambda value: progress_results.append(value)
-        )
-        thread.sigCorrectionReady.connect(lambda value: ready.append(value))
+        signal_order = []
+
+        def record_progress(value):
+            signal_order.append("progress")
+            progress_results.append(value)
+
+        def record_completed(value):
+            signal_order.append("completed")
+            completed_results.append(value)
+
+        def record_ready(value):
+            signal_order.append("ready")
+            ready.append(value)
+
+        thread.sigCorrectionProgress.connect(record_progress)
+        thread.sigCorrectionCompleted.connect(record_completed)
+        thread.sigCorrectionReady.connect(record_ready)
         thread.sigCorrectionFailed.connect(lambda message: failed.append(message))
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -286,8 +303,10 @@ class CorrectionThreadTests(unittest.TestCase):
             ],
         )
         self.assertEqual(progress_results, [progress])
+        self.assertEqual(completed_results, [completed])
         self.assertEqual(ready, [result])
         self.assertEqual(failed, [])
+        self.assertEqual(signal_order, ["progress", "completed", "ready"])
 
     def test_run_emits_failure_when_do_correction_raises(self):
         get_qapp()

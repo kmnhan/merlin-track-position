@@ -21,6 +21,7 @@ logger = logging.getLogger("merlin_track_position.interface.correction_thread")
 
 class CorrectionThread(QtCore.QThread):
     sigCorrectionProgress = QtCore.Signal(object)
+    sigCorrectionCompleted = QtCore.Signal(object)
     sigCorrectionReady = QtCore.Signal(object)
     sigCorrectionFailed = QtCore.Signal(str)
 
@@ -96,6 +97,7 @@ class CorrectionThread(QtCore.QThread):
                     self._camera_pair,
                     calibration_path=self._calibration_path,
                     progress_callback=self._emit_progress,
+                    completion_callback=self._emit_completed,
                     motor_backend=self._motor_backend,
                     correction_mode=self._correction_mode,
                     active_command_axes=self._active_command_axes,
@@ -128,3 +130,7 @@ class CorrectionThread(QtCore.QThread):
     def _emit_progress(self, result: xr.Dataset) -> None:
         if self._running.is_set() and not self.isInterruptionRequested():
             self.sigCorrectionProgress.emit(result)
+
+    def _emit_completed(self, result: xr.Dataset) -> None:
+        if self._running.is_set() and not self.isInterruptionRequested():
+            self.sigCorrectionCompleted.emit(result)
